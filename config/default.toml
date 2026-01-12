@@ -33,9 +33,15 @@ github_allowed_username = "your-github-username"
 session_secret = "change-this-to-a-random-secret-key"
 
 [instance]
-name = "RustResort"
+title = "RustResort"
 description = "A lightweight, single-user ActivityPub server"
-contact_email = ""
+contact_email = "admin@example.com"
+
+[admin]
+username = "admin"
+display_name = "Admin"
+# email defaults to instance.contact_email
+# note = "Instance administrator"
 
 [cache]
 timeline_max_items = 2000

@@ -140,6 +140,9 @@ impl AppState {
             profile_cache.initialize_from_addresses(&follower_addresses, &http_client),
         );
 
+        // 7. Initialize admin user
+        Self::ensure_admin_user(&db, &config).await?;
+
         tracing::info!("Application state initialized successfully");
 
         Ok(Self {
@@ -151,5 +154,102 @@ impl AppState {
             backup: Arc::new(backup),
             http_client: Arc::new(http_client),
         })
+    }
+
+    /// Ensure admin user exists with current configuration
+    ///
+    /// Creates or updates the admin user account based on configuration.
+    /// Generates RSA keypair if creating new account.
+    async fn ensure_admin_user(
+        db: &data::Database,
+        config: &config::AppConfig,
+    ) -> Result<(), error::AppError> {
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+
+        // Check if admin account exists
+        if let Some(mut account) = db.get_account().await? {
+            // Update admin account if configuration changed
+            let mut updated = false;
+
+            if account.username != config.admin.username {
+                account.username = config.admin.username.clone();
+                updated = true;
+            }
+
+            if account.display_name.as_deref() != Some(&config.admin.display_name) {
+                account.display_name = Some(config.admin.display_name.clone());
+                updated = true;
+            }
+
+            let _admin_email = config.admin.email.as_ref()
+                .unwrap_or(&config.instance.contact_email);
+            // Note: email is not stored in account table currently
+
+            if let Some(ref note) = config.admin.note {
+                if account.note.as_deref() != Some(note) {
+                    account.note = Some(note.clone());
+                    updated = true;
+                }
+            }
+
+            if updated {
+                db.upsert_account(&account).await?;
+                tracing::info!(
+                    username = %account.username,
+                    "Admin account updated"
+                );
+            } else {
+                tracing::info!(
+                    username = %account.username,
+                    "Admin account exists"
+                );
+            }
+
+            return Ok(());
+        }
+
+        // Create new admin account
+        tracing::info!("Creating admin account...");
+
+        // Generate RSA keypair for ActivityPub
+        let mut rng = rand::thread_rng();
+        let bits = 2048;
+        let private_key = RsaPrivateKey::new(&mut rng, bits)
+            .map_err(|e| error::AppError::Internal(e.into()))?;
+        let public_key = RsaPublicKey::from(&private_key);
+
+        // Encode keys to PEM
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map_err(|e| error::AppError::Internal(e.into()))?
+            .to_string();
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .map_err(|e| error::AppError::Internal(e.into()))?;
+
+        // Create account
+        let account = data::Account {
+            id: data::EntityId::new().0,
+            username: config.admin.username.clone(),
+            display_name: Some(config.admin.display_name.clone()),
+            note: config.admin.note.clone(),
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem,
+            public_key_pem,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        db.upsert_account(&account).await?;
+
+        tracing::info!(
+            username = %account.username,
+            display_name = ?account.display_name,
+            "Admin account created"
+        );
+
+        Ok(())
     }
 }

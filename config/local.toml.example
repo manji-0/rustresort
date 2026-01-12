@@ -35,9 +35,16 @@
 # session_secret = "dev-secret-key-change-in-production"
 
 [instance]
-# name = "RustResort Dev"
+# title = "RustResort Dev"
 # description = "Development instance"
 # contact_email = "dev@example.com"
+
+[admin]
+# Admin user configuration (single-user instance)
+# username = "admin"
+# display_name = "Admin"
+# email = "admin@example.com"  # Falls back to instance.contact_email if not set
+# note = "Instance administrator"
 
 [cache]
 # timeline_max_items = 2000

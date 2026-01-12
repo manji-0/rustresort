@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub cloudflare: CloudflareConfig,
     pub auth: AuthConfig,
     pub instance: InstanceConfig,
+    pub admin: AdminConfig,
     pub cache: CacheConfig,
     pub logging: LoggingConfig,
 }
@@ -118,6 +119,30 @@ pub struct InstanceConfig {
     pub description: String,
     pub contact_email: String,
 }
+
+/// Admin user configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminConfig {
+    /// Admin username (default: "admin")
+    #[serde(default = "default_admin_username")]
+    pub username: String,
+    /// Admin display name (default: "Admin")
+    #[serde(default = "default_admin_display_name")]
+    pub display_name: String,
+    /// Admin email (falls back to instance.contact_email if not set)
+    pub email: Option<String>,
+    /// Admin bio/note
+    pub note: Option<String>,
+}
+
+fn default_admin_username() -> String {
+    "admin".to_string()
+}
+
+fn default_admin_display_name() -> String {
+    "Admin".to_string()
+}
+
 
 /// Cache configuration
 #[derive(Debug, Clone, Deserialize)]
