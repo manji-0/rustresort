@@ -214,7 +214,7 @@ impl AppState {
 
         // Generate RSA keypair for ActivityPub
         let mut rng = rand::thread_rng();
-        let bits = 2048;
+        let bits = 4096;
         let private_key = RsaPrivateKey::new(&mut rng, bits)
             .map_err(|e| error::AppError::Internal(e.into()))?;
         let public_key = RsaPublicKey::from(&private_key);

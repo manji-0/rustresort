@@ -9,18 +9,19 @@ This document describes the RSA key requirements and specifications for Activity
 ### Key Size
 
 **Minimum**: 2048 bits  
-**Recommended**: 2048 bits or larger  
-**Current Implementation**: 2048 bits
+**Recommended**: 4096 bits  
+**Current Implementation**: 4096 bits
 
 ```rust
-let bits = 2048;
+let bits = 4096;
 let private_key = RsaPrivateKey::new(&mut rng, bits)?;
 ```
 
 **Rationale:**
 - 1024-bit RSA keys are no longer considered secure
-- 2048-bit keys provide adequate security for the foreseeable future
-- Larger keys (4096 bits) are acceptable but increase computational overhead
+- 2048-bit keys provide adequate security but 4096-bit is preferred
+- 4096-bit keys offer enhanced security with minimal overhead on modern hardware
+- Future-proof against advances in computational power and cryptanalysis
 
 ### Key Format
 
@@ -49,7 +50,7 @@ use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 
 // Generate keypair
 let mut rng = rand::thread_rng();
-let bits = 2048;
+let bits = 4096;
 let private_key = RsaPrivateKey::new(&mut rng, bits)?;
 let public_key = RsaPublicKey::from(&private_key);
 
@@ -256,7 +257,7 @@ When rotating keys:
 
 ## Implementation Checklist
 
-- [ ] Generate 2048-bit RSA keypair
+- [ ] Generate 4096-bit RSA keypair
 - [ ] Store private key securely (PKCS#8 PEM)
 - [ ] Expose public key in actor object (PKCS#1 PEM)
 - [ ] Include `publicKey` object with `id`, `owner`, `publicKeyPem`
