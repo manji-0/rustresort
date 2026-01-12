@@ -1,0 +1,130 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Account",
+    "description": "Mastodon API Account schema based on GoToSocial implementation",
+    "type": "object",
+    "required": [
+        "id",
+        "username",
+        "acct",
+        "url",
+        "created_at"
+    ],
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": "The account id"
+        },
+        "username": {
+            "type": "string",
+            "description": "The username of the account, not including domain"
+        },
+        "acct": {
+            "type": "string",
+            "description": "The account URI as discovered via webfinger"
+        },
+        "display_name": {
+            "type": "string",
+            "description": "The account's display name"
+        },
+        "locked": {
+            "type": "boolean",
+            "description": "Account manually approves follow requests"
+        },
+        "bot": {
+            "type": "boolean",
+            "description": "Account identifies as a bot"
+        },
+        "discoverable": {
+            "type": "boolean",
+            "description": "Account has opted into discovery features"
+        },
+        "group": {
+            "type": "boolean",
+            "description": "Account identifies as a Group actor"
+        },
+        "created_at": {
+            "type": "string",
+            "description": "When the account was created (ISO 8601 Datetime)"
+        },
+        "note": {
+            "type": "string",
+            "description": "Bio/description of this account"
+        },
+        "url": {
+            "type": "string",
+            "description": "Web location of the account's profile page"
+        },
+        "avatar": {
+            "type": "string",
+            "description": "Web location of the account's avatar"
+        },
+        "avatar_static": {
+            "type": "string",
+            "description": "Web location of a static version of the account's avatar"
+        },
+        "header": {
+            "type": "string",
+            "description": "Web location of the account's header image"
+        },
+        "header_static": {
+            "type": "string",
+            "description": "Web location of a static version of the account's header"
+        },
+        "followers_count": {
+            "type": "integer",
+            "description": "Number of accounts following this account"
+        },
+        "following_count": {
+            "type": "integer",
+            "description": "Number of accounts followed by this account"
+        },
+        "statuses_count": {
+            "type": "integer",
+            "description": "Number of statuses posted by this account"
+        },
+        "last_status_at": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "When the account's most recent status was posted (ISO 8601 Date)"
+        },
+        "emojis": {
+            "type": "array",
+            "description": "Array of custom emojis used in this account's note or display name",
+            "items": {
+                "type": "object"
+            }
+        },
+        "fields": {
+            "type": "array",
+            "description": "Additional metadata attached to this account's profile",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    },
+                    "value": {
+                        "type": "string"
+                    },
+                    "verified_at": {
+                        "type": [
+                            "string",
+                            "null"
+                        ]
+                    }
+                }
+            }
+        },
+        "suspended": {
+            "type": "boolean",
+            "description": "Account has been suspended by our instance"
+        },
+        "source": {
+            "type": "object",
+            "description": "Source information for own account"
+        }
+    }
+}

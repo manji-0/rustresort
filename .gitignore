@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Database
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+
+# Configuration
+/config/local.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Backups
+*.bak
+
+# Reference materials
+/activitypub/
+/gotosocial/

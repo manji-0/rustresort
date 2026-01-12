@@ -1,0 +1,846 @@
+//! Account endpoints
+
+use axum::{
+    extract::{Path, Query, State},
+    response::Json,
+};
+use serde::Deserialize;
+
+use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL};
+use crate::AppState;
+use crate::auth::CurrentUser;
+use crate::error::AppError;
+
+/// Pagination parameters
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct PaginationParams {
+    pub max_id: Option<String>,
+    pub min_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// Update credentials request
+#[derive(Debug, Deserialize)]
+pub struct UpdateCredentialsRequest {
+    pub display_name: Option<String>,
+    pub note: Option<String>,
+    pub avatar: Option<String>, // Base64 encoded image
+    pub header: Option<String>, // Base64 encoded image
+    pub locked: Option<bool>,
+    pub bot: Option<bool>,
+    pub discoverable: Option<bool>,
+}
+
+/// Relationships query parameters
+#[derive(Debug, Deserialize)]
+pub struct RelationshipsParams {
+    #[serde(rename = "id[]")]
+    pub ids: Vec<String>,
+}
+
+/// Search query parameters
+#[derive(Debug, Deserialize)]
+pub struct SearchParams {
+    pub q: String,
+    pub limit: Option<usize>,
+    pub resolve: Option<bool>,
+    pub following: Option<bool>,
+}
+
+/// GET /api/v1/accounts/verify_credentials
+pub async fn verify_credentials(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Start timing the request
+    let _timer = HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&["GET", "/api/v1/accounts/verify_credentials"])
+        .start_timer();
+
+    // Get the account from database
+    let db_timer = DB_QUERY_DURATION_SECONDS
+        .with_label_values(&["SELECT", "accounts"])
+        .start_timer();
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    db_timer.observe_duration();
+
+    // Convert to API response
+    let mut response = crate::api::account_to_response(&account, &state.config);
+
+    // Get counts
+    let db_timer = DB_QUERY_DURATION_SECONDS
+        .with_label_values(&["SELECT", "followers"])
+        .start_timer();
+    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
+    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "followers"]).inc();
+    db_timer.observe_duration();
+
+    let db_timer = DB_QUERY_DURATION_SECONDS
+        .with_label_values(&["SELECT", "follows"])
+        .start_timer();
+    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "follows"]).inc();
+    db_timer.observe_duration();
+
+    response.followers_count = followers_count;
+    response.following_count = following_count;
+
+    // Update metrics
+    FOLLOWERS_TOTAL.set(followers_count as i64);
+    FOLLOWING_TOTAL.set(following_count as i64);
+
+    // Record successful request
+    HTTP_REQUESTS_TOTAL
+        .with_label_values(&["GET", "/api/v1/accounts/verify_credentials", "200"])
+        .inc();
+
+    Ok(Json(serde_json::to_value(response).unwrap()))
+}
+
+/// PATCH /api/v1/accounts/update_credentials
+pub async fn update_credentials(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Json(req): Json<UpdateCredentialsRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use chrono::Utc;
+
+    // Get current account
+    let mut account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Update fields if provided
+    if let Some(display_name) = req.display_name {
+        account.display_name = Some(display_name);
+    }
+
+    if let Some(note) = req.note {
+        account.note = Some(note);
+    }
+
+    // TODO: Handle avatar and header uploads
+    // For now, we skip image processing as it requires multipart/form-data handling
+    // and S3 upload integration
+
+    account.updated_at = Utc::now();
+
+    // Save to database
+    state.db.upsert_account(&account).await?;
+
+    // Return updated account
+    let mut response = crate::api::account_to_response(&account, &state.config);
+
+    // Get counts
+    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
+    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+
+    response.followers_count = followers_count;
+    response.following_count = following_count;
+
+    Ok(Json(serde_json::to_value(response).unwrap()))
+}
+
+/// GET /api/v1/accounts/:id
+pub async fn get_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Get the account from database
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Check if ID matches
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Convert to API response
+    let mut response = crate::api::account_to_response(&account, &state.config);
+
+    // Get counts
+    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
+    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+
+    response.followers_count = followers_count;
+    response.following_count = following_count;
+
+    Ok(Json(serde_json::to_value(response).unwrap()))
+}
+
+/// GET /api/v1/accounts/:id/statuses
+pub async fn account_statuses(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get the account
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Get local statuses
+    let limit = params.limit.unwrap_or(20).min(40);
+    let statuses = state
+        .db
+        .get_local_statuses(limit, params.max_id.as_deref())
+        .await?;
+
+    // Convert to API responses
+    let responses: Vec<_> = statuses
+        .iter()
+        .map(|status| {
+            let response =
+                crate::api::status_to_response(status, &account, &state.config, None, None, None);
+            serde_json::to_value(response).unwrap()
+        })
+        .collect();
+
+    Ok(Json(responses))
+}
+
+/// GET /api/v1/accounts/:id/followers
+pub async fn get_account_followers(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(_params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get the account
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Get follower addresses
+    let _follower_addresses = state.db.get_all_follower_addresses().await?;
+
+    // TODO: Fetch full account info for each follower from cache/federation
+    // For now, return empty array as we don't have remote account info
+    Ok(Json(vec![]))
+}
+
+/// GET /api/v1/accounts/:id/following
+pub async fn get_account_following(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(_params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get the account
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Get following addresses
+    let _following_addresses = state.db.get_all_follow_addresses().await?;
+
+    // TODO: Fetch full account info for each followed account from cache/federation
+    // For now, return empty array as we don't have remote account info
+    Ok(Json(vec![]))
+}
+
+/// POST /api/v1/accounts/:id/follow
+pub async fn follow_account(
+    State(state): State<AppState>,
+    CurrentUser(_user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // For single-user instance, the ID should be an actor URI or account address
+    // Parse it to extract the account address
+    let _target_address = if id.starts_with("http://") || id.starts_with("https://") {
+        // It's a full URI, extract the address
+        // TODO: Fetch actor info and extract preferredUsername and domain
+        return Err(AppError::Validation(
+            "Follow by URI not yet supported".to_string(),
+        ));
+    } else if id.contains('@') {
+        // It's an account address like user@domain.com
+        id.clone()
+    } else {
+        // Invalid format
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Get our account
+    let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Send Follow activity via ActivityPub
+    // This will be handled by the federation service
+    // For now, we'll just return a relationship indicating we're following
+
+    // TODO: Actually send Follow activity and store the follow relationship
+    // state.federation.send_follow(&account, &target_address).await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: true, // We just followed
+        followed_by: false,
+        blocking: false,
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// POST /api/v1/accounts/:id/unfollow
+pub async fn unfollow_account(
+    State(state): State<AppState>,
+    CurrentUser(_user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID (same logic as follow)
+    let _target_address = if id.starts_with("http://") || id.starts_with("https://") {
+        return Err(AppError::Validation(
+            "Unfollow by URI not yet supported".to_string(),
+        ));
+    } else if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Get our account
+    let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Send Undo Follow activity via ActivityPub
+    // TODO: Actually send Undo activity and remove the follow relationship
+    // state.federation.send_unfollow(&account, &target_address).await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false, // We just unfollowed
+        followed_by: false,
+        blocking: false,
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// GET /api/v1/accounts/relationships
+pub async fn get_relationships(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<RelationshipsParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Get following and follower addresses
+    let _following_addresses = state.db.get_all_follow_addresses().await?;
+    let _follower_addresses = state.db.get_all_follower_addresses().await?;
+
+    // Create relationship responses for each requested ID
+    let mut relationships = vec![];
+    for id in params.ids {
+        // For single-user instance, we check if the ID matches our account
+        let _account = state.db.get_account().await?;
+
+        let relationship = RelationshipResponse {
+            id: id.clone(),
+            following: false,   // TODO: Check if we follow this account
+            followed_by: false, // TODO: Check if this account follows us
+            blocking: false,
+            blocked_by: false,
+            muting: false,
+            muting_notifications: false,
+            requested: false,
+            domain_blocking: false,
+            showing_reblogs: true,
+            endorsed: false,
+            notifying: false,
+            note: String::new(),
+        };
+
+        relationships.push(serde_json::to_value(relationship).unwrap());
+    }
+
+    Ok(Json(relationships))
+}
+
+/// GET /api/v1/accounts/search
+pub async fn search_accounts(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // For single-user instance, we can only search for:
+    // 1. Our own account (by username)
+    // 2. Remote accounts (by address like user@domain.com)
+
+    let query = params.q.trim().to_lowercase();
+    let mut results = vec![];
+
+    // Get our account
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Check if query matches our username
+    if account.username.to_lowercase().contains(&query)
+        || account
+            .display_name
+            .as_ref()
+            .map(|d| d.to_lowercase().contains(&query))
+            .unwrap_or(false)
+    {
+        let account_response = crate::api::account_to_response(&account, &state.config);
+        results.push(serde_json::to_value(account_response).unwrap());
+    }
+
+    // If resolve=true and query looks like an account address, try WebFinger
+    if params.resolve.unwrap_or(false) && query.contains('@') {
+        // TODO: Implement WebFinger lookup for remote accounts
+        // This would:
+        // 1. Parse the account address
+        // 2. Perform WebFinger lookup
+        // 3. Fetch the actor profile
+        // 4. Convert to AccountResponse
+        // 5. Add to results
+    }
+
+    // Apply limit
+    let limit = params.limit.unwrap_or(40).min(80);
+    results.truncate(limit);
+
+    Ok(Json(results))
+}
+
+/// Create account request
+#[derive(Debug, Deserialize)]
+pub struct CreateAccountRequest {
+    pub username: String,
+    pub email: String,
+    pub password: String,
+    pub agreement: Option<bool>,
+    pub locale: Option<String>,
+}
+
+/// POST /api/v1/accounts
+/// Create a new account
+///
+/// For single-user instance, this endpoint returns an error
+/// as account creation is not supported.
+pub async fn create_account(
+    State(_state): State<AppState>,
+    Json(_req): Json<CreateAccountRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Single-user instance doesn't support account creation via API
+    Err(AppError::Validation(
+        "Account creation is not supported on this single-user instance".to_string(),
+    ))
+}
+
+/// GET /api/v1/accounts/:id/lists
+/// Get lists that contain the specified account
+///
+/// For single-user instance, this returns an empty array
+/// as list functionality is not yet implemented.
+pub async fn get_account_lists(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Verify account exists
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Lists not yet implemented, return empty array
+    Ok(Json(vec![]))
+}
+
+/// GET /api/v1/accounts/:id/identity_proofs
+/// Get identity proofs for the specified account
+///
+/// Identity proofs (e.g., Keybase) are not supported,
+/// so this always returns an empty array.
+pub async fn get_account_identity_proofs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Verify account exists
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    if account.id != id {
+        return Err(AppError::NotFound);
+    }
+
+    // Identity proofs not supported, return empty array
+    Ok(Json(vec![]))
+}
+
+/// Mute account request
+#[derive(Debug, Deserialize)]
+pub struct MuteAccountRequest {
+    pub notifications: Option<bool>,
+    pub duration: Option<i64>, // Duration in seconds, 0 = indefinite
+}
+
+/// POST /api/v1/accounts/:id/block
+/// Block an account
+pub async fn block_account(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let target_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Store block in database
+    state.db.block_account(&target_address).await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: false,
+        blocking: true, // Now blocking
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: false,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// POST /api/v1/accounts/:id/unblock
+/// Unblock an account
+pub async fn unblock_account(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let target_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Remove block from database
+    state.db.unblock_account(&target_address).await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: false,
+        blocking: false, // No longer blocking
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// POST /api/v1/accounts/:id/mute
+/// Mute an account
+pub async fn mute_account(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+    Json(req): Json<MuteAccountRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let target_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    let mute_notifications = req.notifications.unwrap_or(true);
+    let duration = req.duration;
+
+    // Store mute in database
+    state
+        .db
+        .mute_account(&target_address, mute_notifications, duration)
+        .await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: false,
+        blocking: false,
+        blocked_by: false,
+        muting: true, // Now muting
+        muting_notifications: mute_notifications,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// POST /api/v1/accounts/:id/unmute
+/// Unmute an account
+pub async fn unmute_account(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let target_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Remove mute from database
+    state.db.unmute_account(&target_address).await?;
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: false,
+        blocking: false,
+        blocked_by: false,
+        muting: false, // No longer muting
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// GET /api/v1/blocks
+/// Get list of blocked accounts
+pub async fn get_blocks(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get blocked account addresses from database
+    let limit = params.limit.unwrap_or(40).min(80);
+
+    let _addresses = state.db.get_blocked_accounts(limit).await?;
+
+    // For now, return empty array as we don't have remote account info
+    // TODO: Fetch full account info for each blocked account
+    Ok(Json(vec![]))
+}
+
+/// GET /api/v1/mutes
+/// Get list of muted accounts
+pub async fn get_mutes(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get muted account addresses from database
+    let limit = params.limit.unwrap_or(40).min(80);
+
+    let _addresses = state.db.get_muted_accounts(limit).await?;
+
+    // For now, return empty array as we don't have remote account info
+    // TODO: Fetch full account info for each muted account
+    Ok(Json(vec![]))
+}
+
+/// GET /api/v1/follow_requests
+/// Get list of pending follow requests
+pub async fn get_follow_requests(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    // Get follow requests from database
+    let limit = params.limit.unwrap_or(40).min(80);
+
+    let _addresses = state.db.get_follow_request_addresses(limit).await?;
+
+    // For now, return empty array as we don't have remote account info
+    // TODO: Fetch full account info for each requester
+    Ok(Json(vec![]))
+}
+
+/// GET /api/v1/follow_requests/:id
+/// Get a specific follow request
+pub async fn get_follow_request(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Parse account ID to address
+    let requester_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Check if follow request exists
+    if !state.db.has_follow_request(&requester_address).await? {
+        return Err(AppError::NotFound);
+    }
+
+    // TODO: Fetch full account info for the requester
+    // For now, return a minimal account object
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "username": requester_address.split('@').next().unwrap_or(&requester_address),
+        "acct": requester_address,
+    })))
+}
+
+/// POST /api/v1/follow_requests/:id/authorize
+/// Accept a follow request
+pub async fn authorize_follow_request(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let requester_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Accept the follow request (moves to followers table)
+    state.db.accept_follow_request(&requester_address).await?;
+
+    // TODO: Send Accept activity via ActivityPub
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: true, // Now following us
+        blocking: false,
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+/// POST /api/v1/follow_requests/:id/reject
+/// Reject a follow request
+pub async fn reject_follow_request(
+    State(state): State<AppState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    // Parse account ID to address
+    let requester_address = if id.contains('@') {
+        id.clone()
+    } else {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    };
+
+    // Remove from follow_requests
+    if !state.db.reject_follow_request(&requester_address).await? {
+        return Err(AppError::NotFound);
+    }
+
+    // TODO: Send Reject activity via ActivityPub
+
+    // Return relationship response
+    let relationship = RelationshipResponse {
+        id: id.clone(),
+        following: false,
+        followed_by: false,
+        blocking: false,
+        blocked_by: false,
+        muting: false,
+        muting_notifications: false,
+        requested: false,
+        domain_blocking: false,
+        showing_reblogs: true,
+        endorsed: false,
+        notifying: false,
+        note: String::new(),
+    };
+
+    Ok(Json(serde_json::to_value(relationship).unwrap()))
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Notification represents a notification of an event relevant to the user.",
+  "properties": {
+    "account": {
+      "type": "object",
+      "description": "Reference: #/definitions/account"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "The timestamp of the notification (ISO 8601 Datetime)"
+    },
+    "id": {
+      "type": "string",
+      "description": "The id of the notification in the database."
+    },
+    "status": {
+      "type": "object",
+      "description": "Reference: #/definitions/status"
+    },
+    "type": {
+      "type": "string",
+      "description": "The type of event that resulted in the notification.\nfollow = Someone followed you. `account` will be set.\nfollow_request = Someone requested to follow you. `account` will be set.\nmention = Someone mentioned you in their status. `status` will be set. `account` will be set.\nreblog = Someone boosted one of your statuses. `status` will be set. `account` will be set.\nfavourite = Someone favourited one of your statuses. `status` will be set. `account` will be set.\npoll = A poll you have voted in or created has ended. `status` will be set. `account` will be set.\nstatus = Someone you enabled notifications for has posted a status. `status` will be set. `account` will be set.\nadmin.sign_up = Someone has signed up for a new account on the instance. `account` will be set."
+    }
+  }
+}

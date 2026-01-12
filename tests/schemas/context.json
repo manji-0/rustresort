@@ -1,0 +1,28 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "title": "Context",
+    "description": "Represents the tree around a given status. Used for reconstructing threads of statuses.",
+    "properties": {
+        "ancestors": {
+            "type": "array",
+            "description": "Parents in the thread",
+            "items": {
+                "type": "object",
+                "description": "Status object"
+            }
+        },
+        "descendants": {
+            "type": "array",
+            "description": "Children in the thread",
+            "items": {
+                "type": "object",
+                "description": "Status object"
+            }
+        }
+    },
+    "required": [
+        "ancestors",
+        "descendants"
+    ]
+}

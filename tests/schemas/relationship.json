@@ -1,0 +1,67 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Relationship",
+    "description": "Mastodon API Relationship schema - represents relationship between accounts",
+    "type": "object",
+    "required": [
+        "id"
+    ],
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": "The account id"
+        },
+        "following": {
+            "type": "boolean",
+            "description": "You are following this account"
+        },
+        "followed_by": {
+            "type": "boolean",
+            "description": "This account follows you"
+        },
+        "blocking": {
+            "type": "boolean",
+            "description": "You are blocking this account"
+        },
+        "blocked_by": {
+            "type": "boolean",
+            "description": "This account is blocking you"
+        },
+        "muting": {
+            "type": "boolean",
+            "description": "You are muting this account"
+        },
+        "muting_notifications": {
+            "type": "boolean",
+            "description": "You are muting notifications from this account"
+        },
+        "requested": {
+            "type": "boolean",
+            "description": "You have requested to follow this account, and the request is pending"
+        },
+        "requested_by": {
+            "type": "boolean",
+            "description": "This account has requested to follow you, and the request is pending"
+        },
+        "domain_blocking": {
+            "type": "boolean",
+            "description": "You are blocking this account's domain"
+        },
+        "showing_reblogs": {
+            "type": "boolean",
+            "description": "You are seeing reblogs/boosts from this account in your home timeline"
+        },
+        "endorsed": {
+            "type": "boolean",
+            "description": "You are featuring this account on your profile"
+        },
+        "notifying": {
+            "type": "boolean",
+            "description": "You are seeing notifications when this account posts"
+        },
+        "note": {
+            "type": "string",
+            "description": "Your note on this account"
+        }
+    }
+}

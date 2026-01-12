@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "FilterV2 represents a user-defined filter for determining which statuses should not be shown to the user.",
+  "description": "v2 filters have names and can include multiple phrases and status IDs to filter.",
+  "properties": {
+    "context": {
+      "type": "array",
+      "description": "The contexts in which the filter should be applied.",
+      "example": [
+        "home",
+        "public"
+      ],
+      "items": {
+        "type": "object",
+        "description": "Reference: #/definitions/filterContext"
+      }
+    },
+    "expires_at": {
+      "type": "string",
+      "description": "When the filter should no longer be applied. Null if the filter does not expire.",
+      "example": "2024-02-01T02:57:49Z"
+    },
+    "filter_action": {
+      "type": "object",
+      "description": "Reference: #/definitions/FilterAction"
+    },
+    "id": {
+      "type": "string",
+      "description": "The ID of the filter in the database."
+    },
+    "keywords": {
+      "type": "array",
+      "description": "The keywords grouped under this filter.",
+      "items": {
+        "type": "object",
+        "description": "Reference: #/definitions/filterKeyword"
+      }
+    },
+    "statuses": {
+      "type": "array",
+      "description": "The statuses grouped under this filter.",
+      "items": {
+        "type": "object",
+        "description": "Reference: #/definitions/filterStatus"
+      }
+    },
+    "title": {
+      "type": "string",
+      "description": "The name of the filter.",
+      "example": "Linux Words"
+    }
+  }
+}

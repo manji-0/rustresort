@@ -1,0 +1,176 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Status",
+    "description": "Mastodon API Status schema based on GoToSocial implementation",
+    "type": "object",
+    "required": [
+        "id",
+        "created_at",
+        "account",
+        "content",
+        "visibility"
+    ],
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": "ID of the status"
+        },
+        "created_at": {
+            "type": "string",
+            "description": "The date when this status was created (ISO 8601 Datetime)"
+        },
+        "in_reply_to_id": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "ID of the status being replied to"
+        },
+        "in_reply_to_account_id": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "ID of the account being replied to"
+        },
+        "sensitive": {
+            "type": "boolean",
+            "description": "Status contains sensitive content"
+        },
+        "spoiler_text": {
+            "type": "string",
+            "description": "Subject, summary, or content warning for the status"
+        },
+        "visibility": {
+            "type": "string",
+            "enum": [
+                "public",
+                "unlisted",
+                "private",
+                "direct"
+            ],
+            "description": "Visibility of this status"
+        },
+        "language": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "Primary language of this status (ISO 639 Part 1 two-letter language code)"
+        },
+        "uri": {
+            "type": "string",
+            "description": "ActivityPub URI of the status"
+        },
+        "url": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "The status's publicly available web URL"
+        },
+        "replies_count": {
+            "type": "integer",
+            "description": "Number of replies to this status"
+        },
+        "reblogs_count": {
+            "type": "integer",
+            "description": "Number of times this status has been boosted/reblogged"
+        },
+        "favourites_count": {
+            "type": "integer",
+            "description": "Number of favourites/likes this status has received"
+        },
+        "favourited": {
+            "type": "boolean",
+            "description": "This status has been favourited by the account viewing it"
+        },
+        "reblogged": {
+            "type": "boolean",
+            "description": "This status has been boosted/reblogged by the account viewing it"
+        },
+        "muted": {
+            "type": "boolean",
+            "description": "Replies to this status have been muted by the account viewing it"
+        },
+        "bookmarked": {
+            "type": "boolean",
+            "description": "This status has been bookmarked by the account viewing it"
+        },
+        "pinned": {
+            "type": "boolean",
+            "description": "This status has been pinned by the account viewing it"
+        },
+        "content": {
+            "type": "string",
+            "description": "The content of this status (HTML or plaintext)"
+        },
+        "reblog": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "description": "The boosted status (if this is a boost)"
+        },
+        "application": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "description": "The application used to post this status"
+        },
+        "account": {
+            "type": "object",
+            "description": "The account that posted this status"
+        },
+        "media_attachments": {
+            "type": "array",
+            "description": "Media that is attached to this status",
+            "items": {
+                "type": "object"
+            }
+        },
+        "mentions": {
+            "type": "array",
+            "description": "Mentions of users within the status content",
+            "items": {
+                "type": "object"
+            }
+        },
+        "tags": {
+            "type": "array",
+            "description": "Hashtags used within the status content",
+            "items": {
+                "type": "object"
+            }
+        },
+        "emojis": {
+            "type": "array",
+            "description": "Custom emoji to be used when rendering status content",
+            "items": {
+                "type": "object"
+            }
+        },
+        "card": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "description": "Preview card for links in the status"
+        },
+        "poll": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "description": "Poll attached to the status"
+        },
+        "edited_at": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "Timestamp of when the status was last edited (ISO 8601 Datetime)"
+        }
+    }
+}

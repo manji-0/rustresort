@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Tag represents a hashtag used within the content of a status.",
+  "properties": {
+    "following": {
+      "type": "boolean",
+      "description": "Following is true if the user is following this tag, false if they're not,\nand not present if there is no currently authenticated user."
+    },
+    "history": {
+      "type": "array",
+      "description": "History of this hashtag's usage.\nCurrently just a stub, if provided will always be an empty array.",
+      "example": [],
+      "items": {}
+    },
+    "name": {
+      "type": "string",
+      "description": "The value of the hashtag after the # sign.",
+      "example": "helloworld"
+    },
+    "url": {
+      "type": "string",
+      "description": "Web link to the hashtag.",
+      "example": "https://example.org/tags/helloworld"
+    }
+  }
+}

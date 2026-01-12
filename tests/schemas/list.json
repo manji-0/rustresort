@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "List represents a user-created list of accounts that the user follows.",
+  "properties": {
+    "exclusive": {
+      "type": "boolean",
+      "description": "Exclusive setting for this list.\nIf true, hide posts from members of this list from your home timeline."
+    },
+    "id": {
+      "type": "string",
+      "description": "The ID of the list."
+    },
+    "replies_policy": {
+      "type": "string",
+      "description": "RepliesPolicy for this list.\nfollowed = Show replies to any followed user\nlist = Show replies to members of the list\nnone = Show replies to no one"
+    },
+    "title": {
+      "type": "string",
+      "description": "The user-defined title of the list."
+    }
+  }
+}

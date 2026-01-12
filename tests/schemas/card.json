@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Card represents a rich preview card that is generated using OpenGraph tags from a URL.",
+  "properties": {
+    "author_name": {
+      "type": "string",
+      "description": "The author of the original resource.",
+      "example": "weewee@buzzfeed.com"
+    },
+    "author_url": {
+      "type": "string",
+      "description": "A link to the author of the original resource.",
+      "example": "https://buzzfeed.com/authors/weewee"
+    },
+    "blurhash": {
+      "type": "string",
+      "description": "A hash computed by the BlurHash algorithm, for generating colorful preview thumbnails when media has not been downloaded yet."
+    },
+    "description": {
+      "type": "string",
+      "description": "Description of preview.",
+      "example": "Is water wet? We're not sure. In this article, we ask an expert..."
+    },
+    "embed_url": {
+      "type": "string",
+      "description": "Used for photo embeds, instead of custom html."
+    },
+    "height": {
+      "type": "integer",
+      "description": "Height of preview, in pixels.",
+      "format": "int64"
+    },
+    "html": {
+      "type": "string",
+      "description": "HTML to be used for generating the preview card."
+    },
+    "image": {
+      "type": "string",
+      "description": "Preview thumbnail.",
+      "example": "https://example.org/fileserver/preview/thumb.jpg"
+    },
+    "provider_name": {
+      "type": "string",
+      "description": "The provider of the original resource.",
+      "example": "Buzzfeed"
+    },
+    "provider_url": {
+      "type": "string",
+      "description": "A link to the provider of the original resource.",
+      "example": "https://buzzfeed.com"
+    },
+    "title": {
+      "type": "string",
+      "description": "Title of linked resource.",
+      "example": "Buzzfeed - Is Water Wet?"
+    },
+    "type": {
+      "type": "string",
+      "description": "The type of the preview card.",
+      "example": "link"
+    },
+    "url": {
+      "type": "string",
+      "description": "Location of linked resource.",
+      "example": "https://buzzfeed.com/some/fuckin/buzzfeed/article"
+    },
+    "width": {
+      "type": "integer",
+      "description": "Width of preview, in pixels.",
+      "format": "int64"
+    }
+  }
+}

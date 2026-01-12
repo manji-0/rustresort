@@ -1,0 +1,78 @@
+[package]
+name = "rustresort"
+version = "0.1.0"
+edition = "2024"
+authors = ["RustResort Contributors"]
+description = "A lightweight, single-user ActivityPub server"
+license = "AGPL-3.0"
+repository = "https://github.com/yourusername/rustresort"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Web framework
+axum = { version = "0.7", features = ["macros", "multipart"] }
+axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database (SQLite only)
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+# Note: rusqlite removed to avoid libsqlite3-sys version conflict with sqlx
+# Backup functionality will be implemented using sqlx or alternative approach
+
+# Cloudflare R2 (S3-compatible)
+aws-sdk-s3 = "1.0"
+aws-config = "1.0"
+
+# Cache
+moka = { version = "0.12", features = ["future"] }
+
+# Crypto/Signatures
+rsa = "0.9"
+sha2 = "0.10"
+base64 = "0.21"
+hmac = "0.12"
+rand = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+http = "1.0"
+
+# Utilities
+ulid = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+config = "0.14"
+url = { version = "2", features = ["serde"] }
+urlencoding = "2"
+html-escape = "0.2"
+
+# Metrics
+prometheus = "0.13"
+lazy_static = "1.4"
+
+# ActivityPub / JSON-LD
+# TODO: Add appropriate crates
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+tempfile = "3"
+serde_json = "1"
+serde_yaml = "0.9"
+jsonschema = "0.18"
+
+[profile.release]
+lto = true
+codegen-units = 1

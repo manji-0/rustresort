@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Application models an api application.",
+  "properties": {
+    "client_id": {
+      "type": "string",
+      "description": "Client ID associated with this application."
+    },
+    "client_secret": {
+      "type": "string",
+      "description": "Client secret associated with this application."
+    },
+    "created_at": {
+      "type": "string",
+      "description": "When the application was created. (ISO 8601 Datetime)",
+      "example": "2021-07-30T09:20:25+00:00"
+    },
+    "id": {
+      "type": "string",
+      "description": "The ID of the application.",
+      "example": "01FBVD42CQ3ZEEVMW180SBX03B"
+    },
+    "name": {
+      "type": "string",
+      "description": "The name of the application.",
+      "example": "Tusky"
+    },
+    "redirect_uri": {
+      "type": "string",
+      "description": "Post-authorization redirect URI for the application (OAuth2).",
+      "example": "https://example.org/callback?some=query"
+    },
+    "redirect_uris": {
+      "type": "array",
+      "description": "Post-authorization redirect URIs for the application (OAuth2).",
+      "example": [
+        "https://example.org/callback?some=query"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "scopes": {
+      "type": "array",
+      "description": "OAuth scopes for this application.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "vapid_key": {
+      "type": "string",
+      "description": "Push API key for this application."
+    },
+    "website": {
+      "type": "string",
+      "description": "The website associated with the application (url)",
+      "example": "https://tusky.app"
+    }
+  }
+}

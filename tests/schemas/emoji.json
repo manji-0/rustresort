@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Emoji represents a custom emoji.",
+  "properties": {
+    "category": {
+      "type": "string",
+      "description": "Used for sorting custom emoji in the picker.",
+      "example": "blobcats"
+    },
+    "shortcode": {
+      "type": "string",
+      "description": "The name of the custom emoji.",
+      "example": "blobcat_uwu"
+    },
+    "static_url": {
+      "type": "string",
+      "description": "A link to a static copy of the custom emoji.",
+      "example": "https://example.org/fileserver/emojis/blogcat_uwu.png"
+    },
+    "url": {
+      "type": "string",
+      "description": "Web URL of the custom emoji.",
+      "example": "https://example.org/fileserver/emojis/blogcat_uwu.gif"
+    },
+    "visible_in_picker": {
+      "type": "boolean",
+      "description": "Emoji is visible in the emoji picker of the instance.",
+      "example": true
+    }
+  }
+}

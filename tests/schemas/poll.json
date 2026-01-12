@@ -1,0 +1,87 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Poll",
+    "description": "Mastodon API Poll schema",
+    "type": "object",
+    "required": [
+        "id",
+        "expires_at",
+        "expired",
+        "multiple",
+        "votes_count",
+        "options"
+    ],
+    "properties": {
+        "id": {
+            "type": "string",
+            "description": "The ID of the poll"
+        },
+        "expires_at": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "When the poll ends (ISO 8601 Datetime)"
+        },
+        "expired": {
+            "type": "boolean",
+            "description": "Is the poll currently expired?"
+        },
+        "multiple": {
+            "type": "boolean",
+            "description": "Does the poll allow multiple-choice answers?"
+        },
+        "votes_count": {
+            "type": "integer",
+            "description": "How many votes have been received"
+        },
+        "voters_count": {
+            "type": [
+                "integer",
+                "null"
+            ],
+            "description": "How many unique accounts have voted (null if multiple is false)"
+        },
+        "voted": {
+            "type": "boolean",
+            "description": "Have you voted in this poll?"
+        },
+        "own_votes": {
+            "type": "array",
+            "description": "Which options you have voted for (if voted)",
+            "items": {
+                "type": "integer"
+            }
+        },
+        "options": {
+            "type": "array",
+            "description": "Possible answers for the poll",
+            "items": {
+                "type": "object",
+                "required": [
+                    "title"
+                ],
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The text value of the poll option"
+                    },
+                    "votes_count": {
+                        "type": [
+                            "integer",
+                            "null"
+                        ],
+                        "description": "The number of received votes for this option"
+                    }
+                }
+            }
+        },
+        "emojis": {
+            "type": "array",
+            "description": "Custom emoji to be used for rendering poll options",
+            "items": {
+                "type": "object"
+            }
+        }
+    }
+}

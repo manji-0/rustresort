@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "description": "Conversation represents a conversation\nwith \"direct message\" visibility.",
+  "properties": {
+    "accounts": {
+      "type": "array",
+      "description": "Participants in the conversation.\n\nIf this is a conversation between no accounts (ie., a self-directed DM),\nthis will include only the requesting account itself. Otherwise, it will\ninclude every other account in the conversation *except* the requester.",
+      "items": {
+        "type": "object",
+        "description": "Reference: #/definitions/account"
+      }
+    },
+    "id": {
+      "type": "string",
+      "description": "Local database ID of the conversation."
+    },
+    "last_status": {
+      "type": "object",
+      "description": "Reference: #/definitions/status"
+    },
+    "unread": {
+      "type": "boolean",
+      "description": "Is the conversation currently marked as unread?"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "Attachment models a media attachment.",
+  "properties": {
+    "blurhash": {
+      "type": "string",
+      "description": "A hash computed by the BlurHash algorithm, for generating colorful preview thumbnails when media has not been downloaded yet.\nSee https://github.com/woltapp/blurhash"
+    },
+    "description": {
+      "type": "string",
+      "description": "Alt text that describes what is in the media attachment.",
+      "example": "This is a picture of a kitten."
+    },
+    "id": {
+      "type": "string",
+      "description": "The ID of the attachment.",
+      "example": "01FC31DZT1AYWDZ8XTCRWRBYRK"
+    },
+    "meta": {
+      "type": "object",
+      "description": "Reference: #/definitions/mediaMeta"
+    },
+    "preview_remote_url": {
+      "type": "string",
+      "description": "The location of a scaled-down preview of the attachment on the remote server.\nOnly defined for instances other than our own.",
+      "example": "https://some-other-server.org/attachments/small/ahhhhh.jpeg"
+    },
+    "preview_url": {
+      "type": "string",
+      "description": "The location of a scaled-down preview of the attachment.",
+      "example": "https://example.org/fileserver/some_id/attachments/some_id/small/attachment.jpeg"
+    },
+    "remote_url": {
+      "type": "string",
+      "description": "The location of the full-size original attachment on the remote server.\nOnly defined for instances other than our own.",
+      "example": "https://some-other-server.org/attachments/original/ahhhhh.jpeg"
+    },
+    "text_url": {
+      "type": "string",
+      "description": "A shorter URL for the attachment.\nIn our case, we just give the URL again since we don't create smaller URLs."
+    },
+    "type": {
+      "type": "string",
+      "description": "The type of the attachment.",
+      "example": "image"
+    },
+    "url": {
+      "type": "string",
+      "description": "The location of the original full-size attachment.",
+      "example": "https://example.org/fileserver/some_id/attachments/some_id/original/attachment.jpeg"
+    }
+  }
+}

@@ -1,0 +1,160 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Instance",
+    "description": "Mastodon API Instance schema based on GoToSocial implementation",
+    "type": "object",
+    "required": [
+        "uri",
+        "title",
+        "version"
+    ],
+    "properties": {
+        "uri": {
+            "type": "string",
+            "description": "The domain name of the instance"
+        },
+        "title": {
+            "type": "string",
+            "description": "The title of the instance"
+        },
+        "description": {
+            "type": "string",
+            "description": "Admin-defined description of the instance"
+        },
+        "short_description": {
+            "type": "string",
+            "description": "A shorter description of the instance"
+        },
+        "email": {
+            "type": "string",
+            "description": "An email that may be contacted for inquiries"
+        },
+        "version": {
+            "type": "string",
+            "description": "The version of Mastodon installed on the instance"
+        },
+        "languages": {
+            "type": "array",
+            "description": "Primary languages of the instance",
+            "items": {
+                "type": "string"
+            }
+        },
+        "registrations": {
+            "type": "boolean",
+            "description": "Whether registrations are enabled"
+        },
+        "approval_required": {
+            "type": "boolean",
+            "description": "Whether registrations require moderator approval"
+        },
+        "invites_enabled": {
+            "type": "boolean",
+            "description": "Whether invites are enabled"
+        },
+        "configuration": {
+            "type": "object",
+            "description": "Instance configuration",
+            "properties": {
+                "statuses": {
+                    "type": "object",
+                    "properties": {
+                        "max_characters": {
+                            "type": "integer"
+                        },
+                        "max_media_attachments": {
+                            "type": "integer"
+                        }
+                    }
+                },
+                "media_attachments": {
+                    "type": "object",
+                    "properties": {
+                        "supported_mime_types": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        },
+                        "image_size_limit": {
+                            "type": "integer"
+                        },
+                        "video_size_limit": {
+                            "type": "integer"
+                        }
+                    }
+                },
+                "polls": {
+                    "type": "object",
+                    "properties": {
+                        "max_options": {
+                            "type": "integer"
+                        },
+                        "max_characters_per_option": {
+                            "type": "integer"
+                        },
+                        "min_expiration": {
+                            "type": "integer"
+                        },
+                        "max_expiration": {
+                            "type": "integer"
+                        }
+                    }
+                }
+            }
+        },
+        "urls": {
+            "type": "object",
+            "description": "URLs of interest for clients apps",
+            "properties": {
+                "streaming_api": {
+                    "type": "string"
+                }
+            }
+        },
+        "stats": {
+            "type": "object",
+            "description": "Statistics about the instance",
+            "properties": {
+                "user_count": {
+                    "type": "integer"
+                },
+                "status_count": {
+                    "type": "integer"
+                },
+                "domain_count": {
+                    "type": "integer"
+                }
+            }
+        },
+        "thumbnail": {
+            "type": [
+                "string",
+                "null"
+            ],
+            "description": "Banner image for the instance"
+        },
+        "contact_account": {
+            "type": [
+                "object",
+                "null"
+            ],
+            "description": "A user that can be contacted regarding the instance"
+        },
+        "rules": {
+            "type": "array",
+            "description": "An itemized list of rules for this instance",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string"
+                    },
+                    "text": {
+                        "type": "string"
+                    }
+                }
+            }
+        }
+    }
+}

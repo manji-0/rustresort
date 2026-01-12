@@ -1,0 +1,75 @@
+# Prometheus configuration for RustResort
+#
+# This configuration file sets up Prometheus to scrape metrics from RustResort.
+# Place this file at /etc/prometheus/prometheus.yml or use it with Docker.
+
+global:
+  scrape_interval: 15s      # How frequently to scrape targets
+  evaluation_interval: 15s  # How frequently to evaluate rules
+  
+  # Attach these labels to any time series or alerts when communicating with
+  # external systems (federation, remote storage, Alertmanager).
+  external_labels:
+    monitor: 'rustresort-monitor'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - 'localhost:9093'
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+# rule_files:
+#   - "rustresort_alerts.yml"
+
+# Scrape configurations
+scrape_configs:
+  # RustResort application metrics
+  - job_name: 'rustresort'
+    
+    # Override the global default and scrape targets from this job every 10 seconds.
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    
+    # Metrics path defaults to '/metrics'
+    metrics_path: '/metrics'
+    
+    # Scheme defaults to 'http'.
+    scheme: http
+    
+    static_configs:
+      - targets: ['localhost:3000']
+        labels:
+          instance: 'rustresort-main'
+          environment: 'production'
+    
+    # Optional: Add relabeling rules
+    # relabel_configs:
+    #   - source_labels: [__address__]
+    #     target_label: __param_target
+    #   - source_labels: [__param_target]
+    #     target_label: instance
+    #   - target_label: __address__
+    #     replacement: localhost:3000
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+# Optional: Remote write configuration for long-term storage
+# remote_write:
+#   - url: "http://localhost:9201/write"
+#     queue_config:
+#       capacity: 10000
+#       max_shards: 200
+#       min_shards: 1
+#       max_samples_per_send: 5000
+#       batch_send_deadline: 5s
+#       min_backoff: 30ms
+#       max_backoff: 100ms
+
+# Optional: Remote read configuration
+# remote_read:
+#   - url: "http://localhost:9201/read"

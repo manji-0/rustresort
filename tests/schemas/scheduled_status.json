@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "title": "ScheduledStatus represents a status that will be published at a future scheduled date.",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "media_attachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "Reference: #/definitions/attachment"
+      }
+    },
+    "params": {
+      "type": "object",
+      "description": "Reference: #/definitions/ScheduledStatusParams"
+    },
+    "scheduled_at": {
+      "type": "string"
+    }
+  }
+}
