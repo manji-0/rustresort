@@ -1,59 +1,59 @@
-# RustResort API設計
+# API Specification
 
-## 概要
+## Overview
 
-RustResortは2種類のAPIを提供します：
+RustResort provides two types of APIs:
 
-1. **Mastodon互換API** - 既存のMastodonクライアントとの互換性
-2. **ActivityPub API** - Fediverse連携用
+1. **Mastodon-compatible API** - Compatibility with existing Mastodon clients
+2. **ActivityPub API** - Fediverse federation
 
-## ベースURL構成
+## Base URL Structure
 
 ```
 https://example.com/
-├── api/v1/          # Mastodon互換API
-├── api/v2/          # Mastodon v2互換API
-├── oauth/           # OAuth認証
-├── users/{username} # ActivityPubアクター
-├── statuses/{id}    # ActivityPubオブジェクト
+├── api/v1/          # Mastodon-compatible API
+├── api/v2/          # Mastodon v2 API
+├── oauth/           # OAuth authentication
+├── users/{username} # ActivityPub actor
+├── statuses/{id}    # ActivityPub object
 ├── .well-known/     # Well-known endpoints
 └── nodeinfo/        # NodeInfo
 ```
 
-## 認証
+## Authentication
 
-### OAuth 2.0フロー
+### OAuth 2.0 Flow
 
 ```
-1. アプリ登録: POST /api/v1/apps
-2. 認可要求:   GET /oauth/authorize
-3. トークン取得: POST /oauth/token
-4. APIアクセス: Authorization: Bearer <token>
+1. Register app:    POST /api/v1/apps
+2. Authorization:   GET /oauth/authorize
+3. Get token:       POST /oauth/token
+4. API access:      Authorization: Bearer <token>
 ```
 
-### スコープ
+### Scopes
 
-| スコープ | 説明 |
-|---------|------|
-| `read` | 読み取り全般 |
-| `read:accounts` | アカウント情報の読み取り |
-| `read:statuses` | 投稿の読み取り |
-| `read:notifications` | 通知の読み取り |
-| `write` | 書き込み全般 |
-| `write:statuses` | 投稿の作成 |
-| `write:media` | メディアアップロード |
-| `write:favourites` | お気に入り操作 |
-| `follow` | フォロー関係の管理 |
-| `push` | WebPushの管理 |
+| Scope | Description |
+|-------|-------------|
+| `read` | Read access (all) |
+| `read:accounts` | Read account information |
+| `read:statuses` | Read statuses |
+| `read:notifications` | Read notifications |
+| `write` | Write access (all) |
+| `write:statuses` | Create statuses |
+| `write:media` | Upload media |
+| `write:favourites` | Favourite operations |
+| `follow` | Manage follow relationships |
+| `push` | Manage Web Push |
 
-## Mastodon互換API
+## Mastodon-Compatible API
 
-### アカウント
+### Accounts
 
 #### GET /api/v1/accounts/:id
-アカウント情報を取得。
+Get account information.
 
-**レスポンス例:**
+**Response:**
 ```json
 {
   "id": "01H8Y3VXPQM5JNABCDEFGHIJK",
@@ -66,9 +66,7 @@ https://example.com/
   "note": "<p>Hello, world!</p>",
   "url": "https://example.com/@alice",
   "avatar": "https://example.com/media/avatars/alice.jpg",
-  "avatar_static": "https://example.com/media/avatars/alice.jpg",
   "header": "https://example.com/media/headers/alice.jpg",
-  "header_static": "https://example.com/media/headers/alice.jpg",
   "followers_count": 42,
   "following_count": 23,
   "statuses_count": 100,
@@ -78,61 +76,60 @@ https://example.com/
       "value": "<a href=\"https://alice.example.com\">alice.example.com</a>",
       "verified_at": "2024-01-01T00:00:00.000Z"
     }
-  ],
-  "emojis": []
+  ]
 }
 ```
 
 #### GET /api/v1/accounts/verify_credentials
-認証済みユーザー自身の情報を取得。
+Get authenticated user's information.
 
 #### PATCH /api/v1/accounts/update_credentials
-プロフィールを更新。
+Update profile.
 
-**パラメータ:**
-- `display_name` - 表示名
-- `note` - 自己紹介
-- `avatar` - アバター画像
-- `header` - ヘッダー画像
-- `locked` - フォロー承認制
-- `fields_attributes` - プロフィールフィールド
+**Parameters:**
+- `display_name` - Display name
+- `note` - Biography
+- `avatar` - Avatar image
+- `header` - Header image
+- `locked` - Require follow approval
+- `fields_attributes` - Profile fields
 
 #### GET /api/v1/accounts/:id/statuses
-アカウントの投稿一覧を取得。
+Get account's statuses.
 
 #### GET /api/v1/accounts/:id/followers
-フォロワー一覧を取得。
+Get followers list.
 
 #### GET /api/v1/accounts/:id/following
-フォロー中一覧を取得。
+Get following list.
 
 #### POST /api/v1/accounts/:id/follow
-アカウントをフォロー。
+Follow account.
 
 #### POST /api/v1/accounts/:id/unfollow
-フォロー解除。
+Unfollow account.
 
 #### POST /api/v1/accounts/:id/block
-ブロック。
+Block account.
 
 #### POST /api/v1/accounts/:id/unblock
-ブロック解除。
+Unblock account.
 
 #### POST /api/v1/accounts/:id/mute
-ミュート。
+Mute account.
 
 #### POST /api/v1/accounts/:id/unmute
-ミュート解除。
+Unmute account.
 
 #### GET /api/v1/accounts/relationships
-複数アカウントとの関係性を取得。
+Get relationships with multiple accounts.
 
-### ステータス（投稿）
+### Statuses
 
 #### POST /api/v1/statuses
-新規投稿を作成。
+Create new status.
 
-**パラメータ:**
+**Parameters:**
 ```json
 {
   "status": "Hello, Fediverse!",
@@ -146,153 +143,148 @@ https://example.com/
   "sensitive": false,
   "spoiler_text": "",
   "visibility": "public",
-  "language": "ja",
-  "scheduled_at": null
+  "language": "en"
 }
 ```
 
-**レスポンス例:**
+**Response:**
 ```json
 {
   "id": "01H8Y3VXPQM5JNABCDEFGHIJK",
   "uri": "https://example.com/statuses/01H8Y3VXPQM5JNABCDEFGHIJK",
-  "url": "https://example.com/@alice/01H8Y3VXPQM5JNABCDEFGHIJK",
   "created_at": "2024-01-01T12:00:00.000Z",
   "account": { ... },
   "content": "<p>Hello, Fediverse!</p>",
   "visibility": "public",
   "sensitive": false,
-  "spoiler_text": "",
   "media_attachments": [],
   "mentions": [],
   "tags": [],
-  "emojis": [],
   "reblogs_count": 0,
   "favourites_count": 0,
-  "replies_count": 0,
-  "application": {
-    "name": "Web",
-    "website": null
-  },
-  "language": "ja",
-  "favourited": false,
-  "reblogged": false,
-  "muted": false,
-  "bookmarked": false,
-  "pinned": false
+  "replies_count": 0
 }
 ```
 
 #### GET /api/v1/statuses/:id
-投稿を取得。
+Get status.
 
 #### DELETE /api/v1/statuses/:id
-投稿を削除。
+Delete status.
 
 #### PUT /api/v1/statuses/:id
-投稿を編集。
+Edit status.
 
 #### GET /api/v1/statuses/:id/context
-投稿のコンテキスト（リプライツリー）を取得。
+Get status context (reply tree).
 
 #### POST /api/v1/statuses/:id/reblog
-ブースト（リブログ）。
+Reblog (boost) status.
 
 #### POST /api/v1/statuses/:id/unreblog
-ブースト解除。
+Unreblog status.
 
 #### POST /api/v1/statuses/:id/favourite
-お気に入り。
+Favourite status.
 
 #### POST /api/v1/statuses/:id/unfavourite
-お気に入り解除。
+Unfavourite status.
 
 #### POST /api/v1/statuses/:id/bookmark
-ブックマーク。
+Bookmark status.
 
 #### POST /api/v1/statuses/:id/unbookmark
-ブックマーク解除。
+Unbookmark status.
 
 #### POST /api/v1/statuses/:id/pin
-プロフィールにピン留め。
+Pin status to profile.
 
 #### POST /api/v1/statuses/:id/unpin
-ピン解除。
+Unpin status.
 
-### タイムライン
+### Timelines
 
 #### GET /api/v1/timelines/home
-ホームタイムライン。
+Home timeline.
 
-**パラメータ:**
-- `max_id` - この投稿IDより古いものを取得
-- `since_id` - この投稿IDより新しいものを取得
-- `min_id` - この投稿ID以降を取得（逆順）
-- `limit` - 取得件数（デフォルト20、最大40）
+**Parameters:**
+- `max_id` - Get statuses older than this ID
+- `since_id` - Get statuses newer than this ID
+- `min_id` - Get statuses from this ID onwards (reverse)
+- `limit` - Number of results (default 20, max 40)
 
 #### GET /api/v1/timelines/public
-連合タイムライン。
+Public (federated) timeline.
 
-**パラメータ:**
-- `local` - ローカルのみ
-- `remote` - リモートのみ
-- `only_media` - メディア付きのみ
+**Parameters:**
+- `local` - Local only
+- `remote` - Remote only
+- `only_media` - Media attachments only
 
 #### GET /api/v1/timelines/tag/:hashtag
-ハッシュタグタイムライン。
+Hashtag timeline.
 
-### 通知
+### Notifications
 
 #### GET /api/v1/notifications
-通知一覧を取得。
+Get notifications list.
 
-**パラメータ:**
-- `types[]` - 取得する通知タイプ
-- `exclude_types[]` - 除外する通知タイプ
+**Parameters:**
+- `types[]` - Notification types to include
+- `exclude_types[]` - Notification types to exclude
+
+**Notification Types:**
+- `mention` - Mentioned in status
+- `reblog` - Status reblogged
+- `favourite` - Status favourited
+- `follow` - New follower
+- `follow_request` - Follow request (if locked)
+- `poll` - Poll ended
+- `status` - New status from followed account
 
 #### GET /api/v1/notifications/:id
-特定の通知を取得。
+Get specific notification.
 
 #### POST /api/v1/notifications/clear
-全通知をクリア。
+Clear all notifications.
 
 #### POST /api/v1/notifications/:id/dismiss
-特定の通知を削除。
+Dismiss specific notification.
 
-### メディア
+### Media
 
 #### POST /api/v1/media
-メディアをアップロード。
+Upload media.
 
-**パラメータ:**
-- `file` - ファイル（multipart/form-data）
-- `description` - 代替テキスト
-- `focus` - フォーカスポイント（x,y）
+**Parameters:**
+- `file` - File (multipart/form-data)
+- `description` - Alt text
+- `focus` - Focus point (x,y)
 
 #### POST /api/v2/media
-メディアを非同期でアップロード（処理中は202を返す）。
+Upload media asynchronously (returns 202 while processing).
 
 #### GET /api/v1/media/:id
-メディア情報を取得。
+Get media information.
 
 #### PUT /api/v1/media/:id
-メディア情報を更新。
+Update media information.
 
-### 検索
+### Search
 
 #### GET /api/v2/search
-検索を実行。
+Search.
 
-**パラメータ:**
-- `q` - 検索クエリ
-- `type` - 検索タイプ（accounts, hashtags, statuses）
-- `resolve` - WebFingerで解決を試みるか
-- `limit` - 取得件数
+**Parameters:**
+- `q` - Search query
+- `type` - Search type (accounts, hashtags, statuses)
+- `resolve` - Attempt WebFinger resolution
+- `limit` - Number of results
 
-### インスタンス情報
+### Instance
 
 #### GET /api/v1/instance
-インスタンス情報を取得。
+Get instance information.
 
 ```json
 {
@@ -301,20 +293,15 @@ https://example.com/
   "short_description": "A friendly instance",
   "description": "Full description here...",
   "email": "admin@example.com",
-  "version": "0.1.0",
-  "urls": {
-    "streaming_api": "wss://example.com"
-  },
+  "version": "0.1.0 (compatible; RustResort 0.1.0)",
   "stats": {
-    "user_count": 100,
+    "user_count": 1,
     "status_count": 1000,
     "domain_count": 50
   },
   "thumbnail": "https://example.com/thumbnail.png",
-  "languages": ["ja", "en"],
-  "registrations": true,
-  "approval_required": false,
-  "invites_enabled": false,
+  "languages": ["en", "ja"],
+  "registrations": false,
   "configuration": {
     "statuses": {
       "max_characters": 5000,
@@ -331,21 +318,19 @@ https://example.com/
       "min_expiration": 300,
       "max_expiration": 2629746
     }
-  },
-  "contact_account": { ... },
-  "rules": []
+  }
 }
 ```
 
 #### GET /api/v2/instance
-v2形式のインスタンス情報。
+Instance information (v2 format).
 
-### アプリ登録
+### App Registration
 
 #### POST /api/v1/apps
-クライアントアプリを登録。
+Register client application.
 
-**パラメータ:**
+**Parameters:**
 ```json
 {
   "client_name": "My App",
@@ -355,15 +340,111 @@ v2形式のインスタンス情報。
 }
 ```
 
-## Well-known Endpoints
+### Lists
+
+#### GET /api/v1/lists
+Get user's lists.
+
+#### GET /api/v1/lists/:id
+Get specific list.
+
+#### POST /api/v1/lists
+Create list.
+
+#### PUT /api/v1/lists/:id
+Update list.
+
+#### DELETE /api/v1/lists/:id
+Delete list.
+
+#### GET /api/v1/lists/:id/accounts
+Get accounts in list.
+
+#### POST /api/v1/lists/:id/accounts
+Add accounts to list.
+
+#### DELETE /api/v1/lists/:id/accounts
+Remove accounts from list.
+
+### Filters
+
+#### GET /api/v2/filters
+Get filters.
+
+#### GET /api/v2/filters/:id
+Get specific filter.
+
+#### POST /api/v2/filters
+Create filter.
+
+#### PUT /api/v2/filters/:id
+Update filter.
+
+#### DELETE /api/v2/filters/:id
+Delete filter.
+
+### Polls
+
+#### GET /api/v1/polls/:id
+Get poll.
+
+#### POST /api/v1/polls/:id/votes
+Vote in poll.
+
+### Scheduled Statuses
+
+#### GET /api/v1/scheduled_statuses
+Get scheduled statuses.
+
+#### GET /api/v1/scheduled_statuses/:id
+Get specific scheduled status.
+
+#### PUT /api/v1/scheduled_statuses/:id
+Update scheduled status.
+
+#### DELETE /api/v1/scheduled_statuses/:id
+Cancel scheduled status.
+
+### Bookmarks
+
+#### GET /api/v1/bookmarks
+Get bookmarked statuses.
+
+### Favourites
+
+#### GET /api/v1/favourites
+Get favourited statuses.
+
+### Blocks
+
+#### GET /api/v1/blocks
+Get blocked accounts.
+
+### Mutes
+
+#### GET /api/v1/mutes
+Get muted accounts.
+
+### Follow Requests
+
+#### GET /api/v1/follow_requests
+Get follow requests.
+
+#### POST /api/v1/follow_requests/:id/authorize
+Authorize follow request.
+
+#### POST /api/v1/follow_requests/:id/reject
+Reject follow request.
+
+## Well-Known Endpoints
 
 ### GET /.well-known/webfinger
-WebFinger。ユーザー発見用。
+WebFinger for user discovery.
 
-**パラメータ:**
-- `resource` - `acct:username@domain`形式
+**Parameters:**
+- `resource` - Format: `acct:username@domain`
 
-**レスポンス例:**
+**Response:**
 ```json
 {
   "subject": "acct:alice@example.com",
@@ -387,9 +468,9 @@ WebFinger。ユーザー発見用。
 ```
 
 ### GET /.well-known/nodeinfo
-NodeInfo発見。
+NodeInfo discovery.
 
-**レスポンス:**
+**Response:**
 ```json
 {
   "links": [
@@ -402,12 +483,12 @@ NodeInfo発見。
 ```
 
 ### GET /.well-known/host-meta
-host-meta（XML）。
+Host-meta (XML).
 
 ## NodeInfo
 
 ### GET /nodeinfo/2.0
-NodeInfo 2.0形式。
+NodeInfo 2.0 format.
 
 ```json
 {
@@ -419,150 +500,63 @@ NodeInfo 2.0形式。
   "protocols": ["activitypub"],
   "usage": {
     "users": {
-      "total": 100,
-      "activeMonth": 50,
-      "activeHalfyear": 80
+      "total": 1,
+      "activeMonth": 1,
+      "activeHalfyear": 1
     },
     "localPosts": 1000
   },
-  "openRegistrations": true
+  "openRegistrations": false
 }
 ```
 
 ## ActivityPub API
 
+See [FEDERATION.md](FEDERATION.md) for detailed ActivityPub specifications.
+
 ### Actor
 
 #### GET /users/{username}
-アクターオブジェクトを取得。
+Get actor object.
 
-**Accept:** `application/activity+json`, `application/ld+json`
-
-```json
-{
-  "@context": [
-    "https://www.w3.org/ns/activitystreams",
-    "https://w3id.org/security/v1"
-  ],
-  "id": "https://example.com/users/alice",
-  "type": "Person",
-  "preferredUsername": "alice",
-  "name": "Alice",
-  "summary": "<p>Hello, world!</p>",
-  "inbox": "https://example.com/users/alice/inbox",
-  "outbox": "https://example.com/users/alice/outbox",
-  "followers": "https://example.com/users/alice/followers",
-  "following": "https://example.com/users/alice/following",
-  "featured": "https://example.com/users/alice/collections/featured",
-  "url": "https://example.com/@alice",
-  "manuallyApprovesFollowers": false,
-  "discoverable": true,
-  "published": "2024-01-01T00:00:00Z",
-  "icon": {
-    "type": "Image",
-    "mediaType": "image/jpeg",
-    "url": "https://example.com/media/avatars/alice.jpg"
-  },
-  "image": {
-    "type": "Image",
-    "mediaType": "image/jpeg",
-    "url": "https://example.com/media/headers/alice.jpg"
-  },
-  "publicKey": {
-    "id": "https://example.com/users/alice#main-key",
-    "owner": "https://example.com/users/alice",
-    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-  },
-  "attachment": [
-    {
-      "type": "PropertyValue",
-      "name": "Website",
-      "value": "<a href=\"https://alice.example.com\">alice.example.com</a>"
-    }
-  ],
-  "endpoints": {
-    "sharedInbox": "https://example.com/inbox"
-  }
-}
-```
+**Headers:** `Accept: application/activity+json`
 
 ### Inbox
 
 #### POST /users/{username}/inbox
-アクターのInboxにActivityを送信。
+Send activity to actor's inbox.
 
-**必須:** HTTP Signature
-
-**サポートするActivity:**
-- `Create` - 投稿作成
-- `Update` - 投稿・プロフィール更新
-- `Delete` - 投稿削除
-- `Follow` - フォロー
-- `Accept` - フォロー承認
-- `Reject` - フォロー拒否
-- `Undo` - アクション取り消し
-- `Announce` - ブースト
-- `Like` - お気に入り
-- `Block` - ブロック
-- `Move` - アカウント移行
+**Required:** HTTP Signature
 
 #### POST /inbox
-共有Inbox。
+Shared inbox.
 
 ### Outbox
 
 #### GET /users/{username}/outbox
-アクターのOutboxを取得（OrderedCollection）。
+Get actor's outbox (OrderedCollection).
 
 ### Collections
 
 #### GET /users/{username}/followers
-フォロワーコレクション。
+Followers collection.
 
 #### GET /users/{username}/following
-フォロー中コレクション。
+Following collection.
 
 #### GET /users/{username}/collections/featured
-ピン留め投稿コレクション。
+Featured (pinned) posts collection.
 
 ### Object
 
 #### GET /statuses/{id}
-Noteオブジェクトを取得。
+Get Note object.
 
-```json
-{
-  "@context": "https://www.w3.org/ns/activitystreams",
-  "id": "https://example.com/statuses/01H8Y3VXPQM5JNABCDEFGHIJK",
-  "type": "Note",
-  "summary": null,
-  "inReplyTo": null,
-  "published": "2024-01-01T12:00:00Z",
-  "url": "https://example.com/@alice/01H8Y3VXPQM5JNABCDEFGHIJK",
-  "attributedTo": "https://example.com/users/alice",
-  "to": ["https://www.w3.org/ns/activitystreams#Public"],
-  "cc": ["https://example.com/users/alice/followers"],
-  "sensitive": false,
-  "content": "<p>Hello, Fediverse!</p>",
-  "contentMap": {
-    "ja": "<p>Hello, Fediverse!</p>"
-  },
-  "attachment": [],
-  "tag": [],
-  "replies": {
-    "id": "https://example.com/statuses/01H8Y3VXPQM5JNABCDEFGHIJK/replies",
-    "type": "Collection",
-    "first": {
-      "type": "CollectionPage",
-      "items": []
-    }
-  }
-}
-```
+**Headers:** `Accept: application/activity+json`
 
-## エラーレスポンス
+## Error Responses
 
-全APIで統一されたエラー形式:
+Unified error format across all APIs:
 
 ```json
 {
@@ -571,59 +565,61 @@ Noteオブジェクトを取得。
 }
 ```
 
-### HTTPステータスコード
+### HTTP Status Codes
 
-| コード | 意味 |
-|--------|------|
-| 200 | 成功 |
-| 201 | 作成成功 |
-| 202 | 受理（非同期処理中） |
-| 400 | 不正なリクエスト |
-| 401 | 認証エラー |
-| 403 | 権限エラー |
-| 404 | リソースが見つからない |
-| 410 | リソースが削除済み |
-| 422 | バリデーションエラー |
-| 429 | レート制限 |
-| 500 | サーバーエラー |
-| 503 | サービス利用不可 |
+| Code | Meaning |
+|------|---------|
+| 200 | Success |
+| 201 | Created |
+| 202 | Accepted (async processing) |
+| 400 | Bad request |
+| 401 | Authentication error |
+| 403 | Permission error |
+| 404 | Resource not found |
+| 410 | Resource deleted |
+| 422 | Validation error |
+| 429 | Rate limited |
+| 500 | Server error |
+| 503 | Service unavailable |
 
-## レート制限
+## Rate Limiting
 
-| エンドポイント | 制限 |
-|---------------|------|
-| 一般API | 300 req/5min |
-| 認証エンドポイント | 30 req/5min |
-| メディアアップロード | 30 req/30min |
-| 投稿作成 | 30 req/30min |
+| Endpoint | Limit |
+|----------|-------|
+| General API | 300 req/5min |
+| Auth endpoints | 30 req/5min |
+| Media upload | 30 req/30min |
+| Status creation | 30 req/30min |
 
-レスポンスヘッダー:
-- `X-RateLimit-Limit`: 制限値
-- `X-RateLimit-Remaining`: 残り回数
-- `X-RateLimit-Reset`: リセット時刻
+**Response Headers:**
+- `X-RateLimit-Limit` - Limit value
+- `X-RateLimit-Remaining` - Remaining requests
+- `X-RateLimit-Reset` - Reset time
 
-## ページネーション
+## Pagination
 
-Link ヘッダーによるページネーション:
+Link header pagination:
 
 ```
 Link: <https://example.com/api/v1/timelines/home?max_id=123>; rel="next",
       <https://example.com/api/v1/timelines/home?min_id=456>; rel="prev"
 ```
 
-## Streaming API（将来実装）
+## Streaming API
 
-WebSocket接続:
+WebSocket connection (future implementation):
 - `wss://example.com/api/v1/streaming`
 
-ストリーム:
-- `user` - ユーザー通知
-- `public` - 公開タイムライン
-- `public:local` - ローカルタイムライン
-- `hashtag` - ハッシュタグ
-- `direct` - ダイレクトメッセージ
+**Streams:**
+- `user` - User notifications
+- `public` - Public timeline
+- `public:local` - Local timeline
+- `hashtag` - Hashtag timeline
+- `direct` - Direct messages
 
-## 次のステップ
+## Related Documentation
 
-- [FEDERATION.md](./FEDERATION.md) - フェデレーション詳細仕様
-- [DEVELOPMENT.md](./DEVELOPMENT.md) - 開発ガイド
+- [FEDERATION.md](FEDERATION.md) - Federation specifications
+- [AUTHENTICATION.md](AUTHENTICATION.md) - Authentication details
+- [DEVELOPMENT.md](DEVELOPMENT.md) - Development guide
+- [TESTING.md](TESTING.md) - Testing specifications

@@ -1,111 +1,128 @@
-# RustResort Documentation Index
+# RustResort Documentation
 
-This directory contains comprehensive documentation for the RustResort project.
+Complete documentation for the RustResort ActivityPub server.
 
-## 📋 Core Documentation
+## 📖 Core Specifications
 
-Essential documents for understanding and working with RustResort:
+Essential technical specifications:
 
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture and design principles |
-| [DATA_MODEL.md](DATA_MODEL.md) | Database schema and data structures |
-| [API.md](API.md) | API endpoints and specifications |
+| [API.md](API.md) | Mastodon-compatible and ActivityPub API specifications |
 | [FEDERATION.md](FEDERATION.md) | ActivityPub federation implementation |
-| [AUTHENTICATION.md](AUTHENTICATION.md) | Authentication and authorization |
+| [DATABASE.md](DATABASE.md) | Database schema and design |
+| [DATA_MODEL.md](DATA_MODEL.md) | Data structures and models |
+| [AUTHENTICATION.md](AUTHENTICATION.md) | OAuth 2.0 and authentication |
 | [STORAGE_STRATEGY.md](STORAGE_STRATEGY.md) | Data persistence and caching strategy |
 
-## 🚀 Getting Started
+## 🚀 Development
+
+Getting started and development guides:
 
 | Document | Description |
 |----------|-------------|
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development setup and workflow |
+| [TESTING.md](TESTING.md) | Testing specifications and practices |
 | [ROADMAP.md](ROADMAP.md) | Project roadmap and milestones |
-| [FUTURE_IMPLEMENTATION_ROADMAP.md](FUTURE_IMPLEMENTATION_ROADMAP.md) | Detailed future implementation plans |
-
-## 🔧 Implementation Guides
-
-Detailed implementation documentation:
-
-### Federation
-- [FEDERATION_PHASE2_SUMMARY.md](FEDERATION_PHASE2_SUMMARY.md) - Phase 2 implementation summary
-- [FEDERATION_PHASE2_2026-01-12.md](FEDERATION_PHASE2_2026-01-12.md) - Detailed Phase 2 documentation
-- [FEDERATION_IMPLEMENTATION_2026-01-12.md](FEDERATION_IMPLEMENTATION_2026-01-12.md) - Implementation details
-- [FEDERATION_QUICK_REFERENCE.md](FEDERATION_QUICK_REFERENCE.md) - Quick reference guide
-- [ACTIVITYPUB_INTEGRATION_PLAN.md](ACTIVITYPUB_INTEGRATION_PLAN.md) - ActivityPub integration plan
-- [ACTIVITY_PROCESSING_2026-01-12.md](ACTIVITY_PROCESSING_2026-01-12.md) - Activity processing implementation
-- [OUTBOUND_SIGNATURES_2026-01-12.md](OUTBOUND_SIGNATURES_2026-01-12.md) - HTTP signature implementation
-
-### Mastodon API
-- [MASTODON_API_FINAL_REPORT_2026-01-11.md](MASTODON_API_FINAL_REPORT_2026-01-11.md) - Final implementation report
-- [PHASE3_SEARCH_COMPLETE.md](PHASE3_SEARCH_COMPLETE.md) - Search API implementation
-
-### Authentication & Middleware
-- [AUTH_MIDDLEWARE_IMPLEMENTATION.md](AUTH_MIDDLEWARE_IMPLEMENTATION.md) - Authentication middleware details
-
-### Metrics & Monitoring
-- [METRICS.md](METRICS.md) - Basic metrics implementation
-- [METRICS_ADVANCED.md](METRICS_ADVANCED.md) - Advanced metrics features
-- [METRICS_IMPLEMENTATION.md](METRICS_IMPLEMENTATION.md) - Implementation details
-
-## 🧪 Testing
-
-| Document | Description |
-|----------|-------------|
-| [E2E_TEST_IMPLEMENTATION.md](E2E_TEST_IMPLEMENTATION.md) | End-to-end testing setup |
-| [E2E_TEST_REPORT_UPDATED.md](E2E_TEST_REPORT_UPDATED.md) | Test results and coverage |
-| [API_SCHEMA_VALIDATION.md](API_SCHEMA_VALIDATION.md) | API schema validation approach |
-| [API_SCHEMA_TEST_REPORT.md](API_SCHEMA_TEST_REPORT.md) | Schema validation test results |
-| [SCHEMA_TESTING_QUICKREF.md](SCHEMA_TESTING_QUICKREF.md) | Quick reference for schema testing |
-| [SCHEMA_TESTING_SUMMARY.md](SCHEMA_TESTING_SUMMARY.md) | Schema testing summary |
 
 ## ☁️ Infrastructure
+
+Deployment and infrastructure:
 
 | Document | Description |
 |----------|-------------|
 | [CLOUDFLARE.md](CLOUDFLARE.md) | Cloudflare R2 configuration |
-| [BACKUP.md](BACKUP.md) | Backup strategy and implementation |
+| [BACKUP.md](BACKUP.md) | Backup strategy and procedures |
 
-## 📊 Performance & Optimization
+## 📊 Monitoring
 
-| Document | Description |
-|----------|-------------|
-| [DATABASE_PERFORMANCE_ANALYSIS.md](DATABASE_PERFORMANCE_ANALYSIS.md) | Database performance analysis |
-| [DATABASE_PERFORMANCE_IMPROVEMENTS.md](DATABASE_PERFORMANCE_IMPROVEMENTS.md) | Performance optimization guide |
-
-## 📝 Session Reports & Decisions
+Observability and monitoring:
 
 | Document | Description |
 |----------|-------------|
-| [SESSION_SUMMARY_2026-01-11.md](SESSION_SUMMARY_2026-01-11.md) | Development session summary |
-| [NEXT_SESSION_GUIDE.md](NEXT_SESSION_GUIDE.md) | Guide for next development session |
-| [WARNING_RESOLUTION_2026-01-11.md](WARNING_RESOLUTION_2026-01-11.md) | Compiler warning resolutions |
-| [DECIDE_PERSISTENCE_SPEC_CHANGE_2026-01-12.md](DECIDE_PERSISTENCE_SPEC_CHANGE_2026-01-12.md) | Persistence specification decisions |
-| [SCHEMA_MIGRATION_REPORT.md](SCHEMA_MIGRATION_REPORT.md) | Database migration report |
+| [METRICS.md](METRICS.md) | Basic metrics implementation |
+| [METRICS_ADVANCED.md](METRICS_ADVANCED.md) | Advanced metrics and monitoring |
 
-## 📚 Document Categories
+## 🔍 Quick Navigation
 
-### By Topic
-- **Architecture**: ARCHITECTURE.md, DATA_MODEL.md, STORAGE_STRATEGY.md
-- **API**: API.md, Mastodon API docs
-- **Federation**: All FEDERATION_*.md files
-- **Testing**: E2E_TEST_*.md, API_SCHEMA_*.md, SCHEMA_TESTING_*.md
-- **Infrastructure**: CLOUDFLARE.md, BACKUP.md
-- **Performance**: DATABASE_PERFORMANCE_*.md, METRICS*.md
+### New to RustResort?
+Start here:
+1. [ARCHITECTURE.md](ARCHITECTURE.md) - Understand the system design
+2. [DEVELOPMENT.md](DEVELOPMENT.md) - Set up your development environment
+3. [API.md](API.md) - Learn the API endpoints
 
-### By Status
-- **Completed Features**: FEDERATION_PHASE2_SUMMARY.md, MASTODON_API_FINAL_REPORT_2026-01-11.md
-- **In Progress**: FUTURE_IMPLEMENTATION_ROADMAP.md
-- **Planning**: ACTIVITYPUB_INTEGRATION_PLAN.md
+### Implementing Features?
+- **Federation**: See [FEDERATION.md](FEDERATION.md)
+- **API Endpoints**: See [API.md](API.md)
+- **Database Changes**: See [DATABASE.md](DATABASE.md)
+- **Testing**: See [TESTING.md](TESTING.md)
 
-## 🔍 Quick Links
+### Deploying?
+- **Infrastructure**: See [CLOUDFLARE.md](CLOUDFLARE.md)
+- **Backups**: See [BACKUP.md](BACKUP.md)
+- **Monitoring**: See [METRICS.md](METRICS.md)
 
-- **New to the project?** Start with [ARCHITECTURE.md](ARCHITECTURE.md) and [DEVELOPMENT.md](DEVELOPMENT.md)
-- **Setting up development?** See [DEVELOPMENT.md](DEVELOPMENT.md)
-- **Working on federation?** Check [FEDERATION.md](FEDERATION.md) and [FEDERATION_QUICK_REFERENCE.md](FEDERATION_QUICK_REFERENCE.md)
-- **Implementing APIs?** See [API.md](API.md) and [MASTODON_API_FINAL_REPORT_2026-01-11.md](MASTODON_API_FINAL_REPORT_2026-01-11.md)
-- **Need to understand data flow?** Read [STORAGE_STRATEGY.md](STORAGE_STRATEGY.md) and [DATA_MODEL.md](DATA_MODEL.md)
+## 📚 Documentation Standards
+
+All documentation follows these principles:
+- **Specification-focused**: Documents describe what is implemented, not implementation history
+- **English**: All documentation in English for public release
+- **Up-to-date**: Documentation reflects current implementation
+- **Comprehensive**: Complete coverage of features and APIs
+
+## 🏗️ Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        RustResort                           │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  Mastodon    │  │  ActivityPub │  │   Storage    │     │
+│  │     API      │  │  Federation  │  │  (R2 + DB)   │     │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │
+│         │                  │                  │             │
+│         └──────────┬───────┴──────────────────┘             │
+│                    │                                        │
+│         ┌──────────┴───────────┐                           │
+│         │   Core Services      │                           │
+│         │  - Auth              │                           │
+│         │  - Timeline          │                           │
+│         │  - Notifications     │                           │
+│         └──────────────────────┘                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 🎯 Key Features
+
+- ✅ **Mastodon API Compatible** - 88+ endpoints implemented
+- ✅ **ActivityPub Federation** - Full federation support with HTTP signatures
+- ✅ **Single-User Optimized** - Designed for personal instances
+- ✅ **Cloudflare R2 Storage** - Efficient media storage and delivery
+- ✅ **SQLite Database** - Lightweight and fast
+- ✅ **OAuth 2.0** - Standard authentication
+- ✅ **Full-Text Search** - SQLite FTS5 integration
+- ✅ **Comprehensive Testing** - Unit, integration, and schema validation tests
+
+## 📝 Version
+
+**Current Version**: 0.1.0
+
+**Last Updated**: 2026-01-12
+
+## 🤝 Contributing
+
+When contributing documentation:
+1. Keep it specification-focused
+2. Update related documents
+3. Follow existing formatting
+4. Test code examples
+5. Update this index if adding new documents
+
+## 📄 License
+
+This project is licensed under AGPL-3.0. See LICENSE file for details.
 
 ---
 
-**Last Updated**: 2026-01-12
+**Made with ❤️ and 🦀**
