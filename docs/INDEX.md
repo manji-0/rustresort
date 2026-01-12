@@ -11,6 +11,7 @@ Essential technical specifications:
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture and design principles |
 | [API.md](API.md) | Mastodon-compatible and ActivityPub API specifications |
 | [FEDERATION.md](FEDERATION.md) | ActivityPub federation implementation |
+| [RSA_KEY_SPEC.md](RSA_KEY_SPEC.md) | RSA key specification for HTTP Signatures |
 | [DATABASE.md](DATABASE.md) | Database schema and design |
 | [DATA_MODEL.md](DATA_MODEL.md) | Data structures and models |
 | [AUTHENTICATION.md](AUTHENTICATION.md) | OAuth 2.0 and authentication |
