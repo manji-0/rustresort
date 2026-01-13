@@ -1,21 +1,21 @@
-# RustResort バックアップ設計
+# RustResort Backup Design
 
-## 概要
+## Overview
 
-RustResortはSQLite単一ファイルデータベースを採用しています。バックアップは**Cloudflare R2**への定期アップロードにより実現されます。
+RustResort uses a single SQLite database file. Backups are implemented through periodic uploads to **Cloudflare R2**.
 
-**重要:** DBバックアップはメディアとは別のR2バケットに保存されます。
+**Important:** Database backups are stored in a separate R2 bucket from media files.
 
-## 設計方針
+## Design Philosophy
 
-### データベースサポート
+### Database Support
 
-| 項目 | 選択 | 理由 |
-|------|------|------|
-| データベース | **SQLite** | シングルユーザー個人インスタンスに最適 |
-| PostgreSQL | ✗ 非サポート | 過剰なインフラ要件を排除 |
+| Item | Choice | Reason |
+|------|--------|--------|
+| Database | **SQLite** | Optimal for single-user personal instances |
+| PostgreSQL | ✗ Not supported | Eliminates excessive infrastructure requirements |
 
-### バックアップ戦略
+### Backup Strategy
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -24,54 +24,54 @@ RustResortはSQLite単一ファイルデータベースを採用しています�
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
 │  │   SQLite     │───▶│   Backup     │───▶│   R2 Backup  │  │
 │  │  Database    │    │   Scheduler  │    │   Bucket     │  │
-│  │              │    │              │    │  (非公開)     │  │
-│  │ rustresort.db│    │ - 日次       │    │              │  │
+│  │              │    │              │    │  (Private)    │  │
+│  │ rustresort.db│    │ - Daily      │    │              │  │
 │  └──────────────┘    └──────────────┘    └──────────────┘  │
 │                                                              │
 │  ┌──────────────┐                        ┌──────────────┐  │
 │  │    Media     │───────────────────────▶│   R2 Media   │  │
 │  │   Upload     │                        │   Bucket     │  │
-│  └──────────────┘                        │  (公開)       │  │
+│  └──────────────┘                        │  (Public)     │  │
 │                                          └──────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 
-バケット分離:
-- rustresort-media: Custom Domain経由で公開（media.example.com）
-- rustresort-backup: 完全非公開（APIアクセスのみ）
+Bucket Separation:
+- rustresort-media: Public via Custom Domain (media.example.com)
+- rustresort-backup: Fully private (API access only)
 ```
 
-## バックアップ実装
+## Backup Implementation
 
-### 設定
+### Configuration
 
 ```toml
-# DBバックアップ
+# Database backup
 [storage.backup]
 enabled = true
-bucket = "rustresort-backup"  # メディアとは別バケット
-interval_seconds = 86400      # 24時間ごと
-retention_count = 7           # 7世代保持
+bucket = "rustresort-backup"  # Separate from media bucket
+interval_seconds = 86400      # Every 24 hours
+retention_count = 7           # Keep 7 generations
 
-# Cloudflare R2認証
+# Cloudflare R2 authentication
 [cloudflare]
 account_id = "${CLOUDFLARE_ACCOUNT_ID}"
 r2_access_key_id = "${R2_ACCESS_KEY_ID}"
 r2_secret_access_key = "${R2_SECRET_ACCESS_KEY}"
 
-# オプション: バックアップファイルの暗号化
+# Optional: Backup file encryption
 [storage.backup.encryption]
 enabled = true
-key = "${BACKUP_ENCRYPTION_KEY}"  # 32バイト、Base64エンコード
+key = "${BACKUP_ENCRYPTION_KEY}"  # 32 bytes, Base64 encoded
 ```
 
-### バックアップスケジューラ
+### Backup Scheduler
 
 ```rust
 use aws_sdk_s3::Client as S3Client;
 use tokio::time::{interval, Duration};
 use std::path::Path;
 
-/// バックアップスケジューラ
+/// Backup scheduler
 pub struct BackupScheduler {
     config: BackupConfig,
     s3_client: S3Client,
@@ -100,7 +100,7 @@ impl BackupScheduler {
         })
     }
     
-    /// バックアップループを開始
+    /// Start backup loop
     pub async fn run(&self) {
         if !self.config.enabled {
             tracing::info!("Backup is disabled");
@@ -109,7 +109,7 @@ impl BackupScheduler {
         
         let mut interval = interval(Duration::from_secs(self.config.interval_seconds));
         
-        // 起動時に一度実行
+        // Run once on startup
         self.perform_backup().await;
         
         loop {
@@ -118,7 +118,7 @@ impl BackupScheduler {
         }
     }
     
-    /// バックアップを実行
+    /// Perform backup
     async fn perform_backup(&self) {
         tracing::info!("Starting scheduled backup");
         
@@ -126,7 +126,7 @@ impl BackupScheduler {
             Ok(key) => {
                 tracing::info!(%key, "Backup completed successfully");
                 
-                // 古いバックアップを削除
+                // Clean up old backups
                 if self.config.retention_count > 0 {
                     if let Err(e) = self.cleanup_old_backups().await {
                         tracing::warn!(error = %e, "Failed to cleanup old backups");
@@ -139,19 +139,19 @@ impl BackupScheduler {
         }
     }
     
-    /// データベースをS3にバックアップ
+    /// Backup database to S3
     async fn backup_database(&self) -> Result<String, Error> {
-        // 1. SQLiteのバックアップAPIを使用して安全にコピー
+        // 1. Use SQLite backup API for safe copy
         let backup_file = self.create_safe_backup().await?;
         
-        // 2. オプション: 暗号化
+        // 2. Optional: Encryption
         let upload_data = if self.config.encryption.enabled {
             self.encrypt_file(&backup_file).await?
         } else {
             tokio::fs::read(&backup_file).await?
         };
         
-        // 3. S3にアップロード
+        // 3. Upload to S3
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let key = format!("backups/rustresort_{}.db", timestamp);
         
@@ -164,17 +164,17 @@ impl BackupScheduler {
             .send()
             .await?;
         
-        // 4. 一時ファイル削除
+        // 4. Delete temporary file
         tokio::fs::remove_file(&backup_file).await?;
         
         Ok(key)
     }
     
-    /// SQLiteのオンラインバックアップAPIを使用
+    /// Use SQLite online backup API
     async fn create_safe_backup(&self) -> Result<PathBuf, Error> {
         let backup_path = self.db_path.with_extension("db.backup");
         
-        // SQLiteのオンラインバックアップを使用（書き込み中でも安全）
+        // Use SQLite online backup (safe during writes)
         let db_path = self.db_path.clone();
         let backup_path_clone = backup_path.clone();
         
@@ -194,7 +194,7 @@ impl BackupScheduler {
         Ok(backup_path)
     }
     
-    /// ファイルを暗号化
+    /// Encrypt file
     async fn encrypt_file(&self, path: &Path) -> Result<Vec<u8>, Error> {
         use aes_gcm::{Aes256Gcm, Key, Nonce};
         use aes_gcm::aead::{Aead, NewAead};
@@ -204,24 +204,24 @@ impl BackupScheduler {
         let key = Key::from_slice(&self.config.encryption.key);
         let cipher = Aes256Gcm::new(key);
         
-        // ランダムなnonceを生成
+        // Generate random nonce
         let nonce_bytes: [u8; 12] = rand::thread_rng().gen();
         let nonce = Nonce::from_slice(&nonce_bytes);
         
-        // 暗号化
+        // Encrypt
         let ciphertext = cipher.encrypt(nonce, data.as_ref())
             .map_err(|e| Error::Encryption(e.to_string()))?;
         
-        // nonce + ciphertext を結合
+        // Combine nonce + ciphertext
         let mut result = nonce_bytes.to_vec();
         result.extend(ciphertext);
         
         Ok(result)
     }
     
-    /// 古いバックアップを削除
+    /// Clean up old backups
     async fn cleanup_old_backups(&self) -> Result<(), Error> {
-        // バックアップ一覧を取得
+        // List backups
         let response = self.s3_client
             .list_objects_v2()
             .bucket(&self.config.s3.bucket)
@@ -234,10 +234,10 @@ impl BackupScheduler {
             .filter_map(|obj| obj.key().map(|k| k.to_string()))
             .collect();
         
-        // 古い順にソート
+        // Sort by oldest first
         objects.sort();
         
-        // 保持数を超えた分を削除
+        // Delete excess backups
         let to_delete = objects.len().saturating_sub(self.config.retention_count);
         
         for key in objects.into_iter().take(to_delete) {
@@ -255,13 +255,13 @@ impl BackupScheduler {
 }
 ```
 
-### 手動バックアップAPI
+### Manual Backup API
 
 ```rust
-/// 管理者用エンドポイント
+/// Admin endpoints
 impl AdminApi {
     /// POST /api/admin/backup
-    /// 手動でバックアップを実行
+    /// Trigger manual backup
     pub async fn trigger_backup(
         State(state): State<AppState>,
     ) -> Result<Json<BackupResponse>, AppError> {
@@ -275,7 +275,7 @@ impl AdminApi {
     }
     
     /// GET /api/admin/backups
-    /// バックアップ一覧を取得
+    /// List backups
     pub async fn list_backups(
         State(state): State<AppState>,
     ) -> Result<Json<Vec<BackupInfo>>, AppError> {
@@ -316,66 +316,64 @@ pub struct BackupInfo {
 }
 ```
 
-### 復元手順
+### Restore Procedure
 
-バックアップからの復元は手動で行います：
+Restore from backup is done manually:
 
 ```bash
-# 1. S3からバックアップをダウンロード
+# 1. Download backup from S3
 aws s3 cp s3://my-rustresort-backup/backups/rustresort_20240101_120000.db ./restore.db
 
-# 2. 暗号化されている場合は復号（復号ツールを提供予定）
+# 2. Decrypt if encrypted (decryption tool to be provided)
 rustresort-cli decrypt --key $BACKUP_ENCRYPTION_KEY ./restore.db ./rustresort.db
 
-# 3. サーバーを停止
+# 3. Stop server
 systemctl stop rustresort
 
-# 4. データベースを置き換え
+# 4. Replace database
 cp ./rustresort.db /var/lib/rustresort/data/rustresort.db
 
-# 5. サーバーを起動
+# 5. Start server
 systemctl start rustresort
 ```
 
-
-
-## 依存クレート
+## Dependencies
 
 ```toml
 [dependencies]
-# S3クライアント
+# S3 client
 aws-sdk-s3 = "1.0"
 aws-config = "1.0"
 
-# SQLiteオンラインバックアップ
+# SQLite online backup
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
-# 暗号化
+# Encryption
 aes-gcm = "0.10"
 rand = "0.8"
 ```
 
-## セキュリティ考慮事項
+## Security Considerations
 
-### 認証情報の管理
+### Credential Management
 
 ```bash
-# 環境変数で管理（推奨）
+# Manage via environment variables (recommended)
 export BACKUP_S3_ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 export BACKUP_S3_SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 export BACKUP_ENCRYPTION_KEY="base64encodedkey..."
 
-# または AWS IAMロール（EC2/ECS使用時）
-# 認証情報は自動的に取得される
+# Or use AWS IAM roles (when using EC2/ECS)
+# Credentials are automatically retrieved
 ```
 
-### 暗号化
+### Encryption
 
-- バックアップファイルはAES-256-GCMで暗号化
-- 暗号化キーは環境変数で管理
-- S3バケット自体のサーバーサイド暗号化も推奨
+- Backup files encrypted with AES-256-GCM
+- Encryption key managed via environment variables
+- S3 bucket server-side encryption also recommended
 
-### アクセス制御
+### Access Control
 
 ```json
 {
@@ -398,11 +396,10 @@ export BACKUP_ENCRYPTION_KEY="base64encodedkey..."
 }
 ```
 
-
-## 監視とアラート
+## Monitoring and Alerts
 
 ```rust
-/// バックアップ状態のヘルスチェック
+/// Backup status health check
 impl HealthCheck {
     pub async fn check_backup_status(&self) -> BackupHealth {
         let last_backup = self.get_last_backup_time().await;
@@ -426,8 +423,8 @@ impl HealthCheck {
 }
 ```
 
-## 次のステップ
+## Next Steps
 
-- [CLOUDFLARE.md](./CLOUDFLARE.md) - Cloudflareインフラ設計
-- [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - データ永続化戦略
-- [DEVELOPMENT.md](./DEVELOPMENT.md) - 開発ガイド
+- [CLOUDFLARE.md](./CLOUDFLARE.md) - Cloudflare infrastructure design
+- [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - Data persistence strategy
+- [DEVELOPMENT.md](./DEVELOPMENT.md) - Development guide

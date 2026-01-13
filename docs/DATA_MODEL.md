@@ -1,40 +1,41 @@
-# RustResort データモデル設計
+# RustResort Data Model Design
 
-## 概要
+## Overview
 
-このドキュメントでは、RustResortで使用するデータモデルを定義します。
-GoToSocialの`gtsmodel`パッケージを参考に、Rustの型システムを活用した設計を行います。
+This document defines the data model used in RustResort, a single-user ActivityPub instance. The design is inspired by GoToSocial's `gtsmodel` package while leveraging Rust's type system for safety and correctness.
 
-## 設計原則
+## Design Principles
 
-1. **型安全性**: Rustの型システムを最大限活用
-2. **不変条件の強制**: newtypeパターンによる制約
-3. **NULL安全性**: `Option<T>`による明示的なnull許容
-4. **シリアライゼーション**: serde対応
-5. **SQLx互換**: SQLiteスキーマとのマッピング
+1. **Type Safety**: Maximize use of Rust's type system
+2. **Invariant Enforcement**: Constraints through newtype patterns
+3. **NULL Safety**: Explicit nullability via `Option<T>`
+4. **Serialization**: Full serde support
+5. **SQLx Compatibility**: Direct mapping to SQLite schema
 
-## 型定義共通
+## Common Type Definitions
 
-### ID型（ULID）
+### ID Type (ULID)
+
+All entities use ULID (Universally Unique Lexicographically Sortable Identifier) for IDs:
 
 ```rust
 use ulid::Ulid;
 
-/// 全エンティティで使用する26文字のULID識別子
+/// Entity ID wrapper (ULID format, 26 characters)
+/// Example: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EntityId(String);
 
 impl EntityId {
+    /// Generate a new ULID
     pub fn new() -> Self {
         Self(Ulid::new().to_string())
     }
     
-    pub fn from_string(s: String) -> Result<Self, IdError> {
-        if s.len() != 26 {
-            return Err(IdError::InvalidLength);
-        }
-        Ok(Self(s))
+    /// Create from existing string
+    pub fn from_string(s: String) -> Self {
+        Self(s)
     }
     
     pub fn as_str(&self) -> &str {
@@ -43,800 +44,504 @@ impl EntityId {
 }
 ```
 
-### 時刻型
+### Timestamp Type
 
 ```rust
 use chrono::{DateTime, Utc};
 
-/// タイムスタンプ型（UTC）
+/// Timestamp type (UTC)
 pub type Timestamp = DateTime<Utc>;
 ```
 
-## コアモデル
+## Core Models
 
-### Account（アカウント）
+### Account (Single User)
 
-ローカルおよびリモートのActivityPubアクターを表現。
+RustResort is designed as a **single-user instance**. Only one local account exists in the database.
 
 ```rust
-/// ActivityPubアクター（ローカル/リモートアカウント）
-#[derive(Debug, Clone)]
+/// The single admin account for this instance
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Account {
-    /// データベースID (ULID)
-    pub id: EntityId,
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// 最後にフェッチした日時（リモートのみ）
-    pub fetched_at: Option<Timestamp>,
-    
-    /// ユーザー名
+    /// Username (unique)
     pub username: String,
     
-    /// ドメイン（ローカルの場合はNone）
-    pub domain: Option<String>,
-    
-    /// 表示名
+    /// Display name
     pub display_name: Option<String>,
     
-    /// プロフィール説明（HTML）
+    /// Profile bio/note
     pub note: Option<String>,
     
-    /// プロフィール説明（raw text、ローカルのみ）
-    pub note_raw: Option<String>,
+    /// Avatar S3 key (Cloudflare R2)
+    pub avatar_s3_key: Option<String>,
     
-    /// アバター画像ID
-    pub avatar_media_attachment_id: Option<EntityId>,
+    /// Header image S3 key
+    pub header_s3_key: Option<String>,
     
-    /// アバターのリモートURL（リモートのみ）
-    pub avatar_remote_url: Option<String>,
+    /// RSA private key (PEM format, 4096-bit)
+    pub private_key_pem: String,
     
-    /// ヘッダー画像ID
-    pub header_media_attachment_id: Option<EntityId>,
-    
-    /// ヘッダーのリモートURL（リモートのみ）
-    pub header_remote_url: Option<String>,
-    
-    /// フォローリクエストの手動承認が必要か
-    pub locked: bool,
-    
-    /// ディスカバリー可能か
-    pub discoverable: bool,
-    
-    /// 検索インデックス可能か
-    pub indexable: bool,
-    
-    /// ActivityPub URI/ID
-    pub uri: String,
-    
-    /// Web表示用URL
-    pub url: Option<String>,
-    
-    /// Inbox URI
-    pub inbox_uri: Option<String>,
-    
-    /// Shared Inbox URI
-    pub shared_inbox_uri: Option<String>,
-    
-    /// Outbox URI
-    pub outbox_uri: Option<String>,
-    
-    /// Following URI
-    pub following_uri: Option<String>,
-    
-    /// Followers URI
-    pub followers_uri: Option<String>,
-    
-    /// Featured (Pinned) Posts URI
-    pub featured_collection_uri: Option<String>,
-    
-    /// アクタータイプ
-    pub actor_type: ActorType,
-    
-    /// 公開鍵（PEM形式）
+    /// RSA public key (PEM format, 4096-bit)
     pub public_key_pem: String,
     
-    /// 公開鍵URI
-    pub public_key_uri: String,
+    /// Creation timestamp
+    pub created_at: String,
     
-    /// 秘密鍵（PEM形式、ローカルのみ）
-    pub private_key_pem: Option<String>,
-    
-    /// プロフィールフィールド
-    pub fields: Vec<ProfileField>,
-    
-    /// 使用カスタム絵文字ID
-    pub emoji_ids: Vec<EntityId>,
-    
-    /// Also Known As URIs（アカウント移行用）
-    pub also_known_as_uris: Vec<String>,
-    
-    /// 移行先URI
-    pub moved_to_uri: Option<String>,
-    
-    /// 凍結日時
-    pub suspended_at: Option<Timestamp>,
-    
-    /// サイレンス日時
-    pub silenced_at: Option<Timestamp>,
-}
-
-impl Account {
-    /// ローカルアカウントかどうか
-    pub fn is_local(&self) -> bool {
-        self.domain.is_none()
-    }
-    
-    /// リモートアカウントかどうか
-    pub fn is_remote(&self) -> bool {
-        self.domain.is_some()
-    }
-    
-    /// @username@domain 形式の文字列を返す
-    pub fn acct(&self) -> String {
-        match &self.domain {
-            Some(domain) => format!("@{}@{}", self.username, domain),
-            None => format!("@{}", self.username),
-        }
-    }
-}
-
-/// ActivityPubアクタータイプ
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActorType {
-    Person,
-    Application,
-    Service,
-    Group,
-    Organization,
-}
-
-/// プロフィールフィールド
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileField {
-    pub name: String,
-    pub value: String,
-    pub verified_at: Option<Timestamp>,
+    /// Last update timestamp
+    pub updated_at: String,
 }
 ```
 
-### User（ユーザー）
+**Key Design Decisions:**
+- **Single user only**: No multi-user support needed
+- **S3-based media**: Avatar and header stored in Cloudflare R2
+- **RSA 4096-bit keys**: For ActivityPub HTTP Signatures (see [RSA_KEY_SPEC.md](./RSA_KEY_SPEC.md))
 
-ローカルアカウントの認証情報。
+### Status (Post/Toot)
 
-```rust
-/// ローカルユーザーの認証・設定情報
-#[derive(Debug, Clone)]
-pub struct User {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// 関連するアカウントID
-    pub account_id: EntityId,
-    
-    /// メールアドレス
-    pub email: String,
-    
-    /// メール確認済みか
-    pub email_verified_at: Option<Timestamp>,
-    
-    /// パスワードハッシュ（bcrypt/argon2）
-    pub encrypted_password: String,
-    
-    /// ロケール設定
-    pub locale: String,
-    
-    /// 最終ログイン日時
-    pub last_signed_in_at: Option<Timestamp>,
-    
-    /// 管理者フラグ
-    pub admin: bool,
-    
-    /// モデレーターフラグ
-    pub moderator: bool,
-    
-    /// 2FA有効フラグ
-    pub two_factor_enabled: bool,
-    
-    /// 2FA秘密鍵
-    pub two_factor_secret: Option<String>,
-    
-    /// 承認済みか（サインアップフロー用）
-    pub approved: bool,
-    
-    /// 確認トークン
-    pub confirmation_token: Option<String>,
-    
-    /// パスワードリセットトークン
-    pub reset_password_token: Option<String>,
-}
-```
-
-### Status（ステータス/投稿）
-
-投稿を表現。
+Represents a post, which can be:
+- User's own post (`is_local = true`)
+- Remote post that the user interacted with (repost/favorite/bookmark)
 
 ```rust
-/// ステータス/投稿
-#[derive(Debug, Clone)]
+/// A post/toot
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Status {
-    /// データベースID (ULID)
-    pub id: EntityId,
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 編集日時
-    pub edited_at: Option<Timestamp>,
-    
-    /// フェッチ日時（リモートのみ）
-    pub fetched_at: Option<Timestamp>,
-    
-    /// ピン留め日時
-    pub pinned_at: Option<Timestamp>,
-    
-    /// ActivityPub URI
+    /// ActivityPub URI (unique)
     pub uri: String,
     
-    /// Web表示URL
-    pub url: Option<String>,
-    
-    /// コンテンツHTML
+    /// HTML content
     pub content: String,
     
-    /// コンテンツraw text（ローカルのみ）
-    pub text: Option<String>,
-    
-    /// コンテンツ警告（CW）
+    /// Content warning (CW)
     pub content_warning: Option<String>,
     
-    /// 公開範囲
-    pub visibility: Visibility,
+    /// Visibility: "public", "unlisted", "private", "direct"
+    pub visibility: String,
     
-    /// センシティブフラグ
-    pub sensitive: bool,
-    
-    /// 言語（BCP47）
+    /// Language code (BCP47)
     pub language: Option<String>,
     
-    /// 投稿者アカウントID
-    pub account_id: EntityId,
+    /// Author's account address (@user@domain)
+    pub account_address: String,
     
-    /// リプライ先ステータスID
-    pub in_reply_to_id: Option<EntityId>,
+    /// Is this a local post?
+    pub is_local: bool,
     
-    /// リプライ先ステータスURI
+    /// Reply to URI
     pub in_reply_to_uri: Option<String>,
     
-    /// リプライ先アカウントID
-    pub in_reply_to_account_id: Option<EntityId>,
+    /// Boost of URI
+    pub boost_of_uri: Option<String>,
     
-    /// ブースト元ステータスID
-    pub boost_of_id: Option<EntityId>,
+    /// Reason for persisting: "own", "reposted", "favourited", "bookmarked", "reply_to_own"
+    pub persisted_reason: String,
     
-    /// ブースト元アカウントID
-    pub boost_of_account_id: Option<EntityId>,
+    /// Creation timestamp
+    pub created_at: String,
     
-    /// スレッドID
-    pub thread_id: Option<EntityId>,
-    
-    /// ポールID
-    pub poll_id: Option<EntityId>,
-    
-    /// 添付メディアID
-    pub attachment_ids: Vec<EntityId>,
-    
-    /// タグID
-    pub tag_ids: Vec<EntityId>,
-    
-    /// メンションID
-    pub mention_ids: Vec<EntityId>,
-    
-    /// 絵文字ID
-    pub emoji_ids: Vec<EntityId>,
-    
-    /// ローカル投稿フラグ
-    pub local: bool,
-    
-    /// フェデレーション対象か
-    pub federated: bool,
-    
-    /// ActivityStreamsタイプ（通常はNote）
-    pub activity_streams_type: String,
-    
-    /// 作成アプリケーションID
-    pub application_id: Option<EntityId>,
-}
-
-/// 投稿の公開範囲
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Visibility {
-    /// 公開（誰でも見える、連合タイムラインに表示）
-    Public,
-    /// 未収載（誰でも見えるがタイムラインに非表示）
-    Unlisted,
-    /// フォロワーのみ
-    FollowersOnly,
-    /// ダイレクト（メンションされたユーザーのみ）
-    Direct,
-}
-
-impl Visibility {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Visibility::Public => "public",
-            Visibility::Unlisted => "unlisted",
-            Visibility::FollowersOnly => "private",
-            Visibility::Direct => "direct",
-        }
-    }
+    /// Fetch timestamp (for remote posts)
+    pub fetched_at: Option<String>,
 }
 ```
 
-### MediaAttachment（メディア添付）
+**Persisted Reason:**
+Remote posts are only stored if there's a reason:
+- `own`: User's own post
+- `reposted`: User boosted this
+- `favourited`: User favorited this
+- `bookmarked`: User bookmarked this
+- `reply_to_own`: Reply to user's post
+
+### MediaAttachment
+
+Media files are stored in **Cloudflare R2** (S3-compatible storage). The database only stores metadata and S3 keys.
 
 ```rust
-/// メディア添付ファイル
-#[derive(Debug, Clone)]
+/// Media file attached to a status
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MediaAttachment {
-    /// データベースID (ULID)
-    pub id: EntityId,
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
+    /// Status ID (optional, set when attached)
+    pub status_id: Option<String>,
     
-    /// 更新日時
-    pub updated_at: Timestamp,
+    /// S3 key for the media file
+    pub s3_key: String,
     
-    /// 所有アカウントID
-    pub account_id: EntityId,
+    /// S3 key for thumbnail
+    pub thumbnail_s3_key: Option<String>,
     
-    /// 添付先ステータスID
-    pub status_id: Option<EntityId>,
-    
-    /// メディアタイプ
-    pub media_type: MediaType,
-    
-    /// MIMEタイプ
+    /// MIME type
     pub content_type: String,
     
-    /// ファイルサイズ（バイト）
+    /// File size in bytes
     pub file_size: i64,
     
-    /// ローカルファイルパス
-    pub file_path: Option<String>,
-    
-    /// リモートURL
-    pub remote_url: Option<String>,
-    
-    /// サムネイルパス
-    pub thumbnail_path: Option<String>,
-    
-    /// 代替テキスト
+    /// Alt text description
     pub description: Option<String>,
     
-    /// ブラーハッシュ
+    /// Blurhash for preview
     pub blurhash: Option<String>,
     
-    /// メタ情報（幅、高さ、再生時間など）
-    pub meta: Option<MediaMeta>,
+    /// Image width (pixels)
+    pub width: Option<i32>,
     
-    /// 処理状態
-    pub processing_status: ProcessingStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaType {
-    Image,
-    Video,
-    Audio,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaMeta {
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub duration: Option<f64>,
-    pub fps: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProcessingStatus {
-    Pending,
-    Processing,
-    Complete,
-    Failed,
+    /// Image height (pixels)
+    pub height: Option<i32>,
+    
+    /// Creation timestamp
+    pub created_at: String,
 }
 ```
 
-### Follow（フォロー関係）
+### Follow (Users We Follow)
 
 ```rust
-/// フォロー関係
-#[derive(Debug, Clone)]
+/// A user this instance follows
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Follow {
-    /// データベースID (ULID)
-    pub id: EntityId,
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
+    /// Target account address (@user@domain)
+    pub target_address: String,
     
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// フォローするアカウントID
-    pub account_id: EntityId,
-    
-    /// フォローされるアカウントID
-    pub target_account_id: EntityId,
-    
-    /// ActivityPub URI
+    /// ActivityPub Follow activity URI
     pub uri: String,
     
-    /// リブログを表示するか
-    pub show_reblogs: bool,
-    
-    /// 通知を受け取るか
-    pub notify: bool,
-}
-
-/// フォローリクエスト
-#[derive(Debug, Clone)]
-pub struct FollowRequest {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// リクエスト元アカウントID
-    pub account_id: EntityId,
-    
-    /// リクエスト先アカウントID
-    pub target_account_id: EntityId,
-    
-    /// ActivityPub URI
-    pub uri: String,
-    
-    /// リブログを表示するか
-    pub show_reblogs: bool,
-    
-    /// 通知を受け取るか
-    pub notify: bool,
+    /// Creation timestamp
+    pub created_at: String,
 }
 ```
 
-### Block（ブロック）
+**Note:** Full profile data is cached in memory, not stored in the database.
+
+### Follower (Users Following Us)
 
 ```rust
-/// アカウントブロック
-#[derive(Debug, Clone)]
-pub struct Block {
-    /// データベースID (ULID)
-    pub id: EntityId,
+/// A user following this instance
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Follower {
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
+    /// Follower account address (@user@domain)
+    pub follower_address: String,
     
-    /// 更新日時
-    pub updated_at: Timestamp,
+    /// Follower's inbox URI (for activity delivery)
+    pub inbox_uri: String,
     
-    /// ブロックするアカウントID
-    pub account_id: EntityId,
-    
-    /// ブロックされるアカウントID
-    pub target_account_id: EntityId,
-    
-    /// ActivityPub URI
+    /// ActivityPub Follow activity URI
     pub uri: String,
+    
+    /// Creation timestamp
+    pub created_at: String,
 }
 ```
 
-### Notification（通知）
+### Notification
 
 ```rust
-/// 通知
-#[derive(Debug, Clone)]
+/// Notification for user interactions
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notification {
-    /// データベースID (ULID)
-    pub id: EntityId,
+    /// Database ID (ULID)
+    pub id: String,
     
-    /// 作成日時
-    pub created_at: Timestamp,
+    /// Type: "mention", "favourite", "reblog", "follow", "follow_request"
+    pub notification_type: String,
     
-    /// 通知タイプ
-    pub notification_type: NotificationType,
+    /// Origin account address
+    pub origin_account_address: String,
     
-    /// 通知を受けるアカウントID
-    pub target_account_id: EntityId,
+    /// Related status URI (optional)
+    pub status_uri: Option<String>,
     
-    /// 通知元アカウントID
-    pub origin_account_id: EntityId,
-    
-    /// 関連ステータスID
-    pub status_id: Option<EntityId>,
-    
-    /// 既読フラグ
+    /// Read flag
     pub read: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NotificationType {
-    Follow,
-    FollowRequest,
-    Mention,
-    Reblog,
-    Favourite,
-    Poll,
-    Status,
-    Update,
-    AdminSignUp,
-    AdminReport,
+    
+    /// Creation timestamp
+    pub created_at: String,
 }
 ```
 
-### Emoji（カスタム絵文字）
+### Favourite (Like)
 
 ```rust
-/// カスタム絵文字
-#[derive(Debug, Clone)]
-pub struct Emoji {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// ショートコード（:emoji:）
-    pub shortcode: String,
-    
-    /// ドメイン（ローカルの場合はNone）
-    pub domain: Option<String>,
-    
-    /// 画像ファイルパス
-    pub image_path: Option<String>,
-    
-    /// リモートURL
-    pub image_remote_url: Option<String>,
-    
-    /// 静的画像パス
-    pub image_static_path: Option<String>,
-    
-    /// コンテンツタイプ
-    pub content_type: String,
-    
-    /// 有効フラグ
-    pub disabled: bool,
-    
-    /// ActivityPub URI
-    pub uri: String,
-    
-    /// カテゴリID
-    pub category_id: Option<EntityId>,
+/// Favourite (like) relationship
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Favourite {
+    pub id: String,
+    pub status_id: String,
+    pub created_at: String,
 }
 ```
 
-### Instance（インスタンス/ドメイン情報）
+### Bookmark
 
 ```rust
-/// リモートインスタンス情報
-#[derive(Debug, Clone)]
-pub struct Instance {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// 更新日時
-    pub updated_at: Timestamp,
-    
-    /// ドメイン名
-    pub domain: String,
-    
-    /// インスタンスタイトル
-    pub title: Option<String>,
-    
-    /// 説明
-    pub short_description: Option<String>,
-    
-    /// ソフトウェア名
-    pub software: Option<String>,
-    
-    /// ソフトウェアバージョン
-    pub software_version: Option<String>,
-    
-    /// 連絡先メールアドレス
-    pub contact_email: Option<String>,
-    
-    /// 連絡先アカウントURI
-    pub contact_account_uri: Option<String>,
+/// Bookmark relationship
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Bookmark {
+    pub id: String,
+    pub status_id: String,
+    pub created_at: String,
 }
 ```
 
-### DomainBlock/DomainAllow（ドメインブロック・許可）
+### Repost (Boost)
 
 ```rust
-/// ドメインブロック
-#[derive(Debug, Clone)]
+/// Repost (boost) relationship
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Repost {
+    pub id: String,
+    pub status_id: String,
+    pub uri: String,  // ActivityPub Announce activity URI
+    pub created_at: String,
+}
+```
+
+### DomainBlock
+
+```rust
+/// Blocked domain
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DomainBlock {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// ドメイン
+    pub id: String,
     pub domain: String,
-    
-    /// ブロック作成者ID
-    pub created_by_account_id: EntityId,
-    
-    /// 公開コメント
-    pub public_comment: Option<String>,
-    
-    /// プライベートコメント
-    pub private_comment: Option<String>,
-    
-    /// 難読化フラグ
-    pub obfuscate: bool,
-}
-
-/// ドメイン許可（Allowlistモード用）
-#[derive(Debug, Clone)]
-pub struct DomainAllow {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// ドメイン
-    pub domain: String,
-    
-    /// 許可作成者ID
-    pub created_by_account_id: EntityId,
+    pub created_at: String,
 }
 ```
 
-## OAuth関連
+## OAuth Models
+
+### Application
 
 ```rust
-/// OAuthアプリケーション
-#[derive(Debug, Clone)]
+/// OAuth application
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Application {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// アプリ名
+    pub id: String,
     pub name: String,
-    
-    /// リダイレクトURIs
-    pub redirect_uris: Vec<String>,
-    
-    /// スコープ
+    pub redirect_uris: String,  // JSON array
     pub scopes: String,
-    
-    /// クライアントID
     pub client_id: String,
-    
-    /// クライアントシークレット
     pub client_secret: String,
-    
-    /// WebサイトURL
     pub website: Option<String>,
+    pub created_at: String,
 }
+```
 
-/// OAuthトークン
-#[derive(Debug, Clone)]
+### Token
+
+```rust
+/// OAuth access token
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Token {
-    /// データベースID (ULID)
-    pub id: EntityId,
-    
-    /// 作成日時
-    pub created_at: Timestamp,
-    
-    /// アクセストークン
+    pub id: String,
     pub access_token: String,
-    
-    /// リフレッシュトークン
-    pub refresh_token: Option<String>,
-    
-    /// 有効期限
-    pub expires_at: Option<Timestamp>,
-    
-    /// スコープ
-    pub scopes: String,
-    
-    /// アプリケーションID
-    pub application_id: EntityId,
-    
-    /// ユーザーID
-    pub user_id: EntityId,
+    pub token_type: String,  // "Bearer"
+    pub scope: String,
+    pub application_id: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
 }
 ```
 
-## ER図（概要）
+## Additional Features
+
+### Polls
+
+```rust
+/// Poll attached to a status
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Poll {
+    pub id: String,
+    pub status_id: String,
+    pub expires_at: Option<String>,
+    pub multiple: bool,
+    pub voters_count: i32,
+    pub created_at: String,
+}
+
+/// Poll option
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PollOption {
+    pub id: String,
+    pub poll_id: String,
+    pub title: String,
+    pub votes_count: i32,
+}
+
+/// User's vote on a poll
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PollVote {
+    pub id: String,
+    pub poll_id: String,
+    pub option_id: String,
+    pub created_at: String,
+}
+```
+
+### Blocks and Mutes
+
+```rust
+/// Account block
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AccountBlock {
+    pub id: String,
+    pub target_address: String,
+    pub created_at: String,
+}
+
+/// Account mute
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AccountMute {
+    pub id: String,
+    pub target_address: String,
+    pub notifications: bool,  // Mute notifications too?
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+```
+
+### Lists
+
+```rust
+/// User-defined list
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct List {
+    pub id: String,
+    pub title: String,
+    pub replies_policy: String,  // "followed", "list", "none"
+    pub created_at: String,
+}
+
+/// Account in a list
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ListAccount {
+    pub id: String,
+    pub list_id: String,
+    pub account_address: String,
+    pub created_at: String,
+}
+```
+
+### Filters
+
+```rust
+/// Content filter
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Filter {
+    pub id: String,
+    pub title: String,
+    pub context: String,  // JSON array: ["home", "notifications", "public", "thread"]
+    pub expires_at: Option<String>,
+    pub filter_action: String,  // "warn", "hide"
+    pub created_at: String,
+}
+
+/// Filter keyword
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FilterKeyword {
+    pub id: String,
+    pub filter_id: String,
+    pub keyword: String,
+    pub whole_word: bool,
+}
+```
+
+### Hashtags
+
+```rust
+/// Hashtag
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Hashtag {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub created_at: String,
+}
+
+/// Status-Hashtag relationship
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StatusHashtag {
+    pub status_id: String,
+    pub hashtag_id: String,
+}
+```
+
+## ER Diagram (Simplified)
 
 ```
-┌──────────────┐     ┌──────────────┐
-│    User      │────◇│   Account    │
-└──────────────┘  1:1└──────┬───────┘
-                           │
-                     ┌─────┴─────┐
-                     │           │
-              ┌──────┴───┐ ┌─────┴──────┐
-              │  Status  │ │   Follow   │
-              └────┬─────┘ └────────────┘
-                   │
-     ┌─────────────┼─────────────┐
-     │             │             │
-┌────┴────┐  ┌─────┴─────┐ ┌─────┴─────┐
-│  Media  │  │  Mention  │ │    Tag    │
-└─────────┘  └───────────┘ └───────────┘
+┌──────────────┐
+│   Account    │  (Single user)
+└──────┬───────┘
+       │
+       ├─────────────┐
+       │             │
+┌──────┴───┐   ┌────┴─────┐
+│  Status  │   │  Follow  │
+└────┬─────┘   └──────────┘
+     │
+     ├──────────┬──────────┬──────────┐
+     │          │          │          │
+┌────┴────┐ ┌──┴───┐ ┌────┴────┐ ┌──┴──────┐
+│  Media  │ │ Poll │ │Favourite│ │Bookmark │
+└─────────┘ └──────┘ └─────────┘ └─────────┘
 ```
 
-## マイグレーション戦略
+## Migration Strategy
 
-1. **SQLiteのみサポート**（シングルユーザー個人インスタンス向け）
-2. SQLXのマイグレーション機能 (`sqlx migrate`) を使用
-3. 各テーブルの作成順序は依存関係を考慮
-4. コンパイル時クエリ検証 (`sqlx::query!` マクロ) を活用
-5. バックアップはS3互換ストレージへ自動アップロード（[BACKUP.md](./BACKUP.md)参照）
+1. **SQLite Only** (for single-user personal instances)
+2. Use SQLx migration feature (`sqlx migrate`)
+3. Table creation order respects dependencies
+4. Leverage compile-time query verification (`sqlx::query!` macro)
+5. Automatic backup to S3-compatible storage (see [BACKUP.md](./BACKUP.md))
 
-### SQLiteの利点（個人インスタンス向け）
+### SQLite Benefits (for Personal Instances)
 
-- **単一ファイル**: `data/rustresort.db` のみ
-- **ゼロ設定**: 外部DBサーバー不要
-- **ポータブル**: ファイルコピーで完全移行
-- **バックアップ容易**: ファイル単位でS3にアップロード
-- **軽量**: メモリ使用量最小
+- **Single File**: Only `data/rustresort.db`
+- **Zero Configuration**: No external DB server required
+- **Portable**: Complete migration via file copy
+- **Easy Backup**: File-level upload to S3
+- **Lightweight**: Minimal memory usage
 
-### マイグレーションファイル
+### Migration Files
 
 ```
 migrations/
-├── 20240101000000_create_account.sql
-├── 20240101000001_create_statuses.sql
-├── 20240101000002_create_follows.sql
-├── 20240101000003_create_followers.sql
-└── ...
+├── 001_initial.sql
+├── 002_oauth.sql
+├── 003_blocks_mutes_lists_filters.sql
+├── 004_polls_scheduled_conversations.sql
+└── 005_hashtags_fts.sql
 ```
 
-## インデックス設計
+## Index Design
 
-主要なインデックス:
+Key indexes:
 
-- `accounts.username, accounts.domain` (UNIQUE)
-- `accounts.uri` (UNIQUE)
 - `statuses.uri` (UNIQUE)
-- `statuses.account_id`
+- `statuses.is_local`
 - `statuses.created_at DESC`
-- `statuses.in_reply_to_id`
-- `follows.account_id, follows.target_account_id` (UNIQUE)
-- `notifications.target_account_id, notifications.created_at DESC`
+- `statuses.account_address`
+- `follows.target_address` (UNIQUE)
+- `followers.follower_address` (UNIQUE)
+- `notifications.created_at DESC`
+- `notifications.read`
 
-## 次のステップ
+## Next Steps
 
-- [API.md](./API.md) - API仕様の詳細
-- [FEDERATION.md](./FEDERATION.md) - ActivityPubフェデレーション仕様
+- [API.md](./API.md) - API specification details
+- [FEDERATION.md](./FEDERATION.md) - ActivityPub federation specification
+- [RSA_KEY_SPEC.md](./RSA_KEY_SPEC.md) - RSA key specifications for HTTP Signatures

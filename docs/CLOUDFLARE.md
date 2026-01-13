@@ -1,17 +1,17 @@
-# RustResort Cloudflare R2 設定
+# RustResort Cloudflare R2 Configuration
 
-## 概要
+## Overview
 
-RustResortはCloudflare R2をメディアストレージとして使用します。
+RustResort uses Cloudflare R2 for media storage.
 
-| コンポーネント | サービス | 用途 |
-|---------------|---------|------|
-| データベース | **SQLite** | メインDB（ローカル） |
-| メディアストレージ | **Cloudflare R2** | 画像・動画保存 |
-| DBバックアップ | **Cloudflare R2** (別バケット) | SQLite自動バックアップ |
-| CDN | **Cloudflare CDN** | Custom Domain経由でメディア配信 |
+| Component | Service | Purpose |
+|-----------|---------|---------|
+| Database | **SQLite** | Main DB (local) |
+| Media Storage | **Cloudflare R2** | Image/video storage |
+| DB Backup | **Cloudflare R2** (separate bucket) | SQLite automatic backup |
+| CDN | **Cloudflare CDN** | Media delivery via Custom Domain |
 
-## アーキテクチャ
+## Architecture
 
 ```
                                     ┌─────────────────────┐
@@ -26,7 +26,8 @@ RustResortはCloudflare R2をメディアストレージとして使用します
 │  │          R2             │  │          R2             │       │
 │  │     Media Bucket        │  │     Backup Bucket       │       │
 │  │                         │  │                         │       │
-│  │  media.example.com 公開 │  │      (非公開)           │       │
+│  │  media.example.com      │  │      (Private)          │       │
+│  │       (Public)          │  │                         │       │
 │  └────────────┬────────────┘  └────────────┬────────────┘       │
 └───────────────┼─────────────────────────────┼───────────────────┘
                 │                             │
@@ -43,41 +44,41 @@ RustResortはCloudflare R2をメディアストレージとして使用します
                  └───────────────────────────┘
 ```
 
-## R2バケット構成
+## R2 Bucket Configuration
 
-### 用途別バケット分離
+### Bucket Separation by Purpose
 
-| バケット名 | 用途 | 公開設定 |
-|-----------|------|---------|
-| `rustresort-media` | メディアファイル | Custom Domain公開 |
-| `rustresort-backup` | DBバックアップ | 完全非公開 |
+| Bucket Name | Purpose | Public Access |
+|------------|---------|---------------|
+| `rustresort-media` | Media files | Public via Custom Domain |
+| `rustresort-backup` | DB backups | Fully private |
 
-## R2設定
+## R2 Setup
 
-### 1. R2バケットの作成
+### 1. Create R2 Buckets
 
 Cloudflare Dashboard → R2 → Create bucket:
 
 ```
-rustresort-media    ← メディア用
-rustresort-backup   ← バックアップ用
+rustresort-media    ← For media
+rustresort-backup   ← For backups
 ```
 
-### 2. Custom Domainの設定（メディアバケット）
+### 2. Configure Custom Domain (Media Bucket)
 
 1. R2 → rustresort-media → Settings
 2. Public access → Custom Domains → Connect Domain
-3. `media.example.com` を入力
-4. DNSレコードが自動作成される
+3. Enter `media.example.com`
+4. DNS records are automatically created
 
-### 3. R2 APIトークンの作成
+### 3. Create R2 API Token
 
 1. R2 → Manage R2 API Tokens → Create API token
-2. 権限: Object Read & Write
-3. バケット指定: rustresort-media, rustresort-backup
-4. Access Key ID と Secret Access Key をメモ
+2. Permissions: Object Read & Write
+3. Specify buckets: rustresort-media, rustresort-backup
+4. Save Access Key ID and Secret Access Key
 
-## 設定ファイル
+## Configuration File
 
 ```toml
 [server]
@@ -86,23 +87,23 @@ port = 8080
 domain = "social.example.com"
 protocol = "https"
 
-# データベース（SQLiteのみ）
+# Database (SQLite only)
 [database]
 path = "./data/rustresort.db"
 
-# メディアストレージ（R2）
+# Media storage (R2)
 [storage.media]
 bucket = "rustresort-media"
 public_url = "https://media.example.com"
 
-# DBバックアップ（R2別バケット）
+# DB backup (R2 separate bucket)
 [storage.backup]
 enabled = true
 bucket = "rustresort-backup"
-interval_seconds = 86400  # 24時間
-retention_count = 7       # 7世代
+interval_seconds = 86400  # 24 hours
+retention_count = 7       # 7 generations
 
-# Cloudflare R2認証
+# Cloudflare R2 authentication
 [cloudflare]
 account_id = "${CLOUDFLARE_ACCOUNT_ID}"
 r2_access_key_id = "${R2_ACCESS_KEY_ID}"
@@ -118,18 +119,18 @@ level = "info"
 format = "json"
 ```
 
-## 環境変数
+## Environment Variables
 
 ```bash
-# Cloudflareアカウント
+# Cloudflare account
 export CLOUDFLARE_ACCOUNT_ID="your-account-id"
 
-# R2アクセスキー
+# R2 access keys
 export R2_ACCESS_KEY_ID="your-r2-access-key"
 export R2_SECRET_ACCESS_KEY="your-r2-secret-key"
 ```
 
-## メディア配信フロー
+## Media Delivery Flow
 
 ```
 ┌──────────┐     ┌──────────────┐     ┌─────────────┐
@@ -143,17 +144,17 @@ export R2_SECRET_ACCESS_KEY="your-r2-secret-key"
 │          │     ┌──────────────┐            │
 │          │◀────│  media.      │◀───────────┘
 │          │     │  example.com │     Custom Domain
-│          │     │  (CDN)       │     経由で公開
+│          │     │  (CDN)       │     public access
 └──────────┘     └──────────────┘
 ```
 
-**ポイント:**
-- アップロード: RustResort → R2 (API経由)
-- 配信: Client ← CDN ← R2 (RustResortを経由しない)
+**Key Points:**
+- Upload: RustResort → R2 (via API)
+- Delivery: Client ← CDN ← R2 (bypasses RustResort)
 
-## 実装例
+## Implementation Example
 
-### メディアストレージ
+### Media Storage
 
 ```rust
 use aws_sdk_s3::Client as S3Client;
@@ -165,7 +166,7 @@ pub struct MediaStorage {
 }
 
 impl MediaStorage {
-    /// メディアをR2にアップロード
+    /// Upload media to R2
     pub async fn upload(
         &self,
         key: &str,
@@ -178,22 +179,22 @@ impl MediaStorage {
             .key(key)
             .body(ByteStream::from(data))
             .content_type(content_type)
-            .cache_control("public, max-age=31536000")  // 1年キャッシュ
+            .cache_control("public, max-age=31536000")  // 1 year cache
             .send()
             .await?;
         
-        // Custom Domain経由の公開URLを返す
+        // Return public URL via Custom Domain
         Ok(format!("{}/{}", self.public_url, key))
     }
     
-    /// メディアの公開URLを取得
+    /// Get public URL for media
     pub fn get_public_url(&self, key: &str) -> String {
         format!("{}/{}", self.public_url, key)
     }
 }
 ```
 
-### DBバックアップ
+### DB Backup
 
 ```rust
 pub struct BackupService {
@@ -204,10 +205,10 @@ pub struct BackupService {
 
 impl BackupService {
     pub async fn backup(&self) -> Result<String, Error> {
-        // 1. SQLiteオンラインバックアップ
+        // 1. SQLite online backup
         let backup_data = self.create_sqlite_backup().await?;
         
-        // 2. R2にアップロード
+        // 2. Upload to R2
         let key = format!(
             "backups/rustresort_{}.db",
             Utc::now().format("%Y%m%d_%H%M%S")
@@ -227,52 +228,52 @@ impl BackupService {
 }
 ```
 
-## 料金目安（2024年時点）
+## Pricing Estimate (as of 2024)
 
-| サービス | 無料枠 | 超過料金 |
-|---------|-------|---------|
-| R2 ストレージ | 10GB/月 | $0.015/GB |
-| R2 Class A Ops (Write) | 1M/月 | $4.50/1M |
-| R2 Class B Ops (Read) | 10M/月 | $0.36/1M |
-| 転送量 | **無料** | $0 |
+| Service | Free Tier | Overage Rate |
+|---------|-----------|--------------|
+| R2 Storage | 10GB/month | $0.015/GB |
+| R2 Class A Ops (Write) | 1M/month | $4.50/1M |
+| R2 Class B Ops (Read) | 10M/month | $0.36/1M |
+| Egress | **Free** | $0 |
 
-**個人インスタンスの場合**: 無料枠内で収まることがほとんど。
+**For personal instances**: Usually stays within free tier.
 
-## セキュリティ
+## Security
 
-### アクセス制御
+### Access Control
 
-- **メディアバケット**: Custom Domain経由で公開（読み取りのみ）
-- **バックアップバケット**: 完全プライベート（APIアクセスのみ）
+- **Media bucket**: Public via Custom Domain (read-only)
+- **Backup bucket**: Fully private (API access only)
 
-### 認証情報の保護
+### Credential Protection
 
 ```bash
-# 本番環境では必ず環境変数を使用
-# 設定ファイルに直接書かない
+# Always use environment variables in production
+# Never hardcode in configuration files
 
 chmod 600 .env
 ```
 
-## トラブルシューティング
+## Troubleshooting
 
-### アップロードが失敗する
+### Upload Failures
 
-1. R2 APIトークンの権限を確認
-2. バケット名が正しいか確認
-3. `aws-sdk-s3`のエンドポイントが正しいか確認:
+1. Check R2 API token permissions
+2. Verify bucket name is correct
+3. Confirm `aws-sdk-s3` endpoint is correct:
    ```
    https://<account_id>.r2.cloudflarestorage.com
    ```
 
-### Custom Domainでアクセスできない
+### Custom Domain Not Accessible
 
-1. DNSレコードがプロキシ（オレンジ雲）になっているか確認
-2. SSL/TLSモードを確認
-3. キャッシュをパージ
+1. Verify DNS record is proxied (orange cloud)
+2. Check SSL/TLS mode
+3. Purge cache
 
-## 次のステップ
+## Next Steps
 
-- [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - データ永続化戦略
-- [BACKUP.md](./BACKUP.md) - バックアップ詳細
-- [DEVELOPMENT.md](./DEVELOPMENT.md) - 開発ガイド
+- [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - Data persistence strategy
+- [BACKUP.md](./BACKUP.md) - Backup details
+- [DEVELOPMENT.md](./DEVELOPMENT.md) - Development guide

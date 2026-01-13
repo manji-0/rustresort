@@ -1,19 +1,18 @@
-# RustResort - Rust製ActivityPub Twitterライクサービス アーキテクチャ設計
+# RustResort - Rust ActivityPub Twitter-like Service Architecture
 
-## 概要
+## Overview
 
-RustResortは、GoToSocialを参考にしたRust製の軽量ActivityPubサーバーです。
-Twitter/Mastodonライクなマイクロブログ機能を提供し、Fediverseとの相互運用性を重視した設計となっています。
+RustResort is a lightweight ActivityPub server built in Rust, inspired by GoToSocial. It provides Twitter/Mastodon-like microblogging functionality with a focus on Fediverse interoperability.
 
-## プロジェクト目標
+## Project Goals
 
-1. **軽量性**: 低リソース環境（VPS、SBCなど）での動作
-2. **安全性**: Rustの型システムによるメモリ安全性とセキュリティ
-3. **相互運用性**: ActivityPub/ActivityStreams準拠によるFediverse連携
-4. **シンプルさ**: 個人〜小規模インスタンス向けの管理しやすい設計
-5. **パフォーマンス**: Rustの非同期処理による高スループット
+1. **Lightweight**: Runs on low-resource environments (VPS, SBC, etc.)
+2. **Safety**: Memory safety and security through Rust's type system
+3. **Interoperability**: Fediverse integration via ActivityPub/ActivityStreams compliance
+4. **Simplicity**: Easy-to-manage design for personal to small-scale instances
+5. **Performance**: High throughput through Rust's async processing
 
-## ハイレベルアーキテクチャ
+## High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -55,61 +54,61 @@ Twitter/Mastodonライクなマイクロブログ機能を提供し、Fediverse�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 技術スタック
+## Technology Stack
 
-### コア
+### Core
 
-| カテゴリ | 技術 | 理由 |
+| Category | Technology | Reason |
 |---------|------|------|
-| 言語 | Rust 2024 Edition | メモリ安全性、パフォーマンス |
-| 非同期ランタイム | Tokio | 業界標準、成熟度 |
-| Webフレームワーク | Axum | Tower統合、型安全性 |
-| データベース | **SQLite** | シングルユーザー特化、ゼロ設定 |
-| SQLライブラリ | SQLx | コンパイル時クエリ検証、非同期ファースト |
-| キャッシュ | Moka | 高性能インメモリキャッシュ |
-| シリアライゼーション | serde | 業界標準 |
+| Language | Rust 2024 Edition | Memory safety, performance |
+| Async Runtime | Tokio | Industry standard, maturity |
+| Web Framework | Axum | Tower integration, type safety |
+| Database | **SQLite** | Single-user optimized, zero configuration |
+| SQL Library | SQLx | Compile-time query verification, async-first |
+| Cache | Moka | High-performance in-memory cache |
+| Serialization | serde | Industry standard |
 
-### ActivityPub関連
+### ActivityPub Related
 
-| カテゴリ | 技術 | 理由 |
+| Category | Technology | Reason |
 |---------|------|------|
-| HTTP Signatures | http-signature-normalization | ActivityPub必須 |
-| JSON-LD | json-ld (crate) | ActivityStreams処理 |
-| WebFinger | カスタム実装 | ユーザー発見 |
+| HTTP Signatures | http-signature-normalization | ActivityPub requirement |
+| JSON-LD | json-ld (crate) | ActivityStreams processing |
+| WebFinger | Custom implementation | User discovery |
 
-### インフラ（Cloudflare）
+### Infrastructure (Cloudflare)
 
-| カテゴリ | 技術 | 理由 |
+| Category | Technology | Reason |
 |---------|------|------|
-| 設定管理 | config-rs | 柔軟な設定読み込み |
-| ログ | tracing | 構造化ログ |
-| メディアストレージ | **Cloudflare R2** | Custom Domain経由で公開 |
-| DBバックアップ | **Cloudflare R2** | 別バケットに保存 |
-| TLS | rustls | メモリ安全なTLS |
+| Configuration | config-rs | Flexible configuration loading |
+| Logging | tracing | Structured logging |
+| Media Storage | **Cloudflare R2** | Public via Custom Domain |
+| DB Backup | **Cloudflare R2** | Stored in separate bucket |
+| TLS | rustls | Memory-safe TLS |
 
-詳細は [CLOUDFLARE.md](./CLOUDFLARE.md) を参照。
+See [CLOUDFLARE.md](./CLOUDFLARE.md) for details.
 
-## モジュール構成
+## Module Structure
 
 ```
 rustresort/
 ├── Cargo.toml
 ├── config/
-│   └── default.toml          # デフォルト設定
+│   └── default.toml          # Default configuration
 ├── docs/
-│   ├── ARCHITECTURE.md       # このファイル
-│   ├── DATA_MODEL.md         # データモデル設計
-│   ├── API.md                # API仕様
-│   ├── FEDERATION.md         # フェデレーション仕様
-│   └── DEVELOPMENT.md        # 開発ガイド
-├── migrations/               # DBマイグレーション
+│   ├── ARCHITECTURE.md       # This file
+│   ├── DATA_MODEL.md         # Data model design
+│   ├── API.md                # API specification
+│   ├── FEDERATION.md         # Federation specification
+│   └── DEVELOPMENT.md        # Development guide
+├── migrations/               # DB migrations
 ├── src/
 │   ├── main.rs
 │   ├── lib.rs
-│   ├── config/              # 設定管理
+│   ├── config/              # Configuration management
 │   │   ├── mod.rs
 │   │   └── settings.rs
-│   ├── models/              # データモデル
+│   ├── models/              # Data models
 │   │   ├── mod.rs
 │   │   ├── account.rs
 │   │   ├── status.rs
@@ -117,19 +116,19 @@ rustresort/
 │   │   ├── notification.rs
 │   │   ├── follow.rs
 │   │   └── ...
-│   ├── db/                  # データベース層
+│   ├── db/                  # Database layer
 │   │   ├── mod.rs
-│   │   ├── repository.rs    # Repositoryパターン
+│   │   ├── repository.rs    # Repository pattern
 │   │   ├── account.rs
 │   │   ├── status.rs
 │   │   └── ...
-│   ├── cache/               # キャッシュ層
+│   ├── cache/               # Cache layer
 │   │   ├── mod.rs
 │   │   └── account.rs
-│   ├── api/                 # API層
+│   ├── api/                 # API layer
 │   │   ├── mod.rs
 │   │   ├── router.rs
-│   │   ├── client/          # Mastodon互換API
+│   │   ├── client/          # Mastodon-compatible API
 │   │   │   ├── mod.rs
 │   │   │   ├── accounts.rs
 │   │   │   ├── statuses.rs
@@ -146,14 +145,14 @@ rustresort/
 │   │   │   ├── webfinger.rs
 │   │   │   ├── nodeinfo.rs
 │   │   │   └── hostmeta.rs
-│   │   ├── auth/            # 認証関連
+│   │   ├── auth/            # Authentication
 │   │   │   ├── mod.rs
 │   │   │   ├── oauth.rs
 │   │   │   └── middleware.rs
-│   │   └── model/           # APIレスポンスモデル
+│   │   └── model/           # API response models
 │   │       ├── mod.rs
 │   │       └── ...
-│   ├── service/             # ビジネスロジック層
+│   ├── service/             # Business logic layer
 │   │   ├── mod.rs
 │   │   ├── account.rs
 │   │   ├── status.rs
@@ -161,88 +160,88 @@ rustresort/
 │   │   ├── media.rs
 │   │   ├── notification.rs
 │   │   └── ...
-│   ├── federation/          # フェデレーション層
+│   ├── federation/          # Federation layer
 │   │   ├── mod.rs
-│   │   ├── federator.rs     # フェデレーション管理
-│   │   ├── dereferencing/   # リモートリソース取得
+│   │   ├── federator.rs     # Federation management
+│   │   ├── dereferencing/   # Remote resource fetching
 │   │   │   ├── mod.rs
 │   │   │   ├── account.rs
 │   │   │   └── status.rs
-│   │   ├── delivery/        # アクティビティ配信
+│   │   ├── delivery/        # Activity delivery
 │   │   │   ├── mod.rs
 │   │   │   └── worker.rs
-│   │   └── protocol/        # ActivityPubプロトコル
+│   │   └── protocol/        # ActivityPub protocol
 │   │       ├── mod.rs
 │   │       ├── activities.rs
 │   │       ├── actors.rs
 │   │       └── objects.rs
-│   ├── transport/           # HTTPトランスポート
+│   ├── transport/           # HTTP transport
 │   │   ├── mod.rs
-│   │   ├── client.rs        # HTTPクライアント
-│   │   └── signature.rs     # HTTP署名
-│   ├── media/               # メディア処理
+│   │   ├── client.rs        # HTTP client
+│   │   └── signature.rs     # HTTP signatures
+│   ├── media/               # Media processing
 │   │   ├── mod.rs
 │   │   ├── processor.rs
 │   │   └── storage.rs
-│   ├── queue/               # バックグラウンドジョブ
+│   ├── queue/               # Background jobs
 │   │   ├── mod.rs
 │   │   └── worker.rs
-│   ├── state/               # アプリケーション状態
+│   ├── state/               # Application state
 │   │   └── mod.rs
-│   └── util/                # ユーティリティ
+│   └── util/                # Utilities
 │       ├── mod.rs
-│       ├── id.rs            # ULID生成
+│       ├── id.rs            # ULID generation
 │       └── time.rs
 └── tests/
     ├── integration/
     └── fixtures/
 ```
 
-## レイヤー責務
+## Layer Responsibilities
 
 ### 1. API Layer (`src/api/`)
 
-- HTTPリクエストのルーティングと処理
-- リクエストバリデーション
-- 認証・認可チェック
-- レスポンスシリアライゼーション
+- HTTP request routing and handling
+- Request validation
+- Authentication/authorization checks
+- Response serialization
 
-**サブモジュール:**
-- `client/`: Mastodon API互換エンドポイント
-- `activitypub/`: ActivityPubプロトコルエンドポイント
-- `wellknown/`: `.well-known`エンドポイント
-- `auth/`: OAuth2認証
+**Submodules:**
+- `client/`: Mastodon API-compatible endpoints
+- `activitypub/`: ActivityPub protocol endpoints
+- `wellknown/`: `.well-known` endpoints
+- `auth/`: OAuth2 authentication
 
 ### 2. Service Layer (`src/service/`)
 
-- ビジネスロジックの実装
-- トランザクション管理
-- 複数リポジトリの調整
-- イベント発行
+- Business logic implementation
+- Transaction management
+- Multi-repository coordination
+- Event publishing
 
 ### 3. Federation Layer (`src/federation/`)
 
-- ActivityPubプロトコル処理
-- リモートアクター/オブジェクトの取得（dereferencing）
-- アクティビティの配信
-- フェデレーションポリシー適用
+- ActivityPub protocol processing
+- Remote actor/object fetching (dereferencing)
+- Activity delivery
+- Federation policy enforcement
 
 ### 4. Data Layer (`src/db/`, `src/cache/`)
 
-- データの永続化
-- キャッシュ管理
-- クエリの最適化
+- Data persistence
+- Cache management
+- Query optimization
 
 ### 5. Transport Layer (`src/transport/`)
 
-- HTTP通信
+- HTTP communication
 - HTTP Signatures
-- リトライ処理
+- Retry handling
 
-## 依存性注入とステート管理
+## Dependency Injection and State Management
 
 ```rust
-/// アプリケーション全体の共有状態
+/// Shared application state
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Arc<DbPool>,
@@ -254,12 +253,12 @@ pub struct AppState {
 }
 ```
 
-Axumの`State`エクストラクターを使用して各ハンドラに注入。
+Injected into handlers using Axum's `State` extractor.
 
-## エラーハンドリング
+## Error Handling
 
 ```rust
-/// アプリケーションエラー型
+/// Application error type
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Not found: {0}")]
@@ -286,54 +285,54 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        // 適切なHTTPステータスコードとJSON bodyに変換
+        // Convert to appropriate HTTP status code and JSON body
     }
 }
 ```
 
-## 非同期処理モデル
+## Async Processing Model
 
-GoToSocialのworkerパターンを参考に、Tokioベースのバックグラウンドジョブシステムを実装:
+Inspired by GoToSocial's worker pattern, implements Tokio-based background job system:
 
 ```rust
-/// ワーカータスクの種類
+/// Worker task types
 pub enum WorkerTask {
-    /// アクティビティを配信
+    /// Deliver activity
     DeliverActivity {
         activity: Activity,
         inbox_urls: Vec<String>,
     },
-    /// リモートアカウントを取得・更新
+    /// Fetch/update remote account
     FetchRemoteAccount {
         uri: String,
     },
-    /// メディアを処理
+    /// Process media
     ProcessMedia {
         attachment_id: String,
     },
 }
 ```
 
-## セキュリティ考慮事項
+## Security Considerations
 
-1. **HTTP Signatures**: 全てのActivityPubリクエストに署名を要求
-2. **Input Validation**: 全入力の厳格なバリデーション
-3. **Rate Limiting**: Tower middlewareによるレート制限
-4. **CORS**: 適切なCORS設定
-5. **CSP**: コンテンツセキュリティポリシー
+1. **HTTP Signatures**: Require signatures on all ActivityPub requests
+2. **Input Validation**: Strict validation of all inputs
+3. **Rate Limiting**: Rate limiting via Tower middleware
+4. **CORS**: Proper CORS configuration
+5. **CSP**: Content Security Policy
 
-## パフォーマンス最適化
+## Performance Optimizations
 
-1. **コネクションプーリング**: DBコネクションプール
-2. **キャッシング**: 頻繁にアクセスされるデータのメモリキャッシュ
-3. **遅延読み込み**: 必要時のみ関連データを読み込み
-4. **バッチ処理**: 配信の一括処理
-5. **非同期I/O**: 全I/O操作の非同期化
+1. **Connection Pooling**: DB connection pooling
+2. **Caching**: Memory cache for frequently accessed data
+3. **Lazy Loading**: Load related data only when needed
+4. **Batch Processing**: Bulk delivery processing
+5. **Async I/O**: All I/O operations are async
 
-## 次のステップ
+## Next Steps
 
-1. [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - データ永続化戦略（重要）
-2. [DATA_MODEL.md](./DATA_MODEL.md) - データモデルの詳細設計
-3. [API.md](./API.md) - API仕様
-4. [FEDERATION.md](./FEDERATION.md) - フェデレーション仕様
-5. [DEVELOPMENT.md](./DEVELOPMENT.md) - 開発環境セットアップ
+1. [STORAGE_STRATEGY.md](./STORAGE_STRATEGY.md) - Data persistence strategy (important)
+2. [DATA_MODEL.md](./DATA_MODEL.md) - Detailed data model design
+3. [API.md](./API.md) - API specification
+4. [FEDERATION.md](./FEDERATION.md) - Federation specification
+5. [DEVELOPMENT.md](./DEVELOPMENT.md) - Development environment setup
