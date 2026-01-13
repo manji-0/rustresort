@@ -1,83 +1,83 @@
-# RustResort データ永続化戦略
+# RustResort Data Persistence Strategy
 
-## 概要
+## Overview
 
-RustResortは**シングルユーザーインスタンス**を前提とし、「自分視点の情報のみをDBに永続化する」という設計思想を採用しています。この戦略により、ストレージ使用量を最小限に抑えつつ、Fediverseとの完全な相互運用性を維持します。
+RustResort is designed as a **single-user instance** with the philosophy of "persisting only information from my perspective to the database." This strategy minimizes storage usage while maintaining full interoperability with the Fediverse.
 
-## 設計思想
+## Design Philosophy
 
-### コアコンセプト: 「自分視点」ストレージ
+### Core Concept: "My Perspective" Storage
 
-従来のActivityPubサーバーは、フェデレーション経由で受信した全てのデータをDBに保存します。これは複数ユーザーインスタンスでは必要ですが、シングルユーザーインスタンスでは過剰です。
+Traditional ActivityPub servers store all data received via federation in the database. While necessary for multi-user instances, this is excessive for single-user instances.
 
-RustResortでは以下の原則を採用します：
+RustResort adopts the following principles:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    データ永続化の原則                        │
+│                Data Persistence Principles                   │
 ├─────────────────────────────────────────────────────────────┤
-│  ✓ 自分が作成したコンテンツ → DB永続化                      │
-│  ✓ 自分がアクションしたコンテンツ → DB永続化                │
+│  ✓ Content I created → Persist to DB                        │
+│  ✓ Content I acted on → Persist to DB                       │
 │     (Repost, Fav, Bookmark)                                 │
-│  ✓ フォロー関係のアドレス → DB永続化                        │
-│  ✗ 他者のタイムラインtoot → メモリキャッシュのみ（揮発性）   │
-│  ✗ 他者のプロフィール全文 → メモリキャッシュのみ（揮発性）   │
+│  ✓ Follow relationship addresses → Persist to DB            │
+│  ✗ Others' timeline toots → Memory cache only (volatile)    │
+│  ✗ Others' full profiles → Memory cache only (volatile)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### シングルユーザー前提
+### Single-User Premise
 
-- インスタンスには**adminユーザーのみ**が存在
-- ユーザー登録・追加機能は実装しない
-- 全ての操作は単一ユーザーの視点から行われる
+- Only an **admin user** exists on the instance
+- No user registration/addition features implemented
+- All operations are from a single user's perspective
 
-## データ分類とストレージ戦略
+## Data Classification and Storage Strategy
 
-### 1. 永続化データ（DB保存）
+### 1. Persistent Data (DB Storage)
 
-以下のデータはSQLiteに永続保存されます：
+The following data is permanently stored in SQLite:
 
-| データ種別 | 説明 | 理由 |
-|-----------|------|------|
-| 自分のStatus | 自分が作成した投稿 | コア資産 |
-| メディアメタデータ | S3上のファイルへの参照情報 | コア資産（実ファイルはS3） |
-| Repostした他者のStatus | ブースト対象 | 自分のアクション |
-| Favした他者のStatus | お気に入り対象 | 自分のアクション |
-| Bookmarkした他者のStatus | ブックマーク対象 | 自分のアクション |
-| フォロー関係アドレス | `user@domain` 形式 | 関係性の維持 |
-| **通知** | メンション、Like、ブースト等 | 履歴保持 |
-| ドメインブロック | ブロックしたドメイン | モデレーション設定 |
-| インスタンス設定 | 各種設定値 | 動作に必要 |
+| Data Type | Description | Reason |
+|-----------|-------------|--------|
+| My Status | Posts I created | Core asset |
+| Media Metadata | Reference info to files on S3 | Core asset (actual files on S3) |
+| Reposted Status | Boosted content | My action |
+| Favourited Status | Favourited content | My action |
+| Bookmarked Status | Bookmarked content | My action |
+| Follow Addresses | `user@domain` format | Relationship maintenance |
+| **Notifications** | Mentions, Likes, Boosts, etc. | History retention |
+| Domain Blocks | Blocked domains | Moderation settings |
+| Instance Settings | Configuration values | Required for operation |
 
-### 2. 揮発性データ（メモリキャッシュ）
+### 2. Volatile Data (Memory Cache)
 
-以下のデータはメモリにのみ保持され、再起動で消失します：
+The following data is kept only in memory and lost on restart:
 
-| データ種別 | キャッシュサイズ | ライフサイクル |
-|-----------|-----------------|---------------|
-| タイムラインtoot | 最新2000件 | LRUで自動削除 |
-| フォロイー/フォロワープロフィール | 全件 | 起動時取得、Federationで更新 |
-| リモートアクターの公開鍵 | LRU 1000件 | 署名検証時に取得 |
+| Data Type | Cache Size | Lifecycle |
+|-----------|------------|-----------|
+| Timeline toots | Latest 2000 | Auto-deleted via LRU |
+| Followee/Follower profiles | All | Fetched at startup, updated via Federation |
+| Remote actor public keys | LRU 1000 | Fetched during signature verification |
 
-### 3. オブジェクトストレージ（Cloudflare R2）
+### 3. Object Storage (Cloudflare R2)
 
-メディアファイルはCloudflare R2に保存され、Custom Domain経由で公開されます：
+Media files are stored in Cloudflare R2 and served via Custom Domain:
 
-| データ種別 | 保存先 | 公開URL例 |
-|-----------|--------|---------|
-| アバター画像 | R2 | `https://media.example.com/avatars/{id}.webp` |
-| ヘッダー画像 | R2 | `https://media.example.com/headers/{id}.webp` |
-| 投稿添付メディア | R2 | `https://media.example.com/attachments/{id}.webp` |
-| サムネイル | R2 | `https://media.example.com/thumbnails/{id}.webp` |
+| Data Type | Storage | Public URL Example |
+|-----------|---------|-------------------|
+| Avatar images | R2 | `https://media.example.com/avatars/{id}.webp` |
+| Header images | R2 | `https://media.example.com/headers/{id}.webp` |
+| Post attachments | R2 | `https://media.example.com/attachments/{id}.webp` |
+| Thumbnails | R2 | `https://media.example.com/thumbnails/{id}.webp` |
 
-**メディア配信フロー:**
-1. ユーザーがメディアをアップロード → RustResortがR2に保存
-2. メディアURLは `https://media.example.com/...` (R2 Custom Domain)
-3. クライアントはCDN経由でR2から直接取得（RustResortを経由しない）
+**Media Delivery Flow:**
+1. User uploads media → RustResort saves to R2
+2. Media URL is `https://media.example.com/...` (R2 Custom Domain)
+3. Client fetches directly from R2 via CDN (bypasses RustResort)
 
-詳細は [CLOUDFLARE.md](./CLOUDFLARE.md) を参照。
+See [CLOUDFLARE.md](./CLOUDFLARE.md) for details.
 
-## アーキテクチャ
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -95,7 +95,7 @@ RustResortでは以下の原則を採用します：
               ▼               ▼               ▼
 ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
 │  Persist Path   │ │   Cache Path    │ │  Ignore Path    │
-│  (自分に関係)    │ │  (参照のみ)     │ │  (関係なし)      │
+│  (Related to me)│ │ (Reference only)│ │ (Not related)   │
 └────────┬────────┘ └────────┬────────┘ └─────────────────┘
          │                   │
          ▼                   ▼
@@ -105,23 +105,23 @@ RustResortでは以下の原則を採用します：
 └─────────────────┘ └─────────────────┘
 ```
 
-## 詳細設計
+## Detailed Design
 
-### タイムラインキャッシュ
+### Timeline Cache
 
 ```rust
 use moka::future::Cache;
 use std::sync::Arc;
 
-/// タイムラインキャッシュ（最大2000件、LRU）
+/// Timeline cache (max 2000 items, LRU)
 pub struct TimelineCache {
     /// Status ID -> CachedStatus
     statuses: Cache<String, Arc<CachedStatus>>,
-    /// 最大保持件数
+    /// Maximum items to keep
     max_items: usize,
 }
 
-/// キャッシュ用Status（軽量版）
+/// Lightweight Status for caching
 #[derive(Debug, Clone)]
 pub struct CachedStatus {
     pub id: String,
@@ -133,7 +133,7 @@ pub struct CachedStatus {
     pub attachments: Vec<CachedAttachment>,
     pub reply_to_uri: Option<String>,
     pub boost_of_uri: Option<String>,
-    // Note: アカウント詳細は含まない（別キャッシュ参照）
+    // Note: Account details not included (separate cache reference)
 }
 
 impl TimelineCache {
@@ -141,34 +141,34 @@ impl TimelineCache {
         Self {
             statuses: Cache::builder()
                 .max_capacity(max_items as u64)
-                .time_to_live(Duration::from_secs(3600 * 24 * 7)) // 7日
+                .time_to_live(Duration::from_secs(3600 * 24 * 7)) // 7 days
                 .build(),
             max_items,
         }
     }
     
-    /// タイムラインに追加（自動でLRU削除）
+    /// Add to timeline (auto LRU deletion)
     pub async fn insert(&self, status: CachedStatus) {
         self.statuses.insert(status.id.clone(), Arc::new(status)).await;
     }
     
-    /// ホームタイムライン取得
+    /// Get home timeline
     pub async fn get_home_timeline(
         &self,
         followee_addresses: &HashSet<String>,
         limit: usize,
         max_id: Option<&str>,
     ) -> Vec<Arc<CachedStatus>> {
-        // フォロイーのStatusのみをフィルタして返す
+        // Filter and return only followee's statuses
         // ...
     }
 }
 ```
 
-### プロフィールキャッシュ
+### Profile Cache
 
 ```rust
-/// フォロイー/フォロワーのプロフィールキャッシュ
+/// Profile cache for followees/followers
 pub struct ProfileCache {
     /// user@domain -> CachedProfile
     profiles: Cache<String, Arc<CachedProfile>>,
@@ -191,7 +191,7 @@ pub struct CachedProfile {
 }
 
 impl ProfileCache {
-    /// 起動時にDB保存のフォロー関係からプロフィールを一括取得
+    /// Bulk fetch profiles from DB-stored follow relationships at startup
     pub async fn initialize_from_follows(
         &self,
         follow_addresses: Vec<String>,
@@ -209,7 +209,7 @@ impl ProfileCache {
         }
     }
     
-    /// Federation経由のUpdate Activityで更新
+    /// Update from Federation Update Activity
     pub async fn update_from_activity(&self, actor: &ActivityActor) {
         let address = format!("{}@{}", actor.preferred_username, actor.domain);
         if let Some(existing) = self.profiles.get(&address).await {
@@ -227,118 +227,118 @@ impl ProfileCache {
 }
 ```
 
-### 永続化判定ロジック
+### Persistence Decision Logic
 
 ```rust
-/// Activityの永続化判定
+/// Activity persistence decision
 pub enum PersistenceDecision {
-    /// DBに永続保存
+    /// Persist to DB
     Persist,
-    /// メモリキャッシュのみ
+    /// Memory cache only
     CacheOnly,
-    /// 保存しない
+    /// Don't save
     Ignore,
 }
 
 impl ActivityProcessor {
-    /// 受信したActivityの永続化判定
+    /// Determine persistence for received Activity
     pub fn decide_persistence(&self, activity: &Activity) -> PersistenceDecision {
         match &activity.activity_type {
-            // 自分へのメンション → 通知をDB保存 + 元Statusはキャッシュ
+            // Mention to me → Save notification to DB + Cache original Status
             ActivityType::Create if self.mentions_me(&activity) => {
-                // 通知はDBに永続化、Status自体はキャッシュ
-                PersistenceDecision::Persist  // 通知部分
+                // Notification is persisted to DB, Status itself is cached
+                PersistenceDecision::Persist  // notification part
             }
             
-            // フォロイーの投稿 → タイムラインキャッシュのみ
+            // Followee's post → Timeline cache only
             ActivityType::Create if self.is_followee(&activity.actor) => {
                 PersistenceDecision::CacheOnly
             }
             
-            // 誰かが自分をフォロー → フォロワーアドレス + 通知をDB保存
+            // Someone follows me → Save follower address + notification to DB
             ActivityType::Follow if self.targets_me(&activity) => {
                 PersistenceDecision::Persist
             }
             
-            // 自分の投稿へのLike → 通知をDB保存
+            // Like on my post → Save notification to DB
             ActivityType::Like if self.is_my_status(&activity.object) => {
-                PersistenceDecision::Persist  // 通知として永続化
+                PersistenceDecision::Persist  // persist as notification
             }
             
-            // 自分の投稿のブースト → 通知をDB保存
+            // Boost of my post → Save notification to DB
             ActivityType::Announce if self.is_my_status(&activity.object) => {
-                PersistenceDecision::Persist  // 通知として永続化
+                PersistenceDecision::Persist  // persist as notification
             }
             
-            // その他 → 無視
+            // Others → Ignore
             _ => PersistenceDecision::Ignore,
         }
     }
 }
 ```
 
-### ユーザーアクションによる永続化
+### User Action Persistence
 
 ```rust
-/// ユーザーアクションによる他者Statusの永続化
+/// Persist others' Status through user action
 impl StatusService {
-    /// Repost（ブースト）
+    /// Repost (boost)
     pub async fn repost(&self, status_uri: &str) -> Result<Status, Error> {
-        // 1. キャッシュからStatusを取得
+        // 1. Get Status from cache
         let cached = self.timeline_cache.get_by_uri(status_uri).await
             .ok_or(Error::NotFound)?;
         
-        // 2. 他者のStatusをDBに永続化（まだ保存されていない場合）
+        // 2. Persist others' Status to DB (if not already saved)
         let persisted = self.persist_remote_status(&cached).await?;
         
-        // 3. Repost関係をDBに保存
+        // 3. Save Repost relationship to DB
         self.db.insert_repost(&self.my_account_id, &persisted.id).await?;
         
-        // 4. Announce Activityを配信
+        // 4. Deliver Announce Activity
         self.federation.send_announce(&persisted).await?;
         
         Ok(persisted)
     }
     
-    /// お気に入り
+    /// Favourite
     pub async fn favourite(&self, status_uri: &str) -> Result<(), Error> {
         let cached = self.timeline_cache.get_by_uri(status_uri).await
             .ok_or(Error::NotFound)?;
         
-        // 他者のStatusをDBに永続化
+        // Persist others' Status to DB
         let persisted = self.persist_remote_status(&cached).await?;
         
-        // Favourite関係をDBに保存
+        // Save Favourite relationship to DB
         self.db.insert_favourite(&self.my_account_id, &persisted.id).await?;
         
-        // Like Activityを配信
+        // Deliver Like Activity
         self.federation.send_like(&persisted).await?;
         
         Ok(())
     }
     
-    /// ブックマーク（ローカルのみ、Federationなし）
+    /// Bookmark (local only, no Federation)
     pub async fn bookmark(&self, status_uri: &str) -> Result<(), Error> {
         let cached = self.timeline_cache.get_by_uri(status_uri).await
             .ok_or(Error::NotFound)?;
         
-        // 他者のStatusをDBに永続化
+        // Persist others' Status to DB
         let persisted = self.persist_remote_status(&cached).await?;
         
-        // Bookmark関係をDBに保存
+        // Save Bookmark relationship to DB
         self.db.insert_bookmark(&self.my_account_id, &persisted.id).await?;
         
         Ok(())
     }
     
-    /// キャッシュStatusをDBに永続化
+    /// Persist cached Status to DB
     async fn persist_remote_status(&self, cached: &CachedStatus) -> Result<Status, Error> {
-        // 既にDBにある場合はそれを返す
+        // Return if already in DB
         if let Some(existing) = self.db.get_status_by_uri(&cached.uri).await? {
             return Ok(existing);
         }
         
-        // 新規保存
+        // Save new
         let status = Status {
             id: EntityId::new(),
             uri: cached.uri.clone(),
@@ -353,51 +353,51 @@ impl StatusService {
     }
 }
 
-/// Status永続化の理由
+/// Reason for Status persistence
 #[derive(Debug, Clone, PartialEq)]
 pub enum PersistedReason {
-    /// 自分が作成
+    /// I created it
     OwnContent,
-    /// Repost対象
+    /// Repost target
     Reposted,
-    /// お気に入り対象
+    /// Favourite target
     Favourited,
-    /// ブックマーク対象
+    /// Bookmark target
     Bookmarked,
-    /// 自分の投稿へのリプライ（コンテキスト保持用）
+    /// Reply to my post (for context retention)
     ReplyToOwn,
 }
 ```
 
-### フォロー関係のDB設計
+### Follow Relationship DB Design
 
 ```rust
-/// フォロー関係（アドレスのみ保存）
+/// Follow relationship (address only)
 #[derive(Debug, Clone)]
 pub struct Follow {
     pub id: EntityId,
     pub created_at: DateTime<Utc>,
-    /// フォロー先アドレス（user@domain）
+    /// Target address (user@domain)
     pub target_address: String,
-    /// ActivityPub URI（Accept/Undo用）
+    /// ActivityPub URI (for Accept/Undo)
     pub uri: String,
 }
 
-/// フォロワー（アドレスのみ保存）
+/// Follower (address only)
 #[derive(Debug, Clone)]
 pub struct Follower {
     pub id: EntityId,
     pub created_at: DateTime<Utc>,
-    /// フォロワーのアドレス（user@domain）
+    /// Follower's address (user@domain)
     pub follower_address: String,
     /// ActivityPub URI
     pub uri: String,
 }
 ```
 
-SQLマイグレーション:
+SQL Migration:
 ```sql
--- フォロー関係（自分がフォローしている相手）
+-- Follow relationships (accounts I follow)
 CREATE TABLE follows (
     id TEXT PRIMARY KEY,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -405,33 +405,33 @@ CREATE TABLE follows (
     uri TEXT NOT NULL UNIQUE
 );
 
--- フォロワー（自分をフォローしている相手）
+-- Followers (accounts following me)
 CREATE TABLE followers (
     id TEXT PRIMARY KEY,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     follower_address TEXT NOT NULL UNIQUE,  -- user@domain
-    inbox_uri TEXT NOT NULL,  -- 配信先（プロフィールキャッシュにもあるが配信確実性のため保持）
+    inbox_uri TEXT NOT NULL,  -- delivery target (also in profile cache, kept here for delivery reliability)
     uri TEXT NOT NULL UNIQUE
 );
 ```
 
-### 起動時の初期化フロー
+### Startup Initialization Flow
 
 ```rust
 impl AppState {
     pub async fn initialize() -> Result<Self, Error> {
-        // 1. DB接続
+        // 1. DB connection
         let db = Database::connect(&config.database_url).await?;
         
-        // 2. キャッシュ初期化
+        // 2. Initialize caches
         let timeline_cache = TimelineCache::new(2000);
         let profile_cache = ProfileCache::new();
         
-        // 3. フォロー関係をDBから読み込み
+        // 3. Load follow relationships from DB
         let follow_addresses = db.get_all_follow_addresses().await?;
         let follower_addresses = db.get_all_follower_addresses().await?;
         
-        // 4. フォロイー/フォロワーのプロフィールを並列取得
+        // 4. Fetch followee/follower profiles in parallel
         let http_client = HttpClient::new();
         
         tokio::join!(
@@ -445,9 +445,9 @@ impl AppState {
             "Initialized profile cache"
         );
         
-        // 5. タイムラインは空の状態で開始
-        // → Federationでリアルタイムに受信するか、
-        //   フォロイーのOutboxから最新を取得するオプションあり
+        // 5. Timeline starts empty
+        // → Populated in real-time via Federation,
+        //   or optionally fetch latest from followee's Outbox
         
         Ok(Self {
             db: Arc::new(db),
@@ -460,24 +460,24 @@ impl AppState {
 }
 ```
 
-## DBスキーマ（最小構成）
+## DB Schema (Minimal Configuration)
 
 ```sql
--- 自分のアカウント情報（1レコードのみ）
+-- My account info (single record only)
 CREATE TABLE account (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
     display_name TEXT,
     note TEXT,
-    avatar_s3_key TEXT,     -- S3上のキー
-    header_s3_key TEXT,     -- S3上のキー
+    avatar_s3_key TEXT,     -- S3 key
+    header_s3_key TEXT,     -- S3 key
     private_key_pem TEXT NOT NULL,
     public_key_pem TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 自分の投稿 + 永続化された他者の投稿
+-- My posts + persisted others' posts
 CREATE TABLE statuses (
     id TEXT PRIMARY KEY,
     uri TEXT NOT NULL UNIQUE,
@@ -485,7 +485,7 @@ CREATE TABLE statuses (
     content_warning TEXT,
     visibility TEXT NOT NULL,
     language TEXT,
-    account_address TEXT NOT NULL,  -- 自分の場合は空文字列
+    account_address TEXT NOT NULL,  -- empty string for my posts
     is_local INTEGER NOT NULL DEFAULT 0,
     in_reply_to_uri TEXT,
     boost_of_uri TEXT,
@@ -494,12 +494,12 @@ CREATE TABLE statuses (
     fetched_at TIMESTAMP
 );
 
--- メディア添付（S3キーを保存、実ファイルはS3上）
+-- Media attachments (S3 keys stored, actual files on S3)
 CREATE TABLE media_attachments (
     id TEXT PRIMARY KEY,
     status_id TEXT,
-    s3_key TEXT NOT NULL,           -- S3オブジェクトキー
-    thumbnail_s3_key TEXT,          -- サムネイルのS3キー
+    s3_key TEXT NOT NULL,           -- S3 object key
+    thumbnail_s3_key TEXT,          -- Thumbnail S3 key
     content_type TEXT NOT NULL,
     file_size INTEGER NOT NULL,
     description TEXT,
@@ -510,12 +510,12 @@ CREATE TABLE media_attachments (
     FOREIGN KEY (status_id) REFERENCES statuses(id)
 );
 
--- 通知（永続化）
+-- Notifications (persisted)
 CREATE TABLE notifications (
     id TEXT PRIMARY KEY,
     notification_type TEXT NOT NULL,  -- mention/favourite/reblog/follow/follow_request
     origin_account_address TEXT NOT NULL,  -- user@domain
-    status_uri TEXT,                  -- 関連StatusのURI（あれば）
+    status_uri TEXT,                  -- Related Status URI (if any)
     read INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -523,7 +523,7 @@ CREATE TABLE notifications (
 CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
 CREATE INDEX idx_notifications_read ON notifications(read);
 
--- フォロー関係
+-- Follow relationships
 CREATE TABLE follows (
     id TEXT PRIMARY KEY,
     target_address TEXT NOT NULL UNIQUE,
@@ -531,7 +531,7 @@ CREATE TABLE follows (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- フォロワー
+-- Followers
 CREATE TABLE followers (
     id TEXT PRIMARY KEY,
     follower_address TEXT NOT NULL UNIQUE,
@@ -540,7 +540,7 @@ CREATE TABLE followers (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- お気に入り
+-- Favourites
 CREATE TABLE favourites (
     id TEXT PRIMARY KEY,
     status_id TEXT NOT NULL,
@@ -549,7 +549,7 @@ CREATE TABLE favourites (
     UNIQUE (status_id)
 );
 
--- ブックマーク
+-- Bookmarks
 CREATE TABLE bookmarks (
     id TEXT PRIMARY KEY,
     status_id TEXT NOT NULL,
@@ -558,7 +558,7 @@ CREATE TABLE bookmarks (
     UNIQUE (status_id)
 );
 
--- Repost関係
+-- Repost relationships
 CREATE TABLE reposts (
     id TEXT PRIMARY KEY,
     status_id TEXT NOT NULL,
@@ -568,72 +568,72 @@ CREATE TABLE reposts (
     UNIQUE (status_id)
 );
 
--- ドメインブロック
+-- Domain blocks
 CREATE TABLE domain_blocks (
     id TEXT PRIMARY KEY,
     domain TEXT NOT NULL UNIQUE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- インスタンス設定
+-- Instance settings
 CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- インデックス
+-- Indexes
 CREATE INDEX idx_statuses_created_at ON statuses(created_at DESC);
 CREATE INDEX idx_statuses_account_address ON statuses(account_address);
 CREATE INDEX idx_statuses_persisted_reason ON statuses(persisted_reason);
 ```
 
-## 利点と制約
+## Benefits and Constraints
 
-### 利点
+### Benefits
 
-| 利点 | 説明 |
-|------|------|
-| 💾 ストレージ節約 | DBサイズが劇的に小さくなる |
-| ⚡ 高速起動 | DBからの読み込みが最小限 |
-| 🔒 プライバシー | 他者のデータを保持しない |
-| 🧹 管理不要 | 自動クリーンアップが不要 |
-| 🎯 シンプル | シングルユーザー特化で複雑さ削減 |
+| Benefit | Description |
+|---------|-------------|
+| 💾 Storage Savings | Dramatically smaller DB size |
+| ⚡ Fast Startup | Minimal DB reads |
+| 🔒 Privacy | No retention of others' data |
+| 🧹 No Maintenance | No auto-cleanup needed |
+| 🎯 Simple | Reduced complexity with single-user focus |
 
-### 制約
+### Constraints
 
-| 制約 | 説明 | 対処 |
-|------|------|------|
-| タイムラインの履歴 | 再起動で消失 | 重要なものはBookmark |
-| 検索機能 | キャッシュ内のみ | 自分の投稿は全文検索可能 |
-| オフライン時 | タイムライン空 | 起動時にOutbox取得オプション |
-| S3必須 | メディア保存にS3が必要 | MinIO等のセルフホストも可 |
+| Constraint | Description | Mitigation |
+|------------|-------------|------------|
+| Timeline History | Lost on restart | Bookmark important items |
+| Search | Cache only | Full-text search for own posts |
+| Offline Startup | Empty timeline | Optional Outbox fetch at startup |
+| S3 Required | S3 needed for media | Self-hosted MinIO also works |
 
-## 設定オプション
+## Configuration Options
 
 ```toml
 [cache]
-# タイムラインキャッシュの最大件数
+# Maximum timeline cache items
 timeline_max_items = 2000
 
-# プロフィールキャッシュTTL（秒）
-profile_ttl = 86400  # 24時間
+# Profile cache TTL (seconds)
+profile_ttl = 86400  # 24 hours
 
 [storage]
-# S3互換ストレージ（必須）
+# S3-compatible storage (required)
 endpoint = "https://s3.amazonaws.com"
 bucket = "my-rustresort-media"
 region = "ap-northeast-1"
-# access_key と secret_key は環境変数から
+# access_key and secret_key from environment variables
 
 [startup]
-# 起動時にフォロイーのOutboxから最新投稿を取得するか
+# Fetch latest posts from followee's Outbox at startup
 fetch_followee_outbox = true
 
-# Outboxから取得する最大件数
+# Maximum items to fetch from Outbox
 outbox_fetch_limit = 50
 ```
 
-## 次のステップ
+## Next Steps
 
-- [DATA_MODEL.md](./DATA_MODEL.md) - 詳細なデータモデル
-- [FEDERATION.md](./FEDERATION.md) - フェデレーション処理
+- [DATA_MODEL.md](./DATA_MODEL.md) - Detailed data model
+- [FEDERATION.md](./FEDERATION.md) - Federation processing

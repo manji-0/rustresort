@@ -1,11 +1,11 @@
-# RustResort 認証設計
+# RustResort Authentication Design
 
-## 概要
+## Overview
 
-RustResortはシングルユーザーインスタンスであり、認証は**GitHub OAuth**のみをサポートします。
-設定されたGitHubユーザーのみがインスタンスにログイン可能です。
+RustResort is a single-user instance and supports **GitHub OAuth only** for authentication.
+Only the GitHub user specified in the configuration can log in to the instance.
 
-## 認証フロー
+## Authentication Flow
 
 ### GitHub OAuth 2.0
 
@@ -51,59 +51,59 @@ RustResortはシングルユーザーインスタンスであり、認証は**Gi
      │                  │                    │
 ```
 
-### シングルユーザー認証
+### Single-User Authentication
 
-RustResortでは、設定ファイルで指定された**1つのGitHubユーザー名**のみがログイン可能です：
+RustResort allows only **one GitHub username** specified in the configuration to log in:
 
 ```toml
 [auth]
-# 許可するGitHubユーザー名（これがインスタンスの管理者）
+# GitHub username allowed to login (this becomes the instance admin)
 github_username = "your-github-username"
 ```
 
-他のGitHubユーザーがログインしようとしても拒否されます。
+Login attempts from other GitHub users are rejected.
 
-## 設定
+## Configuration
 
-### 1. GitHub OAuth Appの作成
+### 1. Create GitHub OAuth App
 
 1. GitHub → Settings → Developer settings → OAuth Apps → New OAuth App
-2. 以下を入力：
+2. Enter the following:
    - **Application name**: `RustResort`
    - **Homepage URL**: `https://social.example.com`
    - **Authorization callback URL**: `https://social.example.com/auth/github/callback`
-3. Client ID と Client Secret をメモ
+3. Note the Client ID and Client Secret
 
-### 2. 設定ファイル
+### 2. Configuration File
 
 ```toml
 [auth]
-# 許可するGitHubユーザー名
+# GitHub username allowed to login
 github_username = "your-github-username"
 
-# セッション設定
-session_secret = "${SESSION_SECRET}"  # 32バイト以上のランダム文字列
-session_max_age = 604800              # 7日間（秒）
+# Session settings
+session_secret = "${SESSION_SECRET}"  # Random string of 32+ bytes
+session_max_age = 604800              # 7 days (seconds)
 
 [auth.github]
 client_id = "${GITHUB_CLIENT_ID}"
 client_secret = "${GITHUB_CLIENT_SECRET}"
 ```
 
-### 3. 環境変数
+### 3. Environment Variables
 
 ```bash
 # GitHub OAuth
 export GITHUB_CLIENT_ID="Iv1.xxxxxxxxxxxx"
 export GITHUB_CLIENT_SECRET="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# セッション秘密鍵（生成: openssl rand -base64 32）
+# Session secret (generate with: openssl rand -base64 32)
 export SESSION_SECRET="$(openssl rand -base64 32)"
 ```
 
-## 実装
+## Implementation
 
-### 認証ルーター
+### Authentication Router
 
 ```rust
 use axum::{
@@ -120,11 +120,11 @@ pub fn auth_router() -> Router<AppState> {
 }
 ```
 
-### ログインページ
+### Login Page
 
 ```rust
 /// GET /login
-/// シンプルなログインページを表示
+/// Display simple login page
 async fn login_page() -> impl IntoResponse {
     Html(r#"
         <!DOCTYPE html>
@@ -181,17 +181,17 @@ async fn login_page() -> impl IntoResponse {
 }
 ```
 
-### GitHub OAuth リダイレクト
+### GitHub OAuth Redirect
 
 ```rust
 /// GET /auth/github
-/// GitHubの認可ページにリダイレクト
+/// Redirect to GitHub authorization page
 async fn github_redirect(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let csrf_state = generate_csrf_state();
     
-    // CSRFトークンをセッションに保存
+    // Store CSRF token in session
     // ...
     
     let auth_url = format!(
@@ -205,7 +205,7 @@ async fn github_redirect(
 }
 ```
 
-### GitHub コールバック
+### GitHub Callback
 
 ```rust
 #[derive(Deserialize)]
@@ -229,16 +229,16 @@ struct GitHubUser {
 }
 
 /// GET /auth/github/callback
-/// GitHubからのコールバックを処理
+/// Handle GitHub callback
 async fn github_callback(
     State(state): State<AppState>,
     Query(query): Query<GitHubCallbackQuery>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. CSRFトークンを検証
+    // 1. Verify CSRF token
     verify_csrf_state(&query.state, &jar)?;
     
-    // 2. アクセストークンを取得
+    // 2. Get access token
     let token_response: GitHubTokenResponse = state.http_client
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
@@ -252,7 +252,7 @@ async fn github_callback(
         .json()
         .await?;
     
-    // 3. ユーザー情報を取得
+    // 3. Get user info
     let github_user: GitHubUser = state.http_client
         .get("https://api.github.com/user")
         .header("Authorization", format!("Bearer {}", token_response.access_token))
@@ -262,7 +262,7 @@ async fn github_callback(
         .json()
         .await?;
     
-    // 4. 許可されたユーザーか確認
+    // 4. Verify authorized user
     if github_user.login != state.config.auth.github_username {
         tracing::warn!(
             attempted_user = %github_user.login,
@@ -274,7 +274,7 @@ async fn github_callback(
     
     tracing::info!(user = %github_user.login, "Admin logged in");
     
-    // 5. セッションを作成
+    // 5. Create session
     let session = Session {
         github_username: github_user.login,
         github_id: github_user.id,
@@ -286,7 +286,7 @@ async fn github_callback(
     
     let session_token = create_session_token(&session, &state.config.auth.session_secret)?;
     
-    // 6. セッションCookieを設定してリダイレクト
+    // 6. Set session cookie and redirect
     let cookie = Cookie::build(("session", session_token))
         .path("/")
         .http_only(true)
@@ -299,7 +299,7 @@ async fn github_callback(
 }
 ```
 
-### ログアウト
+### Logout
 
 ```rust
 /// POST /logout
@@ -313,12 +313,12 @@ async fn logout(jar: CookieJar) -> impl IntoResponse {
 }
 ```
 
-### 認証ミドルウェア
+### Authentication Middleware
 
 ```rust
 use axum::middleware::Next;
 
-/// 認証が必要なルートを保護するミドルウェア
+/// Middleware to protect routes requiring authentication
 pub async fn require_auth(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -332,19 +332,19 @@ pub async fn require_auth(
     
     let session = verify_session_token(&session_token, &state.config.auth.session_secret)?;
     
-    // セッションの有効期限をチェック
+    // Check session expiration
     if session.expires_at < Utc::now() {
         return Err(AppError::Unauthorized);
     }
     
-    // セッション情報をリクエスト拡張に追加
+    // Add session info to request extensions
     let mut request = request;
     request.extensions_mut().insert(session);
     
     Ok(next.run(request).await)
 }
 
-/// 現在のセッション情報を取得
+/// Get current session info
 pub struct CurrentUser(pub Session);
 
 #[async_trait]
@@ -365,7 +365,7 @@ where
 }
 ```
 
-### セッショントークン
+### Session Token
 
 ```rust
 use hmac::{Hmac, Mac};
@@ -384,7 +384,7 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
 }
 
-/// セッショントークンを作成（署名付きJSONペイロード）
+/// Create session token (signed JSON payload)
 fn create_session_token(session: &Session, secret: &str) -> Result<String, Error> {
     let payload = serde_json::to_string(session)?;
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
@@ -396,7 +396,7 @@ fn create_session_token(session: &Session, secret: &str) -> Result<String, Error
     Ok(format!("{}.{}", payload_b64, signature))
 }
 
-/// セッショントークンを検証してデコード
+/// Verify and decode session token
 fn verify_session_token(token: &str, secret: &str) -> Result<Session, Error> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 2 {
@@ -405,7 +405,7 @@ fn verify_session_token(token: &str, secret: &str) -> Result<Session, Error> {
     
     let (payload_b64, signature) = (parts[0], parts[1]);
     
-    // 署名を検証
+    // Verify signature
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())?;
     mac.update(payload_b64.as_bytes());
     let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
@@ -414,7 +414,7 @@ fn verify_session_token(token: &str, secret: &str) -> Result<Session, Error> {
         return Err(Error::InvalidSignature);
     }
     
-    // ペイロードをデコード
+    // Decode payload
     let payload = URL_SAFE_NO_PAD.decode(payload_b64)?;
     let session: Session = serde_json::from_slice(&payload)?;
     
@@ -422,19 +422,19 @@ fn verify_session_token(token: &str, secret: &str) -> Result<Session, Error> {
 }
 ```
 
-## ルーター構成
+## Router Configuration
 
 ```rust
 use axum::middleware;
 
 pub fn app_router(state: AppState) -> Router {
     Router::new()
-        // 認証不要なルート
+        // Routes not requiring authentication
         .merge(auth_router())
         .merge(wellknown_router())
         .merge(activitypub_router())
         
-        // 認証必要なルート
+        // Routes requiring authentication
         .nest("/api/v1", 
             mastodon_api_router()
                 .layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -448,12 +448,12 @@ pub fn app_router(state: AppState) -> Router {
 }
 ```
 
-## Mastodon API認証
+## Mastodon API Authentication
 
-Mastodonクライアントアプリ向けには、OAuth 2.0トークン認証もサポートします：
+For Mastodon client apps, OAuth 2.0 token authentication is also supported:
 
 ```rust
-/// Mastodon API用のトークン認証ミドルウェア
+/// Token authentication middleware for Mastodon API
 pub async fn require_api_token(
     State(state): State<AppState>,
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
@@ -463,7 +463,7 @@ pub async fn require_api_token(
     let token = state.db.get_token(auth.token()).await?
         .ok_or(AppError::Unauthorized)?;
     
-    // トークンの有効期限をチェック
+    // Check token expiration
     if let Some(expires_at) = token.expires_at {
         if expires_at < Utc::now() {
             return Err(AppError::Unauthorized);
@@ -474,17 +474,17 @@ pub async fn require_api_token(
 }
 ```
 
-### Mastodon OAuth フロー
+### Mastodon OAuth Flow
 
 ```
-POST /api/v1/apps       → アプリ登録
-GET  /oauth/authorize   → 認可ページ（GitHub OAuthにリダイレクト）
-POST /oauth/token       → トークン発行
+POST /api/v1/apps       → App registration
+GET  /oauth/authorize   → Authorization page (redirects to GitHub OAuth)
+POST /oauth/token       → Token issuance
 ```
 
-## セキュリティ考慮事項
+## Security Considerations
 
-### CSRFトークン
+### CSRF Token
 
 ```rust
 fn generate_csrf_state() -> String {
@@ -494,16 +494,16 @@ fn generate_csrf_state() -> String {
 }
 ```
 
-### セッションセキュリティ
+### Session Security
 
-| 設定 | 値 | 理由 |
-|------|-----|------|
-| `HttpOnly` | true | XSS攻撃からの保護 |
-| `Secure` | true (HTTPS) | 暗号化通信のみ |
-| `SameSite` | Lax | CSRF保護 |
-| `Path` | / | 全パスで有効 |
+| Setting | Value | Reason |
+|---------|-------|--------|
+| `HttpOnly` | true | Protection against XSS attacks |
+| `Secure` | true (HTTPS) | Encrypted transport only |
+| `SameSite` | Lax | CSRF protection |
+| `Path` | / | Valid for all paths |
 
-### レート制限
+### Rate Limiting
 
 ```rust
 use tower_governor::{GovernorLayer, GovernorConfigBuilder};
@@ -520,11 +520,11 @@ let auth_router = auth_router()
     });
 ```
 
-## 依存クレート
+## Dependencies
 
 ```toml
 [dependencies]
-# 認証
+# Authentication
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.21"
@@ -535,11 +535,11 @@ urlencoding = "2"
 tower-cookies = "0.10"
 axum-extra = { version = "0.9", features = ["typed-header", "cookie"] }
 
-# レート制限
+# Rate limiting
 tower-governor = "0.3"
 ```
 
-## 次のステップ
+## Next Steps
 
-- [API.md](./API.md) - Mastodon API仕様
-- [DEVELOPMENT.md](./DEVELOPMENT.md) - 開発ガイド
+- [API.md](./API.md) - Mastodon API specification
+- [DEVELOPMENT.md](./DEVELOPMENT.md) - Development guide
