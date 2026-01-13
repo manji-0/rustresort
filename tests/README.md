@@ -1,148 +1,148 @@
 # RustResort E2E Tests
 
-このディレクトリには、RustResortの主要シナリオに対するEnd-to-End(E2E)テストが含まれています。
+This directory contains End-to-End (E2E) tests for RustResort's major scenarios.
 
-## 📁 ディレクトリ構造
+## 📁 Directory Structure
 
 ```
 tests/
 ├── common/
-│   └── mod.rs          # 共通テストユーティリティ(TestServerヘルパー)
-├── e2e_health.rs       # ヘルスチェック・基本サーバー機能
-├── e2e_wellknown.rs    # .well-knownエンドポイント(WebFinger, NodeInfo)
-├── e2e_account.rs      # アカウント操作(取得、更新、フォロー)
-├── e2e_status.rs       # ステータス操作(投稿、削除、お気に入り、ブースト)
-├── e2e_timeline.rs     # タイムライン(ホーム、公開、ローカル、ハッシュタグ)
-└── e2e_activitypub.rs  # ActivityPub連携(Actor, Inbox, Outbox)
+│   └── mod.rs          # Common test utilities (TestServer helper)
+├── e2e_health.rs       # Health check & basic server functionality
+├── e2e_wellknown.rs    # .well-known endpoints (WebFinger, NodeInfo)
+├── e2e_account.rs      # Account operations (get, update, follow)
+├── e2e_status.rs       # Status operations (post, delete, favourite, boost)
+├── e2e_timeline.rs     # Timelines (home, public, local, hashtag)
+└── e2e_activitypub.rs  # ActivityPub integration (Actor, Inbox, Outbox)
 ```
 
-## 🚀 テスト実行方法
+## 🚀 Running Tests
 
-### 全E2Eテスト実行
+### Run All E2E Tests
 ```bash
 cargo test --tests
 ```
 
-### 特定のテストスイート実行
+### Run Specific Test Suite
 ```bash
-# ヘルスチェックテスト
+# Health check tests
 cargo test --test e2e_health
 
-# アカウント関連テスト
+# Account-related tests
 cargo test --test e2e_account
 
-# ステータス関連テスト
+# Status-related tests
 cargo test --test e2e_status
 
-# タイムライン関連テスト
+# Timeline-related tests
 cargo test --test e2e_timeline
 
-# ActivityPub関連テスト
+# ActivityPub-related tests
 cargo test --test e2e_activitypub
 
-# .well-known関連テスト
+# .well-known-related tests
 cargo test --test e2e_wellknown
 ```
 
-### 特定のテストケース実行
+### Run Specific Test Cases
 ```bash
-# テスト名で実行
+# Run by test name
 cargo test test_health_check
 cargo test test_create_status_with_auth
 
-# パターンマッチで実行
+# Run by pattern matching
 cargo test timeline
 cargo test account
 ```
 
-### 詳細出力付きで実行
+### Run with Verbose Output
 ```bash
-# 標準出力を表示
+# Show standard output
 cargo test --test e2e_health -- --nocapture
 
-# テスト名も表示
+# Show test names too
 cargo test --test e2e_health -- --nocapture --show-output
 ```
 
-## 🧪 テストスイート詳細
+## 🧪 Test Suite Details
 
 ### 1. Health Tests (`e2e_health.rs`)
-基本的なサーバー機能のテスト
+Basic server functionality tests
 
-- ✅ ヘルスチェックエンドポイント
-- ✅ サーバー起動確認
-- ✅ CORSヘッダー検証
-- ✅ 未知のルートで404返却
+- ✅ Health check endpoint
+- ✅ Server startup confirmation
+- ✅ CORS header verification
+- ✅ Unknown routes return 404
 
 ### 2. WellKnown Tests (`e2e_wellknown.rs`)
-Fediverse連携に必要な.well-knownエンドポイントのテスト
+Tests for .well-known endpoints required for Fediverse integration
 
-- ✅ WebFingerエンドポイント
-- ✅ NodeInfo検出
-- ✅ host-metaエンドポイント
-- ✅ アカウント付きWebFinger
+- ✅ WebFinger endpoint
+- ✅ NodeInfo discovery
+- ✅ host-meta endpoint
+- ✅ WebFinger with account
 
 ### 3. Account Tests (`e2e_account.rs`)
-アカウント管理機能のテスト
+Account management functionality tests
 
-- ⚠️ 認証なしでの認証情報確認(401エラー)
-- ✅ 認証付き認証情報確認
-- ✅ IDによるアカウント取得
-- ✅ アカウント情報更新
-- ✅ アカウントのステータス一覧
-- ✅ フォロワー一覧
-- ✅ フォロー中一覧
+- ⚠️ Verify credentials without auth (401 error)
+- ✅ Verify credentials with auth
+- ✅ Get account by ID
+- ✅ Update account information
+- ✅ List account statuses
+- ✅ List followers
+- ✅ List following
 
 ### 4. Status Tests (`e2e_status.rs`)
-ステータス(投稿)管理機能のテスト
+Status (post) management functionality tests
 
-- ⚠️ 認証なしでのステータス作成(401エラー)
-- ✅ 認証付きステータス作成
-- ✅ ステータス取得
-- ✅ ステータス削除
-- ✅ お気に入り登録
-- ✅ ブースト(リブログ)
-- ✅ ステータスのコンテキスト取得
+- ⚠️ Create status without auth (401 error)
+- ✅ Create status with auth
+- ✅ Get status
+- ✅ Delete status
+- ✅ Favourite status
+- ✅ Boost (reblog) status
+- ✅ Get status context
 
 ### 5. Timeline Tests (`e2e_timeline.rs`)
-タイムライン表示機能のテスト
+Timeline display functionality tests
 
-- ⚠️ 認証なしでのホームタイムライン(401エラー)
-- ✅ 認証付きホームタイムライン
-- ✅ 公開タイムライン
-- ✅ ローカルタイムライン
-- ✅ ページネーション
-- ✅ ハッシュタグタイムライン
-- ✅ max_idパラメータ
-- ✅ since_idパラメータ
+- ⚠️ Home timeline without auth (401 error)
+- ✅ Home timeline with auth
+- ✅ Public timeline
+- ✅ Local timeline
+- ✅ Pagination
+- ✅ Hashtag timeline
+- ✅ max_id parameter
+- ✅ since_id parameter
 
 ### 6. ActivityPub Tests (`e2e_activitypub.rs`)
-ActivityPub連携機能のテスト
+ActivityPub integration functionality tests
 
-- ✅ Actorエンドポイント
-- ✅ Inboxエンドポイント
-- ✅ Outboxエンドポイント
-- ✅ Followersコレクション
-- ✅ Followingコレクション
-- ✅ ステータスのActivity表現
-- ✅ 共有Inbox
-- ✅ コンテンツネゴシエーション
+- ✅ Actor endpoint
+- ✅ Inbox endpoint
+- ✅ Outbox endpoint
+- ✅ Followers collection
+- ✅ Following collection
+- ✅ Status Activity representation
+- ✅ Shared Inbox
+- ✅ Content negotiation
 
-## 🛠️ TestServerヘルパー
+## 🛠️ TestServer Helper
 
-`tests/common/mod.rs`に実装された共通テストユーティリティ。
+Common test utilities implemented in `tests/common/mod.rs`.
 
-### 主な機能
+### Main Features
 
 ```rust
 use common::TestServer;
 
 #[tokio::test]
 async fn my_test() {
-    // テストサーバーを起動
+    // Start test server
     let server = TestServer::new().await;
     
-    // HTTPリクエストを送信
+    // Send HTTP request
     let response = server.client
         .get(&server.url("/health"))
         .send()
@@ -153,50 +153,50 @@ async fn my_test() {
 }
 ```
 
-### 提供されるメソッド
+### Available Methods
 
-- `TestServer::new()` - 新しいテストサーバーインスタンスを作成
-- `server.url(path)` - 完全なURLを生成
-- `server.create_test_account()` - テスト用アカウントを作成
-- `server.create_test_token()` - テスト用認証トークンを作成
-- `server.state` - AppStateへのアクセス
-- `server.client` - HTTPクライアント
+- `TestServer::new()` - Create a new test server instance
+- `server.url(path)` - Generate complete URL
+- `server.create_test_account()` - Create test account
+- `server.create_test_token()` - Create test auth token
+- `server.state` - Access to AppState
+- `server.client` - HTTP client
 
-### 特徴
+### Characteristics
 
-- **独立性**: 各テストは独立したサーバーインスタンスを使用
-- **一時DB**: テストごとに新しいSQLiteデータベースを作成
-- **自動ポート**: OSが自動的に空きポートを割り当て
-- **自動クリーンアップ**: テスト終了後に自動的にリソースを解放
+- **Independence**: Each test uses an isolated server instance
+- **Temporary DB**: New SQLite database created per test
+- **Auto-port**: OS automatically assigns free port
+- **Auto-cleanup**: Resources released automatically after test
 
-## 📊 現在のテスト状況
+## 📊 Current Test Status
 
-**総テスト数**: 39  
-**成功**: 35 (89.7%)  
-**失敗**: 3 (7.7%)  
+**Total Tests**: 39  
+**Passing**: 35 (89.7%)  
+**Failing**: 3 (7.7%)  
 
-### 失敗しているテスト
+### Failing Tests
 
-以下の3つのテストは、認証ミドルウェアの実装が完了していないため失敗しています:
+The following 3 tests fail because authentication middleware implementation is incomplete:
 
-1. `test_verify_credentials_without_auth` - 401ではなく404を返す
-2. `test_create_status_without_auth` - 401ではなく404を返す
-3. `test_home_timeline_without_auth` - 401ではなく404を返す
+1. `test_verify_credentials_without_auth` - Returns 404 instead of 401
+2. `test_create_status_without_auth` - Returns 404 instead of 401
+3. `test_home_timeline_without_auth` - Returns 404 instead of 401
 
-これらは実装の進捗に伴い、自然に解決される予定です。
+These will be resolved naturally as implementation progresses.
 
-## 🔧 テストの追加方法
+## 🔧 Adding Tests
 
-### 新しいテストケースの追加
+### Adding New Test Cases
 
-既存のテストファイルに追加:
+Add to existing test file:
 
 ```rust
 #[tokio::test]
 async fn test_my_new_feature() {
     let server = TestServer::new().await;
     
-    // テストロジック
+    // Test logic
     let response = server.client
         .get(&server.url("/api/v1/my_endpoint"))
         .send()
@@ -207,11 +207,11 @@ async fn test_my_new_feature() {
 }
 ```
 
-### 新しいテストスイートの追加
+### Adding New Test Suite
 
-1. `tests/e2e_myfeature.rs`を作成
-2. `mod common;`を追加
-3. テストケースを実装
+1. Create `tests/e2e_myfeature.rs`
+2. Add `mod common;`
+3. Implement test cases
 
 ```rust
 mod common;
@@ -221,72 +221,72 @@ use common::TestServer;
 #[tokio::test]
 async fn test_my_feature() {
     let server = TestServer::new().await;
-    // テストロジック
+    // Test logic
 }
 ```
 
-## 📈 ベストプラクティス
+## 📈 Best Practices
 
-### テストの独立性
-- 各テストは他のテストに依存しない
-- テストの実行順序に依存しない
-- 共有状態を使用しない
+### Test Independence
+- Each test is independent of other tests
+- No dependency on test execution order
+- No shared state
 
-### テストデータ
-- テストごとに新しいデータを作成
-- ハードコードされたIDを避ける
-- 一時的なデータベースを使用
+### Test Data
+- Create new data for each test
+- Avoid hardcoded IDs
+- Use temporary databases
 
-### アサーション
-- 明確なアサーションメッセージ
-- 複数の条件を個別にテスト
-- エッジケースもカバー
+### Assertions
+- Clear assertion messages
+- Test multiple conditions individually
+- Cover edge cases
 
-### パフォーマンス
-- 不要な待機を避ける
-- 並列実行可能に保つ
-- 重いセットアップは共通化
+### Performance
+- Avoid unnecessary waits
+- Keep tests parallelizable
+- Share heavy setup
 
-## 🐛 トラブルシューティング
+## 🐛 Troubleshooting
 
-### テストがタイムアウトする
+### Tests Timing Out
 ```bash
-# タイムアウト時間を延長
+# Extend timeout duration
 RUST_TEST_TIMEOUT=60 cargo test
 ```
 
-### ポートが既に使用されている
-TestServerは自動的に空きポートを使用するため、通常この問題は発生しません。
+### Port Already in Use
+TestServer automatically uses free ports, so this issue typically doesn't occur.
 
-### データベースエラー
-一時ディレクトリの権限を確認してください。
+### Database Errors
+Check permissions on temporary directory.
 
-### 並列実行の問題
+### Parallel Execution Issues
 ```bash
-# シーケンシャルに実行
+# Run sequentially
 cargo test -- --test-threads=1
 ```
 
-## 📚 関連ドキュメント
+## 📚 Related Documentation
 
-- [E2E Test Report](../docs/E2E_TEST_REPORT.md) - 詳細なテスト実行レポート
-- [DEVELOPMENT.md](../docs/DEVELOPMENT.md) - 開発ガイド
-- [API.md](../docs/API.md) - API仕様
-- [ROADMAP.md](../docs/ROADMAP.md) - 実装ロードマップ
+- [E2E Test Report](../docs/E2E_TEST_REPORT.md) - Detailed test execution report
+- [DEVELOPMENT.md](../docs/DEVELOPMENT.md) - Development guide
+- [API.md](../docs/API.md) - API specification
+- [ROADMAP.md](../docs/ROADMAP.md) - Implementation roadmap
 
-## 🎯 今後の予定
+## 🎯 Future Plans
 
-### 短期
-- [ ] 認証ミドルウェアの修正
-- [ ] OAuth2フローのテスト追加
-- [ ] メディアアップロードのテスト追加
+### Short-term
+- [ ] Fix authentication middleware
+- [ ] Add OAuth2 flow tests
+- [ ] Add media upload tests
 
-### 中期
-- [ ] HTTP Signaturesのテスト追加
-- [ ] Activity配信のテスト追加
-- [ ] パフォーマンステストの追加
+### Mid-term
+- [ ] Add HTTP Signatures tests
+- [ ] Add Activity delivery tests
+- [ ] Add performance tests
 
-### 長期
-- [ ] 統合テスト環境の構築
-- [ ] CI/CDパイプラインへの統合
-- [ ] カバレッジレポートの自動生成
+### Long-term
+- [ ] Build integration test environment
+- [ ] Integrate with CI/CD pipeline
+- [ ] Auto-generate coverage reports
