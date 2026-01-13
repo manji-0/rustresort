@@ -1,4 +1,4 @@
-# RustResort 🏝️
+# RustResort 🏝️ (Under Development)
 
 **Lightweight ActivityPub Twitter-like Service Built with Rust**
 
