@@ -153,13 +153,62 @@ async fn test_status_as_activity() {
         .await
         .unwrap();
 
-    // Should return ActivityPub Note
-    if response.status().is_success() {
-        let json: Value = response.json().await.unwrap();
-        assert_eq!(json["type"], "Note");
-        assert!(json.get("content").is_some());
-        assert!(json.get("attributedTo").is_some());
-    }
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["type"], "Note");
+    assert_eq!(
+        json["id"],
+        "https://test.example.com/users/testuser/statuses/123"
+    );
+    assert!(json.get("content").is_some());
+    assert!(json.get("attributedTo").is_some());
+}
+
+#[tokio::test]
+async fn test_unlisted_status_activity_audience() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/users/testuser/statuses/124".to_string(),
+        content: "<p>Unlisted ActivityPub test</p>".to_string(),
+        content_warning: None,
+        visibility: "unlisted".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/users/testuser/statuses/124"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["type"], "Note");
+    assert_eq!(
+        json["to"],
+        serde_json::json!(["http://test.example.com/users/testuser/followers"])
+    );
+    assert_eq!(
+        json["cc"],
+        serde_json::json!(["https://www.w3.org/ns/activitystreams#Public"])
+    );
 }
 
 #[tokio::test]
@@ -195,7 +244,7 @@ async fn test_actor_content_negotiation() {
     server.create_test_account().await;
 
     // Request with HTML Accept header
-    let html_response = server
+    let _html_response = server
         .client
         .get(&server.url("/users/testuser"))
         .header("Accept", "text/html")

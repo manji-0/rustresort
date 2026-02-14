@@ -14,8 +14,11 @@ use axum::{
 };
 use http::HeaderMap;
 
-use crate::api::metrics::{ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUESTS_TOTAL, FEDERATION_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS};
 use crate::AppState;
+use crate::api::metrics::{
+    ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUEST_DURATION_SECONDS,
+    FEDERATION_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 use crate::error::AppError;
 
 /// Create ActivityPub router
@@ -25,6 +28,7 @@ use crate::error::AppError;
 /// - POST /users/:username/inbox - Personal inbox
 /// - POST /inbox - Shared inbox
 /// - GET /users/:username/outbox - Outbox
+/// - GET /users/:username/statuses/:id - Note object
 /// - GET /users/:username/followers - Followers collection
 /// - GET /users/:username/following - Following collection
 pub fn activitypub_router() -> Router<AppState> {
@@ -33,6 +37,7 @@ pub fn activitypub_router() -> Router<AppState> {
         .route("/users/:username/inbox", post(inbox))
         .route("/inbox", post(shared_inbox))
         .route("/users/:username/outbox", get(outbox))
+        .route("/users/:username/statuses/:id", get(status_object))
         .route("/users/:username/followers", get(followers))
         .route("/users/:username/following", get(following))
 }
@@ -151,20 +156,13 @@ async fn inbox(
 
     // Fetch the actor's public key
     let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client)
-        .await?;
+    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client).await?;
 
     // Get the request path
     let path = format!("/users/{}/inbox", username);
 
     // Verify the HTTP signature
-    crate::federation::verify_signature(
-        "POST",
-        &path,
-        &headers,
-        Some(&body),
-        &public_key_pem,
-    )?;
+    crate::federation::verify_signature("POST", &path, &headers, Some(&body), &public_key_pem)?;
 
     // Record activity type
     if let Some(activity_type) = activity.get("type").and_then(|t| t.as_str()) {
@@ -174,7 +172,8 @@ async fn inbox(
     }
 
     // Process the activity
-    let local_address = format!("{}@{}", 
+    let local_address = format!(
+        "{}@{}",
         account.as_ref().unwrap().username,
         state.config.server.domain
     );
@@ -231,29 +230,19 @@ async fn shared_inbox(
 
     // Fetch the actor's public key
     let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client)
-        .await?;
+    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client).await?;
 
     // Get the request path
     let path = "/inbox";
 
     // Verify the HTTP signature
-    crate::federation::verify_signature(
-        "POST",
-        path,
-        &headers,
-        Some(&body),
-        &public_key_pem,
-    )?;
+    crate::federation::verify_signature("POST", path, &headers, Some(&body), &public_key_pem)?;
 
     // Verify we have at least one account on this instance
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Process the activity
-    let local_address = format!("{}@{}", 
-        account.username,
-        state.config.server.domain
-    );
+    let local_address = format!("{}@{}", account.username, state.config.server.domain);
 
     let processor = crate::federation::ActivityProcessor::new(
         state.db.clone(),
@@ -319,6 +308,77 @@ async fn outbox(
                 "totalItems": items.len(),
                 "orderedItems": items
             })))
+        }
+        _ => Err(AppError::NotFound),
+    }
+}
+
+/// GET /users/:username/statuses/:id
+///
+/// Returns a Note object for a local status URI.
+async fn status_object(
+    State(state): State<AppState>,
+    Path((username, id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _timer = HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&["GET", "/users/:username/statuses/:id"])
+        .start_timer();
+
+    let account = state.db.get_account().await?;
+    match account {
+        Some(acc) if acc.username == username => {
+            let base_url = state.config.server.base_url();
+            let actor_url = format!("{}/users/{}", base_url, username);
+            let status_uri = format!("{}/statuses/{}", actor_url, id);
+            let followers_url = format!("{}/followers", actor_url);
+
+            let status = state
+                .db
+                .get_status_by_uri(&status_uri)
+                .await?
+                .ok_or(AppError::NotFound)?;
+
+            if status.visibility != "public" && status.visibility != "unlisted" {
+                return Err(AppError::NotFound);
+            }
+
+            let public_audience = "https://www.w3.org/ns/activitystreams#Public";
+            let (to_audience, cc_audience) = match status.visibility.as_str() {
+                "unlisted" => (
+                    serde_json::json!([followers_url.clone()]),
+                    serde_json::json!([public_audience]),
+                ),
+                _ => (
+                    serde_json::json!([public_audience]),
+                    serde_json::json!([followers_url.clone()]),
+                ),
+            };
+
+            let mut note = serde_json::json!({
+                "@context": "https://www.w3.org/ns/activitystreams",
+                "type": "Note",
+                "id": status.uri,
+                "attributedTo": actor_url,
+                "content": status.content,
+                "published": status.created_at.to_rfc3339(),
+                "to": to_audience,
+                "cc": cc_audience
+            });
+
+            if let Some(summary) = status.content_warning {
+                note["summary"] = serde_json::json!(summary);
+                note["sensitive"] = serde_json::json!(true);
+            }
+
+            if let Some(in_reply_to) = status.in_reply_to_uri {
+                note["inReplyTo"] = serde_json::json!(in_reply_to);
+            }
+
+            HTTP_REQUESTS_TOTAL
+                .with_label_values(&["GET", "/users/:username/statuses/:id", "200"])
+                .inc();
+
+            Ok(Json(note))
         }
         _ => Err(AppError::NotFound),
     }
