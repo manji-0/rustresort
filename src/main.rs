@@ -76,7 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the Axum router with all routes
 fn build_router(state: AppState) -> axum::Router {
     use axum::Router;
-    use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+    use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+
+    let cors_layer = build_cors_layer(&state.config.server);
 
     Router::new()
         // Health check endpoint
@@ -96,11 +98,36 @@ fn build_router(state: AppState) -> axum::Router {
         // Middleware
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
         // State
         .with_state(state)
         // Metrics endpoint (Prometheus format) - stateless, added after state
         .merge(rustresort::api::metrics_router())
+}
+
+fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {
+    use axum::http::HeaderValue;
+    use tower_http::cors::{Any, CorsLayer};
+
+    if !server.protocol.eq_ignore_ascii_case("https") {
+        return CorsLayer::permissive();
+    }
+
+    let allowed_origin = server.base_url();
+    match HeaderValue::from_str(&allowed_origin) {
+        Ok(origin) => CorsLayer::new()
+            .allow_origin([origin])
+            .allow_methods(Any)
+            .allow_headers(Any),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                origin = %allowed_origin,
+                "Failed to parse CORS origin from server base URL; denying cross-origin requests"
+            );
+            CorsLayer::new().allow_methods(Any).allow_headers(Any)
+        }
+    }
 }
 
 /// Health check endpoint
