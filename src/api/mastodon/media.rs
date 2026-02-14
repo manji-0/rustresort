@@ -6,8 +6,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, MEDIA_UPLOADS_TOTAL, MEDIA_BYTES_UPLOADED};
 use crate::AppState;
+use crate::api::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
+    HTTP_REQUESTS_TOTAL, MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL,
+};
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -172,7 +175,9 @@ pub async fn upload_media(
         .with_label_values(&["INSERT", "media"])
         .start_timer();
     state.db.insert_media(&media).await?;
-    DB_QUERIES_TOTAL.with_label_values(&["INSERT", "media"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["INSERT", "media"])
+        .inc();
     db_timer.observe_duration();
 
     // Update media metrics

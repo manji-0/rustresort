@@ -1,0 +1,5 @@
+[alias]
+# Best measured wall-clock in this repository on 2026-02-14.
+test-e2e-fast = "test --tests -- --test-threads=2"
+# Lowest CPU pressure (slower wall-clock).
+test-e2e-lowcpu = "test --tests -- --test-threads=1"

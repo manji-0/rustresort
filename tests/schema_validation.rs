@@ -1,5 +1,5 @@
 //! Schema validation tests for Mastodon API
-//! 
+//!
 //! These tests validate that RustResort's API responses conform to the
 //! Mastodon API schema as defined by GoToSocial's swagger.yaml
 
@@ -26,7 +26,7 @@ async fn test_account_schema_verify_credentials() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         let schema = load_test_schema("account");
-        
+
         match validate_against_schema(&json, &schema) {
             Ok(_) => println!("✓ Account schema validation passed"),
             Err(errors) => {
@@ -34,7 +34,10 @@ async fn test_account_schema_verify_credentials() {
                 for error in &errors {
                     eprintln!("  - {}", error);
                 }
-                eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                eprintln!(
+                    "\nActual response:\n{}",
+                    serde_json::to_string_pretty(&json).unwrap()
+                );
                 panic!("Schema validation failed with {} errors", errors.len());
             }
         }
@@ -58,7 +61,7 @@ async fn test_account_schema_get_account() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         let schema = load_test_schema("account");
-        
+
         match validate_against_schema(&json, &schema) {
             Ok(_) => println!("✓ Account schema validation passed"),
             Err(errors) => {
@@ -66,7 +69,10 @@ async fn test_account_schema_get_account() {
                 for error in &errors {
                     eprintln!("  - {}", error);
                 }
-                eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                eprintln!(
+                    "\nActual response:\n{}",
+                    serde_json::to_string_pretty(&json).unwrap()
+                );
                 panic!("Schema validation failed with {} errors", errors.len());
             }
         }
@@ -96,7 +102,7 @@ async fn test_status_schema_create() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         let schema = load_test_schema("status");
-        
+
         match validate_against_schema(&json, &schema) {
             Ok(_) => println!("✓ Status schema validation passed"),
             Err(errors) => {
@@ -104,7 +110,10 @@ async fn test_status_schema_create() {
                 for error in &errors {
                     eprintln!("  - {}", error);
                 }
-                eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                eprintln!(
+                    "\nActual response:\n{}",
+                    serde_json::to_string_pretty(&json).unwrap()
+                );
                 panic!("Schema validation failed with {} errors", errors.len());
             }
         }
@@ -149,7 +158,7 @@ async fn test_status_schema_get() {
         if response.status().is_success() {
             let json: Value = response.json().await.unwrap();
             let schema = load_test_schema("status");
-            
+
             match validate_against_schema(&json, &schema) {
                 Ok(_) => println!("✓ Status schema validation passed"),
                 Err(errors) => {
@@ -157,7 +166,10 @@ async fn test_status_schema_get() {
                     for error in &errors {
                         eprintln!("  - {}", error);
                     }
-                    eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                    eprintln!(
+                        "\nActual response:\n{}",
+                        serde_json::to_string_pretty(&json).unwrap()
+                    );
                     panic!("Schema validation failed with {} errors", errors.len());
                 }
             }
@@ -179,7 +191,7 @@ async fn test_instance_schema() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         let schema = load_test_schema("instance");
-        
+
         match validate_against_schema(&json, &schema) {
             Ok(_) => println!("✓ Instance schema validation passed"),
             Err(errors) => {
@@ -187,7 +199,10 @@ async fn test_instance_schema() {
                 for error in &errors {
                     eprintln!("  - {}", error);
                 }
-                eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                eprintln!(
+                    "\nActual response:\n{}",
+                    serde_json::to_string_pretty(&json).unwrap()
+                );
                 panic!("Schema validation failed with {} errors", errors.len());
             }
         }
@@ -230,13 +245,13 @@ async fn test_timeline_schema() {
 
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
-        
+
         // Timeline should be an array
         assert!(json.is_array(), "Timeline response should be an array");
-        
+
         let statuses = json.as_array().unwrap();
         let schema = load_test_schema("status");
-        
+
         // Validate each status in the timeline
         for (idx, status) in statuses.iter().enumerate() {
             match validate_against_schema(status, &schema) {
@@ -246,8 +261,15 @@ async fn test_timeline_schema() {
                     for error in &errors {
                         eprintln!("  - {}", error);
                     }
-                    eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(status).unwrap());
-                    panic!("Schema validation failed for status {} with {} errors", idx, errors.len());
+                    eprintln!(
+                        "\nActual response:\n{}",
+                        serde_json::to_string_pretty(status).unwrap()
+                    );
+                    panic!(
+                        "Schema validation failed for status {} with {} errors",
+                        idx,
+                        errors.len()
+                    );
                 }
             }
         }
@@ -284,21 +306,27 @@ async fn test_status_with_media_schema() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         let schema = load_test_schema("status");
-        
+
         match validate_against_schema(&json, &schema) {
             Ok(_) => {
                 println!("✓ Status with extended fields schema validation passed");
-                
+
                 // Verify specific fields
                 assert_eq!(json["sensitive"], true, "sensitive field should be true");
-                assert_eq!(json["spoiler_text"], "Test warning", "spoiler_text should match");
-            },
+                assert_eq!(
+                    json["spoiler_text"], "Test warning",
+                    "spoiler_text should match"
+                );
+            }
             Err(errors) => {
                 eprintln!("✗ Status schema validation failed:");
                 for error in &errors {
                     eprintln!("  - {}", error);
                 }
-                eprintln!("\nActual response:\n{}", serde_json::to_string_pretty(&json).unwrap());
+                eprintln!(
+                    "\nActual response:\n{}",
+                    serde_json::to_string_pretty(&json).unwrap()
+                );
                 panic!("Schema validation failed with {} errors", errors.len());
             }
         }

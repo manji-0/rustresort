@@ -7,10 +7,10 @@ use std::path::Path;
 pub fn load_schema(schema_path: &str) -> JSONSchema {
     let schema_content = fs::read_to_string(schema_path)
         .unwrap_or_else(|_| panic!("Failed to read schema file: {}", schema_path));
-    
+
     let schema_json: Value = serde_json::from_str(&schema_content)
         .unwrap_or_else(|_| panic!("Failed to parse schema JSON: {}", schema_path));
-    
+
     JSONSchema::options()
         .with_draft(Draft::Draft7)
         .compile(&schema_json)

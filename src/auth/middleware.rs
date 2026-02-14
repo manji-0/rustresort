@@ -4,16 +4,49 @@
 
 use axum::{
     async_trait,
-    extract::{FromRequestParts, State},
-    http::{Request, request::Parts},
+    extract::{FromRef, FromRequestParts, State},
+    http::{HeaderMap, Request, request::Parts},
     middleware::Next,
     response::Response,
 };
 use axum_extra::extract::CookieJar;
+use chrono::{Duration, Utc};
 
 use super::session::{Session, verify_session_token};
 use crate::AppState;
 use crate::error::AppError;
+
+fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let jar = CookieJar::from_headers(headers);
+            jar.get("session").map(|cookie| cookie.value().to_owned())
+        })
+}
+
+async fn authenticate_token(token: &str, state: &AppState) -> Result<Session, AppError> {
+    if let Ok(session) = verify_session_token(token, &state.config.auth.session_secret) {
+        return Ok(session);
+    }
+
+    if state.db.get_oauth_token(token).await?.is_some() {
+        let now = Utc::now();
+        return Ok(Session {
+            github_username: state.config.auth.github_username.clone(),
+            github_id: 0,
+            avatar_url: String::new(),
+            name: Some(state.config.admin.display_name.clone()),
+            created_at: now,
+            expires_at: now + Duration::seconds(state.config.auth.session_max_age),
+        });
+    }
+
+    Err(AppError::Unauthorized)
+}
 
 /// Middleware to require authentication
 ///
@@ -28,25 +61,14 @@ use crate::error::AppError;
 /// ```
 pub async fn require_auth(
     State(state): State<AppState>,
-    jar: CookieJar,
+    _jar: CookieJar,
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Try to get token from Authorization header first
-    let token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| {
-            // Fallback to cookie
-            jar.get("session").map(|cookie| cookie.value())
-        });
-
-    let token = token.ok_or(AppError::Unauthorized)?;
+    let token = extract_token_from_headers(request.headers()).ok_or(AppError::Unauthorized)?;
 
     // Verify token and get session
-    let session = verify_session_token(token, &state.config.auth.session_secret)?;
+    let session = authenticate_token(&token, &state).await?;
 
     // Add session to request extensions
     request.extensions_mut().insert(session);
@@ -73,21 +95,25 @@ pub struct CurrentUser(pub Session);
 #[async_trait]
 impl<S> FromRequestParts<S> for CurrentUser
 where
+    AppState: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = AppError;
 
     /// Extract current user from request
     ///
-    /// Requires that require_auth middleware has run.
+    /// Accepts both session tokens and OAuth access tokens.
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Get Session from request extensions
-        parts
-            .extensions
-            .get::<Session>()
-            .cloned()
-            .map(CurrentUser)
-            .ok_or(AppError::Unauthorized)
+        if let Some(session) = parts.extensions.get::<Session>().cloned() {
+            return Ok(CurrentUser(session));
+        }
+
+        let state = AppState::from_ref(_state);
+        let token = extract_token_from_headers(&parts.headers).ok_or(AppError::Unauthorized)?;
+        let session = authenticate_token(&token, &state).await?;
+        parts.extensions.insert(session.clone());
+
+        Ok(CurrentUser(session))
     }
 }
 
@@ -100,13 +126,26 @@ pub struct MaybeUser(pub Option<Session>);
 #[async_trait]
 impl<S> FromRequestParts<S> for MaybeUser
 where
+    AppState: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Get Session from extensions, return None if missing
-        let session = parts.extensions.get::<Session>().cloned();
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(session) = parts.extensions.get::<Session>().cloned() {
+            return Ok(MaybeUser(Some(session)));
+        }
+
+        let app_state = AppState::from_ref(state);
+        let session = match extract_token_from_headers(&parts.headers) {
+            Some(token) => authenticate_token(&token, &app_state).await.ok(),
+            None => None,
+        };
+
+        if let Some(session) = &session {
+            parts.extensions.insert(session.clone());
+        }
+
         Ok(MaybeUser(session))
     }
 }

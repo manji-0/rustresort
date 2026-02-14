@@ -27,7 +27,6 @@ pub mod statuses;
 pub mod streaming;
 pub mod timelines;
 
-
 /// Create Mastodon API router
 ///
 /// Routes are split into public and authenticated endpoints.
@@ -49,9 +48,18 @@ pub fn mastodon_api_router() -> Router<AppState> {
         // Public account and status views
         .route("/v1/accounts/:id", get(accounts::get_account))
         .route("/v1/statuses/:id", get(statuses::get_status))
-        .route("/v1/statuses/:id/context", get(statuses::get_status_context))
-        .route("/v1/statuses/:id/reblogged_by", get(statuses::get_reblogged_by))
-        .route("/v1/statuses/:id/favourited_by", get(statuses::get_favourited_by));
+        .route(
+            "/v1/statuses/:id/context",
+            get(statuses::get_status_context),
+        )
+        .route(
+            "/v1/statuses/:id/reblogged_by",
+            get(statuses::get_reblogged_by),
+        )
+        .route(
+            "/v1/statuses/:id/favourited_by",
+            get(statuses::get_favourited_by),
+        );
 
     // Authenticated endpoints (require valid token)
     let authenticated_routes = Router::new()
@@ -225,7 +233,10 @@ pub fn mastodon_api_router() -> Router<AppState> {
         .route("/v1/streaming/health", get(streaming::streaming_health))
         .route("/v1/streaming/user", get(streaming::stream_user))
         .route("/v1/streaming/public", get(streaming::stream_public))
-        .route("/v1/streaming/public/local", get(streaming::stream_public_local))
+        .route(
+            "/v1/streaming/public/local",
+            get(streaming::stream_public_local),
+        )
         .route("/v1/streaming/hashtag", get(streaming::stream_hashtag))
         .route("/v1/streaming/list", get(streaming::stream_list))
         .route("/v1/streaming/direct", get(streaming::stream_direct))
@@ -235,8 +246,14 @@ pub fn mastodon_api_router() -> Router<AppState> {
         .route("/v1/admin/accounts/:id/action", post(admin::account_action))
         .route("/v1/admin/reports", get(admin::list_reports))
         .route("/v1/admin/domain_blocks", get(admin::list_domain_blocks_v1))
-        .route("/v1/admin/domain_blocks", post(admin::create_domain_block_v1))
-        .route("/v1/admin/domain_blocks/:id", delete(admin::delete_domain_block_v1));
+        .route(
+            "/v1/admin/domain_blocks",
+            post(admin::create_domain_block_v1),
+        )
+        .route(
+            "/v1/admin/domain_blocks/:id",
+            delete(admin::delete_domain_block_v1),
+        );
 
     // Merge public and authenticated routes
     // Note: Authentication is enforced by using CurrentUser extractor in handlers

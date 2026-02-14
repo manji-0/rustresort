@@ -65,7 +65,8 @@ impl ActivityDelivery {
         )?;
 
         // 3. POST to inbox with signed headers
-        let mut request = self.http_client
+        let mut request = self
+            .http_client
             .post(inbox_uri)
             .header("Content-Type", "application/activity+json")
             .header("Date", sig_headers.date)
@@ -75,11 +76,9 @@ impl ActivityDelivery {
             request = request.header("Digest", digest);
         }
 
-        let response = request
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| AppError::Federation(format!("Failed to deliver to {}: {}", inbox_uri, e)))?;
+        let response = request.body(body).send().await.map_err(|e| {
+            AppError::Federation(format!("Failed to deliver to {}: {}", inbox_uri, e))
+        })?;
 
         // 4. Handle response
         if !response.status().is_success() {
@@ -112,7 +111,7 @@ impl ActivityDelivery {
 
         // 1. Group by shared inbox domain to reduce deliveries
         let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
-        
+
         for inbox_uri in inbox_uris {
             // Extract domain from inbox URI
             let domain = inbox_uri
@@ -121,7 +120,7 @@ impl ActivityDelivery {
                 .and_then(|s| s.split('/').next())
                 .unwrap_or(&inbox_uri)
                 .to_string();
-            
+
             grouped.entry(domain).or_default().push(inbox_uri);
         }
 
@@ -180,7 +179,7 @@ impl ActivityDelivery {
         // Log summary
         let success_count = results.iter().filter(|r| r.success).count();
         let failure_count = results.len() - success_count;
-        
+
         tracing::info!(
             "Batch delivery complete: {} succeeded, {} failed",
             success_count,
@@ -189,7 +188,6 @@ impl ActivityDelivery {
 
         results
     }
-
 
     /// Send Follow activity
     ///
@@ -202,19 +200,23 @@ impl ActivityDelivery {
         target_inbox_uri: &str,
     ) -> Result<String, AppError> {
         // 1. Generate Follow activity with ID
-        let follow_id = format!("{}/follow/{}", self.actor_uri, crate::data::EntityId::new().0);
-        
-        let activity = builder::follow(
-            &follow_id,
-            &self.actor_uri,
-            target_actor_uri,
+        let follow_id = format!(
+            "{}/follow/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
         );
+
+        let activity = builder::follow(&follow_id, &self.actor_uri, target_actor_uri);
 
         // 2. Deliver to inbox
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
-        tracing::info!("Sent Follow to {} for {}", target_inbox_uri, target_actor_uri);
-        
+        tracing::info!(
+            "Sent Follow to {} for {}",
+            target_inbox_uri,
+            target_actor_uri
+        );
+
         // 3. Return activity URI
         Ok(follow_id)
     }
@@ -230,8 +232,12 @@ impl ActivityDelivery {
         follower_inbox_uri: &str,
     ) -> Result<(), AppError> {
         // 1. Generate Accept activity wrapping Follow
-        let accept_id = format!("{}/accept/{}", self.actor_uri, crate::data::EntityId::new().0);
-        
+        let accept_id = format!(
+            "{}/accept/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
+        );
+
         let activity = builder::accept(
             &accept_id,
             &self.actor_uri,
@@ -244,7 +250,11 @@ impl ActivityDelivery {
         // 2. Deliver to inbox
         self.deliver_to_inbox(follower_inbox_uri, activity).await?;
 
-        tracing::info!("Sent Accept to {} for Follow {}", follower_inbox_uri, follow_activity_uri);
+        tracing::info!(
+            "Sent Accept to {} for Follow {}",
+            follower_inbox_uri,
+            follow_activity_uri
+        );
         Ok(())
     }
 
@@ -281,7 +291,11 @@ impl ActivityDelivery {
         };
 
         // 2. Wrap in Create activity
-        let create_id = format!("{}/create/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let create_id = format!(
+            "{}/create/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
+        );
         let activity = builder::create(
             &create_id,
             &self.actor_uri,
@@ -301,7 +315,11 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         // Build and deliver Delete activity
-        let delete_id = format!("{}/delete/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let delete_id = format!(
+            "{}/delete/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
+        );
         let activity = builder::delete(&delete_id, &self.actor_uri, object_uri);
 
         self.deliver_to_followers(activity, inbox_uris).await
@@ -331,7 +349,7 @@ impl ActivityDelivery {
     ) -> Vec<DeliveryResult> {
         // Build and deliver Undo activity
         let undo_id = format!("{}/undo/{}", self.actor_uri, crate::data::EntityId::new().0);
-        
+
         // We need to wrap the original activity
         // For simplicity, just reference it by ID
         let activity = builder::undo(
@@ -352,17 +370,24 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Result<String, AppError> {
         // Build Announce activity
-        let announce_id = format!("{}/announce/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let announce_id = format!(
+            "{}/announce/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
+        );
         let activity = builder::announce(
             &announce_id,
             &self.actor_uri,
             status_uri,
-            vec!["https://www.w3.org/ns/activitystreams#Public", &format!("{}/followers", self.actor_uri)],
+            vec![
+                "https://www.w3.org/ns/activitystreams#Public",
+                &format!("{}/followers", self.actor_uri),
+            ],
         );
 
         // Deliver to followers
         let results = self.deliver_to_followers(activity, inbox_uris).await;
-        
+
         // Check if at least one delivery succeeded
         if results.iter().any(|r| r.success) {
             tracing::info!("Sent Announce for {}", status_uri);
@@ -372,7 +397,6 @@ impl ActivityDelivery {
         }
     }
 }
-
 
 /// Result of a delivery attempt
 #[derive(Debug, Clone)]
@@ -431,13 +455,7 @@ pub mod builder {
     /// * `object` - Object being created (usually a Note)
     /// * `to` - Primary recipients (public timeline, followers, etc.)
     /// * `cc` - CC recipients (mentions, etc.)
-    pub fn create(
-        id: &str,
-        actor: &str,
-        object: Value,
-        to: Vec<&str>,
-        cc: Vec<&str>,
-    ) -> Value {
+    pub fn create(id: &str, actor: &str, object: Value, to: Vec<&str>, cc: Vec<&str>) -> Value {
         serde_json::json!({
             "@context": "https://www.w3.org/ns/activitystreams",
             "type": "Create",

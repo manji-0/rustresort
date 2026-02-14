@@ -46,7 +46,7 @@ git clone https://github.com/yourusername/rustresort.git
 cd rustresort
 
 # Create configuration file
-cp config/default.toml.example config/local.toml
+cp config/local.toml.example config/local.toml
 # Edit config/local.toml
 
 # Build & Run

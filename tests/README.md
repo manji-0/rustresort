@@ -263,8 +263,15 @@ Check permissions on temporary directory.
 
 ### Parallel Execution Issues
 ```bash
-# Run sequentially
-cargo test -- --test-threads=1
+# Recommended for fastest wall-clock in this repository's current E2E mix
+cargo test-e2e-fast
+
+# Lowest CPU pressure (slower)
+cargo test-e2e-lowcpu
+
+# Equivalent explicit forms
+cargo test --tests -- --test-threads=2
+cargo test --tests -- --test-threads=1
 ```
 
 ## 📚 Related Documentation

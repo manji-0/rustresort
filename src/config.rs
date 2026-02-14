@@ -133,6 +133,9 @@ pub struct AdminConfig {
     pub email: Option<String>,
     /// Admin bio/note
     pub note: Option<String>,
+    /// RSA key size for ActivityPub signing keys
+    #[serde(default = "default_admin_rsa_bits")]
+    pub rsa_bits: usize,
 }
 
 fn default_admin_username() -> String {
@@ -143,6 +146,9 @@ fn default_admin_display_name() -> String {
     "Admin".to_string()
 }
 
+fn default_admin_rsa_bits() -> usize {
+    4096
+}
 
 /// Cache configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +193,7 @@ impl AppConfig {
             .set_default("storage.backup.interval_seconds", 86400)?
             .set_default("storage.backup.retention_count", 7)?
             .set_default("auth.session_max_age", 604800)?
+            .set_default("admin.rsa_bits", 4096)?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "pretty")?
             // Load from config/default.toml if it exists

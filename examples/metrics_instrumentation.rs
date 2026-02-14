@@ -3,7 +3,7 @@
 //! This file demonstrates best practices for adding metrics to your handlers.
 
 use crate::api::metrics::*;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
 /// Example handler showing metrics instrumentation

@@ -184,7 +184,10 @@ async fn test_notification_api_returns_data() {
     );
 
     let notifications: Vec<Value> = response.json().await.unwrap();
-    assert!(!notifications.is_empty(), "Should have at least one notification");
+    assert!(
+        !notifications.is_empty(),
+        "Should have at least one notification"
+    );
 }
 
 /// Test follow notification database integration
@@ -230,7 +233,9 @@ async fn test_follow_notification_database() {
         .unwrap();
 
     assert!(
-        notifications.iter().any(|n| n.notification_type == "follow"),
+        notifications
+            .iter()
+            .any(|n| n.notification_type == "follow"),
         "Should have follow notification in database"
     );
 }
@@ -345,9 +350,18 @@ async fn test_followers_collection_updates() {
 
     // Add multiple followers
     let followers = vec![
-        ("user1@instance1.com", "https://instance1.com/users/user1/inbox"),
-        ("user2@instance2.com", "https://instance2.com/users/user2/inbox"),
-        ("user3@instance3.com", "https://instance3.com/users/user3/inbox"),
+        (
+            "user1@instance1.com",
+            "https://instance1.com/users/user1/inbox",
+        ),
+        (
+            "user2@instance2.com",
+            "https://instance2.com/users/user2/inbox",
+        ),
+        (
+            "user3@instance3.com",
+            "https://instance3.com/users/user3/inbox",
+        ),
     ];
 
     for (i, (addr, inbox)) in followers.iter().enumerate() {
@@ -438,7 +452,10 @@ async fn test_boost_notification_database() {
         .find(|n| n.notification_type == "reblog")
         .expect("Should have reblog notification");
 
-    assert_eq!(reblog_notif.origin_account_address, "dave@remote.example.com");
+    assert_eq!(
+        reblog_notif.origin_account_address,
+        "dave@remote.example.com"
+    );
 }
 
 // =============================================================================
@@ -504,7 +521,12 @@ async fn test_reply_chain_context() {
 
     server.state.db.insert_status(&original).await.unwrap();
     server.state.db.insert_status(&reply).await.unwrap();
-    server.state.db.insert_status(&reply_to_reply).await.unwrap();
+    server
+        .state
+        .db
+        .insert_status(&reply_to_reply)
+        .await
+        .unwrap();
 
     // Get context for the reply
     let response = server
@@ -589,8 +611,6 @@ async fn test_shared_inbox_requires_signature() {
         "Unsigned shared inbox request should be rejected"
     );
 }
-
-
 
 // =============================================================================
 // Scenario 7: Notification Lifecycle
@@ -724,9 +744,11 @@ async fn test_home_timeline_aggregation() {
         let timeline: Vec<Value> = response.json().await.unwrap();
 
         // Should contain our local post
-        let has_local = timeline
-            .iter()
-            .any(|s| s["content"].as_str().map_or(false, |c| c.contains("Local post")));
+        let has_local = timeline.iter().any(|s| {
+            s["content"]
+                .as_str()
+                .map_or(false, |c| c.contains("Local post"))
+        });
 
         assert!(has_local, "Home timeline should include local posts");
     }
@@ -871,7 +893,10 @@ async fn test_delivery_target_collection() {
     let followers_data = vec![
         ("user1@instance1.com", "https://instance1.com/inbox"),
         ("user2@instance1.com", "https://instance1.com/inbox"), // Same shared inbox
-        ("user3@instance2.com", "https://instance2.com/users/user3/inbox"),
+        (
+            "user3@instance2.com",
+            "https://instance2.com/users/user3/inbox",
+        ),
     ];
 
     for (addr, inbox) in followers_data {
@@ -889,8 +914,7 @@ async fn test_delivery_target_collection() {
     let follower_inboxes = server.state.db.get_follower_inboxes().await.unwrap();
 
     // Collect unique inboxes (for shared inbox optimization)
-    let unique_inboxes: std::collections::HashSet<_> =
-        follower_inboxes.into_iter().collect();
+    let unique_inboxes: std::collections::HashSet<_> = follower_inboxes.into_iter().collect();
 
     // Should have 2 unique inboxes (instance1 shared + instance2 personal)
     assert_eq!(unique_inboxes.len(), 2, "Should deduplicate shared inboxes");

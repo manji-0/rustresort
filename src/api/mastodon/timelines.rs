@@ -6,8 +6,10 @@ use axum::{
 };
 
 use super::accounts::PaginationParams;
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS};
 use crate::AppState;
+use crate::api::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -27,7 +29,9 @@ pub async fn home_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Get local statuses (home timeline = local statuses for single-user instance)
@@ -39,7 +43,9 @@ pub async fn home_timeline(
         .db
         .get_local_statuses(limit, params.max_id.as_deref())
         .await?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Convert to API responses
@@ -75,7 +81,9 @@ pub async fn public_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Get local statuses (public timeline = local statuses for single-user instance)
@@ -87,7 +95,9 @@ pub async fn public_timeline(
         .db
         .get_local_statuses(limit, params.max_id.as_deref())
         .await?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Filter to only include public visibility statuses

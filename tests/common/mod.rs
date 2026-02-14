@@ -63,6 +63,13 @@ impl TestServer {
                 description: "Test RustResort Instance".to_string(),
                 contact_email: "test@example.com".to_string(),
             },
+            admin: config::AdminConfig {
+                username: "testuser".to_string(),
+                display_name: "Test User".to_string(),
+                email: Some("test@example.com".to_string()),
+                note: Some("Test bio".to_string()),
+                rsa_bits: 1024,
+            },
             cache: config::CacheConfig {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,
@@ -95,8 +102,8 @@ impl TestServer {
             axum::serve(listener, app).await.unwrap();
         });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Hand control back to scheduler so the server task can start accepting.
+        tokio::task::yield_now().await;
 
         Self {
             addr: addr_str,
@@ -157,16 +164,14 @@ impl TestServer {
 /// Build router for testing
 fn build_test_router(state: AppState) -> axum::Router {
     use axum::Router;
-    use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+    use tower_http::cors::CorsLayer;
 
     Router::new()
         .route("/health", axum::routing::get(health_check))
-        .nest("/.well-known", rustresort::api::wellknown_router())
+        .merge(rustresort::api::wellknown_router())
         .nest("/api", rustresort::api::mastodon_api_router())
         .merge(rustresort::api::activitypub_router())
         .nest("/admin", rustresort::api::admin_router())
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

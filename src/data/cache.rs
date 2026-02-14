@@ -79,16 +79,18 @@ impl TimelineCache {
     pub async fn insert(&self, status: CachedStatus) {
         let id = status.id.clone();
         self.statuses.insert(id, Arc::new(status)).await;
-        
+
         // Update cache size metric
         use crate::api::metrics::CACHE_SIZE;
-        CACHE_SIZE.with_label_values(&["timeline"]).set(self.statuses.entry_count() as i64);
+        CACHE_SIZE
+            .with_label_values(&["timeline"])
+            .set(self.statuses.entry_count() as i64);
     }
 
     /// Get status by ID
     pub async fn get(&self, id: &str) -> Option<Arc<CachedStatus>> {
         let result = self.statuses.get(id).await;
-        
+
         // Record cache hit/miss
         use crate::api::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
         if result.is_some() {
@@ -96,7 +98,7 @@ impl TimelineCache {
         } else {
             CACHE_MISSES_TOTAL.with_label_values(&["timeline"]).inc();
         }
-        
+
         result
     }
 
@@ -273,7 +275,7 @@ impl ProfileCache {
     /// Get profile by address
     pub async fn get(&self, address: &str) -> Option<Arc<CachedProfile>> {
         let result = self.profiles.get(address).await;
-        
+
         // Record cache hit/miss
         use crate::api::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
         if result.is_some() {
@@ -281,7 +283,7 @@ impl ProfileCache {
         } else {
             CACHE_MISSES_TOTAL.with_label_values(&["profile"]).inc();
         }
-        
+
         result
     }
 
@@ -289,10 +291,12 @@ impl ProfileCache {
     pub async fn insert(&self, profile: CachedProfile) {
         let address = profile.address.clone();
         self.profiles.insert(address, Arc::new(profile)).await;
-        
+
         // Update cache size metric
         use crate::api::metrics::CACHE_SIZE;
-        CACHE_SIZE.with_label_values(&["profile"]).set(self.profiles.entry_count() as i64);
+        CACHE_SIZE
+            .with_label_values(&["profile"])
+            .set(self.profiles.entry_count() as i64);
     }
 
     /// Update profile from ActivityPub Update activity

@@ -47,7 +47,49 @@ pub mod federation;
 pub mod service;
 pub mod storage;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+static ADMIN_KEYPAIR_CACHE: LazyLock<Mutex<HashMap<usize, (String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn generate_admin_keypair_pem(bits: usize) -> Result<(String, String), error::AppError> {
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    let mut rng = rand::thread_rng();
+    let private_key =
+        RsaPrivateKey::new(&mut rng, bits).map_err(|e| error::AppError::Internal(e.into()))?;
+    let public_key = RsaPublicKey::from(&private_key);
+
+    let private_key_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| error::AppError::Internal(e.into()))?
+        .to_string();
+    let public_key_pem = public_key
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| error::AppError::Internal(e.into()))?;
+
+    Ok((private_key_pem, public_key_pem))
+}
+
+fn admin_keypair_pem(bits: usize) -> Result<(String, String), error::AppError> {
+    if let Some(cached) = ADMIN_KEYPAIR_CACHE
+        .lock()
+        .expect("admin keypair cache lock poisoned")
+        .get(&bits)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let generated = generate_admin_keypair_pem(bits)?;
+    let mut cache = ADMIN_KEYPAIR_CACHE
+        .lock()
+        .expect("admin keypair cache lock poisoned");
+    let cached = cache.entry(bits).or_insert(generated);
+    Ok(cached.clone())
+}
 
 /// Application state shared across all handlers
 ///
@@ -164,9 +206,6 @@ impl AppState {
         db: &data::Database,
         config: &config::AppConfig,
     ) -> Result<(), error::AppError> {
-        use rsa::{RsaPrivateKey, RsaPublicKey};
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-
         // Check if admin account exists
         if let Some(mut account) = db.get_account().await? {
             // Update admin account if configuration changed
@@ -182,7 +221,10 @@ impl AppState {
                 updated = true;
             }
 
-            let _admin_email = config.admin.email.as_ref()
+            let _admin_email = config
+                .admin
+                .email
+                .as_ref()
                 .unwrap_or(&config.instance.contact_email);
             // Note: email is not stored in account table currently
 
@@ -212,21 +254,9 @@ impl AppState {
         // Create new admin account
         tracing::info!("Creating admin account...");
 
-        // Generate RSA keypair for ActivityPub
-        let mut rng = rand::thread_rng();
-        let bits = 4096;
-        let private_key = RsaPrivateKey::new(&mut rng, bits)
-            .map_err(|e| error::AppError::Internal(e.into()))?;
-        let public_key = RsaPublicKey::from(&private_key);
-
-        // Encode keys to PEM
-        let private_key_pem = private_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .map_err(|e| error::AppError::Internal(e.into()))?
-            .to_string();
-        let public_key_pem = public_key
-            .to_public_key_pem(LineEnding::LF)
-            .map_err(|e| error::AppError::Internal(e.into()))?;
+        // Reuse keypairs per key size to avoid repeated expensive generation in test runs.
+        let key_bits = config.admin.rsa_bits.max(1024);
+        let (private_key_pem, public_key_pem) = admin_keypair_pem(key_bits)?;
 
         // Create account
         let account = data::Account {

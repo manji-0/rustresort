@@ -82,13 +82,13 @@ fn build_router(state: AppState) -> axum::Router {
         // Health check endpoint
         .route("/health", axum::routing::get(health_check))
         // Well-known endpoints
-        .nest("/.well-known", rustresort::api::wellknown_router())
+        .merge(rustresort::api::wellknown_router())
         // Mastodon API
         .nest("/api", rustresort::api::mastodon_api_router())
         // OAuth
         .nest("/oauth", rustresort::api::oauth_router())
         // ActivityPub
-        .nest("/users", rustresort::api::activitypub_router())
+        .merge(rustresort::api::activitypub_router())
         // Admin API
         .nest("/admin", rustresort::api::admin_router())
         // Middleware

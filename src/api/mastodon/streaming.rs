@@ -4,8 +4,8 @@
 
 use axum::{
     extract::{Query, State},
-    response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
+    response::sse::{Event, KeepAlive, Sse},
 };
 use futures::stream::{self, Stream};
 use serde::Deserialize;
@@ -43,9 +43,7 @@ pub async fn stream_user(
         // 1. Listen to a message queue/channel for new events
         // 2. Send events when statuses, notifications, etc. are created
         // For now, send periodic heartbeats
-        Event::default()
-            .event("update")
-            .data("{}")
+        Event::default().event("update").data("{}")
     })
     .map(Ok)
     .throttle(Duration::from_secs(30));
@@ -60,13 +58,9 @@ pub async fn stream_public(
     Query(_params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for public timeline
-    let stream = stream::repeat_with(|| {
-        Event::default()
-            .event("update")
-            .data("{}")
-    })
-    .map(Ok)
-    .throttle(Duration::from_secs(30));
+    let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
+        .map(Ok)
+        .throttle(Duration::from_secs(30));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -77,13 +71,9 @@ pub async fn stream_public_local(
     State(_state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for local public timeline
-    let stream = stream::repeat_with(|| {
-        Event::default()
-            .event("update")
-            .data("{}")
-    })
-    .map(Ok)
-    .throttle(Duration::from_secs(30));
+    let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
+        .map(Ok)
+        .throttle(Duration::from_secs(30));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -94,16 +84,14 @@ pub async fn stream_hashtag(
     State(_state): State<AppState>,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let _tag = params.tag.ok_or(AppError::Validation("tag parameter required".to_string()))?;
+    let _tag = params
+        .tag
+        .ok_or(AppError::Validation("tag parameter required".to_string()))?;
 
     // Create a stream for hashtag timeline
-    let stream = stream::repeat_with(|| {
-        Event::default()
-            .event("update")
-            .data("{}")
-    })
-    .map(Ok)
-    .throttle(Duration::from_secs(30));
+    let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
+        .map(Ok)
+        .throttle(Duration::from_secs(30));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -115,19 +103,17 @@ pub async fn stream_list(
     CurrentUser(_session): CurrentUser,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let _list_id = params.list.ok_or(AppError::Validation("list parameter required".to_string()))?;
+    let _list_id = params
+        .list
+        .ok_or(AppError::Validation("list parameter required".to_string()))?;
 
     // Verify list exists
     // state.db.get_list(&list_id).await?.ok_or(AppError::NotFound)?;
 
     // Create a stream for list timeline
-    let stream = stream::repeat_with(|| {
-        Event::default()
-            .event("update")
-            .data("{}")
-    })
-    .map(Ok)
-    .throttle(Duration::from_secs(30));
+    let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
+        .map(Ok)
+        .throttle(Duration::from_secs(30));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -139,13 +125,9 @@ pub async fn stream_direct(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for direct messages
-    let stream = stream::repeat_with(|| {
-        Event::default()
-            .event("update")
-            .data("{}")
-    })
-    .map(Ok)
-    .throttle(Duration::from_secs(30));
+    let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
+        .map(Ok)
+        .throttle(Duration::from_secs(30));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

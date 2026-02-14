@@ -3,14 +3,14 @@
 //! Exposes application metrics in Prometheus format for monitoring and observability.
 
 use axum::{
+    Router,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use lazy_static::lazy_static;
 use prometheus::{
-    Counter, Gauge, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry, TextEncoder, Encoder,
+    Counter, Encoder, Gauge, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -250,16 +250,14 @@ pub fn init_metrics() {
 async fn metrics_handler() -> Response {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
-    
+
     match encoder.encode_to_string(&metric_families) {
-        Ok(metrics_text) => {
-            (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, encoder.format_type())],
-                metrics_text,
-            )
-                .into_response()
-        }
+        Ok(metrics_text) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, encoder.format_type())],
+            metrics_text,
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!(error = %e, "Failed to encode metrics");
             (

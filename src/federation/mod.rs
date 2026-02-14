@@ -18,7 +18,10 @@ mod webfinger;
 
 pub use activity::{ActivityProcessor, ActivityType};
 pub use delivery::ActivityDelivery;
-pub use key_cache::{PublicKeyCache, CacheStats};
-pub use rate_limit::{RateLimiter, RateLimitStats, extract_domain};
-pub use signature::{fetch_public_key, sign_request, verify_signature};
+pub use key_cache::{CacheStats, PublicKeyCache};
+pub use rate_limit::{RateLimitStats, RateLimiter, extract_domain};
+pub use signature::{
+    extract_actor_domain, extract_signature_key_id, fetch_public_key, key_id_matches_actor,
+    sign_request, verify_signature,
+};
 pub use webfinger::{WebFingerResult, resolve_webfinger};

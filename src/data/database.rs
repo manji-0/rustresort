@@ -124,12 +124,8 @@ impl Database {
         Ok(status)
     }
 
-
     /// Get multiple statuses by URIs (batch operation to avoid N+1)
-    pub async fn get_statuses_by_uris(
-        &self,
-        uris: &[String],
-    ) -> Result<Vec<Status>, AppError> {
+    pub async fn get_statuses_by_uris(&self, uris: &[String]) -> Result<Vec<Status>, AppError> {
         if uris.is_empty() {
             return Ok(vec![]);
         }
@@ -182,6 +178,45 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Update an existing status by ID
+    pub async fn update_status(&self, status: &Status) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE statuses
+            SET uri = ?,
+                content = ?,
+                content_warning = ?,
+                visibility = ?,
+                language = ?,
+                account_address = ?,
+                is_local = ?,
+                in_reply_to_uri = ?,
+                boost_of_uri = ?,
+                persisted_reason = ?,
+                created_at = ?,
+                fetched_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&status.uri)
+        .bind(&status.content)
+        .bind(&status.content_warning)
+        .bind(&status.visibility)
+        .bind(&status.language)
+        .bind(&status.account_address)
+        .bind(status.is_local)
+        .bind(&status.in_reply_to_uri)
+        .bind(&status.boost_of_uri)
+        .bind(&status.persisted_reason)
+        .bind(&status.created_at)
+        .bind(&status.fetched_at)
+        .bind(&status.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Delete status by ID
@@ -620,7 +655,7 @@ impl Database {
                     WHERE b.id < ?
                     ORDER BY b.created_at DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(max_id)
                 .bind(limit as i64)
@@ -634,7 +669,7 @@ impl Database {
                     INNER JOIN bookmarks b ON s.id = b.status_id
                     ORDER BY b.created_at DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -660,7 +695,7 @@ impl Database {
                     WHERE f.id < ?
                     ORDER BY f.created_at DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(max_id)
                 .bind(limit as i64)
@@ -674,7 +709,7 @@ impl Database {
                     INNER JOIN favourites f ON s.id = f.status_id
                     ORDER BY f.created_at DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -738,15 +773,7 @@ impl Database {
     /// Block a domain
     pub async fn block_domain(&self, domain: &str) -> Result<(), AppError> {
         let id = EntityId::new().0;
-        sqlx::query(
-            "INSERT INTO domain_blocks (id, domain, created_at) VALUES (?, ?, datetime('now'))",
-        )
-        .bind(&id)
-        .bind(domain)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        self.insert_domain_block_with_id(&id, domain).await
     }
 
     /// Unblock a domain
@@ -759,9 +786,10 @@ impl Database {
         Ok(())
     }
 
-
     /// Get all domain blocks with details
-    pub async fn get_all_domain_blocks(&self) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
+    pub async fn get_all_domain_blocks(
+        &self,
+    ) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
         let blocks = sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
             "SELECT id, domain, created_at FROM domain_blocks ORDER BY created_at DESC",
         )
@@ -774,6 +802,33 @@ impl Database {
     /// Insert domain block (alias for block_domain)
     pub async fn insert_domain_block(&self, domain: &str) -> Result<(), AppError> {
         self.block_domain(domain).await
+    }
+
+    /// Insert domain block with explicit ID
+    pub async fn insert_domain_block_with_id(
+        &self,
+        id: &str,
+        domain: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO domain_blocks (id, domain, created_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(id)
+        .bind(domain)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a domain block by ID
+    pub async fn delete_domain_block_by_id(&self, id: &str) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM domain_blocks WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     // =========================================================================
@@ -1839,8 +1894,11 @@ impl Database {
             r#"
             SELECT s.*
             FROM statuses s
-            INNER JOIN statuses_fts fts ON s.id = fts.status_id
-            WHERE statuses_fts MATCH ?
+            WHERE s.rowid IN (
+                SELECT rowid
+                FROM statuses_fts
+                WHERE statuses_fts MATCH ?
+            )
             ORDER BY s.created_at DESC
             LIMIT ? OFFSET ?
             "#,
@@ -1914,4 +1972,3 @@ impl Database {
         Ok(hashtags)
     }
 }
-

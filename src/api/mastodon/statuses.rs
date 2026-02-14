@@ -7,9 +7,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::accounts::PaginationParams;
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, POSTS_TOTAL};
 use crate::AppState;
-use crate::auth::CurrentUser;
+use crate::api::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
+    HTTP_REQUESTS_TOTAL, POSTS_TOTAL,
+};
+use crate::auth::{CurrentUser, MaybeUser};
 use crate::error::AppError;
 
 /// Status creation request
@@ -32,6 +35,14 @@ struct StatusSourceResponse {
     spoiler_text: String,
 }
 
+fn is_publicly_visible(visibility: &str) -> bool {
+    matches!(visibility, "public" | "unlisted")
+}
+
+fn can_view_status(visibility: &str, is_authenticated: bool) -> bool {
+    is_publicly_visible(visibility) || is_authenticated
+}
+
 /// POST /api/v1/statuses
 pub async fn create_status(
     State(state): State<AppState>,
@@ -51,7 +62,9 @@ pub async fn create_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Validate
@@ -92,7 +105,9 @@ pub async fn create_status(
         .with_label_values(&["INSERT", "statuses"])
         .start_timer();
     state.db.insert_status(&status).await?;
-    DB_QUERIES_TOTAL.with_label_values(&["INSERT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["INSERT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Update posts total metric
@@ -106,7 +121,9 @@ pub async fn create_status(
                 .with_label_values(&["SELECT", "media"])
                 .start_timer();
             let media_exists = state.db.get_media(&media_id).await?.is_some();
-            DB_QUERIES_TOTAL.with_label_values(&["SELECT", "media"]).inc();
+            DB_QUERIES_TOTAL
+                .with_label_values(&["SELECT", "media"])
+                .inc();
             db_timer.observe_duration();
 
             if media_exists {
@@ -117,7 +134,9 @@ pub async fn create_status(
                     .db
                     .attach_media_to_status(&media_id, &status_id)
                     .await?;
-                DB_QUERIES_TOTAL.with_label_values(&["INSERT", "media_attachments"]).inc();
+                DB_QUERIES_TOTAL
+                    .with_label_values(&["INSERT", "media_attachments"])
+                    .inc();
                 db_timer.observe_duration();
             }
         }
@@ -144,6 +163,7 @@ pub async fn create_status(
 /// GET /api/v1/statuses/:id
 pub async fn get_status(
     State(state): State<AppState>,
+    MaybeUser(user): MaybeUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
@@ -156,15 +176,23 @@ pub async fn get_status(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
+
+    if !can_view_status(&status.visibility, user.is_some()) {
+        return Err(AppError::NotFound);
+    }
 
     // Get account
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Check if favourited/reblogged/bookmarked
@@ -205,7 +233,9 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Only allow deleting local statuses
@@ -218,7 +248,9 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Delete the status
@@ -226,7 +258,9 @@ pub async fn delete_status(
         .with_label_values(&["DELETE", "statuses"])
         .start_timer();
     state.db.delete_status(&id).await?;
-    DB_QUERIES_TOTAL.with_label_values(&["DELETE", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["DELETE", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Update posts total metric
@@ -253,12 +287,17 @@ pub async fn delete_status(
 /// GET /api/v1/statuses/:id/context
 pub async fn get_status_context(
     State(state): State<AppState>,
+    MaybeUser(user): MaybeUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::ContextResponse;
 
     // Get the status to verify it exists
-    let _status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+
+    if !can_view_status(&status.visibility, user.is_some()) {
+        return Err(AppError::NotFound);
+    }
 
     // Get account
     let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -280,11 +319,16 @@ pub async fn get_status_context(
 /// GET /api/v1/statuses/:id/reblogged_by
 pub async fn get_reblogged_by(
     State(state): State<AppState>,
+    MaybeUser(user): MaybeUser,
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the status to verify it exists
-    let _status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+
+    if !can_view_status(&status.visibility, user.is_some()) {
+        return Err(AppError::NotFound);
+    }
 
     // For single-user instance, only the owner can reblog
     // In a full implementation, we would query the reposts table
@@ -297,11 +341,16 @@ pub async fn get_reblogged_by(
 /// GET /api/v1/statuses/:id/favourited_by
 pub async fn get_favourited_by(
     State(state): State<AppState>,
+    MaybeUser(user): MaybeUser,
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the status to verify it exists
-    let _status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+
+    if !can_view_status(&status.visibility, user.is_some()) {
+        return Err(AppError::NotFound);
+    }
 
     // For single-user instance, only the owner can favourite
     // Check if the status is favourited by the owner
@@ -568,7 +617,9 @@ pub async fn update_status(
 
     // Save updated status
     // Note: In a full implementation, we would create a new version in an edit_history table
-    state.db.insert_status(&status).await?;
+    if !state.db.update_status(&status).await? {
+        return Err(AppError::NotFound);
+    }
 
     // Return updated status
     let response = crate::api::status_to_response(

@@ -95,9 +95,9 @@ pub fn status_to_response(
         emojis: vec![],
         card: None,
         poll: None,
-        favourited,
-        reblogged,
-        bookmarked,
+        favourited: favourited.unwrap_or(false),
+        reblogged: reblogged.unwrap_or(false),
+        bookmarked: bookmarked.unwrap_or(false),
     }
 }
 
@@ -149,6 +149,13 @@ mod tests {
                 title: "Test".to_string(),
                 description: "Test instance".to_string(),
                 contact_email: "test@example.com".to_string(),
+            },
+            admin: AdminConfig {
+                username: "testuser".to_string(),
+                display_name: "Test User".to_string(),
+                email: Some("test@example.com".to_string()),
+                note: Some("Test bio".to_string()),
+                rsa_bits: 1024,
             },
             cache: CacheConfig {
                 timeline_max_items: 2000,
@@ -238,9 +245,9 @@ mod tests {
         assert_eq!(response.visibility, "public");
         assert_eq!(response.language, Some("en".to_string()));
         assert!(response.sensitive);
-        assert_eq!(response.favourited, Some(true));
-        assert_eq!(response.reblogged, Some(false));
-        assert_eq!(response.bookmarked, Some(false));
+        assert!(response.favourited);
+        assert!(!response.reblogged);
+        assert!(!response.bookmarked);
         assert_eq!(response.account.username, "testuser");
     }
 }

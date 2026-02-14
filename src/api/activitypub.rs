@@ -14,8 +14,11 @@ use axum::{
 };
 use http::HeaderMap;
 
-use crate::api::metrics::{ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUESTS_TOTAL, FEDERATION_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS};
 use crate::AppState;
+use crate::api::metrics::{
+    ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUEST_DURATION_SECONDS,
+    FEDERATION_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 use crate::error::AppError;
 
 /// Create ActivityPub router
@@ -149,22 +152,35 @@ async fn inbox(
         .ok_or_else(|| AppError::Validation("Missing actor field".to_string()))?
         .to_string(); // Clone the string to avoid borrow issues;
 
+    // Ensure keyId points to the same actor before fetching remote key material.
+    let signature_key_id = crate::federation::extract_signature_key_id(&headers)?;
+    if !crate::federation::key_id_matches_actor(&signature_key_id, &actor_id) {
+        FEDERATION_REQUESTS_TOTAL
+            .with_label_values(&["inbound", "unauthorized"])
+            .inc();
+        return Err(AppError::Validation(
+            "Signature keyId actor mismatch".to_string(),
+        ));
+    }
+
+    // Reject blocked domains before any outbound key fetch.
+    let actor_domain = crate::federation::extract_actor_domain(&signature_key_id)?;
+    if state.db.is_domain_blocked(&actor_domain).await? {
+        FEDERATION_REQUESTS_TOTAL
+            .with_label_values(&["inbound", "forbidden"])
+            .inc();
+        return Err(AppError::Forbidden);
+    }
+
     // Fetch the actor's public key
-    let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client)
-        .await?;
+    let public_key_pem =
+        crate::federation::fetch_public_key(&signature_key_id, state.http_client.as_ref()).await?;
 
     // Get the request path
     let path = format!("/users/{}/inbox", username);
 
     // Verify the HTTP signature
-    crate::federation::verify_signature(
-        "POST",
-        &path,
-        &headers,
-        Some(&body),
-        &public_key_pem,
-    )?;
+    crate::federation::verify_signature("POST", &path, &headers, Some(&body), &public_key_pem)?;
 
     // Record activity type
     if let Some(activity_type) = activity.get("type").and_then(|t| t.as_str()) {
@@ -174,7 +190,8 @@ async fn inbox(
     }
 
     // Process the activity
-    let local_address = format!("{}@{}", 
+    let local_address = format!(
+        "{}@{}",
         account.as_ref().unwrap().username,
         state.config.server.domain
     );
@@ -229,31 +246,35 @@ async fn shared_inbox(
         .ok_or_else(|| AppError::Validation("Missing actor field".to_string()))?
         .to_string(); // Clone the string to avoid borrow issues;
 
+    // Ensure keyId points to the same actor before fetching remote key material.
+    let signature_key_id = crate::federation::extract_signature_key_id(&headers)?;
+    if !crate::federation::key_id_matches_actor(&signature_key_id, &actor_id) {
+        return Err(AppError::Validation(
+            "Signature keyId actor mismatch".to_string(),
+        ));
+    }
+
+    // Reject blocked domains before any outbound key fetch.
+    let actor_domain = crate::federation::extract_actor_domain(&signature_key_id)?;
+    if state.db.is_domain_blocked(&actor_domain).await? {
+        return Err(AppError::Forbidden);
+    }
+
     // Fetch the actor's public key
-    let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client)
-        .await?;
+    let public_key_pem =
+        crate::federation::fetch_public_key(&signature_key_id, state.http_client.as_ref()).await?;
 
     // Get the request path
     let path = "/inbox";
 
     // Verify the HTTP signature
-    crate::federation::verify_signature(
-        "POST",
-        path,
-        &headers,
-        Some(&body),
-        &public_key_pem,
-    )?;
+    crate::federation::verify_signature("POST", path, &headers, Some(&body), &public_key_pem)?;
 
     // Verify we have at least one account on this instance
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Process the activity
-    let local_address = format!("{}@{}", 
-        account.username,
-        state.config.server.domain
-    );
+    let local_address = format!("{}@{}", account.username, state.config.server.domain);
 
     let processor = crate::federation::ActivityProcessor::new(
         state.db.clone(),
@@ -284,6 +305,10 @@ async fn outbox(
         Some(acc) if acc.username == username => {
             // Get public statuses from database
             let statuses = state.db.get_local_statuses(20, None).await?;
+            let statuses: Vec<_> = statuses
+                .into_iter()
+                .filter(|status| matches!(status.visibility.as_str(), "public" | "unlisted"))
+                .collect();
 
             let base_url = state.config.server.base_url();
             let outbox_url = format!("{}/users/{}/outbox", base_url, username);

@@ -1,13 +1,16 @@
 //! Account endpoints
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     response::Json,
 };
 use serde::Deserialize;
 
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL};
 use crate::AppState;
+use crate::api::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
+    HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -30,13 +33,6 @@ pub struct UpdateCredentialsRequest {
     pub locked: Option<bool>,
     pub bot: Option<bool>,
     pub discoverable: Option<bool>,
-}
-
-/// Relationships query parameters
-#[derive(Debug, Deserialize)]
-pub struct RelationshipsParams {
-    #[serde(rename = "id[]")]
-    pub ids: Vec<String>,
 }
 
 /// Search query parameters
@@ -63,7 +59,9 @@ pub async fn verify_credentials(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Convert to API response
@@ -74,14 +72,18 @@ pub async fn verify_credentials(
         .with_label_values(&["SELECT", "followers"])
         .start_timer();
     let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "followers"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "followers"])
+        .inc();
     db_timer.observe_duration();
 
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "follows"])
         .start_timer();
     let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "follows"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "follows"])
+        .inc();
     db_timer.observe_duration();
 
     response.followers_count = followers_count;
@@ -350,7 +352,7 @@ pub async fn unfollow_account(
 pub async fn get_relationships(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
-    Query(params): Query<RelationshipsParams>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
@@ -360,7 +362,25 @@ pub async fn get_relationships(
 
     // Create relationship responses for each requested ID
     let mut relationships = vec![];
-    for id in params.ids {
+    let mut requested_ids = Vec::new();
+    if let Some(raw) = raw_query {
+        for pair in raw.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+
+            if key == "id[]" || key == "id%5B%5D" || key == "id" {
+                let decoded = urlencoding::decode(value)
+                    .map(|v| v.into_owned())
+                    .unwrap_or_else(|_| value.to_string());
+                if !decoded.is_empty() {
+                    requested_ids.push(decoded);
+                }
+            }
+        }
+    }
+
+    for id in requested_ids {
         // For single-user instance, we check if the ID matches our account
         let _account = state.db.get_account().await?;
 
@@ -593,7 +613,7 @@ pub async fn mute_account(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<MuteAccountRequest>,
+    req: Option<Json<MuteAccountRequest>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
@@ -606,8 +626,10 @@ pub async fn mute_account(
         ));
     };
 
-    let mute_notifications = req.notifications.unwrap_or(true);
-    let duration = req.duration;
+    let (mute_notifications, duration) = match req {
+        Some(Json(req)) => (req.notifications.unwrap_or(true), req.duration),
+        None => (true, None),
+    };
 
     // Store mute in database
     state
@@ -738,9 +760,7 @@ pub async fn get_follow_request(
     let requester_address = if id.contains('@') {
         id.clone()
     } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
+        return Err(AppError::NotFound);
     };
 
     // Check if follow request exists
@@ -770,10 +790,12 @@ pub async fn authorize_follow_request(
     let requester_address = if id.contains('@') {
         id.clone()
     } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
+        return Err(AppError::NotFound);
     };
+
+    if !state.db.has_follow_request(&requester_address).await? {
+        return Err(AppError::NotFound);
+    }
 
     // Accept the follow request (moves to followers table)
     state.db.accept_follow_request(&requester_address).await?;
@@ -813,9 +835,7 @@ pub async fn reject_follow_request(
     let requester_address = if id.contains('@') {
         id.clone()
     } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
+        return Err(AppError::NotFound);
     };
 
     // Remove from follow_requests
