@@ -203,7 +203,7 @@ async fn test_unlisted_status_activity_audience() {
     assert_eq!(json["type"], "Note");
     assert_eq!(
         json["to"],
-        serde_json::json!(["http://test.example.com/users/testuser/followers"])
+        serde_json::json!(["https://test.example.com/users/testuser/followers"])
     );
     assert_eq!(
         json["cc"],

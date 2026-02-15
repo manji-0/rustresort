@@ -88,7 +88,7 @@ fn build_router(state: AppState) -> axum::Router {
         // Well-known endpoints
         .nest("/.well-known", rustresort::api::wellknown_router())
         // Mastodon API
-        .nest("/api", rustresort::api::mastodon_api_router())
+        .nest("/api", rustresort::api::mastodon_api_router(state.clone()))
         // OAuth
         .nest("/oauth", rustresort::api::oauth_router())
         // ActivityPub

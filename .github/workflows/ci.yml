@@ -28,6 +28,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Setup cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
@@ -46,8 +49,8 @@ jobs:
           -A clippy::iter_kv_map
           -A clippy::double_ended_iterator_last
 
-      - name: Cargo test (lib)
-        run: cargo test --lib
+      - name: Cargo nextest (lib)
+        run: cargo nextest run --lib
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -119,6 +122,9 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

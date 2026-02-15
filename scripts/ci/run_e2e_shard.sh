@@ -25,33 +25,14 @@ if (( shard_index < 0 || shard_index >= total_shards )); then
   exit 2
 fi
 
-if (( total_shards == 1 )); then
-  echo "Running full suite: ${suite}"
-  cargo test --test "${suite}"
-  exit 0
+if ! cargo nextest --version >/dev/null 2>&1; then
+  echo "cargo-nextest is required but not installed" >&2
+  exit 2
 fi
 
-tests=()
-while IFS= read -r test_name; do
-  tests+=("${test_name}")
-done < <(cargo test --test "${suite}" -- --list | sed -n 's/^\(.*\): test$/\1/p')
+# nextest partition index is 1-based (count:m/n).
+partition_index=$((shard_index + 1))
+partition_spec="count:${partition_index}/${total_shards}"
 
-if (( ${#tests[@]} == 0 )); then
-  echo "No tests discovered in suite: ${suite}" >&2
-  exit 1
-fi
-
-selected=()
-for i in "${!tests[@]}"; do
-  if (( i % total_shards == shard_index )); then
-    selected+=("${tests[$i]}")
-  fi
-done
-
-if (( ${#selected[@]} == 0 )); then
-  echo "No tests selected for ${suite} shard $((shard_index + 1))/${total_shards}"
-  exit 0
-fi
-
-echo "Running ${suite} shard $((shard_index + 1))/${total_shards}: ${#selected[@]} tests"
-cargo test --test "${suite}" -- "${selected[@]}" --exact
+echo "Running ${suite} shard ${partition_index}/${total_shards} with nextest (${partition_spec})"
+cargo nextest run --test "${suite}" --partition "${partition_spec}"
