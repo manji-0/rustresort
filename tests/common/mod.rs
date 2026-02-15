@@ -6,6 +6,32 @@ use rustresort::{AppState, config};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
+const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAL1qEJ6Esenbo474
+9+uZLEdGCjBmx3hsp7hSr8kIDu45Ssg0w/dm1Imey6JOWg+4EXeIteqeMs840VQ4
+RwkQ4CsxtP11wmbqZQYUyzN1D//QaJsw+LUBO5DSWjTcQN2Egp0G4wntmd2SSA/V
+n/uxvKAtuHf3Agkxj9JspBDWthBdAgMBAAECgYBMV2lnWngSl1GumC3kKRItj88f
+fu06XiCjK8Bpt/O8lB7N3mZ1Wl6jMPtF6WpnF3sCwHkBnM1Bs9a6qQwIXWLblFnk
+WcygjRtsecUygZR9OcgDR3iUmMrRcJw9vpgdbklEMmfQoVmfibq0bxgLoQmjmBD3
+e5u5GPHMv2oJJWQdSQJBAOFSueufpOz7q5F7G/f/mGQ3K9vxCgmyHngNepBMYWTU
+WDDmb/ADyg6WP+zsI3YEnWqb24WHmaH7pxaQkI1f5jMCQQDXM8tdJ/zrNeTcp8Lo
++48KSyqGcLUNcjQUHVTLts5JhfcwKM481SlTy5JKUGFN1ImUD+tPUAR6or+v34I6
++v8vAkBS0S00xYDA+d+doToudOt2KjEcrgOafLVmOs4Jq4lAniusDYanGT1zDxZ/
+5mtCPX/+ZzrQYX6+YtiPGqOG0vCxAkEApKZuK+IScmuTpPd9+v+tGzUTXjURcS41
+hkZCwHInNr2WuHQgBw8YRZJ1ZQJG0GOSt4POh6ozIxkuDAO4AiRT5QJAMaOkNwxr
+8wOcEsOq4fz1NbwZWopRkXl1Bei82uO5cw9whSTf2xGkIKxnu3gJ11Jnw7POXY2L
+6Ym7721cQmof3w==
+-----END PRIVATE KEY-----
+"#;
+
+const TEST_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC9ahCehLHp26OO+PfrmSxHRgow
+Zsd4bKe4Uq/JCA7uOUrINMP3ZtSJnsuiTloPuBF3iLXqnjLPONFUOEcJEOArMbT9
+dcJm6mUGFMszdQ//0GibMPi1ATuQ0lo03EDdhIKdBuMJ7ZndkkgP1Z/7sbygLbh3
+9wIJMY/SbKQQ1rYQXQIDAQAB
+-----END PUBLIC KEY-----
+"#;
+
 /// Test server instance
 pub struct TestServer {
     pub addr: String,
@@ -79,6 +105,29 @@ impl TestServer {
             },
         };
 
+        // Pre-seed the admin account to avoid expensive RSA key generation
+        // in AppState::ensure_admin_user for every test server startup.
+        {
+            use chrono::Utc;
+            use rustresort::data::{Account, Database, EntityId};
+
+            let db = Database::connect(&db_path).await.unwrap();
+            let now = Utc::now();
+            let seeded_account = Account {
+                id: EntityId::new().0,
+                username: "testuser".to_string(),
+                display_name: Some("Test User".to_string()),
+                note: Some("Test account".to_string()),
+                avatar_s3_key: None,
+                header_s3_key: None,
+                private_key_pem: TEST_PRIVATE_KEY_PEM.to_string(),
+                public_key_pem: TEST_PUBLIC_KEY_PEM.to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            db.upsert_account(&seeded_account).await.unwrap();
+        }
+
         // Initialize app state
         let state = AppState::new(config.clone()).await.unwrap();
 
@@ -101,8 +150,21 @@ impl TestServer {
             axum::serve(listener, app).await.unwrap();
         });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Poll health endpoint instead of fixed sleep to minimize startup wait.
+        let mut healthy = false;
+        for _ in 0..200 {
+            match client.get(format!("{}/health", addr_str)).send().await {
+                Ok(response) if response.status().is_success() => {
+                    healthy = true;
+                    break;
+                }
+                _ => tokio::time::sleep(tokio::time::Duration::from_millis(5)).await,
+            }
+        }
+        assert!(
+            healthy,
+            "Test server failed to become healthy within the startup timeout"
+        );
 
         Self {
             addr: addr_str,
@@ -129,8 +191,8 @@ impl TestServer {
             account.note = Some("Test bio".to_string());
             account.avatar_s3_key = None;
             account.header_s3_key = None;
-            account.private_key_pem = "test_private_key".to_string();
-            account.public_key_pem = "test_public_key".to_string();
+            account.private_key_pem = TEST_PRIVATE_KEY_PEM.to_string();
+            account.public_key_pem = TEST_PUBLIC_KEY_PEM.to_string();
             account.updated_at = now;
             account
         } else {
@@ -141,8 +203,8 @@ impl TestServer {
                 note: Some("Test bio".to_string()),
                 avatar_s3_key: None,
                 header_s3_key: None,
-                private_key_pem: "test_private_key".to_string(),
-                public_key_pem: "test_public_key".to_string(),
+                private_key_pem: TEST_PRIVATE_KEY_PEM.to_string(),
+                public_key_pem: TEST_PUBLIC_KEY_PEM.to_string(),
                 created_at: now,
                 updated_at: now,
             }
