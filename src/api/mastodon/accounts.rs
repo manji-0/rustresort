@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::api::metrics::{
+use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
     HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };

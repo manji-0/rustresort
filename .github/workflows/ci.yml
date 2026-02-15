@@ -49,6 +49,21 @@ jobs:
           -A clippy::iter_kv_map
           -A clippy::double_ended_iterator_last
 
+      - name: Enforce architecture boundaries
+        run: |
+          set -euo pipefail
+          if command -v rg >/dev/null 2>&1; then
+            if rg -n "crate::api::" src/data src/error.rs; then
+              echo "Architecture boundary violation: src/data and src/error.rs must not depend on crate::api" >&2
+              exit 1
+            fi
+          else
+            if grep -Rns "crate::api::" src/data src/error.rs; then
+              echo "Architecture boundary violation: src/data and src/error.rs must not depend on crate::api" >&2
+              exit 1
+            fi
+          fi
+
       - name: Cargo nextest (lib)
         run: cargo nextest run --lib
 

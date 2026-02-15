@@ -44,6 +44,7 @@ pub mod config;
 pub mod data;
 pub mod error;
 pub mod federation;
+pub mod metrics;
 pub mod service;
 pub mod storage;
 
@@ -164,8 +165,8 @@ impl AppState {
         db: &data::Database,
         config: &config::AppConfig,
     ) -> Result<(), error::AppError> {
-        use rsa::{RsaPrivateKey, RsaPublicKey};
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::{RsaPrivateKey, RsaPublicKey};
 
         // Check if admin account exists
         if let Some(mut account) = db.get_account().await? {
@@ -182,7 +183,10 @@ impl AppState {
                 updated = true;
             }
 
-            let _admin_email = config.admin.email.as_ref()
+            let _admin_email = config
+                .admin
+                .email
+                .as_ref()
                 .unwrap_or(&config.instance.contact_email);
             // Note: email is not stored in account table currently
 
@@ -215,8 +219,8 @@ impl AppState {
         // Generate RSA keypair for ActivityPub
         let mut rng = rand::thread_rng();
         let bits = 4096;
-        let private_key = RsaPrivateKey::new(&mut rng, bits)
-            .map_err(|e| error::AppError::Internal(e.into()))?;
+        let private_key =
+            RsaPrivateKey::new(&mut rng, bits).map_err(|e| error::AppError::Internal(e.into()))?;
         let public_key = RsaPublicKey::from(&private_key);
 
         // Encode keys to PEM
@@ -252,4 +256,58 @@ impl AppState {
 
         Ok(())
     }
+}
+
+/// Build the Axum router with all routes.
+///
+/// This is shared by the binary and integration tests to keep route
+/// composition consistent across environments.
+pub fn build_router(state: AppState) -> axum::Router {
+    use axum::Router;
+    use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+
+    let cors_layer = build_cors_layer(&state.config.server);
+
+    Router::new()
+        .route("/health", axum::routing::get(health_check))
+        .merge(auth::auth_router())
+        .merge(api::wellknown_router())
+        .nest("/api", api::mastodon_api_router(state.clone()))
+        .nest("/oauth", api::oauth_router())
+        .merge(api::activitypub_router())
+        .nest("/admin", api::admin_router())
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(cors_layer)
+        .with_state(state)
+        .merge(api::metrics_router())
+}
+
+fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {
+    use axum::http::HeaderValue;
+    use tower_http::cors::{Any, CorsLayer};
+
+    if !server.protocol.eq_ignore_ascii_case("https") {
+        return CorsLayer::permissive();
+    }
+
+    let allowed_origin = server.base_url();
+    match HeaderValue::from_str(&allowed_origin) {
+        Ok(origin) => CorsLayer::new()
+            .allow_origin([origin])
+            .allow_methods(Any)
+            .allow_headers(Any),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                origin = %allowed_origin,
+                "Failed to parse CORS origin from server base URL; denying cross-origin requests"
+            );
+            CorsLayer::new().allow_methods(Any).allow_headers(Any)
+        }
+    }
+}
+
+async fn health_check() -> &'static str {
+    "OK"
 }

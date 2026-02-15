@@ -47,10 +47,9 @@ async fn trigger_backup(
     State(_state): State<AppState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<BackupResponse>, AppError> {
-    // TODO:
-    // 1. Call backup service
-    // 2. Return backup info
-    Err(AppError::NotFound)
+    Err(AppError::NotImplemented(
+        "admin backup endpoint is not implemented yet".to_string(),
+    ))
 }
 
 /// Backup response
@@ -68,8 +67,9 @@ async fn list_backups(
     State(_state): State<AppState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<BackupInfo>>, AppError> {
-    // TODO: List backups from R2
-    Err(AppError::NotFound)
+    Err(AppError::NotImplemented(
+        "admin backups listing endpoint is not implemented yet".to_string(),
+    ))
 }
 
 /// Backup info
@@ -97,8 +97,9 @@ async fn block_domain(
     CurrentUser(_user): CurrentUser,
     Json(_req): Json<BlockDomainRequest>,
 ) -> Result<(), AppError> {
-    // TODO: Add domain to block list
-    Err(AppError::NotFound)
+    Err(AppError::NotImplemented(
+        "admin domain block endpoint is not implemented yet".to_string(),
+    ))
 }
 
 /// DELETE /api/admin/domain_blocks/:domain
@@ -107,8 +108,9 @@ async fn unblock_domain(
     CurrentUser(_user): CurrentUser,
     axum::extract::Path(_domain): axum::extract::Path<String>,
 ) -> Result<(), AppError> {
-    // TODO: Remove domain from block list
-    Err(AppError::NotFound)
+    Err(AppError::NotImplemented(
+        "admin domain unblock endpoint is not implemented yet".to_string(),
+    ))
 }
 
 /// GET /api/admin/domain_blocks
@@ -116,6 +118,7 @@ async fn list_domain_blocks(
     State(_state): State<AppState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<String>>, AppError> {
-    // TODO: List blocked domains
-    Err(AppError::NotFound)
+    Err(AppError::NotImplemented(
+        "admin domain blocks listing endpoint is not implemented yet".to_string(),
+    ))
 }

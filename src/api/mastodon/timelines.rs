@@ -6,10 +6,12 @@ use axum::{
 };
 
 use super::accounts::PaginationParams;
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS};
 use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
+use crate::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 
 /// GET /api/v1/timelines/home
 pub async fn home_timeline(

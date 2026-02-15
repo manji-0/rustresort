@@ -252,6 +252,98 @@ async fn test_bookmark_operations() {
 }
 
 #[tokio::test]
+async fn test_bookmarked_statuses_order_and_cursor_by_bookmark_time() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    for id in ["100", "200", "300"] {
+        let status = Status {
+            id: id.to_string(),
+            uri: format!("https://example.com/status/{}", id),
+            content: "<p>Test</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        db.insert_status(&status).await.unwrap();
+    }
+
+    // Intentionally make bookmark order different from status ID order.
+    db.insert_bookmark("300").await.unwrap();
+    db.insert_bookmark("100").await.unwrap();
+    db.insert_bookmark("200").await.unwrap();
+    db.set_bookmark_created_at_for_test("300", "2024-01-01 00:00:01")
+        .await
+        .unwrap();
+    db.set_bookmark_created_at_for_test("100", "2024-01-01 00:00:02")
+        .await
+        .unwrap();
+    db.set_bookmark_created_at_for_test("200", "2024-01-01 00:00:03")
+        .await
+        .unwrap();
+
+    let all = db.get_bookmarked_statuses(10, None).await.unwrap();
+    let all_ids: Vec<_> = all.into_iter().map(|s| s.id).collect();
+    assert_eq!(all_ids, vec!["200", "100", "300"]);
+
+    let next_page = db.get_bookmarked_statuses(10, Some("100")).await.unwrap();
+    let next_ids: Vec<_> = next_page.into_iter().map(|s| s.id).collect();
+    assert_eq!(next_ids, vec!["300"]);
+}
+
+#[tokio::test]
+async fn test_favourited_statuses_order_and_cursor_by_favourite_time() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    for id in ["400", "500", "600"] {
+        let status = Status {
+            id: id.to_string(),
+            uri: format!("https://example.com/status/{}", id),
+            content: "<p>Test</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        db.insert_status(&status).await.unwrap();
+    }
+
+    // Intentionally make favourite order different from status ID order.
+    db.insert_favourite("600").await.unwrap();
+    db.insert_favourite("400").await.unwrap();
+    db.insert_favourite("500").await.unwrap();
+    db.set_favourite_created_at_for_test("600", "2024-01-01 00:00:01")
+        .await
+        .unwrap();
+    db.set_favourite_created_at_for_test("400", "2024-01-01 00:00:02")
+        .await
+        .unwrap();
+    db.set_favourite_created_at_for_test("500", "2024-01-01 00:00:03")
+        .await
+        .unwrap();
+
+    let all = db.get_favourited_statuses(10, None).await.unwrap();
+    let all_ids: Vec<_> = all.into_iter().map(|s| s.id).collect();
+    assert_eq!(all_ids, vec!["500", "400", "600"]);
+
+    let next_page = db.get_favourited_statuses(10, Some("400")).await.unwrap();
+    let next_ids: Vec<_> = next_page.into_iter().map(|s| s.id).collect();
+    assert_eq!(next_ids, vec!["600"]);
+}
+
+#[tokio::test]
 async fn test_domain_block_operations() {
     let (db, _temp_dir) = create_test_db().await;
 

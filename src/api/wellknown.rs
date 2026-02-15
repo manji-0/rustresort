@@ -44,7 +44,7 @@ struct WebFingerQuery {
 async fn webfinger(
     State(state): State<AppState>,
     Query(query): Query<WebFingerQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<crate::federation::WebFingerResponse>, AppError> {
     // Parse resource (acct:username@domain)
     let resource = &query.resource;
 
@@ -74,26 +74,13 @@ async fn webfinger(
 
     match account {
         Some(acc) if acc.username == username => {
-            // Build WebFinger response (JRD)
-            let base_url = state.config.server.base_url();
-            let actor_url = format!("{}/users/{}", base_url, username);
-
-            Ok(Json(serde_json::json!({
-                "subject": resource,
-                "aliases": [actor_url.clone()],
-                "links": [
-                    {
-                        "rel": "self",
-                        "type": "application/activity+json",
-                        "href": actor_url
-                    },
-                    {
-                        "rel": "http://webfinger.net/rel/profile-page",
-                        "type": "text/html",
-                        "href": actor_url
-                    }
-                ]
-            })))
+            // Build WebFinger response (JRD) from shared federation helper.
+            let response = crate::federation::generate_webfinger_response(
+                &acc.username,
+                &state.config.server.domain,
+                &state.config.server.base_url(),
+            );
+            Ok(Json(response))
         }
         _ => Err(AppError::NotFound),
     }

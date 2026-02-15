@@ -19,17 +19,11 @@ pub async fn get_bookmarks(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get bookmarked status IDs
     let limit = params.limit.unwrap_or(20).min(40);
-    let status_ids = state.db.get_bookmarked_status_ids(limit).await?;
-
-    // Fetch full status objects
-    let mut statuses = vec![];
-    for status_id in status_ids {
-        if let Ok(Some(status)) = state.db.get_status(&status_id).await {
-            statuses.push(status);
-        }
-    }
+    let statuses = state
+        .db
+        .get_bookmarked_statuses(limit, params.max_id.as_deref())
+        .await?;
 
     // Convert to API responses
     let mut responses = vec![];
@@ -58,17 +52,11 @@ pub async fn get_favourites(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get favourited status IDs
     let limit = params.limit.unwrap_or(20).min(40);
-    let status_ids = state.db.get_favourited_status_ids(limit).await?;
-
-    // Fetch full status objects
-    let mut statuses = vec![];
-    for status_id in status_ids {
-        if let Ok(Some(status)) = state.db.get_status(&status_id).await {
-            statuses.push(status);
-        }
-    }
+    let statuses = state
+        .db
+        .get_favourited_statuses(limit, params.max_id.as_deref())
+        .await?;
 
     // Convert to API responses
     let mut responses = vec![];

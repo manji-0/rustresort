@@ -6,10 +6,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, MEDIA_UPLOADS_TOTAL, MEDIA_BYTES_UPLOADED};
 use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
+use crate::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+    MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL,
+};
 
 /// Media attachment response
 #[derive(Debug, Serialize)]

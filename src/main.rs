@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting RustResort...");
 
     // 2. Initialize metrics
-    rustresort::api::init_metrics();
+    rustresort::metrics::init_metrics();
 
     // 3. Load configuration
     let config = config::AppConfig::load()?;
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(config.clone()).await?;
 
     // 5. Build Axum router
-    let app = build_router(state.clone());
+    let app = rustresort::build_router(state.clone());
 
     // 6. Start HTTP server
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -71,68 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-/// Build the Axum router with all routes
-fn build_router(state: AppState) -> axum::Router {
-    use axum::Router;
-    use tower_http::{compression::CompressionLayer, trace::TraceLayer};
-
-    let cors_layer = build_cors_layer(&state.config.server);
-
-    Router::new()
-        // Health check endpoint
-        .route("/health", axum::routing::get(health_check))
-        // Auth endpoints
-        .merge(rustresort::auth::auth_router())
-        // Well-known endpoints
-        .nest("/.well-known", rustresort::api::wellknown_router())
-        // Mastodon API
-        .nest("/api", rustresort::api::mastodon_api_router(state.clone()))
-        // OAuth
-        .nest("/oauth", rustresort::api::oauth_router())
-        // ActivityPub
-        .nest("/users", rustresort::api::activitypub_router())
-        // Admin API
-        .nest("/admin", rustresort::api::admin_router())
-        // Middleware
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(cors_layer)
-        // State
-        .with_state(state)
-        // Metrics endpoint (Prometheus format) - stateless, added after state
-        .merge(rustresort::api::metrics_router())
-}
-
-fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {
-    use axum::http::HeaderValue;
-    use tower_http::cors::{Any, CorsLayer};
-
-    if !server.protocol.eq_ignore_ascii_case("https") {
-        return CorsLayer::permissive();
-    }
-
-    let allowed_origin = server.base_url();
-    match HeaderValue::from_str(&allowed_origin) {
-        Ok(origin) => CorsLayer::new()
-            .allow_origin([origin])
-            .allow_methods(Any)
-            .allow_headers(Any),
-        Err(error) => {
-            tracing::error!(
-                %error,
-                origin = %allowed_origin,
-                "Failed to parse CORS origin from server base URL; denying cross-origin requests"
-            );
-            CorsLayer::new().allow_methods(Any).allow_headers(Any)
-        }
-    }
-}
-
-/// Health check endpoint
-async fn health_check() -> &'static str {
-    "OK"
 }
 
 /// Spawn background backup task

@@ -69,6 +69,10 @@ pub enum AppError {
     /// Internal server error (500)
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
+
+    /// Not implemented (501)
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 impl From<config::ConfigError> for AppError {
@@ -105,6 +109,9 @@ impl IntoResponse for AppError {
                 self.to_string(),
                 "rate_limited",
             ),
+            AppError::NotImplemented(msg) => {
+                (StatusCode::NOT_IMPLEMENTED, msg.clone(), "not_implemented")
+            }
             AppError::Federation(msg) => (StatusCode::BAD_GATEWAY, msg.clone(), "federation"),
             AppError::HttpClient(_) => (StatusCode::BAD_GATEWAY, self.to_string(), "http_client"),
             AppError::Database(_) => (
@@ -125,7 +132,7 @@ impl IntoResponse for AppError {
         };
 
         // Record error metric
-        use crate::api::metrics::ERRORS_TOTAL;
+        use crate::metrics::ERRORS_TOTAL;
         ERRORS_TOTAL
             .with_label_values(&[error_type, "unknown"])
             .inc();

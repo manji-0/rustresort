@@ -7,8 +7,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::accounts::PaginationParams;
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, POSTS_TOTAL};
 use crate::AppState;
+use crate::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
+    HTTP_REQUESTS_TOTAL, POSTS_TOTAL,
+};
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -51,7 +54,9 @@ pub async fn create_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Validate
@@ -92,7 +97,9 @@ pub async fn create_status(
         .with_label_values(&["INSERT", "statuses"])
         .start_timer();
     state.db.insert_status(&status).await?;
-    DB_QUERIES_TOTAL.with_label_values(&["INSERT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["INSERT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Update posts total metric
@@ -106,7 +113,9 @@ pub async fn create_status(
                 .with_label_values(&["SELECT", "media"])
                 .start_timer();
             let media_exists = state.db.get_media(&media_id).await?.is_some();
-            DB_QUERIES_TOTAL.with_label_values(&["SELECT", "media"]).inc();
+            DB_QUERIES_TOTAL
+                .with_label_values(&["SELECT", "media"])
+                .inc();
             db_timer.observe_duration();
 
             if media_exists {
@@ -117,7 +126,9 @@ pub async fn create_status(
                     .db
                     .attach_media_to_status(&media_id, &status_id)
                     .await?;
-                DB_QUERIES_TOTAL.with_label_values(&["INSERT", "media_attachments"]).inc();
+                DB_QUERIES_TOTAL
+                    .with_label_values(&["INSERT", "media_attachments"])
+                    .inc();
                 db_timer.observe_duration();
             }
         }
@@ -156,7 +167,9 @@ pub async fn get_status(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Get account
@@ -164,7 +177,9 @@ pub async fn get_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Check if favourited/reblogged/bookmarked
@@ -205,7 +220,9 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Only allow deleting local statuses
@@ -218,7 +235,9 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Delete the status
@@ -226,7 +245,9 @@ pub async fn delete_status(
         .with_label_values(&["DELETE", "statuses"])
         .start_timer();
     state.db.delete_status(&id).await?;
-    DB_QUERIES_TOTAL.with_label_values(&["DELETE", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["DELETE", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Update posts total metric
@@ -567,8 +588,8 @@ pub async fn update_status(
     // For now, we skip media updates as it requires more complex logic
 
     // Save updated status
-    // Note: In a full implementation, we would create a new version in an edit_history table
-    state.db.insert_status(&status).await?;
+    // Note: In a full implementation, we would create a new version in an edit_history table.
+    state.db.update_status(&status).await?;
 
     // Return updated status
     let response = crate::api::status_to_response(

@@ -21,6 +21,6 @@ pub use dto::*;
 pub use activitypub::activitypub_router;
 pub use admin::admin_router;
 pub use mastodon::mastodon_api_router;
-pub use metrics::{init_metrics, metrics_router};
+pub use metrics::metrics_router;
 pub use oauth::oauth_router;
 pub use wellknown::wellknown_router;
