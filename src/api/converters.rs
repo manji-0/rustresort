@@ -150,6 +150,12 @@ mod tests {
                 description: "Test instance".to_string(),
                 contact_email: "test@example.com".to_string(),
             },
+            admin: AdminConfig {
+                username: "admin".to_string(),
+                display_name: "Admin".to_string(),
+                email: Some("admin@test.example.com".to_string()),
+                note: Some("Test administrator".to_string()),
+            },
             cache: CacheConfig {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,

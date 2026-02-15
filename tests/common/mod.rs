@@ -63,6 +63,12 @@ impl TestServer {
                 description: "Test RustResort Instance".to_string(),
                 contact_email: "test@example.com".to_string(),
             },
+            admin: config::AdminConfig {
+                username: "admin".to_string(),
+                display_name: "Admin".to_string(),
+                email: Some("admin@test.example.com".to_string()),
+                note: Some("Test administrator".to_string()),
+            },
             cache: config::CacheConfig {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,
