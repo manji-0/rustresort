@@ -3,7 +3,8 @@
 //! All database access goes through this module.
 //! Uses SQLx for compile-time checked queries.
 
-use sqlx::{Pool, Row, Sqlite, SqlitePool};
+use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
+use std::collections::HashSet;
 use std::path::Path;
 
 use super::models::*;
@@ -243,6 +244,95 @@ impl Database {
                 r#"
                 SELECT * FROM statuses 
                 WHERE is_local = 1
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(statuses)
+    }
+
+    /// Get user's own statuses (paginated) with optional min/max ID window
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of results
+    /// * `max_id` - Return statuses older than this ID (exclusive)
+    /// * `min_id` - Return statuses newer than this ID (exclusive)
+    pub async fn get_local_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = match (max_id, min_id) {
+            (Some(max_id), Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1 AND id < ? AND id > ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None) => self.get_local_statuses(limit, Some(max_id)).await?,
+            (None, Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1 AND id > ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => self.get_local_statuses(limit, None).await?,
+        };
+
+        Ok(statuses)
+    }
+
+    /// Get user's own public statuses (paginated)
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of results
+    /// * `max_id` - Return statuses older than this ID (for pagination)
+    pub async fn get_local_public_statuses(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = if let Some(max_id) = max_id {
+            sqlx::query_as::<_, Status>(
+                r#"
+                SELECT * FROM statuses 
+                WHERE is_local = 1 AND visibility = 'public' AND id < ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(max_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Status>(
+                r#"
+                SELECT * FROM statuses 
+                WHERE is_local = 1 AND visibility = 'public'
                 ORDER BY created_at DESC
                 LIMIT ?
                 "#,
@@ -605,6 +695,33 @@ impl Database {
         Ok(ids)
     }
 
+    /// Get favourited status IDs among the provided IDs
+    pub async fn get_favourited_status_ids_batch(
+        &self,
+        status_ids: &[String],
+    ) -> Result<HashSet<String>, AppError> {
+        if status_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT status_id FROM favourites WHERE status_id IN (");
+        {
+            let mut separated = query_builder.separated(", ");
+            for status_id in status_ids {
+                separated.push_bind(status_id);
+            }
+        }
+        query_builder.push(")");
+
+        let ids = query_builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(ids.into_iter().collect())
+    }
+
     /// Insert bookmark
     pub async fn insert_bookmark(&self, status_id: &str) -> Result<String, AppError> {
         let id = EntityId::new().0;
@@ -663,6 +780,33 @@ impl Database {
         .await?;
 
         Ok(ids)
+    }
+
+    /// Get bookmarked status IDs among the provided IDs
+    pub async fn get_bookmarked_status_ids_batch(
+        &self,
+        status_ids: &[String],
+    ) -> Result<HashSet<String>, AppError> {
+        if status_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT status_id FROM bookmarks WHERE status_id IN (");
+        {
+            let mut separated = query_builder.separated(", ");
+            for status_id in status_ids {
+                separated.push_bind(status_id);
+            }
+        }
+        query_builder.push(")");
+
+        let ids = query_builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(ids.into_iter().collect())
     }
 
     /// Get bookmarked statuses with JOIN (optimized, avoids N+1)

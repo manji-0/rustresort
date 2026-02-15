@@ -9,6 +9,7 @@ use super::accounts::PaginationParams;
 use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
+use crate::service::TimelineService;
 
 /// GET /api/v1/bookmarks
 pub async fn get_bookmarks(
@@ -20,22 +21,25 @@ pub async fn get_bookmarks(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     let limit = params.limit.unwrap_or(20).min(40);
-    let statuses = state
-        .db
-        .get_bookmarked_statuses(limit, params.max_id.as_deref())
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let timeline_items = timeline_service
+        .bookmarks_timeline(limit, params.max_id.as_deref())
         .await?;
 
     // Convert to API responses
     let mut responses = vec![];
-    for status in &statuses {
-        let favourited = state.db.is_favourited(&status.id).await.ok();
+    for item in &timeline_items {
         let response = crate::api::status_to_response(
-            status,
+            &item.status,
             &account,
             &state.config,
-            favourited,
-            Some(false),
-            Some(true), // bookmarked=true
+            Some(item.favourited),
+            Some(item.reblogged),
+            Some(item.bookmarked),
         );
         responses.push(serde_json::to_value(response).unwrap());
     }
@@ -53,22 +57,25 @@ pub async fn get_favourites(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     let limit = params.limit.unwrap_or(20).min(40);
-    let statuses = state
-        .db
-        .get_favourited_statuses(limit, params.max_id.as_deref())
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let timeline_items = timeline_service
+        .favourites_timeline(limit, params.max_id.as_deref())
         .await?;
 
     // Convert to API responses
     let mut responses = vec![];
-    for status in &statuses {
-        let bookmarked = state.db.is_bookmarked(&status.id).await.ok();
+    for item in &timeline_items {
         let response = crate::api::status_to_response(
-            status,
+            &item.status,
             &account,
             &state.config,
-            Some(true), // favourited=true
-            Some(false),
-            bookmarked,
+            Some(item.favourited),
+            Some(item.reblogged),
+            Some(item.bookmarked),
         );
         responses.push(serde_json::to_value(response).unwrap());
     }

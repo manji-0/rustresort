@@ -1,6 +1,6 @@
 //! Timeline service
 //!
-//! Handles timeline retrieval from cache and database.
+//! Handles timeline retrieval from database and cache-backed metadata.
 
 use std::sync::Arc;
 
@@ -30,8 +30,7 @@ impl TimelineService {
 
     /// Get home timeline
     ///
-    /// Returns statuses from followed accounts (from cache)
-    /// plus own statuses (from database).
+    /// Returns local statuses for the single-user instance.
     ///
     /// # Arguments
     /// * `limit` - Maximum results (default 20, max 40)
@@ -39,25 +38,23 @@ impl TimelineService {
     /// * `min_id` - Return statuses newer than this ID
     ///
     /// # Returns
-    /// Merged and sorted list of statuses
+    /// Sorted list of statuses
     pub async fn home_timeline(
         &self,
-        _limit: usize,
-        _max_id: Option<&str>,
-        _min_id: Option<&str>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // TODO:
-        // 1. Get follow addresses from DB
-        // 2. Get cached statuses from followees
-        // 3. Get own local statuses from DB
-        // 4. Merge and sort by created_at desc
-        // 5. Apply pagination
-        todo!()
+        let statuses = self
+            .db
+            .get_local_statuses_in_window(limit, max_id, min_id)
+            .await?;
+        self.build_timeline_items_with_interactions(statuses).await
     }
 
     /// Get public timeline
     ///
-    /// Returns all public statuses from cache.
+    /// Returns local public statuses for the single-user instance.
     ///
     /// # Arguments
     /// * `local_only` - If true, only return local statuses
@@ -65,15 +62,15 @@ impl TimelineService {
     /// * `max_id` - Pagination cursor
     pub async fn public_timeline(
         &self,
-        _local_only: bool,
-        _limit: usize,
-        _max_id: Option<&str>,
+        local_only: bool,
+        limit: usize,
+        max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // TODO:
-        // 1. Get from cache (filtered by visibility=public)
-        // 2. If local_only, also include local from DB
-        // 3. Sort and limit
-        todo!()
+        // Single-user instance currently stores local statuses only,
+        // so local_only doesn't change query behavior yet.
+        let _ = local_only;
+        let statuses = self.db.get_local_public_statuses(limit, max_id).await?;
+        self.build_timeline_items_with_interactions(statuses).await
     }
 
     /// Get account timeline
@@ -94,11 +91,9 @@ impl TimelineService {
         _only_media: bool,
         _exclude_replies: bool,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // TODO:
-        // 1. If local account, get from DB
-        // 2. If remote, get from cache
-        // 3. Apply filters
-        todo!()
+        Err(AppError::NotImplemented(
+            "account timeline is not implemented yet".to_string(),
+        ))
     }
 
     /// Get favourites timeline
@@ -106,23 +101,96 @@ impl TimelineService {
     /// Returns statuses the user has favourited.
     pub async fn favourites_timeline(
         &self,
-        _limit: usize,
-        _max_id: Option<&str>,
+        limit: usize,
+        max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // TODO:
-        // 1. Get favourited status IDs from DB
-        // 2. Get statuses from DB (persisted)
-        todo!()
+        let statuses = self.db.get_favourited_statuses(limit, max_id).await?;
+        let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
+        let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
+
+        let mut items = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            items.push(TimelineItem {
+                account: Self::timeline_account_from_status(&status),
+                bookmarked: bookmarked_ids.contains(&status.id),
+                status,
+                favourited: true,
+                reblogged: false,
+            });
+        }
+
+        Ok(items)
     }
 
     /// Get bookmarks timeline
     pub async fn bookmarks_timeline(
         &self,
-        _limit: usize,
-        _max_id: Option<&str>,
+        limit: usize,
+        max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // TODO: Similar to favourites
-        todo!()
+        let statuses = self.db.get_bookmarked_statuses(limit, max_id).await?;
+        let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
+        let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
+
+        let mut items = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            items.push(TimelineItem {
+                account: Self::timeline_account_from_status(&status),
+                favourited: favourited_ids.contains(&status.id),
+                status,
+                reblogged: false,
+                bookmarked: true,
+            });
+        }
+
+        Ok(items)
+    }
+
+    fn timeline_account_from_status(status: &Status) -> TimelineAccount {
+        let default_address = if status.is_local {
+            "local@local".to_string()
+        } else {
+            "remote@unknown".to_string()
+        };
+        let address = if status.account_address.is_empty() {
+            default_address
+        } else {
+            status.account_address.clone()
+        };
+        let username = address
+            .split('@')
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+
+        TimelineAccount {
+            address,
+            username,
+            display_name: None,
+            avatar_url: None,
+            is_local: status.is_local,
+        }
+    }
+
+    async fn build_timeline_items_with_interactions(
+        &self,
+        statuses: Vec<Status>,
+    ) -> Result<Vec<TimelineItem>, AppError> {
+        let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
+        let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
+        let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
+
+        Ok(statuses
+            .into_iter()
+            .map(|status| TimelineItem {
+                account: Self::timeline_account_from_status(&status),
+                favourited: favourited_ids.contains(&status.id),
+                bookmarked: bookmarked_ids.contains(&status.id),
+                status,
+                reblogged: false,
+            })
+            .collect())
     }
 }
 
