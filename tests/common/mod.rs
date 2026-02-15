@@ -142,8 +142,8 @@ impl TestServer {
         let addr = listener.local_addr().unwrap();
         let addr_str = format!("http://{}", addr);
 
-        // Build router
-        let app = build_test_router(state.clone());
+        // Build router (shared with production composition).
+        let app = rustresort::build_router(state.clone());
 
         // Spawn server in background
         tokio::spawn(async move {
@@ -233,25 +233,4 @@ impl TestServer {
         create_session_token(&session, &self.state.config.auth.session_secret)
             .expect("Failed to create test token")
     }
-}
-
-/// Build router for testing
-fn build_test_router(state: AppState) -> axum::Router {
-    use axum::Router;
-    use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
-
-    Router::new()
-        .route("/health", axum::routing::get(health_check))
-        .nest("/.well-known", rustresort::api::wellknown_router())
-        .nest("/api", rustresort::api::mastodon_api_router(state.clone()))
-        .merge(rustresort::api::activitypub_router())
-        .nest("/admin", rustresort::api::admin_router())
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .with_state(state)
-}
-
-async fn health_check() -> &'static str {
-    "OK"
 }

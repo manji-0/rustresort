@@ -124,12 +124,8 @@ impl Database {
         Ok(status)
     }
 
-
     /// Get multiple statuses by URIs (batch operation to avoid N+1)
-    pub async fn get_statuses_by_uris(
-        &self,
-        uris: &[String],
-    ) -> Result<Vec<Status>, AppError> {
+    pub async fn get_statuses_by_uris(&self, uris: &[String]) -> Result<Vec<Status>, AppError> {
         if uris.is_empty() {
             return Ok(vec![]);
         }
@@ -178,6 +174,31 @@ impl Database {
         .bind(&status.persisted_reason)
         .bind(&status.created_at)
         .bind(&status.fetched_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update an existing status
+    pub async fn update_status(&self, status: &Status) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE statuses
+            SET content = ?, content_warning = ?, visibility = ?, language = ?,
+                in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&status.content)
+        .bind(&status.content_warning)
+        .bind(&status.visibility)
+        .bind(&status.language)
+        .bind(&status.in_reply_to_uri)
+        .bind(&status.boost_of_uri)
+        .bind(&status.persisted_reason)
+        .bind(&status.fetched_at)
+        .bind(&status.id)
         .execute(&self.pool)
         .await?;
 
@@ -500,6 +521,17 @@ impl Database {
         Ok(())
     }
 
+    /// Get a single notification by ID
+    pub async fn get_notification(&self, id: &str) -> Result<Option<Notification>, AppError> {
+        let notification =
+            sqlx::query_as::<_, Notification>("SELECT * FROM notifications WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(notification)
+    }
+
     /// Mark all notifications as read
     pub async fn mark_all_notifications_read(&self) -> Result<(), AppError> {
         sqlx::query("UPDATE notifications SET read = 1")
@@ -525,6 +557,20 @@ impl Database {
         .await?;
 
         Ok(id)
+    }
+
+    #[cfg(test)]
+    pub async fn set_favourite_created_at_for_test(
+        &self,
+        status_id: &str,
+        created_at: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE favourites SET created_at = ? WHERE status_id = ?")
+            .bind(created_at)
+            .bind(status_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Delete favourite
@@ -573,6 +619,20 @@ impl Database {
         Ok(id)
     }
 
+    #[cfg(test)]
+    pub async fn set_bookmark_created_at_for_test(
+        &self,
+        status_id: &str,
+        created_at: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("UPDATE bookmarks SET created_at = ? WHERE status_id = ?")
+            .bind(created_at)
+            .bind(status_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Delete bookmark
     pub async fn delete_bookmark(&self, status_id: &str) -> Result<(), AppError> {
         sqlx::query("DELETE FROM bookmarks WHERE status_id = ?")
@@ -617,11 +677,23 @@ impl Database {
                     r#"
                     SELECT s.* FROM statuses s
                     INNER JOIN bookmarks b ON s.id = b.status_id
-                    WHERE b.id < ?
-                    ORDER BY b.created_at DESC
+                    LEFT JOIN bookmarks cb ON cb.status_id = ?
+                    WHERE (
+                        cb.status_id IS NOT NULL
+                        AND (
+                            b.created_at < cb.created_at
+                            OR (b.created_at = cb.created_at AND s.id < ?)
+                        )
+                    ) OR (
+                        cb.status_id IS NULL
+                        AND s.id < ?
+                    )
+                    ORDER BY b.created_at DESC, s.id DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
+                .bind(max_id)
+                .bind(max_id)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -632,9 +704,9 @@ impl Database {
                     r#"
                     SELECT s.* FROM statuses s
                     INNER JOIN bookmarks b ON s.id = b.status_id
-                    ORDER BY b.created_at DESC
+                    ORDER BY b.created_at DESC, s.id DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -657,11 +729,23 @@ impl Database {
                     r#"
                     SELECT s.* FROM statuses s
                     INNER JOIN favourites f ON s.id = f.status_id
-                    WHERE f.id < ?
-                    ORDER BY f.created_at DESC
+                    LEFT JOIN favourites cf ON cf.status_id = ?
+                    WHERE (
+                        cf.status_id IS NOT NULL
+                        AND (
+                            f.created_at < cf.created_at
+                            OR (f.created_at = cf.created_at AND s.id < ?)
+                        )
+                    ) OR (
+                        cf.status_id IS NULL
+                        AND s.id < ?
+                    )
+                    ORDER BY f.created_at DESC, s.id DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
+                .bind(max_id)
+                .bind(max_id)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -672,9 +756,9 @@ impl Database {
                     r#"
                     SELECT s.* FROM statuses s
                     INNER JOIN favourites f ON s.id = f.status_id
-                    ORDER BY f.created_at DESC
+                    ORDER BY f.created_at DESC, s.id DESC
                     LIMIT ?
-                    "#
+                    "#,
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -759,9 +843,10 @@ impl Database {
         Ok(())
     }
 
-
     /// Get all domain blocks with details
-    pub async fn get_all_domain_blocks(&self) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
+    pub async fn get_all_domain_blocks(
+        &self,
+    ) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
         let blocks = sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
             "SELECT id, domain, created_at FROM domain_blocks ORDER BY created_at DESC",
         )
@@ -1914,4 +1999,3 @@ impl Database {
         Ok(hashtags)
     }
 }
-

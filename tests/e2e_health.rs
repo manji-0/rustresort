@@ -37,12 +37,12 @@ async fn test_cors_headers() {
     let response = server
         .client
         .get(&server.url("/health"))
-        .header("Origin", "https://example.com")
+        .header("Origin", "https://test.example.com")
         .send()
         .await
         .unwrap();
 
-    // CORS should be permissive in test mode
+    // CORS should allow the configured instance origin.
     assert!(
         response
             .headers()

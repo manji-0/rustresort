@@ -104,19 +104,10 @@ pub async fn get_notification(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get all notifications and find the one with matching ID
-    // TODO: Add a get_notification_by_id method to the database
-    let notifications = state
+    let notification = state
         .db
-        .get_notifications(
-            100, // Get a reasonable number to search through
-            None, false,
-        )
-        .await?;
-
-    let notification = notifications
-        .into_iter()
-        .find(|n| n.id == id)
+        .get_notification(&id)
+        .await?
         .ok_or(AppError::NotFound)?;
 
     // Get status if present

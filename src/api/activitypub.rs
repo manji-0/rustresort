@@ -15,7 +15,7 @@ use axum::{
 use http::HeaderMap;
 
 use crate::AppState;
-use crate::api::metrics::{
+use crate::metrics::{
     ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUEST_DURATION_SECONDS,
     FEDERATION_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };

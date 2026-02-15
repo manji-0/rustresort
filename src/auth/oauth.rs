@@ -67,9 +67,10 @@ async fn login_page() -> impl IntoResponse {
 async fn github_redirect(
     State(_state): State<AppState>,
     _jar: CookieJar,
-) -> Result<impl IntoResponse, AppError> {
-    // TODO: Implement GitHub OAuth redirect
-    Ok(Redirect::to("/login"))
+) -> Result<Redirect, AppError> {
+    Err(AppError::NotImplemented(
+        "GitHub OAuth redirect flow is not implemented yet".to_string(),
+    ))
 }
 
 /// Query parameters from GitHub callback
@@ -113,9 +114,10 @@ async fn github_callback(
     State(_state): State<AppState>,
     Query(_query): Query<GitHubCallbackQuery>,
     _jar: CookieJar,
-) -> Result<impl IntoResponse, AppError> {
-    // TODO: Implement OAuth callback
-    Ok(Redirect::to("/login"))
+) -> Result<Redirect, AppError> {
+    Err(AppError::NotImplemented(
+        "GitHub OAuth callback flow is not implemented yet".to_string(),
+    ))
 }
 
 // =============================================================================
@@ -142,6 +144,7 @@ fn generate_csrf_state() -> String {
 
 /// Verify CSRF state from cookie matches callback state
 fn verify_csrf_state(_state: &str, _jar: &CookieJar) -> Result<(), AppError> {
-    // TODO: Implement CSRF verification
-    Ok(())
+    Err(AppError::NotImplemented(
+        "CSRF state verification is not implemented yet".to_string(),
+    ))
 }

@@ -2,7 +2,7 @@
 //!
 //! Used to discover ActivityPub actor URIs from addresses.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
@@ -35,50 +35,64 @@ pub async fn resolve_webfinger(
     _address: &str,
     _http_client: &reqwest::Client,
 ) -> Result<WebFingerResult, AppError> {
-    // TODO:
-    // 1. Parse address into user and domain
-    // 2. Build WebFinger URL: https://{domain}/.well-known/webfinger?resource=acct:{address}
-    // 3. Fetch with Accept: application/jrd+json
-    // 4. Parse response
-    // 5. Find link with type application/activity+json
-    // 6. Return result
-    todo!()
+    Err(AppError::NotImplemented(
+        "WebFinger resolution is not implemented yet".to_string(),
+    ))
 }
 
 /// WebFinger JRD response
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebFingerResponse {
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aliases: Option<Vec<String>>,
     pub links: Vec<WebFingerLink>,
 }
 
 /// WebFinger link
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebFingerLink {
     pub rel: String,
     #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub link_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
 }
 
-/// Generate WebFinger response for local account
-///
-/// Used by /.well-known/webfinger endpoint.
+/// Generate WebFinger response for a local account.
 ///
 /// # Arguments
 /// * `username` - Local username
 /// * `domain` - Instance domain
+/// * `base_url` - Instance base URL (includes protocol)
 ///
 /// # Returns
 /// JRD response for the account
-pub fn generate_webfinger_response(_username: &str, _domain: &str) -> WebFingerResponse {
-    // TODO:
-    // 1. Build subject: acct:{username}@{domain}
-    // 2. Add aliases
-    // 3. Add links (self, profile page)
-    todo!()
+pub fn generate_webfinger_response(username: &str, domain: &str, base_url: &str) -> WebFingerResponse {
+    let subject = format!("acct:{}@{}", username, domain);
+    let actor_url = format!("{}/users/{}", base_url.trim_end_matches('/'), username);
+
+    WebFingerResponse {
+        subject,
+        aliases: Some(vec![actor_url.clone()]),
+        links: vec![
+            WebFingerLink {
+                rel: "self".to_string(),
+                link_type: Some("application/activity+json".to_string()),
+                href: Some(actor_url.clone()),
+                template: None,
+            },
+            WebFingerLink {
+                rel: "http://webfinger.net/rel/profile-page".to_string(),
+                link_type: Some("text/html".to_string()),
+                href: Some(actor_url),
+                template: None,
+            },
+        ],
+    }
 }
 
 /// Fetch actor document
@@ -93,10 +107,9 @@ pub async fn fetch_actor(
     _actor_uri: &str,
     _http_client: &reqwest::Client,
 ) -> Result<serde_json::Value, AppError> {
-    // TODO:
-    // 1. GET actor_uri with Accept: application/activity+json
-    // 2. Parse response
-    todo!()
+    Err(AppError::NotImplemented(
+        "Actor fetch is not implemented yet".to_string(),
+    ))
 }
 
 /// Extract relevant data from actor document
@@ -107,12 +120,9 @@ pub async fn fetch_actor(
 /// # Returns
 /// Parsed actor data
 pub fn parse_actor(_actor: &serde_json::Value) -> Result<ParsedActor, AppError> {
-    // TODO:
-    // 1. Extract id, preferredUsername, name, summary
-    // 2. Extract icon, image URLs
-    // 3. Extract inbox, outbox, followers, following
-    // 4. Extract publicKey
-    todo!()
+    Err(AppError::NotImplemented(
+        "Actor parsing is not implemented yet".to_string(),
+    ))
 }
 
 /// Parsed actor data

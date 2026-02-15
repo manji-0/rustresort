@@ -96,11 +96,14 @@ impl BackupService {
     /// # Note
     /// This method runs indefinitely. Call in a spawned task.
     pub async fn run(&self) {
-        // TODO:
-        // 1. Perform immediate backup
-        // 2. Loop with interval, perform backup
-        // 3. Clean up old backups
-        todo!()
+        let mut interval = tokio::time::interval(self.interval);
+
+        loop {
+            interval.tick().await;
+            if let Err(error) = self.backup_now().await {
+                tracing::error!(%error, "Scheduled backup failed");
+            }
+        }
     }
 
     /// Perform a backup now
@@ -156,9 +159,9 @@ impl BackupService {
     /// # Returns
     /// Backup data as bytes
     async fn create_sqlite_backup(&self) -> Result<Vec<u8>, AppError> {
-        // TODO: Use rusqlite backup API
-        // This should be run in spawn_blocking
-        todo!()
+        Err(AppError::NotImplemented(
+            "online sqlite backup API is not implemented yet".to_string(),
+        ))
     }
 
     /// Encrypt backup data
@@ -171,8 +174,9 @@ impl BackupService {
     /// # Returns
     /// nonce (12 bytes) + ciphertext
     fn encrypt(&self, _data: &[u8]) -> Result<Vec<u8>, AppError> {
-        // TODO: Encrypt with AES-256-GCM
-        todo!()
+        Err(AppError::NotImplemented(
+            "backup encryption is not implemented yet".to_string(),
+        ))
     }
 
     /// Decrypt backup data
@@ -183,8 +187,9 @@ impl BackupService {
     /// # Returns
     /// Decrypted data
     fn decrypt(&self, _data: &[u8]) -> Result<Vec<u8>, AppError> {
-        // TODO: Decrypt with AES-256-GCM
-        todo!()
+        Err(AppError::NotImplemented(
+            "backup decryption is not implemented yet".to_string(),
+        ))
     }
 
     /// Upload backup to R2
