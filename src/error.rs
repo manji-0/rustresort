@@ -30,6 +30,10 @@ pub enum AppError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Unprocessable entity (422)
+    #[error("Unprocessable entity: {0}")]
+    Unprocessable(String),
+
     /// Database error (500)
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
@@ -84,10 +88,23 @@ impl IntoResponse for AppError {
         let (status, error_message, error_type) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string(), "not_found"),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string(), "unauthorized"),
-            AppError::InvalidSignature => (StatusCode::UNAUTHORIZED, self.to_string(), "invalid_signature"),
+            AppError::InvalidSignature => (
+                StatusCode::UNAUTHORIZED,
+                self.to_string(),
+                "invalid_signature",
+            ),
             AppError::Forbidden => (StatusCode::FORBIDDEN, self.to_string(), "forbidden"),
             AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "validation"),
-            AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, self.to_string(), "rate_limited"),
+            AppError::Unprocessable(msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                msg.clone(),
+                "unprocessable",
+            ),
+            AppError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                self.to_string(),
+                "rate_limited",
+            ),
             AppError::Federation(msg) => (StatusCode::BAD_GATEWAY, msg.clone(), "federation"),
             AppError::HttpClient(_) => (StatusCode::BAD_GATEWAY, self.to_string(), "http_client"),
             AppError::Database(_) => (
@@ -97,7 +114,9 @@ impl IntoResponse for AppError {
             ),
             AppError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "storage"),
             AppError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "config"),
-            AppError::Encryption(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "encryption"),
+            AppError::Encryption(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "encryption")
+            }
             AppError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
@@ -107,7 +126,9 @@ impl IntoResponse for AppError {
 
         // Record error metric
         use crate::api::metrics::ERRORS_TOTAL;
-        ERRORS_TOTAL.with_label_values(&[error_type, "unknown"]).inc();
+        ERRORS_TOTAL
+            .with_label_values(&[error_type, "unknown"])
+            .inc();
 
         let body = Json(serde_json::json!({
             "error": error_message,

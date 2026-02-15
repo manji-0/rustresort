@@ -349,8 +349,27 @@ async fn test_get_relationships() {
         .send()
         .await
         .unwrap();
-    
+
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_relationships_decodes_percent_encoded_ids() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships?id[]=alice%40example.com"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["id"], "alice@example.com");
 }
 
 #[tokio::test]

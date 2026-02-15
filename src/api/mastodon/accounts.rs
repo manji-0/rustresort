@@ -1,13 +1,16 @@
 //! Account endpoints
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     response::Json,
 };
 use serde::Deserialize;
 
-use crate::api::metrics::{DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL};
 use crate::AppState;
+use crate::api::metrics::{
+    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
+    HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+};
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -32,13 +35,6 @@ pub struct UpdateCredentialsRequest {
     pub discoverable: Option<bool>,
 }
 
-/// Relationships query parameters
-#[derive(Debug, Deserialize)]
-pub struct RelationshipsParams {
-    #[serde(rename = "id[]")]
-    pub ids: Vec<String>,
-}
-
 /// Search query parameters
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -46,6 +42,31 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
     pub following: Option<bool>,
+}
+
+async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
+    if id.starts_with("http://") || id.starts_with("https://") {
+        return Err(AppError::Validation(
+            "Account URI is not yet supported".to_string(),
+        ));
+    }
+
+    if id.contains('@') {
+        return Ok(id.to_string());
+    }
+
+    if let Some(account) = state.db.get_account().await? {
+        if account.id == id {
+            return Ok(format!(
+                "{}@{}",
+                account.username, state.config.server.domain
+            ));
+        }
+    }
+
+    Err(AppError::Validation(
+        "Invalid account ID format".to_string(),
+    ))
 }
 
 /// GET /api/v1/accounts/verify_credentials
@@ -63,7 +84,9 @@ pub async fn verify_credentials(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
     // Convert to API response
@@ -74,14 +97,18 @@ pub async fn verify_credentials(
         .with_label_values(&["SELECT", "followers"])
         .start_timer();
     let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "followers"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "followers"])
+        .inc();
     db_timer.observe_duration();
 
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "follows"])
         .start_timer();
     let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "follows"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "follows"])
+        .inc();
     db_timer.observe_duration();
 
     response.followers_count = followers_count;
@@ -250,23 +277,8 @@ pub async fn follow_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // For single-user instance, the ID should be an actor URI or account address
-    // Parse it to extract the account address
-    let _target_address = if id.starts_with("http://") || id.starts_with("https://") {
-        // It's a full URI, extract the address
-        // TODO: Fetch actor info and extract preferredUsername and domain
-        return Err(AppError::Validation(
-            "Follow by URI not yet supported".to_string(),
-        ));
-    } else if id.contains('@') {
-        // It's an account address like user@domain.com
-        id.clone()
-    } else {
-        // Invalid format
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let _target_address = resolve_target_address(&state, &id).await?;
 
     // Get our account
     let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -306,18 +318,8 @@ pub async fn unfollow_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID (same logic as follow)
-    let _target_address = if id.starts_with("http://") || id.starts_with("https://") {
-        return Err(AppError::Validation(
-            "Unfollow by URI not yet supported".to_string(),
-        ));
-    } else if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let _target_address = resolve_target_address(&state, &id).await?;
 
     // Get our account
     let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -350,7 +352,7 @@ pub async fn unfollow_account(
 pub async fn get_relationships(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
-    Query(params): Query<RelationshipsParams>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
@@ -358,9 +360,24 @@ pub async fn get_relationships(
     let _following_addresses = state.db.get_all_follow_addresses().await?;
     let _follower_addresses = state.db.get_all_follower_addresses().await?;
 
+    let ids: Vec<String> = raw_query
+        .as_deref()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .filter_map(|(key, value)| {
+                    if key == "id[]" || key == "id" {
+                        Some(value.into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Create relationship responses for each requested ID
     let mut relationships = vec![];
-    for id in params.ids {
+    for id in ids {
         // For single-user instance, we check if the ID matches our account
         let _account = state.db.get_account().await?;
 
@@ -452,7 +469,7 @@ pub async fn create_account(
     Json(_req): Json<CreateAccountRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Single-user instance doesn't support account creation via API
-    Err(AppError::Validation(
+    Err(AppError::Unprocessable(
         "Account creation is not supported on this single-user instance".to_string(),
     ))
 }
@@ -514,14 +531,8 @@ pub async fn block_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let target_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let target_address = resolve_target_address(&state, &id).await?;
 
     // Store block in database
     state.db.block_account(&target_address).await?;
@@ -555,14 +566,8 @@ pub async fn unblock_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let target_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let target_address = resolve_target_address(&state, &id).await?;
 
     // Remove block from database
     state.db.unblock_account(&target_address).await?;
@@ -593,18 +598,19 @@ pub async fn mute_account(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<MuteAccountRequest>,
+    req: Option<Json<MuteAccountRequest>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let target_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let target_address = resolve_target_address(&state, &id).await?;
+
+    let req = req
+        .map(|Json(payload)| payload)
+        .unwrap_or(MuteAccountRequest {
+            notifications: None,
+            duration: None,
+        });
 
     let mute_notifications = req.notifications.unwrap_or(true);
     let duration = req.duration;
@@ -644,14 +650,8 @@ pub async fn unmute_account(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let target_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    // Accept account addresses and local account IDs.
+    let target_address = resolve_target_address(&state, &id).await?;
 
     // Remove mute from database
     state.db.unmute_account(&target_address).await?;
@@ -734,14 +734,7 @@ pub async fn get_follow_request(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Parse account ID to address
-    let requester_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    let requester_address = id.clone();
 
     // Check if follow request exists
     if !state.db.has_follow_request(&requester_address).await? {
@@ -766,14 +759,7 @@ pub async fn authorize_follow_request(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let requester_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    let requester_address = id.clone();
 
     // Accept the follow request (moves to followers table)
     state.db.accept_follow_request(&requester_address).await?;
@@ -809,14 +795,7 @@ pub async fn reject_follow_request(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Parse account ID to address
-    let requester_address = if id.contains('@') {
-        id.clone()
-    } else {
-        return Err(AppError::Validation(
-            "Invalid account ID format".to_string(),
-        ));
-    };
+    let requester_address = id.clone();
 
     // Remove from follow_requests
     if !state.db.reject_follow_request(&requester_address).await? {

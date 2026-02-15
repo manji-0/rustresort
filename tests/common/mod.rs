@@ -27,7 +27,7 @@ impl TestServer {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Let OS assign port
                 domain: "test.example.com".to_string(),
-                protocol: "http".to_string(),
+                protocol: "https".to_string(),
             },
             database: config::DatabaseConfig {
                 path: db_path.clone(),
@@ -64,10 +64,10 @@ impl TestServer {
                 contact_email: "test@example.com".to_string(),
             },
             admin: config::AdminConfig {
-                username: "admin".to_string(),
-                display_name: "Admin".to_string(),
-                email: Some("admin@test.example.com".to_string()),
-                note: Some("Test administrator".to_string()),
+                username: "testuser".to_string(),
+                display_name: "Test User".to_string(),
+                email: Some("testuser@test.example.com".to_string()),
+                note: Some("Test account".to_string()),
             },
             cache: config::CacheConfig {
                 timeline_max_items: 2000,
@@ -122,17 +122,30 @@ impl TestServer {
         use chrono::Utc;
         use rustresort::data::{Account, EntityId};
 
-        let account = Account {
-            id: EntityId::new().0,
-            username: "testuser".to_string(),
-            display_name: Some("Test User".to_string()),
-            note: Some("Test bio".to_string()),
-            avatar_s3_key: None,
-            header_s3_key: None,
-            private_key_pem: "test_private_key".to_string(),
-            public_key_pem: "test_public_key".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+        let now = Utc::now();
+        let account = if let Some(mut account) = self.state.db.get_account().await.unwrap() {
+            account.username = "testuser".to_string();
+            account.display_name = Some("Test User".to_string());
+            account.note = Some("Test bio".to_string());
+            account.avatar_s3_key = None;
+            account.header_s3_key = None;
+            account.private_key_pem = "test_private_key".to_string();
+            account.public_key_pem = "test_public_key".to_string();
+            account.updated_at = now;
+            account
+        } else {
+            Account {
+                id: EntityId::new().0,
+                username: "testuser".to_string(),
+                display_name: Some("Test User".to_string()),
+                note: Some("Test bio".to_string()),
+                avatar_s3_key: None,
+                header_s3_key: None,
+                private_key_pem: "test_private_key".to_string(),
+                public_key_pem: "test_public_key".to_string(),
+                created_at: now,
+                updated_at: now,
+            }
         };
 
         self.state.db.upsert_account(&account).await.unwrap();
@@ -168,7 +181,7 @@ fn build_test_router(state: AppState) -> axum::Router {
     Router::new()
         .route("/health", axum::routing::get(health_check))
         .nest("/.well-known", rustresort::api::wellknown_router())
-        .nest("/api", rustresort::api::mastodon_api_router())
+        .nest("/api", rustresort::api::mastodon_api_router(state.clone()))
         .merge(rustresort::api::activitypub_router())
         .nest("/admin", rustresort::api::admin_router())
         .layer(CompressionLayer::new())
