@@ -53,67 +53,10 @@ jobs:
         run: cargo nextest run --lib
 
   e2e:
-    name: E2E (${{ matrix.name }})
+    name: E2E
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      max-parallel: 10
-      matrix:
-        include:
-          - name: e2e_api_coverage (1/4)
-            suite: e2e_api_coverage
-            total_shards: 4
-            shard_index: 0
-          - name: e2e_api_coverage (2/4)
-            suite: e2e_api_coverage
-            total_shards: 4
-            shard_index: 1
-          - name: e2e_api_coverage (3/4)
-            suite: e2e_api_coverage
-            total_shards: 4
-            shard_index: 2
-          - name: e2e_api_coverage (4/4)
-            suite: e2e_api_coverage
-            total_shards: 4
-            shard_index: 3
-          - name: e2e_federation_scenarios (1/2)
-            suite: e2e_federation_scenarios
-            total_shards: 2
-            shard_index: 0
-          - name: e2e_federation_scenarios (2/2)
-            suite: e2e_federation_scenarios
-            total_shards: 2
-            shard_index: 1
-          - name: e2e_mastodon_api
-            suite: e2e_mastodon_api
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_activitypub
-            suite: e2e_activitypub
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_account
-            suite: e2e_account
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_status
-            suite: e2e_status
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_timeline
-            suite: e2e_timeline
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_wellknown
-            suite: e2e_wellknown
-            total_shards: 1
-            shard_index: 0
-          - name: e2e_health
-            suite: e2e_health
-            total_shards: 1
-            shard_index: 0
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -129,9 +72,15 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run E2E suite
+      - name: Run E2E suites (consolidated)
         run: >
-          ./scripts/ci/run_e2e_shard.sh
-          ${{ matrix.suite }}
-          ${{ matrix.total_shards }}
-          ${{ matrix.shard_index }}
+          cargo nextest run
+          --test e2e_api_coverage
+          --test e2e_federation_scenarios
+          --test e2e_mastodon_api
+          --test e2e_activitypub
+          --test e2e_account
+          --test e2e_status
+          --test e2e_timeline
+          --test e2e_wellknown
+          --test e2e_health
