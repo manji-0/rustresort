@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use super::accounts::PaginationParams;
 use crate::AppState;
+use crate::auth::CurrentUser;
+use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
     HTTP_REQUESTS_TOTAL, POSTS_TOTAL,
 };
-use crate::auth::CurrentUser;
-use crate::error::AppError;
+use crate::service::StatusService;
 
 /// Status creation request
 #[derive(Debug, Deserialize)]
@@ -162,11 +163,17 @@ pub async fn get_status(
         .with_label_values(&["GET", "/api/v1/statuses/:id"])
         .start_timer();
 
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
+
     // Get status from database
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "statuses"])
         .inc();
@@ -183,8 +190,8 @@ pub async fn get_status(
     db_timer.observe_duration();
 
     // Check if favourited/reblogged/bookmarked
-    let favourited = state.db.is_favourited(&id).await.ok();
-    let bookmarked = state.db.is_bookmarked(&id).await.ok();
+    let favourited = status_service.is_favourited(&id).await.ok();
+    let bookmarked = status_service.is_bookmarked(&id).await.ok();
 
     // Convert to API response
     let response = crate::api::status_to_response(
@@ -215,20 +222,21 @@ pub async fn delete_status(
         .with_label_values(&["DELETE", "/api/v1/statuses/:id"])
         .start_timer();
 
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
+
     // Get status to verify it exists and is local
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "statuses"])
         .inc();
     db_timer.observe_duration();
-
-    // Only allow deleting local statuses
-    if !status.is_local {
-        return Err(AppError::Forbidden);
-    }
 
     // Get account for response
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -244,7 +252,7 @@ pub async fn delete_status(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["DELETE", "statuses"])
         .start_timer();
-    state.db.delete_status(&id).await?;
+    status_service.delete_loaded(&status).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["DELETE", "statuses"])
         .inc();
@@ -370,14 +378,17 @@ pub async fn favourite_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Add favourite
-    state.db.insert_favourite(&id).await?;
+    // Get status and add favourite
+    let status = status_service.favourite_by_id(&id).await?;
 
     // Return status with favourited=true
     let response = crate::api::status_to_response(
@@ -386,7 +397,7 @@ pub async fn favourite_status(
         &state.config,
         Some(true),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -398,14 +409,17 @@ pub async fn unfavourite_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Remove favourite
-    state.db.delete_favourite(&id).await?;
+    // Get status and remove favourite
+    let status = status_service.unfavourite_by_id(&id).await?;
 
     // Return status with favourited=false
     let response = crate::api::status_to_response(
@@ -414,7 +428,7 @@ pub async fn unfavourite_status(
         &state.config,
         Some(false),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -492,21 +506,24 @@ pub async fn bookmark_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Add bookmark
-    state.db.insert_bookmark(&id).await?;
+    // Get status and add bookmark
+    let status = status_service.bookmark_by_id(&id).await?;
 
     // Return status with bookmarked=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
         Some(true),
     );
@@ -520,21 +537,24 @@ pub async fn unbookmark_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Remove bookmark
-    state.db.delete_bookmark(&id).await?;
+    // Get status and remove bookmark
+    let status = status_service.unbookmark_by_id(&id).await?;
 
     // Return status with bookmarked=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
         Some(false),
     );
