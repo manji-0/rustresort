@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::config::BackupStorageConfig;
 use crate::error::AppError;
+use crate::storage::build_r2_http_client;
 
 /// Backup service for SQLite database
 ///
@@ -56,7 +57,7 @@ impl BackupService {
         cloudflare: &crate::config::CloudflareConfig,
         db_path: PathBuf,
     ) -> Result<Self, AppError> {
-        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::BehaviorVersion;
         use aws_sdk_s3::config::{Credentials, Region};
 
         let endpoint = format!("https://{}.r2.cloudflarestorage.com", cloudflare.account_id);
@@ -69,8 +70,11 @@ impl BackupService {
             "rustresort-r2-backup",
         );
 
+        let http_client = build_r2_http_client();
+
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
+            .http_client(http_client)
             .region(Region::new("auto"))
             .endpoint_url(&endpoint)
             .credentials_provider(credentials)
