@@ -52,25 +52,22 @@ impl StatusService {
         _in_reply_to_uri: Option<String>,
         _media_ids: Vec<String>,
     ) -> Result<Status, AppError> {
-        // TODO:
-        // 1. Generate ID and URI
-        // 2. Create Status record
-        // 3. Insert into DB
-        // 4. Attach media if any
-        // 5. Return status (federation handled by caller)
-        todo!()
+        Err(AppError::NotImplemented(
+            "status creation via service is not implemented yet".to_string(),
+        ))
     }
 
     /// Get status by ID
-    pub async fn get(&self, _id: &str) -> Result<Status, AppError> {
-        // TODO: Get from DB, return NotFound if missing
-        todo!()
+    pub async fn get(&self, id: &str) -> Result<Status, AppError> {
+        self.db.get_status(id).await?.ok_or(AppError::NotFound)
     }
 
     /// Get status by URI
-    pub async fn get_by_uri(&self, _uri: &str) -> Result<Status, AppError> {
-        // TODO: Get from DB, return NotFound if missing
-        todo!()
+    pub async fn get_by_uri(&self, uri: &str) -> Result<Status, AppError> {
+        self.db
+            .get_status_by_uri(uri)
+            .await?
+            .ok_or(AppError::NotFound)
     }
 
     /// Delete status
@@ -81,12 +78,22 @@ impl StatusService {
     /// - Deletes from database
     /// - Deletes associated media from R2
     /// - Should trigger Delete activity (handled by caller)
-    pub async fn delete(&self, _id: &str) -> Result<(), AppError> {
-        // TODO:
-        // 1. Get status, verify is_local
-        // 2. Delete associated media from R2
-        // 3. Delete from DB
-        todo!()
+    pub async fn delete(&self, id: &str) -> Result<(), AppError> {
+        let status = self.get(id).await?;
+        self.delete_loaded(&status).await
+    }
+
+    /// Delete a preloaded status
+    ///
+    /// Use this to avoid reloading the same status when the caller
+    /// has already resolved it (e.g. API handler needs it for response).
+    pub async fn delete_loaded(&self, status: &Status) -> Result<(), AppError> {
+        if !status.is_local {
+            return Err(AppError::Forbidden);
+        }
+
+        self.db.delete_status(&status.id).await?;
+        Ok(())
     }
 
     // =========================================================================
@@ -99,37 +106,47 @@ impl StatusService {
     /// - Persists remote status if not already persisted
     /// - Creates favourite record
     /// - Should trigger Like activity (handled by caller)
-    pub async fn favourite(&self, _status_uri: &str) -> Result<Status, AppError> {
-        // TODO:
-        // 1. Get status from cache or fetch
-        // 2. Persist if remote (with reason Favourited)
-        // 3. Insert favourite record
-        // 4. Return status
-        todo!()
+    pub async fn favourite(&self, status_uri: &str) -> Result<Status, AppError> {
+        let status = match self.db.get_status_by_uri(status_uri).await? {
+            Some(status) => status,
+            None => {
+                self.persist_remote_status(status_uri, PersistedReason::Favourited)
+                    .await?
+            }
+        };
+
+        self.db.insert_favourite(&status.id).await?;
+        Ok(status)
     }
 
     /// Unfavourite a status
-    pub async fn unfavourite(&self, _status_uri: &str) -> Result<(), AppError> {
-        // TODO: Delete favourite record
-        // Note: Don't delete the persisted status (might have other reasons)
-        todo!()
+    pub async fn unfavourite(&self, status_uri: &str) -> Result<(), AppError> {
+        let status = self.get_by_uri(status_uri).await?;
+        self.db.delete_favourite(&status.id).await?;
+        Ok(())
     }
 
     /// Bookmark a status
     ///
     /// Local-only, no federation.
-    pub async fn bookmark(&self, _status_uri: &str) -> Result<Status, AppError> {
-        // TODO:
-        // 1. Get status from cache or fetch
-        // 2. Persist if remote (with reason Bookmarked)
-        // 3. Insert bookmark record
-        todo!()
+    pub async fn bookmark(&self, status_uri: &str) -> Result<Status, AppError> {
+        let status = match self.db.get_status_by_uri(status_uri).await? {
+            Some(status) => status,
+            None => {
+                self.persist_remote_status(status_uri, PersistedReason::Bookmarked)
+                    .await?
+            }
+        };
+
+        self.db.insert_bookmark(&status.id).await?;
+        Ok(status)
     }
 
     /// Remove bookmark
-    pub async fn unbookmark(&self, _status_uri: &str) -> Result<(), AppError> {
-        // TODO: Delete bookmark record
-        todo!()
+    pub async fn unbookmark(&self, status_uri: &str) -> Result<(), AppError> {
+        let status = self.get_by_uri(status_uri).await?;
+        self.db.delete_bookmark(&status.id).await?;
+        Ok(())
     }
 
     /// Repost (boost) a status
@@ -142,18 +159,16 @@ impl StatusService {
     /// # Returns
     /// The repost status (Announce wrapper)
     pub async fn repost(&self, _status_uri: &str) -> Result<Status, AppError> {
-        // TODO:
-        // 1. Get status from cache or fetch
-        // 2. Persist if remote (with reason Reposted)
-        // 3. Create repost record with Announce URI
-        // 4. Return original status
-        todo!()
+        Err(AppError::NotImplemented(
+            "repost via service is not implemented yet".to_string(),
+        ))
     }
 
     /// Undo repost
     pub async fn unrepost(&self, _status_uri: &str) -> Result<(), AppError> {
-        // TODO: Delete repost record
-        todo!()
+        Err(AppError::NotImplemented(
+            "unrepost via service is not implemented yet".to_string(),
+        ))
     }
 
     // =========================================================================
@@ -175,14 +190,9 @@ impl StatusService {
         _content_type: String,
         _description: Option<String>,
     ) -> Result<MediaAttachment, AppError> {
-        // TODO:
-        // 1. Generate ID
-        // 2. Process image/video if needed
-        // 3. Generate thumbnail
-        // 4. Upload to R2
-        // 5. Create media record
-        // 6. Insert into DB
-        todo!()
+        Err(AppError::NotImplemented(
+            "media upload via service is not implemented yet".to_string(),
+        ))
     }
 
     // =========================================================================
@@ -201,14 +211,73 @@ impl StatusService {
     /// Persisted status
     async fn persist_remote_status(
         &self,
-        _status_uri: &str,
-        _reason: PersistedReason,
+        status_uri: &str,
+        reason: PersistedReason,
     ) -> Result<Status, AppError> {
-        // TODO:
-        // 1. Check if already in DB
-        // 2. Get from cache
-        // 3. Convert to Status with persisted_reason
-        // 4. Insert into DB
-        todo!()
+        if let Some(existing) = self.db.get_status_by_uri(status_uri).await? {
+            return Ok(existing);
+        }
+
+        if let Some(cached) = self.cache.get_by_uri(status_uri).await {
+            let status = Status {
+                id: cached.id.clone(),
+                uri: cached.uri.clone(),
+                content: cached.content.clone(),
+                content_warning: None,
+                visibility: cached.visibility.clone(),
+                language: None,
+                account_address: cached.account_address.clone(),
+                is_local: false,
+                in_reply_to_uri: cached.reply_to_uri.clone(),
+                boost_of_uri: cached.boost_of_uri.clone(),
+                persisted_reason: reason.as_str().to_string(),
+                created_at: cached.created_at,
+                fetched_at: Some(chrono::Utc::now()),
+            };
+            self.db.insert_status(&status).await?;
+            return Ok(status);
+        }
+
+        Err(AppError::NotImplemented(
+            "remote status persistence requires federation fetch; not implemented yet".to_string(),
+        ))
+    }
+
+    /// Favourite by local status ID
+    pub async fn favourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.insert_favourite(status_id).await?;
+        Ok(status)
+    }
+
+    /// Unfavourite by local status ID
+    pub async fn unfavourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.delete_favourite(status_id).await?;
+        Ok(status)
+    }
+
+    /// Bookmark by local status ID
+    pub async fn bookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.insert_bookmark(status_id).await?;
+        Ok(status)
+    }
+
+    /// Unbookmark by local status ID
+    pub async fn unbookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.delete_bookmark(status_id).await?;
+        Ok(status)
+    }
+
+    /// Check whether status is favourited
+    pub async fn is_favourited(&self, status_id: &str) -> Result<bool, AppError> {
+        self.db.is_favourited(status_id).await
+    }
+
+    /// Check whether status is bookmarked
+    pub async fn is_bookmarked(&self, status_id: &str) -> Result<bool, AppError> {
+        self.db.is_bookmarked(status_id).await
     }
 }
