@@ -1133,10 +1133,16 @@ impl Database {
             return Ok(None);
         };
 
-        if auth_code.app_id != app_id
-            || auth_code.redirect_uri != redirect_uri
-            || auth_code.expires_at <= now
-        {
+        if auth_code.expires_at <= now {
+            // Purge expired code on redemption attempt to avoid unbounded table growth.
+            sqlx::query("DELETE FROM oauth_authorization_codes WHERE id = ?")
+                .bind(&auth_code.id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(None);
+        }
+
+        if auth_code.app_id != app_id || auth_code.redirect_uri != redirect_uri {
             return Ok(None);
         }
 
