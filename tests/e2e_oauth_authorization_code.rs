@@ -6,9 +6,13 @@ use serde_json::json;
 use url::Url;
 
 async fn create_app(server: &TestServer) -> serde_json::Value {
+    create_app_with_redirect(server, "https://client.example/callback").await
+}
+
+async fn create_app_with_redirect(server: &TestServer, redirect_uri: &str) -> serde_json::Value {
     let app_request = json!({
         "client_name": "OAuth Test Client",
-        "redirect_uris": "https://client.example/callback",
+        "redirect_uris": redirect_uri,
         "scopes": "read write follow"
     });
 
@@ -171,8 +175,44 @@ async fn test_authorize_rejects_unregistered_redirect_uri() {
         .await
         .unwrap();
 
-    assert_eq!(
-        authorize_response.status(),
-        StatusCode::UNPROCESSABLE_ENTITY
+    assert_eq!(authorize_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_authorize_redirect_keeps_fragment_and_sets_query_code() {
+    let server = TestServer::new().await;
+    let app = create_app_with_redirect(&server, "https://client.example/callback#frag").await;
+
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let authorize_response = no_redirect_client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", app["client_id"].as_str().unwrap()),
+            ("redirect_uri", "https://client.example/callback#frag"),
+            ("state", "st"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorize_response.status(), StatusCode::SEE_OTHER);
+
+    let location = authorize_response
+        .headers()
+        .get(LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let redirect = Url::parse(location).unwrap();
+    assert_eq!(redirect.fragment(), Some("frag"));
+    assert!(redirect.query_pairs().any(|(k, _)| k == "code"));
+    assert!(
+        redirect
+            .query_pairs()
+            .any(|(k, v)| k == "state" && v == "st")
     );
 }

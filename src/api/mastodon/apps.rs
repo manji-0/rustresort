@@ -7,6 +7,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use url::Url;
 
 use crate::AppState;
 use crate::auth::CurrentUser;
@@ -84,7 +85,19 @@ fn build_authorize_redirect_location(
     code: &str,
     state: Option<&str>,
 ) -> String {
-    let separator = if redirect_uri.contains('?') { "&" } else { "?" };
+    if let Ok(mut redirect) = Url::parse(redirect_uri) {
+        let mut serializer =
+            url::form_urlencoded::Serializer::new(redirect.query().unwrap_or("").to_string());
+        serializer.append_pair("code", code);
+        if let Some(state) = state {
+            serializer.append_pair("state", state);
+        }
+        redirect.set_query(Some(&serializer.finish()));
+        return redirect.to_string();
+    }
+
+    // Fallback for unexpected non-URL values.
+    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     let mut location = format!(
         "{}{}code={}",
         redirect_uri,
