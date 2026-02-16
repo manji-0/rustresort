@@ -4,9 +4,11 @@
 //! Mastodon API schema as defined by GoToSocial's swagger.yaml
 
 mod common;
+#[path = "common/schema_validator.rs"]
+mod schema_validator;
 
 use common::TestServer;
-use common::schema_validator::{load_test_schema, validate_against_schema};
+use schema_validator::{load_test_schema, validate_against_schema};
 use serde_json::Value;
 
 #[tokio::test]

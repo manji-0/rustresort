@@ -1,7 +1,6 @@
 use jsonschema::{Draft, JSONSchema};
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
 
 /// Load a JSON schema from a file
 pub fn load_schema(schema_path: &str) -> JSONSchema {
