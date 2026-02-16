@@ -759,7 +759,34 @@ impl ActivityProcessor {
 #[cfg(test)]
 mod tests {
     use super::{extract_follow_target, is_local_follow_target};
+    use crate::data::{Database, ProfileCache, TimelineCache};
+    use crate::error::AppError;
     use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn create_test_processor(
+        local_address: &str,
+        local_protocol: &str,
+    ) -> (super::ActivityProcessor, Arc<Database>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("activity_processor_test.db");
+        let db = Arc::new(Database::connect(&db_path).await.unwrap());
+        let timeline_cache = Arc::new(TimelineCache::new(16));
+        let profile_cache = Arc::new(ProfileCache::new());
+        let http_client = Arc::new(reqwest::Client::new());
+
+        let processor = super::ActivityProcessor::new(
+            db.clone(),
+            timeline_cache,
+            profile_cache,
+            http_client,
+            local_address.to_string(),
+            local_protocol.to_string(),
+        );
+
+        (processor, db, temp_dir)
+    }
 
     #[test]
     fn is_local_follow_target_accepts_local_address_forms() {
@@ -922,5 +949,40 @@ mod tests {
         assert!(extract_follow_target(&missing).is_err());
         assert!(extract_follow_target(&empty_object).is_err());
         assert!(extract_follow_target(&non_string_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_follow_accepts_object_id_target_for_local_actor() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let activity = json!({
+            "type": "Follow",
+            "id": "https://remote.example/follows/1",
+            "actor": actor_uri,
+            "object": {
+                "id": "https://example.com/users/alice"
+            }
+        });
+
+        processor.handle_follow(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert_eq!(follower_addresses, vec!["bob@remote.example".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn handle_follow_rejects_object_id_target_for_non_local_actor() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let activity = json!({
+            "type": "Follow",
+            "id": "https://remote.example/follows/2",
+            "actor": actor_uri,
+            "object": {
+                "id": "https://example.com/users/ALICE"
+            }
+        });
+
+        let result = processor.handle_follow(activity, actor_uri).await;
+        assert!(matches!(result, Err(AppError::Validation(_))));
     }
 }
