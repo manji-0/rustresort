@@ -6,6 +6,7 @@
 use aws_sdk_s3::Client as S3Client;
 
 use crate::error::AppError;
+use crate::storage::build_r2_http_client;
 
 /// Media storage service
 ///
@@ -33,7 +34,7 @@ impl MediaStorage {
         config: &crate::config::MediaStorageConfig,
         cloudflare: &crate::config::CloudflareConfig,
     ) -> Result<Self, AppError> {
-        use aws_config::BehaviorVersion;
+        use aws_sdk_s3::config::BehaviorVersion;
         use aws_sdk_s3::config::{Credentials, Region};
 
         // R2 endpoint: https://{account_id}.r2.cloudflarestorage.com
@@ -48,9 +49,12 @@ impl MediaStorage {
             "rustresort-r2",
         );
 
+        let http_client = build_r2_http_client();
+
         // Build S3 config for R2
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
+            .http_client(http_client)
             .region(Region::new("auto"))
             .endpoint_url(&endpoint)
             .credentials_provider(credentials)
