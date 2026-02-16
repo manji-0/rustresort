@@ -302,3 +302,15 @@ pub struct OAuthToken {
     pub created_at: DateTime<Utc>,
     pub revoked: bool,
 }
+
+/// OAuth authorization code (short-lived, single-use)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OAuthAuthorizationCode {
+    pub id: String,
+    pub app_id: String,
+    pub code: String,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}

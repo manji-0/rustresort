@@ -3,6 +3,7 @@
 //! All database access goes through this module.
 //! Uses SQLx for compile-time checked queries.
 
+use chrono::{DateTime, Utc};
 use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::collections::HashSet;
 use std::path::Path;
@@ -1078,6 +1079,83 @@ impl Database {
             .await?;
 
         Ok(app)
+    }
+
+    /// Insert OAuth authorization code
+    pub async fn insert_oauth_authorization_code(
+        &self,
+        code: &OAuthAuthorizationCode,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            INSERT INTO oauth_authorization_codes (
+                id, app_id, code, redirect_uri, scopes, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&code.id)
+        .bind(&code.app_id)
+        .bind(&code.code)
+        .bind(&code.redirect_uri)
+        .bind(&code.scopes)
+        .bind(&code.created_at)
+        .bind(&code.expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get OAuth authorization code by code value
+    pub async fn get_oauth_authorization_code(
+        &self,
+        code: &str,
+    ) -> Result<Option<OAuthAuthorizationCode>, AppError> {
+        let auth_code = sqlx::query_as::<_, OAuthAuthorizationCode>(
+            "SELECT * FROM oauth_authorization_codes WHERE code = ?",
+        )
+        .bind(code)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(auth_code)
+    }
+
+    /// Consume (single-use) OAuth authorization code with strict binding checks
+    pub async fn consume_oauth_authorization_code(
+        &self,
+        code: &str,
+        app_id: &str,
+        redirect_uri: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<OAuthAuthorizationCode>, AppError> {
+        let Some(auth_code) = self.get_oauth_authorization_code(code).await? else {
+            return Ok(None);
+        };
+
+        if auth_code.expires_at <= now {
+            // Purge expired code on redemption attempt to avoid unbounded table growth.
+            sqlx::query("DELETE FROM oauth_authorization_codes WHERE id = ?")
+                .bind(&auth_code.id)
+                .execute(&self.pool)
+                .await?;
+            return Ok(None);
+        }
+
+        if auth_code.app_id != app_id || auth_code.redirect_uri != redirect_uri {
+            return Ok(None);
+        }
+
+        let result = sqlx::query("DELETE FROM oauth_authorization_codes WHERE id = ?")
+            .bind(&auth_code.id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(auth_code))
     }
 
     /// Insert OAuth token
