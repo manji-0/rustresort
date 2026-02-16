@@ -135,7 +135,7 @@ impl PublicKeyCache {
         cache.retain(|_, v| v.is_valid());
         let after = cache.len();
         let removed = before - after;
-        
+
         if removed > 0 {
             tracing::info!("Pruned {} expired public key cache entries", removed);
         }

@@ -143,7 +143,6 @@ fn default_admin_display_name() -> String {
     "Admin".to_string()
 }
 
-
 /// Cache configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {

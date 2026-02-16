@@ -59,7 +59,7 @@ pub async fn list_accounts(
     Query(_params): Query<AdminAccountParams>,
 ) -> Result<Json<Vec<AdminAccount>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    
+
     let admin_account = AdminAccount {
         id: account.id.clone(),
         username: account.username.clone(),
@@ -73,9 +73,10 @@ pub async fn list_accounts(
         silenced: false,
         disabled: false,
         approved: true,
-        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config)).unwrap(),
+        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config))
+            .unwrap(),
     };
-    
+
     Ok(Json(vec![admin_account]))
 }
 
@@ -86,11 +87,11 @@ pub async fn get_account(
     Path(id): Path<String>,
 ) -> Result<Json<AdminAccount>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    
+
     if account.id != id {
         return Err(AppError::NotFound);
     }
-    
+
     let admin_account = AdminAccount {
         id: account.id.clone(),
         username: account.username.clone(),
@@ -104,9 +105,10 @@ pub async fn get_account(
         silenced: false,
         disabled: false,
         approved: true,
-        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config)).unwrap(),
+        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config))
+            .unwrap(),
     };
-    
+
     Ok(Json(admin_account))
 }
 
@@ -176,7 +178,7 @@ pub async fn list_domain_blocks_v1(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<DomainBlock>>, AppError> {
     let blocks = state.db.get_all_domain_blocks().await?;
-    
+
     let domain_blocks: Vec<DomainBlock> = blocks
         .into_iter()
         .map(|(id, domain, created_at)| DomainBlock {
@@ -191,7 +193,7 @@ pub async fn list_domain_blocks_v1(
             obfuscate: false,
         })
         .collect();
-    
+
     Ok(Json(domain_blocks))
 }
 
@@ -203,10 +205,10 @@ pub async fn create_domain_block_v1(
 ) -> Result<Json<DomainBlock>, AppError> {
     use crate::data::EntityId;
     use chrono::Utc;
-    
+
     let id = EntityId::new().0;
     state.db.insert_domain_block(&req.domain).await?;
-    
+
     Ok(Json(DomainBlock {
         id,
         domain: req.domain,
