@@ -1,7 +1,5 @@
 //! Common test utilities for E2E tests
 
-pub mod schema_validator;
-
 use rustresort::{AppState, config};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
