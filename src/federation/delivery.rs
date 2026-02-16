@@ -22,6 +22,26 @@ pub struct ActivityDelivery {
     private_key_pem: String,
 }
 
+/// Deduplicate identical inbox URIs while keeping distinct personal inboxes.
+///
+/// This preserves recipients on the same domain that use different inbox paths.
+fn unique_inbox_targets(inbox_uris: Vec<String>) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for inbox_uri in inbox_uris {
+        if seen.contains(&inbox_uri) {
+            continue;
+        }
+        seen.insert(inbox_uri.clone());
+        targets.push(inbox_uri);
+    }
+
+    targets
+}
+
 impl ActivityDelivery {
     /// Create new delivery service
     pub fn new(
@@ -100,40 +120,23 @@ impl ActivityDelivery {
     /// * `inbox_uris` - List of follower inbox URIs
     ///
     /// # Note
-    /// Uses shared inbox when possible (group by domain)
+    /// Deduplicates identical inbox URIs while preserving distinct inbox paths.
     pub async fn deliver_to_followers(
         &self,
         activity: serde_json::Value,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
-        use std::collections::HashMap;
         use tokio::sync::Semaphore;
 
-        // 1. Group by shared inbox domain to reduce deliveries
-        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
-
-        for inbox_uri in inbox_uris {
-            // Extract domain from inbox URI
-            let domain = inbox_uri
-                .split("://")
-                .nth(1)
-                .and_then(|s| s.split('/').next())
-                .unwrap_or(&inbox_uri)
-                .to_string();
-
-            grouped.entry(domain).or_default().push(inbox_uri);
-        }
-
-        // 2. For each domain, use the first inbox (could be optimized to use shared inbox)
-        let delivery_targets: Vec<String> = grouped
-            .into_iter()
-            .map(|(_, mut inboxes)| inboxes.remove(0))
-            .collect();
+        // 1. Deduplicate exact inbox URIs only.
+        // Grouping by domain can drop recipients that have distinct personal inboxes.
+        let total_targets = inbox_uris.len();
+        let delivery_targets = unique_inbox_targets(inbox_uris);
 
         tracing::info!(
-            "Delivering to {} unique inboxes (optimized from {} total)",
+            "Delivering to {} unique inboxes (deduplicated from {} total)",
             delivery_targets.len(),
-            delivery_targets.len()
+            total_targets
         );
 
         // 3. Deliver in parallel with concurrency limit
@@ -610,5 +613,52 @@ pub mod builder {
                 "en": content
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_inbox_targets;
+
+    #[test]
+    fn unique_inbox_targets_keeps_distinct_personal_inboxes_on_same_domain() {
+        let targets = unique_inbox_targets(vec![
+            "https://instance1.com/users/alice/inbox".to_string(),
+            "https://instance1.com/users/bob/inbox".to_string(),
+            "https://instance2.com/inbox".to_string(),
+        ]);
+
+        assert_eq!(
+            targets,
+            vec![
+                "https://instance1.com/users/alice/inbox".to_string(),
+                "https://instance1.com/users/bob/inbox".to_string(),
+                "https://instance2.com/inbox".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unique_inbox_targets_deduplicates_identical_shared_inbox_uris() {
+        let targets = unique_inbox_targets(vec![
+            "https://instance1.com/inbox".to_string(),
+            "https://instance1.com/inbox".to_string(),
+            "https://instance2.com/inbox".to_string(),
+            "https://instance2.com/inbox".to_string(),
+        ]);
+
+        assert_eq!(
+            targets,
+            vec![
+                "https://instance1.com/inbox".to_string(),
+                "https://instance2.com/inbox".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unique_inbox_targets_handles_empty_input() {
+        let targets = unique_inbox_targets(vec![]);
+        assert!(targets.is_empty());
     }
 }
