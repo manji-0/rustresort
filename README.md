@@ -1,85 +1,73 @@
-# RustResort 🏝️ (Under Development)
+# RustResort (Under Development)
 
-**Lightweight ActivityPub Twitter-like Service Built with Rust**
+Lightweight, single-user ActivityPub server built with Rust.
 
-RustResort is an ActivityPub server built with Rust, inspired by [GoToSocial](https://gotosocial.org/).
-It aims to be a lightweight and secure Fediverse server designed for personal to small-scale instances.
+RustResort is inspired by GoToSocial and focuses on a small operational footprint, strong safety defaults, and compatibility with Mastodon clients.
 
-## ✨ Features
+## Features
 
-- **🦀 Built with Rust**: Memory safety and performance
-- **👤 Single-user focused**: Optimized for personal instances
-- **🪶 Ultra-lightweight**: Remote data in memory cache only, minimal DB size
-- **☁️ Cloudflare R2**: Media delivery + automatic backups
-- **🌐 Fediverse integration**: ActivityPub compliant, interoperable with Mastodon and others
-- **🔐 Secure**: HTTP Signatures support
-- **📱 Mastodon API compatible**: Use existing client apps as-is
+- Rust-first implementation for safety and performance
+- Single-user instance model
+- Mastodon-compatible API surface
+- ActivityPub and HTTP Signatures support
+- SQLite persistence with in-memory caches for remote data
+- Cloudflare R2 media storage and backup integration
 
-## 📚 Documentation
+## Documentation
 
 | Document | Overview |
 |----------|----------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture design |
-| [AUTHENTICATION.md](docs/AUTHENTICATION.md) | **GitHub authentication setup** |
-| [CLOUDFLARE.md](docs/CLOUDFLARE.md) | Cloudflare R2 configuration |
-| [STORAGE_STRATEGY.md](docs/STORAGE_STRATEGY.md) | Data persistence strategy |
-| [BACKUP.md](docs/BACKUP.md) | R2 backup design |
-| [DATA_MODEL.md](docs/DATA_MODEL.md) | Data model design |
-| [API.md](docs/API.md) | API specification |
-| [FEDERATION.md](docs/FEDERATION.md) | Federation specification |
-| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development guide |
-| [ROADMAP.md](docs/ROADMAP.md) | Implementation roadmap |
+| [QUICKSTART.md](QUICKSTART.md) | Fast local setup and first API calls |
+| [docs/README.md](docs/README.md) | Documentation index |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and module layout |
+| [docs/API.md](docs/API.md) | API specification |
+| [docs/FEDERATION.md](docs/FEDERATION.md) | Federation and ActivityPub behavior |
+| [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) | Authentication model and OAuth design |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Development workflow |
+| [docs/TESTING.md](docs/TESTING.md) | Test strategy and commands |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Planned milestones |
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
-- Rust 1.82 or later (2024 Edition)
-- SQLite 3.35 or later
-- Cloudflare R2 (for media storage)
+- Rust 1.82+
+- SQLite 3.35+
+- Cloudflare R2 account (or MinIO for local emulation)
 
-### Installation
+### Run locally
 
 ```bash
-# Clone
 git clone https://github.com/yourusername/rustresort.git
 cd rustresort
-
-# Create configuration file
-cp config/default.toml.example config/local.toml
-# Edit config/local.toml
-
-# Build & Run
+cp config/local.toml.example config/local.toml
+# edit config/local.toml
 cargo run --release
 ```
 
-For details, see [DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Health check:
 
-## 📊 Status
+```bash
+curl http://localhost:3000/health
+```
 
-**Current Phase**: Implementation in progress
+See [QUICKSTART.md](QUICKSTART.md) for full setup and OAuth/API usage examples.
 
-See [ROADMAP.md](docs/ROADMAP.md) for detailed implementation plans.
+## Current Status
 
-## 🤝 Contributing
+- Core API endpoints and test coverage are in active development.
+- Some auth/federation/admin flows remain intentionally unimplemented.
+- Details: [docs/ROADMAP.md](docs/ROADMAP.md)
 
-Contributions are welcome! You can participate in the following ways:
+## Contributing
 
-- 🐛 Bug reports
-- 💡 Feature suggestions
-- 📖 Documentation improvements
-- 🔧 Pull requests
+Contributions are welcome, especially:
 
-## 📜 License
+- Bug reports
+- Feature proposals
+- Documentation improvements
+- Tests and API compatibility fixes
 
-This project is licensed under [AGPL-3.0](LICENSE).
+## License
 
-## 🙏 Acknowledgments
-
-- [GoToSocial](https://gotosocial.org/) - Design reference
-- [Mastodon](https://joinmastodon.org/) - API specification reference
-- Rust/Tokio/Axum community
-
----
-
-Made with ❤️ and 🦀
+AGPL-3.0 (see `Cargo.toml`).
