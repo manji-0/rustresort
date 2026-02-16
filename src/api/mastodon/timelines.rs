@@ -4,6 +4,7 @@ use axum::{
     extract::{Query, State},
     response::Json,
 };
+use serde::Deserialize;
 
 use super::accounts::PaginationParams;
 use crate::AppState;
@@ -12,6 +13,14 @@ use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };
+use crate::service::TimelineService;
+
+#[derive(Debug, Deserialize)]
+pub struct PublicTimelineParams {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    pub local: Option<bool>,
+}
 
 /// GET /api/v1/timelines/home
 pub async fn home_timeline(
@@ -29,27 +38,40 @@ pub async fn home_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
-    // Get local statuses (home timeline = local statuses for single-user instance)
     let limit = params.limit.unwrap_or(20).min(40);
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let statuses = state
-        .db
-        .get_local_statuses(limit, params.max_id.as_deref())
+    let timeline_items = timeline_service
+        .home_timeline(limit, params.max_id.as_deref(), params.min_id.as_deref())
         .await?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
     // Convert to API responses
-    let responses: Vec<_> = statuses
+    let responses: Vec<_> = timeline_items
         .iter()
-        .map(|status| {
-            let response =
-                crate::api::status_to_response(status, &account, &state.config, None, None, None);
+        .map(|item| {
+            let response = crate::api::status_to_response(
+                &item.status,
+                &account,
+                &state.config,
+                Some(item.favourited),
+                Some(item.reblogged),
+                Some(item.bookmarked),
+            );
             serde_json::to_value(response).unwrap()
         })
         .collect();
@@ -65,7 +87,7 @@ pub async fn home_timeline(
 /// GET /api/v1/timelines/public
 pub async fn public_timeline(
     State(state): State<AppState>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<PublicTimelineParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
@@ -77,33 +99,41 @@ pub async fn public_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "accounts"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "accounts"])
+        .inc();
     db_timer.observe_duration();
 
-    // Get local statuses (public timeline = local statuses for single-user instance)
-    let limit = params.limit.unwrap_or(20).min(40);
+    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let local_only = params.local.unwrap_or(false);
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let statuses = state
-        .db
-        .get_local_statuses(limit, params.max_id.as_deref())
+    let timeline_items = timeline_service
+        .public_timeline(local_only, limit, params.pagination.max_id.as_deref())
         .await?;
-    DB_QUERIES_TOTAL.with_label_values(&["SELECT", "statuses"]).inc();
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
     db_timer.observe_duration();
 
-    // Filter to only include public visibility statuses
-    let public_statuses: Vec<_> = statuses
-        .iter()
-        .filter(|status| status.visibility == "public")
-        .collect();
-
     // Convert to API responses
-    let responses: Vec<_> = public_statuses
+    let responses: Vec<_> = timeline_items
         .iter()
-        .map(|status| {
-            let response =
-                crate::api::status_to_response(status, &account, &state.config, None, None, None);
+        .map(|item| {
+            let response = crate::api::status_to_response(
+                &item.status,
+                &account,
+                &state.config,
+                Some(item.favourited),
+                Some(item.reblogged),
+                Some(item.bookmarked),
+            );
             serde_json::to_value(response).unwrap()
         })
         .collect();
