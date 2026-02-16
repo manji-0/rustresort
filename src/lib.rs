@@ -273,7 +273,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .merge(auth::auth_router())
         .merge(api::wellknown_router())
         .nest("/api", api::mastodon_api_router(state.clone()))
-        .nest("/oauth", api::oauth_router())
+        .nest("/oauth", api::oauth_router(state.clone()))
         .merge(api::activitypub_router())
         .nest("/admin", api::admin_router())
         .layer(CompressionLayer::new())

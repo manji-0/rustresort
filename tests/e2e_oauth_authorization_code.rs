@@ -31,6 +31,7 @@ async fn create_app_with_redirect(server: &TestServer, redirect_uri: &str) -> se
 async fn test_authorization_code_flow_works_and_prevents_replay() {
     let server = TestServer::new().await;
     let app = create_app(&server).await;
+    let session_token = server.create_test_token().await;
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -39,6 +40,7 @@ async fn test_authorization_code_flow_works_and_prevents_replay() {
 
     let authorize_response = no_redirect_client
         .get(server.url("/oauth/authorize"))
+        .bearer_auth(&session_token)
         .query(&[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
@@ -101,6 +103,7 @@ async fn test_authorization_code_flow_works_and_prevents_replay() {
 async fn test_authorization_code_token_rejects_redirect_uri_mismatch() {
     let server = TestServer::new().await;
     let app = create_app(&server).await;
+    let session_token = server.create_test_token().await;
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -109,6 +112,7 @@ async fn test_authorization_code_token_rejects_redirect_uri_mismatch() {
 
     let authorize_response = no_redirect_client
         .get(server.url("/oauth/authorize"))
+        .bearer_auth(&session_token)
         .query(&[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
@@ -158,6 +162,7 @@ async fn test_authorization_code_token_rejects_redirect_uri_mismatch() {
 async fn test_authorize_rejects_unregistered_redirect_uri() {
     let server = TestServer::new().await;
     let app = create_app(&server).await;
+    let session_token = server.create_test_token().await;
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -166,6 +171,7 @@ async fn test_authorize_rejects_unregistered_redirect_uri() {
 
     let authorize_response = no_redirect_client
         .get(server.url("/oauth/authorize"))
+        .bearer_auth(&session_token)
         .query(&[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
@@ -182,6 +188,7 @@ async fn test_authorize_rejects_unregistered_redirect_uri() {
 async fn test_authorize_redirect_keeps_fragment_and_sets_query_code() {
     let server = TestServer::new().await;
     let app = create_app_with_redirect(&server, "https://client.example/callback#frag").await;
+    let session_token = server.create_test_token().await;
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -190,6 +197,7 @@ async fn test_authorize_redirect_keeps_fragment_and_sets_query_code() {
 
     let authorize_response = no_redirect_client
         .get(server.url("/oauth/authorize"))
+        .bearer_auth(&session_token)
         .query(&[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),

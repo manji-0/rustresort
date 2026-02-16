@@ -298,6 +298,7 @@ pub struct OAuthToken {
     pub id: String,
     pub app_id: String,
     pub access_token: String,
+    pub grant_type: String,
     pub scopes: String,
     pub created_at: DateTime<Utc>,
     pub revoked: bool,

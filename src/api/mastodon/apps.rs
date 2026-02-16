@@ -347,6 +347,7 @@ pub async fn create_token(
         id: token_id.clone(),
         app_id: app.id.clone(),
         access_token: access_token.clone(),
+        grant_type: req.grant_type.clone(),
         scopes,
         created_at: Utc::now(),
         revoked: false,
