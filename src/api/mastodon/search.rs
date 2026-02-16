@@ -104,7 +104,7 @@ pub async fn search_v2(
     if search_statuses {
         let limit = params.limit.unwrap_or(20).min(40);
         let offset = params.offset.unwrap_or(0);
-        
+
         match state.db.search_statuses(query, limit, offset).await {
             Ok(found_statuses) => {
                 // Get account for status responses
@@ -135,7 +135,7 @@ pub async fn search_v2(
         let tag = query.trim_start_matches('#');
         if !tag.is_empty() {
             let limit = params.limit.unwrap_or(20).min(40);
-            
+
             match state.db.search_hashtags(tag, limit).await {
                 Ok(found_tags) => {
                     for (name, usage_count, _last_used) in found_tags {
@@ -154,7 +154,7 @@ pub async fn search_v2(
                     eprintln!("Hashtag search error: {}", e);
                 }
             }
-            
+
             // If no results found, still return the searched tag if it looks valid
             if hashtags.is_empty() && tag.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 hashtags.push(serde_json::json!({

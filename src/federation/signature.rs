@@ -5,7 +5,7 @@
 //! https://docs.joinmastodon.org/spec/security/
 
 use crate::error::AppError;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
@@ -44,12 +44,13 @@ pub fn sign_request(
     key_id: &str,
 ) -> Result<SignatureHeaders, AppError> {
     // 1. Parse URL to get host and path
-    let parsed_url = url::Url::parse(url)
-        .map_err(|e| AppError::Validation(format!("Invalid URL: {}", e)))?;
-    
-    let host = parsed_url.host_str()
+    let parsed_url =
+        url::Url::parse(url).map_err(|e| AppError::Validation(format!("Invalid URL: {}", e)))?;
+
+    let host = parsed_url
+        .host_str()
         .ok_or_else(|| AppError::Validation("Missing host in URL".to_string()))?;
-    
+
     let path = parsed_url.path();
     let query = parsed_url.query();
     let path_and_query = if let Some(q) = query {
@@ -68,7 +69,7 @@ pub fn sign_request(
 
     // 4. Build signing string
     let request_target = format!("{} {}", method.to_lowercase(), path_and_query);
-    
+
     let mut signing_parts = vec![
         format!("(request-target): {}", request_target),
         format!("host: {}", host),
@@ -87,7 +88,7 @@ pub fn sign_request(
     // 5. Sign with RSA-SHA256
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
-    
+
     let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(private_key_pem)
         .map_err(|e| AppError::Validation(format!("Invalid private key: {}", e)))?;
 
@@ -158,17 +159,19 @@ pub fn verify_signature(
         let date_str = date_header
             .to_str()
             .map_err(|_| AppError::Validation("Invalid Date header".to_string()))?;
-        
+
         // Parse RFC 2822 date format
         let date = DateTime::parse_from_rfc2822(date_str)
             .map_err(|_| AppError::Validation("Invalid Date format".to_string()))?;
-        
+
         let now = Utc::now();
         let diff = (now.timestamp() - date.timestamp()).abs();
-        
+
         if diff > 300 {
             // 5 minutes
-            return Err(AppError::Validation("Date header too old or in future".to_string()));
+            return Err(AppError::Validation(
+                "Date header too old or in future".to_string(),
+            ));
         }
     }
 
@@ -178,7 +181,7 @@ pub fn verify_signature(
             let digest_str = digest_header
                 .to_str()
                 .map_err(|_| AppError::Validation("Invalid Digest header".to_string()))?;
-            
+
             let expected_digest = generate_digest(body_data);
             if digest_str != expected_digest {
                 return Err(AppError::Validation("Digest mismatch".to_string()));
@@ -188,7 +191,7 @@ pub fn verify_signature(
 
     // 4. Reconstruct signing string
     let mut signing_parts = Vec::new();
-    
+
     for header_name in &parsed.headers {
         let value = match header_name.as_str() {
             "(request-target)" => format!("{} {}", method.to_lowercase(), path),
@@ -214,13 +217,13 @@ pub fn verify_signature(
                 return Err(AppError::Validation(format!(
                     "Unsupported header in signature: {}",
                     header_name
-                )))
+                )));
             }
         };
-        
+
         signing_parts.push(format!("{}: {}", header_name, value));
     }
-    
+
     let signing_string = signing_parts.join("\n");
 
     // 5. Verify RSA signature
@@ -234,7 +237,7 @@ pub fn verify_signature(
 
     // Create verifier (use new_unprefixed for compatibility)
     let verifier = rsa::pkcs1v15::VerifyingKey::<Sha256>::new_unprefixed(public_key);
-    
+
     // Parse signature
     let signature = Pkcs1v15Signature::try_from(signature_bytes.as_slice())
         .map_err(|e| AppError::Validation(format!("Invalid signature format: {}", e)))?;
@@ -294,9 +297,11 @@ pub fn parse_signature_header(header: &str) -> Result<ParsedSignature, AppError>
 
     Ok(ParsedSignature {
         key_id: key_id.ok_or_else(|| AppError::Validation("Missing keyId".to_string()))?,
-        algorithm: algorithm.ok_or_else(|| AppError::Validation("Missing algorithm".to_string()))?,
+        algorithm: algorithm
+            .ok_or_else(|| AppError::Validation("Missing algorithm".to_string()))?,
         headers: headers.ok_or_else(|| AppError::Validation("Missing headers".to_string()))?,
-        signature: signature.ok_or_else(|| AppError::Validation("Missing signature".to_string()))?,
+        signature: signature
+            .ok_or_else(|| AppError::Validation("Missing signature".to_string()))?,
     })
 }
 
@@ -355,4 +360,3 @@ pub async fn fetch_public_key(
 
     Ok(public_key_pem.to_string())
 }
-

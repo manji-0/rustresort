@@ -120,8 +120,9 @@ impl ActivityProcessor {
             .and_then(|t| t.as_str())
             .ok_or_else(|| AppError::Validation("Missing activity type".to_string()))?;
 
-        let activity_type = ActivityType::from_str(activity_type_str)
-            .ok_or_else(|| AppError::Validation(format!("Unknown activity type: {}", activity_type_str)))?;
+        let activity_type = ActivityType::from_str(activity_type_str).ok_or_else(|| {
+            AppError::Validation(format!("Unknown activity type: {}", activity_type_str))
+        })?;
 
         // 2. Check if domain is blocked
         let actor_domain = actor_uri
@@ -344,7 +345,9 @@ impl ActivityProcessor {
 
         // Check if the object is our local user
         if !object.contains(&self.local_address) {
-            return Err(AppError::Validation("Follow target is not local user".to_string()));
+            return Err(AppError::Validation(
+                "Follow target is not local user".to_string(),
+            ));
         }
 
         // 2. Get actor's inbox for later Accept delivery
@@ -354,7 +357,9 @@ impl ActivityProcessor {
                 if let Some(actor_str) = a.as_str() {
                     Some(format!("{}/inbox", actor_str))
                 } else {
-                    a.get("inbox").and_then(|i| i.as_str()).map(|s| s.to_string())
+                    a.get("inbox")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
                 }
             })
             .unwrap_or_else(|| format!("{}/inbox", actor_uri));
@@ -419,15 +424,15 @@ impl ActivityProcessor {
     ) -> Result<(), AppError> {
         // 1. Verify we sent the original Follow
         let object = activity.get("object");
-        
+
         // The object should be our Follow activity
         // For now, just log that we received an Accept
         tracing::info!("Received Accept activity: {:?}", object);
-        
+
         // In a full implementation:
         // 2. Mark follow as accepted in DB
         // 3. Fetch actor's recent posts to cache
-        
+
         Ok(())
     }
 
@@ -439,7 +444,7 @@ impl ActivityProcessor {
     ) -> Result<(), AppError> {
         // 1. Get the undone activity
         let object = activity.get("object");
-        
+
         if let Some(obj) = object {
             // Check the type of the undone activity
             if let Some(obj_type) = obj.get("type").and_then(|t| t.as_str()) {
@@ -455,7 +460,7 @@ impl ActivityProcessor {
                         // Could remove notification, but for simplicity just ignore
                         Ok(())
                     }
-                    _ => Ok(())
+                    _ => Ok(()),
                 }
             } else {
                 Ok(())
@@ -642,12 +647,12 @@ impl ActivityProcessor {
     /// Check if status is by local user
     fn is_local_status(&self, status_uri: &str) -> bool {
         // Check if URI contains local domain/address
-        status_uri.contains(&self.local_address) || 
-        status_uri.contains("/users/") && 
-        status_uri.split("://").nth(1).map_or(false, |s| {
-            s.split('/').next().map_or(false, |domain| {
-                self.local_address.ends_with(domain)
-            })
-        })
+        status_uri.contains(&self.local_address)
+            || status_uri.contains("/users/")
+                && status_uri.split("://").nth(1).map_or(false, |s| {
+                    s.split('/')
+                        .next()
+                        .map_or(false, |domain| self.local_address.ends_with(domain))
+                })
     }
 }

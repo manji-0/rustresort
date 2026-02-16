@@ -7,12 +7,12 @@ use axum::{
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::auth::CurrentUser;
+use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
     HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };
-use crate::auth::CurrentUser;
-use crate::error::AppError;
 
 /// Pagination parameters
 #[derive(Debug, Deserialize)]

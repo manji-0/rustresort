@@ -272,7 +272,11 @@ impl StatusService {
     }
 
     /// Repost a status by its persisted database ID
-    pub async fn repost_by_id(&self, status_id: &str, repost_uri: &str) -> Result<Status, AppError> {
+    pub async fn repost_by_id(
+        &self,
+        status_id: &str,
+        repost_uri: &str,
+    ) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
         self.db.insert_repost(status_id, repost_uri).await?;
         Ok(status)

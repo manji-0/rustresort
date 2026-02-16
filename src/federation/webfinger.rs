@@ -71,7 +71,11 @@ pub struct WebFingerLink {
 ///
 /// # Returns
 /// JRD response for the account
-pub fn generate_webfinger_response(username: &str, domain: &str, base_url: &str) -> WebFingerResponse {
+pub fn generate_webfinger_response(
+    username: &str,
+    domain: &str,
+    base_url: &str,
+) -> WebFingerResponse {
     let subject = format!("acct:{}@{}", username, domain);
     let actor_url = format!("{}/users/{}", base_url.trim_end_matches('/'), username);
 
