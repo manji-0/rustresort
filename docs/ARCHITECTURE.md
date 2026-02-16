@@ -94,107 +94,56 @@ See [CLOUDFLARE.md](./CLOUDFLARE.md) for details.
 rustresort/
 ├── Cargo.toml
 ├── config/
-│   └── default.toml          # Default configuration
+│   ├── default.toml          # Default configuration
+│   └── local.toml.example    # Local override template
 ├── docs/
-│   ├── ARCHITECTURE.md       # This file
-│   ├── DATA_MODEL.md         # Data model design
-│   ├── API.md                # API specification
-│   ├── FEDERATION.md         # Federation specification
-│   └── DEVELOPMENT.md        # Development guide
+│   └── ...                   # Specifications and guides
 ├── migrations/               # DB migrations
 ├── src/
 │   ├── main.rs
 │   ├── lib.rs
-│   ├── config/              # Configuration management
-│   │   ├── mod.rs
-│   │   └── settings.rs
-│   ├── models/              # Data models
-│   │   ├── mod.rs
-│   │   ├── account.rs
-│   │   ├── status.rs
-│   │   ├── media.rs
-│   │   ├── notification.rs
-│   │   ├── follow.rs
-│   │   └── ...
-│   ├── db/                  # Database layer
-│   │   ├── mod.rs
-│   │   ├── repository.rs    # Repository pattern
-│   │   ├── account.rs
-│   │   ├── status.rs
-│   │   └── ...
-│   ├── cache/               # Cache layer
-│   │   ├── mod.rs
-│   │   └── account.rs
+│   ├── config.rs            # Configuration structs/loading
+│   ├── error.rs             # Application error type
+│   ├── metrics.rs           # Prometheus metrics
 │   ├── api/                 # API layer
 │   │   ├── mod.rs
-│   │   ├── router.rs
-│   │   ├── client/          # Mastodon-compatible API
-│   │   │   ├── mod.rs
-│   │   │   ├── accounts.rs
-│   │   │   ├── statuses.rs
-│   │   │   ├── timelines.rs
-│   │   │   └── ...
-│   │   ├── activitypub/     # ActivityPub API
-│   │   │   ├── mod.rs
-│   │   │   ├── inbox.rs
-│   │   │   ├── outbox.rs
-│   │   │   ├── actor.rs
-│   │   │   └── ...
-│   │   ├── wellknown/       # Well-known endpoints
-│   │   │   ├── mod.rs
-│   │   │   ├── webfinger.rs
-│   │   │   ├── nodeinfo.rs
-│   │   │   └── hostmeta.rs
-│   │   ├── auth/            # Authentication
-│   │   │   ├── mod.rs
-│   │   │   ├── oauth.rs
-│   │   │   └── middleware.rs
-│   │   └── model/           # API response models
-│   │       ├── mod.rs
-│   │       └── ...
+│   │   ├── mastodon/        # Mastodon-compatible endpoints
+│   │   ├── activitypub.rs
+│   │   ├── oauth.rs
+│   │   ├── wellknown.rs
+│   │   ├── admin.rs
+│   │   ├── metrics.rs
+│   │   ├── dto.rs
+│   │   └── converters.rs
+│   ├── auth/                # Login/session middleware and routes
+│   │   ├── mod.rs
+│   │   ├── oauth.rs
+│   │   ├── middleware.rs
+│   │   └── session.rs
+│   ├── data/                # SQLite + in-memory cache
+│   │   ├── mod.rs
+│   │   ├── database.rs
+│   │   ├── cache.rs
+│   │   ├── models.rs
+│   │   └── database_test.rs
 │   ├── service/             # Business logic layer
 │   │   ├── mod.rs
 │   │   ├── account.rs
 │   │   ├── status.rs
-│   │   ├── timeline.rs
-│   │   ├── media.rs
-│   │   ├── notification.rs
-│   │   └── ...
+│   │   └── timeline.rs
 │   ├── federation/          # Federation layer
 │   │   ├── mod.rs
-│   │   ├── federator.rs     # Federation management
-│   │   ├── dereferencing/   # Remote resource fetching
-│   │   │   ├── mod.rs
-│   │   │   ├── account.rs
-│   │   │   └── status.rs
-│   │   ├── delivery/        # Activity delivery
-│   │   │   ├── mod.rs
-│   │   │   └── worker.rs
-│   │   └── protocol/        # ActivityPub protocol
-│   │       ├── mod.rs
-│   │       ├── activities.rs
-│   │       ├── actors.rs
-│   │       └── objects.rs
-│   ├── transport/           # HTTP transport
-│   │   ├── mod.rs
-│   │   ├── client.rs        # HTTP client
-│   │   └── signature.rs     # HTTP signatures
-│   ├── media/               # Media processing
-│   │   ├── mod.rs
-│   │   ├── processor.rs
-│   │   └── storage.rs
-│   ├── queue/               # Background jobs
-│   │   ├── mod.rs
-│   │   └── worker.rs
-│   ├── state/               # Application state
-│   │   └── mod.rs
-│   └── util/                # Utilities
+│   │   ├── activity.rs
+│   │   ├── delivery.rs
+│   │   ├── signature.rs
+│   │   ├── key_cache.rs
+│   │   ├── rate_limit.rs
+│   │   └── webfinger.rs
+│   └── storage/             # R2 media + backup services
 │       ├── mod.rs
-│       ├── id.rs            # ULID generation
-│       └── time.rs
-└── tests/
-    ├── integration/
-    └── fixtures/
+│       ├── media.rs
+│       └── backup.rs
+└── tests/                   # Integration/e2e/schema tests
 ```
 
 ## Layer Responsibilities
@@ -207,49 +156,54 @@ rustresort/
 - Response serialization
 
 **Submodules:**
-- `client/`: Mastodon API-compatible endpoints
-- `activitypub/`: ActivityPub protocol endpoints
-- `wellknown/`: `.well-known` endpoints
-- `auth/`: OAuth2 authentication
+- `mastodon/`: Mastodon API-compatible endpoints
+- `activitypub.rs`: ActivityPub protocol endpoints
+- `wellknown.rs`: `.well-known` endpoints
+- `oauth.rs`: OAuth token/authorization endpoints
 
-### 2. Service Layer (`src/service/`)
+### 2. Auth Layer (`src/auth/`)
+
+- Login/session routes
+- Authentication middleware
+- Session model
+
+### 3. Service Layer (`src/service/`)
 
 - Business logic implementation
 - Transaction management
 - Multi-repository coordination
 - Event publishing
 
-### 3. Federation Layer (`src/federation/`)
+### 4. Federation Layer (`src/federation/`)
 
 - ActivityPub protocol processing
 - Remote actor/object fetching (dereferencing)
 - Activity delivery
 - Federation policy enforcement
 
-### 4. Data Layer (`src/db/`, `src/cache/`)
+### 5. Data Layer (`src/data/`)
 
-- Data persistence
-- Cache management
+- SQLite persistence
+- Timeline/profile cache management
 - Query optimization
 
-### 5. Transport Layer (`src/transport/`)
+### 6. Storage Layer (`src/storage/`)
 
-- HTTP communication
-- HTTP Signatures
-- Retry handling
+- Cloudflare R2 media object operations
+- Scheduled backup upload and retention
 
 ## Dependency Injection and State Management
 
 ```rust
 /// Shared application state
 pub struct AppState {
-    pub config: Arc<Config>,
-    pub db: Arc<DbPool>,
-    pub cache: Arc<Cache>,
-    pub storage: Arc<dyn MediaStorage>,
-    pub http_client: Arc<HttpClient>,
-    pub federator: Arc<Federator>,
-    pub queue: Arc<Queue>,
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub storage: Arc<storage::MediaStorage>,
+    pub backup: Arc<storage::BackupService>,
+    pub http_client: Arc<reqwest::Client>,
 }
 ```
 
@@ -292,42 +246,33 @@ impl IntoResponse for AppError {
 
 ## Async Processing Model
 
-Inspired by GoToSocial's worker pattern, implements Tokio-based background job system:
+RustResort uses Tokio throughout the request and background execution paths:
 
 ```rust
-/// Worker task types
-pub enum WorkerTask {
-    /// Deliver activity
-    DeliverActivity {
-        activity: Activity,
-        inbox_urls: Vec<String>,
-    },
-    /// Fetch/update remote account
-    FetchRemoteAccount {
-        uri: String,
-    },
-    /// Process media
-    ProcessMedia {
-        attachment_id: String,
-    },
+if config.storage.backup.enabled {
+    spawn_backup_task(state.clone());
 }
 ```
 
+- API handlers are async and run on Axum/Tokio.
+- Federation delivery fans out with bounded concurrency in `src/federation/delivery.rs`.
+- Backup scheduling uses a periodic Tokio task in `src/main.rs`.
+
 ## Security Considerations
 
-1. **HTTP Signatures**: Require signatures on all ActivityPub requests
-2. **Input Validation**: Strict validation of all inputs
-3. **Rate Limiting**: Rate limiting via Tower middleware
-4. **CORS**: Proper CORS configuration
-5. **CSP**: Content Security Policy
+1. **HTTP Signatures**: Outbound federation requests are signed (`src/federation/signature.rs`).
+2. **Authentication Middleware**: Protected API routes use auth middleware (`src/auth/middleware.rs`).
+3. **CORS Policy**: CORS is derived from configured protocol/domain (`src/lib.rs`).
+4. **Typed DTOs**: API request/response models reduce parsing ambiguity (`src/api/dto.rs`).
+5. **Incremental Hardening**: Some auth/security flows are intentionally marked as in progress.
 
 ## Performance Optimizations
 
-1. **Connection Pooling**: DB connection pooling
-2. **Caching**: Memory cache for frequently accessed data
-3. **Lazy Loading**: Load related data only when needed
-4. **Batch Processing**: Bulk delivery processing
-5. **Async I/O**: All I/O operations are async
+1. **Connection Pooling**: SQLite access through a shared SQLx pool.
+2. **In-Memory Caching**: Dedicated timeline/profile caches in `src/data/cache.rs`.
+3. **Parallel Delivery**: Federation delivery runs concurrently with semaphore limits.
+4. **Parallel Startup Fetching**: Profile cache warm-up uses parallel fetch calls.
+5. **Async I/O**: Database, HTTP, and storage operations are async.
 
 ## Next Steps
 

@@ -221,7 +221,7 @@ You can use any Mastodon-compatible client:
 2. Authorize the application
 3. Start posting!
 
-## � Configuration
+## Configuration
 
 ### Environment Variables
 
@@ -246,6 +246,12 @@ export RUSTRESORT__DATABASE__PATH=data/rustresort.db
 export RUSTRESORT__LOGGING__LEVEL=info
 export RUSTRESORT__LOGGING__FORMAT=json
 
+# Auth (GitHub OAuth config)
+export RUSTRESORT__AUTH__GITHUB_USERNAME=your-github-username
+export RUSTRESORT__AUTH__SESSION_SECRET=your-session-secret
+export RUSTRESORT__AUTH__GITHUB__CLIENT_ID=your-github-client-id
+export RUSTRESORT__AUTH__GITHUB__CLIENT_SECRET=your-github-client-secret
+
 # Cloudflare R2
 export CLOUDFLARE_ACCOUNT_ID=your-account-id
 export R2_ACCESS_KEY_ID=your-access-key
@@ -267,8 +273,8 @@ Configuration is loaded in this order (later overrides earlier):
 cargo test
 
 # Run specific test suite
-cargo test e2e_account
-cargo test federation
+cargo test --test e2e_account
+cargo test --test e2e_federation_scenarios
 
 # Run with output
 cargo test -- --nocapture
