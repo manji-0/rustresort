@@ -271,6 +271,20 @@ impl StatusService {
         Ok(status)
     }
 
+    /// Repost a status by its persisted database ID
+    pub async fn repost_by_id(&self, status_id: &str, repost_uri: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.insert_repost(status_id, repost_uri).await?;
+        Ok(status)
+    }
+
+    /// Undo repost for a status by its persisted database ID
+    pub async fn unrepost_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        self.db.delete_repost(status_id).await?;
+        Ok(status)
+    }
+
     /// Check whether status is favourited
     pub async fn is_favourited(&self, status_id: &str) -> Result<bool, AppError> {
         self.db.is_favourited(status_id).await
@@ -279,5 +293,10 @@ impl StatusService {
     /// Check whether status is bookmarked
     pub async fn is_bookmarked(&self, status_id: &str) -> Result<bool, AppError> {
         self.db.is_bookmarked(status_id).await
+    }
+
+    /// Check whether status is reposted
+    pub async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError> {
+        self.db.is_reposted(status_id).await
     }
 }

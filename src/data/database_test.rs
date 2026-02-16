@@ -252,6 +252,46 @@ async fn test_bookmark_operations() {
 }
 
 #[tokio::test]
+async fn test_repost_operations() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    // Create a status first (required for foreign key)
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/repost".to_string(),
+        content: "<p>Test</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let status_id = &status.id;
+
+    // Initially not reposted
+    assert!(!db.is_reposted(status_id).await.unwrap());
+
+    // Insert repost
+    db.insert_repost(status_id, "https://example.com/activity/repost")
+        .await
+        .unwrap();
+
+    // Now reposted
+    assert!(db.is_reposted(status_id).await.unwrap());
+
+    // Delete repost
+    db.delete_repost(status_id).await.unwrap();
+    assert!(!db.is_reposted(status_id).await.unwrap());
+}
+
+#[tokio::test]
 async fn test_bookmarked_statuses_order_and_cursor_by_bookmark_time() {
     let (db, _temp_dir) = create_test_db().await;
 

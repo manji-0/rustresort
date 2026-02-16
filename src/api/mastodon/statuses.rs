@@ -191,6 +191,7 @@ pub async fn get_status(
 
     // Check if favourited/reblogged/bookmarked
     let favourited = status_service.is_favourited(&id).await.ok();
+    let reblogged = status_service.is_reposted(&id).await.ok();
     let bookmarked = status_service.is_bookmarked(&id).await.ok();
 
     // Convert to API response
@@ -199,7 +200,7 @@ pub async fn get_status(
         &account,
         &state.config,
         favourited,
-        Some(false), // reblogged - TODO: implement
+        reblogged,
         bookmarked,
     );
 
@@ -442,8 +443,11 @@ pub async fn reblog_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::EntityId;
 
-    // Get original status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -457,16 +461,16 @@ pub async fn reblog_status(
         repost_id
     );
 
-    state.db.insert_repost(&id, &repost_uri).await?;
+    let status = status_service.repost_by_id(&id, &repost_uri).await?;
 
     // Return the original status with reblogged=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(true),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -478,23 +482,26 @@ pub async fn unreblog_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+    );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Remove repost
-    state.db.delete_repost(&id).await?;
+    let status = status_service.unrepost_by_id(&id).await?;
 
     // Return status with reblogged=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))

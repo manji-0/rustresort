@@ -938,6 +938,16 @@ impl Database {
         Ok(())
     }
 
+    /// Check if status is reposted
+    pub async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reposts WHERE status_id = ?")
+            .bind(status_id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(count > 0)
+    }
+
     // =========================================================================
     // Domain blocks
     // =========================================================================
