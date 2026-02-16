@@ -184,6 +184,7 @@ async fn inbox(
         state.profile_cache.clone(),
         state.http_client.clone(),
         local_address,
+        state.config.server.protocol.clone(),
     );
 
     processor.process(activity, &actor_id).await?;
@@ -250,6 +251,7 @@ async fn shared_inbox(
         state.profile_cache.clone(),
         state.http_client.clone(),
         local_address,
+        state.config.server.protocol.clone(),
     );
 
     processor.process(activity, &actor_id).await?;

@@ -14,8 +14,10 @@ use crate::error::AppError;
 /// Accepted forms:
 /// - `username@domain[:port]`
 /// - `acct:username@domain[:port]`
-/// - `https://domain[:port]/users/username` (with optional trailing slash)
-/// - `https://domain[:port]/@username` (with optional trailing slash)
+/// - `<protocol>://domain[:port]/users/username` (with optional trailing slash)
+/// - `<protocol>://domain[:port]/@username` (with optional trailing slash)
+///
+/// `protocol` must match the local instance protocol (`http` or `https`).
 fn default_port_for_scheme(scheme: &str) -> Option<u16> {
     match scheme {
         "http" => Some(80),
@@ -30,7 +32,19 @@ fn parse_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
     Some((host, parsed.port()))
 }
 
-fn is_local_follow_target(local_address: &str, object: &str) -> bool {
+fn extract_follow_target(activity: &serde_json::Value) -> Result<String, AppError> {
+    let object = activity
+        .get("object")
+        .ok_or_else(|| AppError::Validation("Missing object in Follow".to_string()))?;
+
+    object
+        .as_str()
+        .or_else(|| object.get("id").and_then(|id| id.as_str()))
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Validation("Invalid object in Follow".to_string()))
+}
+
+fn is_local_follow_target(local_address: &str, local_protocol: &str, object: &str) -> bool {
     let object = object.trim();
     if object.is_empty() {
         return false;
@@ -40,10 +54,12 @@ fn is_local_follow_target(local_address: &str, object: &str) -> bool {
         return true;
     }
 
-    if let Some(acct) = object.strip_prefix("acct:") {
-        if acct.eq_ignore_ascii_case(local_address) {
-            return true;
-        }
+    if object
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("acct:"))
+    {
+        let acct = &object[5..];
+        return acct.eq_ignore_ascii_case(local_address);
     }
 
     let Some((local_username, local_domain)) = local_address.split_once('@') else {
@@ -56,7 +72,15 @@ fn is_local_follow_target(local_address: &str, object: &str) -> bool {
     let Ok(parsed) = url::Url::parse(object) else {
         return false;
     };
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let local_scheme = if local_protocol.eq_ignore_ascii_case("http") {
+        "http"
+    } else if local_protocol.eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        return false;
+    };
+
+    if parsed.scheme() != local_scheme {
         return false;
     }
 
@@ -80,8 +104,7 @@ fn is_local_follow_target(local_address: &str, object: &str) -> bool {
     }
 
     let path = parsed.path().trim_end_matches('/');
-    path.eq_ignore_ascii_case(&format!("/users/{}", local_username))
-        || path.eq_ignore_ascii_case(&format!("/@{}", local_username))
+    path == format!("/users/{}", local_username) || path == format!("/@{}", local_username)
 }
 
 /// ActivityPub Activity types
@@ -140,6 +163,8 @@ pub struct ActivityProcessor {
     http_client: Arc<reqwest::Client>,
     /// Local account address for comparison
     local_address: String,
+    /// Local instance protocol
+    local_protocol: String,
     /// Activity delivery service for sending responses
     delivery: Option<Arc<super::ActivityDelivery>>,
 }
@@ -152,6 +177,7 @@ impl ActivityProcessor {
         profile_cache: Arc<ProfileCache>,
         http_client: Arc<reqwest::Client>,
         local_address: String,
+        local_protocol: String,
     ) -> Self {
         Self {
             db,
@@ -159,6 +185,7 @@ impl ActivityProcessor {
             profile_cache,
             http_client,
             local_address,
+            local_protocol,
             delivery: None,
         }
     }
@@ -413,17 +440,10 @@ impl ActivityProcessor {
         actor_uri: &str,
     ) -> Result<(), AppError> {
         // 1. Verify target is local user
-        let object = activity
-            .get("object")
-            .ok_or_else(|| AppError::Validation("Missing object in Follow".to_string()))?;
-
-        let target = object
-            .as_str()
-            .or_else(|| object.get("id").and_then(|id| id.as_str()))
-            .ok_or_else(|| AppError::Validation("Invalid object in Follow".to_string()))?;
+        let target = extract_follow_target(&activity)?;
 
         // Check if the object references our local actor.
-        if !is_local_follow_target(&self.local_address, target) {
+        if !is_local_follow_target(&self.local_address, &self.local_protocol, &target) {
             return Err(AppError::Validation(
                 "Follow target is not local user".to_string(),
             ));
@@ -738,32 +758,50 @@ impl ActivityProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_follow_target;
+    use super::{extract_follow_target, is_local_follow_target};
+    use serde_json::json;
 
     #[test]
     fn is_local_follow_target_accepts_local_address_forms() {
         let local = "alice@example.com";
+        let protocol = "https";
 
-        assert!(is_local_follow_target(local, "alice@example.com"));
-        assert!(is_local_follow_target(local, "acct:alice@example.com"));
-        assert!(is_local_follow_target(local, "acct:ALICE@EXAMPLE.COM"));
+        assert!(is_local_follow_target(local, protocol, "alice@example.com"));
+        assert!(is_local_follow_target(
+            local,
+            protocol,
+            "acct:alice@example.com"
+        ));
+        assert!(is_local_follow_target(
+            local,
+            protocol,
+            "ACCT:ALICE@EXAMPLE.COM"
+        ));
     }
 
     #[test]
     fn is_local_follow_target_accepts_local_actor_uri_forms() {
         let local = "alice@example.com";
+        let protocol = "https";
 
         assert!(is_local_follow_target(
             local,
+            protocol,
             "https://example.com/users/alice"
         ));
         assert!(is_local_follow_target(
             local,
+            protocol,
             "https://example.com/users/alice/"
         ));
-        assert!(is_local_follow_target(local, "https://example.com/@alice"));
         assert!(is_local_follow_target(
             local,
+            protocol,
+            "https://example.com/@alice"
+        ));
+        assert!(is_local_follow_target(
+            local,
+            protocol,
             "https://example.com:443/users/alice"
         ));
     }
@@ -771,46 +809,118 @@ mod tests {
     #[test]
     fn is_local_follow_target_accepts_and_enforces_configured_port() {
         let local = "alice@localhost:3000";
+        let protocol = "http";
 
         assert!(is_local_follow_target(
             local,
+            protocol,
             "http://localhost:3000/users/alice"
         ));
         assert!(is_local_follow_target(
             local,
+            protocol,
             "http://localhost:3000/@alice/"
         ));
         assert!(!is_local_follow_target(
             local,
+            protocol,
             "http://localhost/users/alice"
         ));
         assert!(!is_local_follow_target(
             local,
+            protocol,
             "http://localhost:3001/users/alice"
+        ));
+        assert!(!is_local_follow_target(
+            local,
+            protocol,
+            "https://localhost:3000/users/alice"
+        ));
+    }
+
+    #[test]
+    fn is_local_follow_target_enforces_configured_protocol() {
+        let local = "alice@example.com";
+
+        assert!(is_local_follow_target(
+            local,
+            "http",
+            "http://example.com/users/alice"
+        ));
+        assert!(!is_local_follow_target(
+            local,
+            "https",
+            "http://example.com/users/alice"
         ));
     }
 
     #[test]
     fn is_local_follow_target_rejects_other_users_or_domains() {
         let local = "alice@example.com";
+        let protocol = "https";
 
         assert!(!is_local_follow_target(
             local,
+            protocol,
             "https://example.com/users/bob"
         ));
         assert!(!is_local_follow_target(
             local,
+            protocol,
             "https://evil.example/users/alice"
         ));
         assert!(!is_local_follow_target(
             local,
+            protocol,
             "https://example.com:8443/users/alice"
         ));
-        assert!(!is_local_follow_target(local, "acct:bob@example.com"));
         assert!(!is_local_follow_target(
             local,
+            protocol,
+            "acct:bob@example.com"
+        ));
+        assert!(!is_local_follow_target(
+            local,
+            protocol,
             "ftp://example.com/users/alice"
         ));
-        assert!(!is_local_follow_target(local, ""));
+        assert!(!is_local_follow_target(
+            local,
+            protocol,
+            "https://example.com/users/ALICE"
+        ));
+        assert!(!is_local_follow_target(local, protocol, ""));
+    }
+
+    #[test]
+    fn extract_follow_target_accepts_string_and_object_id_forms() {
+        let string_object = json!({
+            "object": "https://example.com/users/alice"
+        });
+        let object_id = json!({
+            "object": {
+                "id": "https://example.com/users/alice"
+            }
+        });
+
+        assert_eq!(
+            extract_follow_target(&string_object).unwrap(),
+            "https://example.com/users/alice"
+        );
+        assert_eq!(
+            extract_follow_target(&object_id).unwrap(),
+            "https://example.com/users/alice"
+        );
+    }
+
+    #[test]
+    fn extract_follow_target_rejects_missing_or_invalid_object() {
+        let missing = json!({});
+        let empty_object = json!({ "object": {} });
+        let non_string_id = json!({ "object": { "id": 123 } });
+
+        assert!(extract_follow_target(&missing).is_err());
+        assert!(extract_follow_target(&empty_object).is_err());
+        assert!(extract_follow_target(&non_string_id).is_err());
     }
 }
