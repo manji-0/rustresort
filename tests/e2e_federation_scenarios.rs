@@ -548,7 +548,6 @@ async fn test_reply_chain_context() {
 
 // =============================================================================
 // Scenario 6: Inbox Processing (Signature validation)
-// These tests are ignored since signature verification is not yet implemented
 // =============================================================================
 
 /// Test that inbox rejects unsigned requests
