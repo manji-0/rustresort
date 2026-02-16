@@ -29,7 +29,7 @@ async fn test_actor_endpoint() {
 }
 
 #[tokio::test]
-async fn test_inbox_endpoint() {
+async fn test_inbox_endpoint_rejects_unsigned_activity() {
     let server = TestServer::new().await;
     server.create_test_account().await;
 
@@ -50,9 +50,10 @@ async fn test_inbox_endpoint() {
         .await
         .unwrap();
 
-    // Should accept activity (may require HTTP signature in real implementation)
-    // For now, just verify endpoint exists
-    assert!(response.status().is_client_error() || response.status().is_success());
+    assert!(
+        response.status() == 401 || response.status() == 403,
+        "Unsigned inbox request should be rejected"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +213,7 @@ async fn test_unlisted_status_activity_audience() {
 }
 
 #[tokio::test]
-async fn test_shared_inbox() {
+async fn test_shared_inbox_rejects_unsigned_activity() {
     let server = TestServer::new().await;
 
     let activity = serde_json::json!({
@@ -234,8 +235,10 @@ async fn test_shared_inbox() {
         .await
         .unwrap();
 
-    // Should accept activity at shared inbox
-    assert!(response.status().is_client_error() || response.status().is_success());
+    assert!(
+        response.status() == 401 || response.status() == 403,
+        "Unsigned shared inbox request should be rejected"
+    );
 }
 
 #[tokio::test]
