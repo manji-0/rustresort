@@ -1163,13 +1163,14 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO oauth_tokens (
-                id, app_id, access_token, scopes, created_at, revoked
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                id, app_id, access_token, grant_type, scopes, created_at, revoked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&token.id)
         .bind(&token.app_id)
         .bind(&token.access_token)
+        .bind(&token.grant_type)
         .bind(&token.scopes)
         .bind(&token.created_at)
         .bind(token.revoked)
