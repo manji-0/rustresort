@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use crate::data::{Database, ProfileCache, TimelineCache};
+use chrono::{DateTime, Utc};
+
+use crate::data::{CachedAttachment, CachedStatus, Database, ProfileCache, TimelineCache};
 use crate::error::AppError;
 
 /// Return true when a Follow target references the local actor.
@@ -28,8 +30,107 @@ fn default_port_for_scheme(scheme: &str) -> Option<u16> {
 
 fn parse_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
     let parsed = url::Url::parse(&format!("http://{}", authority)).ok()?;
-    let host = parsed.host_str()?.to_string();
-    Some((host, parsed.port()))
+    let host = parsed.host_str()?;
+    let normalized_host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Some((normalized_host, parsed.port()))
+}
+
+fn format_authority_host(host: &str) -> String {
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    if bare_host.contains(':') {
+        format!("[{}]", bare_host)
+    } else {
+        bare_host.to_string()
+    }
+}
+
+fn push_unique_domain_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn append_domain_candidates(candidates: &mut Vec<String>, host: &str, port: Option<u16>) {
+    let normalized_host = host.to_ascii_lowercase();
+    push_unique_domain_candidate(candidates, normalized_host.clone());
+
+    if normalized_host.contains(':') {
+        let bracketed_host = format_authority_host(&normalized_host);
+        push_unique_domain_candidate(candidates, bracketed_host.clone());
+        if let Some(port) = port {
+            push_unique_domain_candidate(candidates, format!("{}:{}", normalized_host, port));
+            push_unique_domain_candidate(candidates, format!("{}:{}", bracketed_host, port));
+        }
+        return;
+    }
+
+    if let Some(port) = port {
+        push_unique_domain_candidate(candidates, format!("{}:{}", normalized_host, port));
+    }
+}
+
+fn extract_username_from_actor_path(path: &str) -> Option<&str> {
+    let mut parts = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    let first_segment = parts.next()?;
+
+    if let Some(username) = first_segment.strip_prefix('@') {
+        return (!username.is_empty()).then_some(username);
+    }
+
+    if first_segment.eq_ignore_ascii_case("users")
+        || first_segment.eq_ignore_ascii_case("accounts")
+        || first_segment.eq_ignore_ascii_case("u")
+        || first_segment.eq_ignore_ascii_case("profile")
+    {
+        let username = parts.next()?;
+        return (!username.is_empty()).then_some(username);
+    }
+
+    None
+}
+
+fn parse_account_address(address: &str) -> Option<(String, String, Option<u16>)> {
+    let (username, domain) = address.split_once('@')?;
+    let (host, port) = parse_host_and_port(domain)?;
+    Some((
+        username.to_ascii_lowercase(),
+        host.to_ascii_lowercase(),
+        port,
+    ))
+}
+
+fn follow_addresses_match(
+    actor_address: &str,
+    follow_address: &str,
+    actor_scheme: Option<&str>,
+) -> bool {
+    let Some((actor_user, actor_host, actor_port)) = parse_account_address(actor_address) else {
+        return actor_address.eq_ignore_ascii_case(follow_address);
+    };
+    let Some((follow_user, follow_host, follow_port)) = parse_account_address(follow_address)
+    else {
+        return actor_address.eq_ignore_ascii_case(follow_address);
+    };
+
+    if actor_user != follow_user || !actor_host.eq_ignore_ascii_case(&follow_host) {
+        return false;
+    }
+
+    if let Some(default_port) = actor_scheme.and_then(default_port_for_scheme) {
+        return actor_port.unwrap_or(default_port) == follow_port.unwrap_or(default_port);
+    }
+
+    actor_port == follow_port
+}
+
+fn sanitize_remote_html(content: &str) -> String {
+    ammonia::clean(content)
 }
 
 fn extract_follow_target(activity: &serde_json::Value) -> Result<String, AppError> {
@@ -42,6 +143,60 @@ fn extract_follow_target(activity: &serde_json::Value) -> Result<String, AppErro
         .or_else(|| object.get("id").and_then(|id| id.as_str()))
         .map(str::to_string)
         .ok_or_else(|| AppError::Validation("Invalid object in Follow".to_string()))
+}
+
+fn extract_delete_target_uri(activity: &serde_json::Value) -> Option<String> {
+    let object = activity.get("object")?;
+
+    if let Some(uri) = object.as_str() {
+        return Some(uri.to_string());
+    }
+
+    let is_tombstone = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("Tombstone"));
+
+    if is_tombstone {
+        return object
+            .get("object")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| object.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string);
+    }
+
+    object
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| object.get("object").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+fn actor_domains_for_blocklist(actor_uri: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(parsed) = url::Url::parse(actor_uri) {
+        if let Some(host) = parsed.host_str() {
+            append_domain_candidates(&mut candidates, host, parsed.port());
+        }
+        return candidates;
+    }
+
+    let Some(authority) = actor_uri
+        .split("://")
+        .nth(1)
+        .and_then(|v| v.split('/').next())
+    else {
+        return candidates;
+    };
+    let authority = authority.to_ascii_lowercase();
+    push_unique_domain_candidate(&mut candidates, authority.clone());
+
+    if let Some((host, port)) = parse_host_and_port(&authority) {
+        append_domain_candidates(&mut candidates, &host, port);
+    }
+
+    candidates
 }
 
 fn is_local_follow_target(local_address: &str, local_protocol: &str, object: &str) -> bool {
@@ -227,19 +382,35 @@ impl ActivityProcessor {
         })?;
 
         // 2. Check if domain is blocked
-        let actor_domain = actor_uri
-            .split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("");
-
-        if self.db.is_domain_blocked(actor_domain).await? {
+        let mut actor_is_blocked = false;
+        for candidate in actor_domains_for_blocklist(actor_uri) {
+            if self.db.is_domain_blocked(&candidate).await? {
+                actor_is_blocked = true;
+                break;
+            }
+        }
+        if actor_is_blocked {
             return Err(AppError::Forbidden);
         }
 
-        // 3. Dispatch to type-specific handler
+        let actor_is_followee = if activity_type == ActivityType::Create {
+            self.is_followee(actor_uri).await
+        } else {
+            false
+        };
+
+        // 3. Decide whether this activity should be handled at all.
+        let persistence_decision = self.decide_persistence(&activity, actor_is_followee);
+        if persistence_decision == PersistenceDecision::Ignore {
+            return Ok(());
+        }
+
+        // 4. Dispatch to type-specific handler
         match activity_type {
-            ActivityType::Create => self.handle_create(activity, actor_uri).await,
+            ActivityType::Create => {
+                self.handle_create(activity, actor_uri, persistence_decision)
+                    .await
+            }
             ActivityType::Update => self.handle_update(activity, actor_uri).await,
             ActivityType::Delete => self.handle_delete(activity, actor_uri).await,
             ActivityType::Follow => self.handle_follow(activity, actor_uri).await,
@@ -255,7 +426,11 @@ impl ActivityProcessor {
     /// Determine how to handle an activity
     ///
     /// Based on activity type and relevance to local user.
-    fn decide_persistence(&self, activity: &serde_json::Value) -> PersistenceDecision {
+    fn decide_persistence(
+        &self,
+        activity: &serde_json::Value,
+        actor_is_followee: bool,
+    ) -> PersistenceDecision {
         // Get activity type
         let activity_type = activity
             .get("type")
@@ -308,10 +483,17 @@ impl ActivityProcessor {
                             return PersistenceDecision::Persist;
                         }
                     }
-                    // Create from followee -> CacheOnly (future enhancement)
-                    // For now, we don't cache
+                    // Create from followee -> CacheOnly
+                    if actor_is_followee {
+                        return PersistenceDecision::CacheOnly;
+                    }
                 }
                 PersistenceDecision::Ignore
+            }
+            Some(ActivityType::Delete) => {
+                // Deletes should always be processed.
+                // Ownership is verified in handle_delete().
+                PersistenceDecision::CacheOnly
             }
             Some(ActivityType::Accept) => {
                 // Accept of our Follow -> Persist
@@ -337,6 +519,7 @@ impl ActivityProcessor {
         &self,
         activity: serde_json::Value,
         actor_uri: &str,
+        persistence_decision: PersistenceDecision,
     ) -> Result<(), AppError> {
         // 1. Extract object (Note, etc.)
         let object = activity
@@ -356,9 +539,12 @@ impl ActivityProcessor {
 
         // Extract actor address
         let actor_address = self.extract_actor_address(actor_uri);
+        let should_persist_notification =
+            matches!(persistence_decision, PersistenceDecision::Persist);
+        let should_cache_status = matches!(persistence_decision, PersistenceDecision::CacheOnly);
 
         // 3. Check for mentions -> create notification
-        if self.mentions_local_user(object) {
+        if should_persist_notification && self.mentions_local_user(object) {
             // Get the status URI
             let status_uri = object
                 .get("id")
@@ -379,32 +565,65 @@ impl ActivityProcessor {
         }
 
         // 4. Check if reply to our post -> create notification
-        if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str()) {
-            if self.is_local_status(in_reply_to) {
-                // Get the status URI
-                let status_uri = object
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
+        if should_persist_notification {
+            if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str()) {
+                if self.is_local_status(in_reply_to) {
+                    // Get the status URI
+                    let status_uri = object
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string());
 
-                // Create reply notification (if not already created as mention)
-                if !self.mentions_local_user(object) {
-                    let notification = crate::data::Notification {
-                        id: crate::data::EntityId::new().0,
-                        notification_type: "mention".to_string(), // Replies are also mentions
-                        origin_account_address: actor_address,
-                        status_uri,
-                        read: false,
-                        created_at: chrono::Utc::now(),
-                    };
+                    // Create reply notification (if not already created as mention)
+                    if !self.mentions_local_user(object) {
+                        let notification = crate::data::Notification {
+                            id: crate::data::EntityId::new().0,
+                            notification_type: "mention".to_string(), // Replies are also mentions
+                            origin_account_address: actor_address.clone(),
+                            status_uri,
+                            read: false,
+                            created_at: chrono::Utc::now(),
+                        };
 
-                    self.db.insert_notification(&notification).await?;
+                        self.db.insert_notification(&notification).await?;
+                    }
                 }
             }
         }
 
-        // 2. Check if from followee -> add to cache (future enhancement)
-        // For now, we don't implement timeline caching
+        // 5. Cache followee posts without persisting to DB.
+        if should_cache_status {
+            if let Some(status_uri) = object.get("id").and_then(|id| id.as_str()) {
+                let created_at = object
+                    .get("published")
+                    .and_then(|published| published.as_str())
+                    .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
+                    .map(|timestamp| timestamp.with_timezone(&Utc))
+                    .unwrap_or_else(Utc::now);
+                let sanitized_content = sanitize_remote_html(
+                    object
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .unwrap_or_default(),
+                );
+
+                let cached = CachedStatus {
+                    id: status_uri.to_string(),
+                    uri: status_uri.to_string(),
+                    content: sanitized_content,
+                    account_address: actor_address,
+                    created_at,
+                    visibility: self.extract_visibility(object),
+                    attachments: self.extract_cached_attachments(object),
+                    reply_to_uri: object
+                        .get("inReplyTo")
+                        .and_then(|reply| reply.as_str())
+                        .map(str::to_string),
+                    boost_of_uri: None,
+                };
+                self.timeline_cache.insert(cached).await;
+            }
+        }
 
         Ok(())
     }
@@ -424,12 +643,52 @@ impl ActivityProcessor {
     /// Handle Delete activity
     async fn handle_delete(
         &self,
-        _activity: serde_json::Value,
-        _actor_uri: &str,
+        activity: serde_json::Value,
+        actor_uri: &str,
     ) -> Result<(), AppError> {
-        // For single-user instance with minimal persistence,
-        // we don't need to track deletions extensively
-        // Cache invalidation would go here in a full implementation
+        let deleted_uri = extract_delete_target_uri(&activity);
+
+        if let Some(uri) = deleted_uri {
+            let actor_address = self.extract_actor_address(actor_uri);
+            let actor_scheme = url::Url::parse(actor_uri)
+                .ok()
+                .map(|url| url.scheme().to_ascii_lowercase());
+
+            if let Some(cached_status) = self.timeline_cache.get_by_uri(&uri).await {
+                if follow_addresses_match(
+                    &actor_address,
+                    &cached_status.account_address,
+                    actor_scheme.as_deref(),
+                ) {
+                    self.timeline_cache.remove_by_uri(&uri).await;
+                } else {
+                    tracing::debug!(
+                        "Delete actor {} does not own cached status {}, ignoring",
+                        actor_address,
+                        uri
+                    );
+                }
+            }
+
+            if let Some(status) = self.db.get_status_by_uri(&uri).await? {
+                if !status.is_local
+                    && follow_addresses_match(
+                        &actor_address,
+                        &status.account_address,
+                        actor_scheme.as_deref(),
+                    )
+                {
+                    self.db.delete_status(&status.id).await?;
+                } else if !status.is_local {
+                    tracing::debug!(
+                        "Delete actor {} does not own persisted status {}, ignoring",
+                        actor_address,
+                        uri
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -541,6 +800,11 @@ impl ActivityProcessor {
         activity: serde_json::Value,
         actor_uri: &str,
     ) -> Result<(), AppError> {
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+
         // 1. Get the undone activity
         let object = activity.get("object");
 
@@ -549,10 +813,48 @@ impl ActivityProcessor {
             if let Some(obj_type) = obj.get("type").and_then(|t| t.as_str()) {
                 match obj_type {
                     "Follow" => {
-                        // Remove from followers
-                        let actor_address = self.extract_actor_address(actor_uri);
-                        // Note: We'd need a delete_follower method in DB
-                        tracing::info!("Unfollowed by {}", actor_address);
+                        let Ok(target) = extract_follow_target(obj) else {
+                            tracing::debug!("Undo Follow missing target object, ignoring");
+                            return Ok(());
+                        };
+                        if !is_local_follow_target(
+                            &self.local_address,
+                            &self.local_protocol,
+                            &target,
+                        ) {
+                            tracing::debug!("Undo Follow target is not local actor, ignoring");
+                            return Ok(());
+                        }
+
+                        if let Some(follow_uri) = obj.get("id").and_then(|id| id.as_str()) {
+                            let removed = self
+                                .db
+                                .delete_follower_by_address_and_uri(
+                                    &actor_address,
+                                    follow_uri,
+                                    actor_default_port,
+                                )
+                                .await?;
+                            if removed {
+                                tracing::info!(
+                                    "Unfollowed by {} via Follow activity URI {}",
+                                    actor_address,
+                                    follow_uri
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "Undo Follow id did not match follower row for actor {}, uri {}",
+                                    actor_address,
+                                    follow_uri
+                                );
+                            }
+                        } else {
+                            // Fallback for minimal Undo payloads that omit Follow.id.
+                            self.db
+                                .delete_follower(&actor_address, actor_default_port)
+                                .await?;
+                            tracing::info!("Unfollowed by {} via address fallback", actor_address);
+                        }
                         Ok(())
                     }
                     "Like" | "Announce" => {
@@ -561,6 +863,30 @@ impl ActivityProcessor {
                     }
                     _ => Ok(()),
                 }
+            } else if let Some(follow_uri) = obj.as_str() {
+                // Compact Undo representation where object is the Follow activity URI.
+                let removed = self
+                    .db
+                    .delete_follower_by_address_and_uri(
+                        &actor_address,
+                        follow_uri,
+                        actor_default_port,
+                    )
+                    .await?;
+                if removed {
+                    tracing::info!(
+                        "Unfollowed by {} via follow activity URI {}",
+                        actor_address,
+                        follow_uri
+                    );
+                } else {
+                    tracing::debug!(
+                        "Undo with URI object did not match follower row for actor {}, uri {}",
+                        actor_address,
+                        follow_uri
+                    );
+                }
+                Ok(())
             } else {
                 Ok(())
             }
@@ -667,16 +993,94 @@ impl ActivityProcessor {
     // Helpers
     // =========================================================================
 
+    fn extract_visibility(&self, object: &serde_json::Value) -> String {
+        const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
+
+        let contains_public = |audience: &serde_json::Value| -> bool {
+            if let Some(value) = audience.as_str() {
+                return value == PUBLIC_AUDIENCE;
+            }
+            audience
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|value| value == PUBLIC_AUDIENCE)
+                })
+                .unwrap_or(false)
+        };
+
+        if object.get("to").is_some_and(contains_public) {
+            "public".to_string()
+        } else if object.get("cc").is_some_and(contains_public) {
+            "unlisted".to_string()
+        } else {
+            "private".to_string()
+        }
+    }
+
+    fn extract_cached_attachments(&self, object: &serde_json::Value) -> Vec<CachedAttachment> {
+        let mut attachments = Vec::new();
+
+        let Some(values) = object
+            .get("attachment")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return attachments;
+        };
+
+        for value in values {
+            if let Some(url) = value.as_str() {
+                attachments.push(CachedAttachment {
+                    url: url.to_string(),
+                    thumbnail_url: None,
+                    content_type: "application/octet-stream".to_string(),
+                    description: None,
+                    blurhash: None,
+                });
+                continue;
+            }
+
+            let Some(url) = value.get("url").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+
+            attachments.push(CachedAttachment {
+                url: url.to_string(),
+                thumbnail_url: None,
+                content_type: value
+                    .get("mediaType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+                description: value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                blurhash: None,
+            });
+        }
+
+        attachments
+    }
+
     /// Extract actor address from actor URI
     /// Example: https://example.com/users/alice -> alice@example.com
     fn extract_actor_address(&self, actor_uri: &str) -> String {
-        // Try to extract domain and username from URI
-        if let Some(domain_and_path) = actor_uri.split("://").nth(1) {
-            let parts: Vec<&str> = domain_and_path.split('/').collect();
-            if parts.len() >= 3 && parts[1] == "users" {
-                let domain = parts[0];
-                let username = parts[2];
-                return format!("{}@{}", username, domain);
+        if let Ok(parsed) = url::Url::parse(actor_uri) {
+            if let Some(host) = parsed.host_str() {
+                let normalized_host = host.to_ascii_lowercase();
+                let authority_host = format_authority_host(&normalized_host);
+                let normalized_port = parsed.port();
+                let domain = match normalized_port {
+                    Some(port) => format!("{}:{}", authority_host, port),
+                    None => authority_host,
+                };
+
+                if let Some(username) = extract_username_from_actor_path(parsed.path()) {
+                    return format!("{}@{}", username.to_ascii_lowercase(), domain);
+                }
             }
         }
         // Fallback: use the full URI as address
@@ -735,11 +1139,18 @@ impl ActivityProcessor {
     /// Check if actor is a followee
     async fn is_followee(&self, actor_uri: &str) -> bool {
         let actor_address = self.extract_actor_address(actor_uri);
+        let actor_scheme = url::Url::parse(actor_uri)
+            .ok()
+            .map(|url| url.scheme().to_ascii_lowercase());
         // Check in DB if we follow this actor
         self.db
             .get_all_follow_addresses()
             .await
-            .map(|addresses| addresses.contains(&actor_address))
+            .map(|addresses| {
+                addresses.iter().any(|address| {
+                    follow_addresses_match(&actor_address, address, actor_scheme.as_deref())
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -759,16 +1170,24 @@ impl ActivityProcessor {
 #[cfg(test)]
 mod tests {
     use super::{extract_follow_target, is_local_follow_target};
-    use crate::data::{Database, ProfileCache, TimelineCache};
+    use crate::data::{
+        CachedStatus, Database, EntityId, Follow, Follower, ProfileCache, TimelineCache,
+    };
     use crate::error::AppError;
+    use chrono::Utc;
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn create_test_processor(
+    async fn create_test_processor_with_timeline(
         local_address: &str,
         local_protocol: &str,
-    ) -> (super::ActivityProcessor, Arc<Database>, TempDir) {
+    ) -> (
+        super::ActivityProcessor,
+        Arc<Database>,
+        Arc<TimelineCache>,
+        TempDir,
+    ) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("activity_processor_test.db");
         let db = Arc::new(Database::connect(&db_path).await.unwrap());
@@ -778,13 +1197,22 @@ mod tests {
 
         let processor = super::ActivityProcessor::new(
             db.clone(),
-            timeline_cache,
+            timeline_cache.clone(),
             profile_cache,
             http_client,
             local_address.to_string(),
             local_protocol.to_string(),
         );
 
+        (processor, db, timeline_cache, temp_dir)
+    }
+
+    async fn create_test_processor(
+        local_address: &str,
+        local_protocol: &str,
+    ) -> (super::ActivityProcessor, Arc<Database>, TempDir) {
+        let (processor, db, _timeline_cache, temp_dir) =
+            create_test_processor_with_timeline(local_address, local_protocol).await;
         (processor, db, temp_dir)
     }
 
@@ -984,5 +1412,781 @@ mod tests {
 
         let result = processor.handle_follow(activity, actor_uri).await;
         assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn process_rejects_blocked_domain_when_actor_uri_has_explicit_default_port() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        db.block_domain("remote.example").await.unwrap();
+
+        let actor_uri = "https://remote.example:443/users/bob";
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": "https://remote.example/statuses/blocked",
+                "content": "<p>blocked</p>",
+                "published": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let result = processor.process(activity, actor_uri).await;
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn process_rejects_blocked_domain_with_explicit_non_default_port_entry() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        db.block_domain("remote.example:8443").await.unwrap();
+
+        let actor_uri = "https://remote.example:8443/users/bob";
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": "https://remote.example:8443/statuses/blocked",
+                "content": "<p>blocked</p>",
+                "published": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let result = processor.process(activity, actor_uri).await;
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_without_id_removes_follower() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "bob@remote.example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: "https://remote.example/follows/1".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "object": "https://example.com/users/alice"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert!(!follower_addresses.contains(&"bob@remote.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_without_id_removes_follower_for_default_https_port_variant() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example:443/users/bob";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "bob@remote.example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: "https://remote.example/follows/no-id-port-variant".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "object": "https://example.com/users/alice"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert!(follower_addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_removes_mixed_case_follower_address() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "Bob@Remote.Example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: "https://remote.example/follows/mixed-case".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "id": "https://remote.example/follows/mixed-case",
+                "object": "https://example.com/users/alice"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert!(follower_addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_with_uri_object_removes_matching_follower() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let follow_uri = "https://remote.example/follows/uri-form";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "bob@remote.example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: follow_uri.to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": follow_uri
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert!(follower_addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_with_mismatched_follow_id_keeps_follower() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "bob@remote.example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: "https://remote.example/follows/current".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "id": "https://remote.example/follows/old",
+                "object": "https://example.com/users/alice"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert_eq!(follower_addresses, vec!["bob@remote.example".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn process_undo_follow_with_non_local_target_keeps_follower() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+
+        let follower = Follower {
+            id: EntityId::new().0,
+            follower_address: "bob@remote.example".to_string(),
+            inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+            uri: "https://remote.example/follows/2".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follower(&follower).await.unwrap();
+
+        let activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "object": "https://example.net/users/alice"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        let follower_addresses = db.get_all_follower_addresses().await.unwrap();
+        assert!(follower_addresses.contains(&"bob@remote.example".to_string()));
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_caches_status_without_db_persist_case_insensitive_match()
+    {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/1";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "Bob@Remote.Example".to_string(),
+            uri: "https://example.com/users/alice/follow/1".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from followee</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_with_default_https_port_actor_uri_caches_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example:443/users/bob";
+        let status_uri = "https://remote.example:443/users/bob/statuses/port-normalized";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/port-normalized".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from :443 actor URI</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_with_explicit_default_port_follow_address_caches_status()
+    {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/port-follow-row";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example:443".to_string(),
+            uri: "https://example.com/users/alice/follow/port-follow-row".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from explicit :443 follow row</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_with_at_actor_uri_caches_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/@bob";
+        let status_uri = "https://remote.example/@bob/statuses/2";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/2".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from @bob</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_with_accounts_actor_uri_caches_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/accounts/bob";
+        let status_uri = "https://remote.example/accounts/bob/statuses/3";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/3".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from /accounts/bob</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_with_ipv6_actor_uri_caches_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://[2001:db8::1]/users/bob";
+        let status_uri = "https://[2001:db8::1]/users/bob/statuses/ipv6";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@[2001:db8::1]".to_string(),
+            uri: "https://example.com/users/alice/follow/ipv6".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello from IPv6 actor</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_from_followee_sanitizes_cached_content() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/sanitized";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/sanitized".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>Hello</p><script>alert(1)</script><a href=\"javascript:alert(2)\">click</a>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        let cached = timeline_cache
+            .get_by_uri(status_uri)
+            .await
+            .expect("cached status should exist");
+        let lowered = cached.content.to_ascii_lowercase();
+        assert!(cached.content.contains("<p>Hello</p>"));
+        assert!(!lowered.contains("<script"));
+        assert!(!lowered.contains("javascript:"));
+    }
+
+    #[tokio::test]
+    async fn process_delete_from_followee_removes_cached_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/3";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/3".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let create_activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "id": status_uri,
+                "content": "<p>To be deleted</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+        processor.process(create_activity, actor_uri).await.unwrap();
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_removes_cached_status_when_cache_id_differs_from_uri() {
+        let (processor, _db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/cache-key-mismatch";
+
+        timeline_cache
+            .insert(CachedStatus {
+                id: "cache-entry-1".to_string(),
+                uri: status_uri.to_string(),
+                content: "<p>Cached only</p>".to_string(),
+                account_address: "bob@remote.example".to_string(),
+                created_at: Utc::now(),
+                visibility: "public".to_string(),
+                attachments: vec![],
+                reply_to_uri: None,
+                boost_of_uri: None,
+            })
+            .await;
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_from_followee_removes_persisted_remote_status() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/4";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/4".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Persisted remote status</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "bookmarked".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_does_not_remove_persisted_status_owned_by_another_actor() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://another.example/users/alice/statuses/5";
+
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "bob@remote.example".to_string(),
+            uri: "https://example.com/users/alice/follow/5".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Owned by another actor</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "alice@another.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "bookmarked".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn process_delete_without_follow_row_still_removes_owned_persisted_status() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/6";
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Persisted remote status after unfollow</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "favourited".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_tombstone_object_field_removes_persisted_remote_status() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/tombstone";
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Persisted remote status</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "bookmarked".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": {
+                "type": "Tombstone",
+                "id": "https://remote.example/tombstones/1",
+                "object": status_uri
+            }
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_with_ipv6_actor_uri_removes_owned_persisted_status() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://[2001:db8::1]/users/bob";
+        let status_uri = "https://[2001:db8::1]/users/bob/statuses/owned";
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Owned by IPv6 actor</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "bob@[2001:db8::1]".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "bookmarked".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_removes_cached_status_owned_by_default_https_port_variant() {
+        let (processor, _db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example:443/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/7";
+
+        timeline_cache
+            .insert(CachedStatus {
+                id: "cache-entry-7".to_string(),
+                uri: status_uri.to_string(),
+                content: "<p>Owned by bob without explicit port</p>".to_string(),
+                account_address: "bob@remote.example".to_string(),
+                created_at: Utc::now(),
+                visibility: "public".to_string(),
+                attachments: vec![],
+                reply_to_uri: None,
+                boost_of_uri: None,
+            })
+            .await;
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn process_delete_removes_persisted_status_owned_by_default_https_port_variant() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example:443/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/8";
+
+        let status = crate::data::Status {
+            id: EntityId::new().0,
+            uri: status_uri.to_string(),
+            content: "<p>Owned by bob without explicit port</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "bookmarked".to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let delete_activity = json!({
+            "type": "Delete",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(delete_activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
     }
 }

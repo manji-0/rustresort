@@ -58,6 +58,7 @@ config = "0.14"
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
 html-escape = "0.2"
+ammonia = "4"
 
 # Metrics
 prometheus = "0.13"

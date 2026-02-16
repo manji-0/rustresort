@@ -170,14 +170,15 @@ async fn test_scope_write_statuses_allows_post_status() {
 #[tokio::test]
 async fn test_scope_follow_required_for_follow_endpoints() {
     let server = TestServer::new().await;
-    let account = server.create_test_account().await;
+    server.create_test_account().await;
+    let target = "alice@remote.example";
 
     let no_follow_token = create_scoped_oauth_token(&server, "read:accounts").await;
     let follow_token = create_scoped_oauth_token(&server, "follow").await;
 
     let blocked_follow_response = server
         .client
-        .post(server.url(&format!("/api/v1/accounts/{}/follow", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/follow", target)))
         .bearer_auth(&no_follow_token)
         .send()
         .await
@@ -186,7 +187,7 @@ async fn test_scope_follow_required_for_follow_endpoints() {
 
     let allowed_follow_response = server
         .client
-        .post(server.url(&format!("/api/v1/accounts/{}/follow", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/follow", target)))
         .bearer_auth(&follow_token)
         .send()
         .await

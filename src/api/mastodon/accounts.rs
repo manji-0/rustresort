@@ -44,6 +44,143 @@ pub struct SearchParams {
     pub following: Option<bool>,
 }
 
+fn default_port_for_protocol(protocol: &str) -> Option<u16> {
+    if protocol.eq_ignore_ascii_case("http") {
+        Some(80)
+    } else if protocol.eq_ignore_ascii_case("https") {
+        Some(443)
+    } else {
+        None
+    }
+}
+
+fn extract_explicit_port(authority: &str) -> Option<u16> {
+    let authority = authority.trim();
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (_, tail) = rest.split_once(']')?;
+        let port_str = tail.strip_prefix(':')?;
+        if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return port_str.parse::<u16>().ok();
+    }
+
+    let (host_part, port_str) = authority.rsplit_once(':')?;
+    if host_part.is_empty()
+        || host_part.contains(':')
+        || port_str.is_empty()
+        || !port_str.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    port_str.parse::<u16>().ok()
+}
+
+fn parse_host_and_port(authority: &str) -> Result<(String, Option<u16>), AppError> {
+    let parsed = url::Url::parse(&format!("http://{}", authority))
+        .map_err(|_| AppError::Validation("Invalid account ID format".to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::Validation("Invalid account ID format".to_string()))?;
+    let normalized_host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+
+    Ok((normalized_host, extract_explicit_port(authority)))
+}
+
+fn format_authority_host(host: &str) -> String {
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    if bare_host.contains(':') {
+        format!("[{}]", bare_host)
+    } else {
+        bare_host.to_string()
+    }
+}
+
+fn is_same_local_account(target_address: &str, local_address: &str, local_protocol: &str) -> bool {
+    let Some((target_user, target_domain)) = target_address.split_once('@') else {
+        return false;
+    };
+    let Some((local_user, local_domain)) = local_address.split_once('@') else {
+        return false;
+    };
+
+    if !target_user.eq_ignore_ascii_case(local_user) {
+        return false;
+    }
+
+    let Ok((target_host, target_port)) = parse_host_and_port(target_domain) else {
+        return false;
+    };
+    let Ok((local_host, local_port)) = parse_host_and_port(local_domain) else {
+        return false;
+    };
+    if !target_host.eq_ignore_ascii_case(&local_host) {
+        return false;
+    }
+
+    let Some(default_port) = default_port_for_protocol(local_protocol) else {
+        return target_port == local_port;
+    };
+    let target_effective_port = target_port.unwrap_or(default_port);
+    let local_effective_port = local_port.unwrap_or(default_port);
+    target_effective_port == local_effective_port
+}
+
+fn normalize_account_address(raw: &str) -> Result<String, AppError> {
+    fn normalize_domain(raw: &str) -> Result<String, AppError> {
+        let parsed = url::Url::parse(&format!("https://{}", raw))
+            .map_err(|_| AppError::Validation("Invalid account ID format".to_string()))?;
+        if parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(AppError::Validation(
+                "Invalid account ID format".to_string(),
+            ));
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| AppError::Validation("Invalid account ID format".to_string()))?;
+        let normalized_host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let authority_host = format_authority_host(&normalized_host);
+        let normalized_port = extract_explicit_port(raw);
+
+        Ok(match normalized_port {
+            Some(port) => format!("{}:{}", authority_host, port),
+            None => authority_host,
+        })
+    }
+
+    let trimmed = raw.trim();
+    let without_leading_at = trimmed.strip_prefix('@').unwrap_or(trimmed);
+    let (username, domain) = without_leading_at
+        .split_once('@')
+        .ok_or_else(|| AppError::Validation("Invalid account ID format".to_string()))?;
+
+    if username.is_empty() || domain.is_empty() || username.contains('@') || domain.contains('@') {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    }
+
+    Ok(format!(
+        "{}@{}",
+        username.to_ascii_lowercase(),
+        normalize_domain(domain)?
+    ))
+}
+
 async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
     if id.starts_with("http://") || id.starts_with("https://") {
         return Err(AppError::Validation(
@@ -52,12 +189,12 @@ async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, Ap
     }
 
     if id.contains('@') {
-        return Ok(id.to_string());
+        return normalize_account_address(id);
     }
 
     if let Some(account) = state.db.get_account().await? {
         if account.id == id {
-            return Ok(format!(
+            return normalize_account_address(&format!(
                 "{}@{}",
                 account.username, state.config.server.domain
             ));
@@ -276,18 +413,47 @@ pub async fn follow_account(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
+    use crate::data::{EntityId, Follow};
+    use chrono::Utc;
 
     // Accept account addresses and local account IDs.
-    let _target_address = resolve_target_address(&state, &id).await?;
+    let target_address = resolve_target_address(&state, &id).await?;
 
     // Get our account
-    let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_address = normalize_account_address(&format!(
+        "{}@{}",
+        account.username, state.config.server.domain
+    ))?;
 
-    // Send Follow activity via ActivityPub
-    // This will be handled by the federation service
-    // For now, we'll just return a relationship indicating we're following
+    if is_same_local_account(
+        &target_address,
+        &local_address,
+        &state.config.server.protocol,
+    ) {
+        return Err(AppError::Validation("cannot follow yourself".to_string()));
+    }
 
-    // TODO: Actually send Follow activity and store the follow relationship
+    // Persist follow relationship if not already present.
+    let follow_id = EntityId::new().0;
+    let follow = Follow {
+        id: follow_id.clone(),
+        target_address: target_address.clone(),
+        uri: format!(
+            "{}/users/{}/follow/{}",
+            state.config.server.base_url(),
+            account.username,
+            follow_id
+        ),
+        created_at: Utc::now(),
+    };
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .insert_follow_if_absent(&follow, default_port)
+        .await?;
+
+    // TODO: Actually send Follow activity via federation delivery.
     // state.federation.send_follow(&account, &target_address).await?;
 
     // Return relationship response
@@ -310,6 +476,23 @@ pub async fn follow_account(
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::normalize_account_address;
+
+    #[test]
+    fn normalize_account_address_preserves_ipv6_brackets_without_port() {
+        let normalized = normalize_account_address("Alice@[2001:DB8::1]").unwrap();
+        assert_eq!(normalized, "alice@[2001:db8::1]");
+    }
+
+    #[test]
+    fn normalize_account_address_preserves_ipv6_brackets_with_port() {
+        let normalized = normalize_account_address("Alice@[2001:DB8::1]:443").unwrap();
+        assert_eq!(normalized, "alice@[2001:db8::1]:443");
+    }
+}
+
 /// POST /api/v1/accounts/:id/unfollow
 pub async fn unfollow_account(
     State(state): State<AppState>,
@@ -319,10 +502,17 @@ pub async fn unfollow_account(
     use crate::api::dto::RelationshipResponse;
 
     // Accept account addresses and local account IDs.
-    let _target_address = resolve_target_address(&state, &id).await?;
+    let target_address = resolve_target_address(&state, &id).await?;
 
     // Get our account
     let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    // Remove follow relationship from DB.
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .delete_follow(&target_address, default_port)
+        .await?;
 
     // Send Undo Follow activity via ActivityPub
     // TODO: Actually send Undo activity and remove the follow relationship
@@ -535,7 +725,11 @@ pub async fn block_account(
     let target_address = resolve_target_address(&state, &id).await?;
 
     // Store block in database
-    state.db.block_account(&target_address).await?;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .block_account(&target_address, default_port)
+        .await?;
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -570,7 +764,11 @@ pub async fn unblock_account(
     let target_address = resolve_target_address(&state, &id).await?;
 
     // Remove block from database
-    state.db.unblock_account(&target_address).await?;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .unblock_account(&target_address, default_port)
+        .await?;
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -618,7 +816,12 @@ pub async fn mute_account(
     // Store mute in database
     state
         .db
-        .mute_account(&target_address, mute_notifications, duration)
+        .mute_account(
+            &target_address,
+            mute_notifications,
+            duration,
+            default_port_for_protocol(&state.config.server.protocol),
+        )
         .await?;
 
     // Return relationship response
@@ -654,7 +857,11 @@ pub async fn unmute_account(
     let target_address = resolve_target_address(&state, &id).await?;
 
     // Remove mute from database
-    state.db.unmute_account(&target_address).await?;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .unmute_account(&target_address, default_port)
+        .await?;
 
     // Return relationship response
     let relationship = RelationshipResponse {

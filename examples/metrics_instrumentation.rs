@@ -2,8 +2,13 @@
 //!
 //! This file demonstrates best practices for adding metrics to your handlers.
 
-use crate::api::metrics::*;
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{Json, http::StatusCode, response::IntoResponse};
+use rustresort::metrics::{
+    ACTIVITYPUB_ACTIVITIES_RECEIVED, ACTIVITYPUB_ACTIVITIES_SENT, BACKUPS_TOTAL, CACHE_HITS_TOTAL,
+    CACHE_MISSES_TOTAL, DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FEDERATION_REQUESTS_TOTAL,
+    FOLLOWERS_TOTAL, FOLLOWING_TOTAL, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
+    MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL, POSTS_TOTAL, USERS_TOTAL,
+};
 use serde_json::json;
 
 /// Example handler showing metrics instrumentation
@@ -106,9 +111,9 @@ pub async fn update_app_stats(users: i64, posts: i64, followers: i64, following:
 /// Example middleware for automatic HTTP metrics
 ///
 /// This can be used as an Axum middleware to automatically record metrics for all requests
-pub async fn metrics_middleware<B>(
-    req: axum::http::Request<B>,
-    next: axum::middleware::Next<B>,
+pub async fn metrics_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -127,4 +132,18 @@ pub async fn metrics_middleware<B>(
     timer.observe_duration();
 
     response
+}
+
+#[tokio::main]
+async fn main() {
+    rustresort::metrics::init_metrics();
+
+    example_db_query_with_metrics().await;
+    example_cache_with_metrics("timeline", true).await;
+    example_federation_activity_with_metrics("Create", "inbound").await;
+    example_media_upload_with_metrics(1024).await;
+    example_backup_with_metrics(true).await;
+    update_app_stats(1, 1, 0, 0).await;
+
+    let _ = example_handler_with_metrics().await;
 }

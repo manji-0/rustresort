@@ -246,18 +246,18 @@ async fn test_account_following() {
 #[tokio::test]
 async fn test_follow_account() {
     let server = TestServer::new().await;
-    let account = server.create_test_account().await;
+    server.create_test_account().await;
     let token = server.create_test_token().await;
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/follow", account.id)))
+        .post(&server.url("/api/v1/accounts/alice@remote.example/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 422);
+    assert!(response.status().is_success());
 }
 
 #[tokio::test]
