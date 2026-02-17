@@ -6,6 +6,7 @@ use lazy_static::lazy_static;
 use prometheus::{
     Counter, Gauge, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 lazy_static! {
     /// Global Prometheus registry
@@ -39,6 +40,21 @@ lazy_static! {
     pub static ref DB_CONNECTIONS_ACTIVE: IntGauge = IntGauge::new(
         "rustresort_db_connections_active",
         "Current number of active database connections"
+    ).expect("metric can be created");
+    pub static ref DB_SYNC_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("rustresort_db_sync_total", "Total number of database sync cycles"),
+        &["backend", "status"]
+    ).expect("metric can be created");
+    pub static ref DB_SYNC_DURATION_SECONDS: prometheus::HistogramVec = prometheus::HistogramVec::new(
+        HistogramOpts::new(
+            "rustresort_db_sync_duration_seconds",
+            "Database sync cycle duration in seconds"
+        ).buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+        &["backend", "status"]
+    ).expect("metric can be created");
+    pub static ref DB_SYNC_LAST_SUCCESS_UNIX_SECONDS: Gauge = Gauge::new(
+        "rustresort_db_sync_last_success_unix_seconds",
+        "Unix timestamp of the most recent successful database sync"
     ).expect("metric can be created");
 
     // Federation Metrics
@@ -137,6 +153,15 @@ pub fn init_metrics() {
         .register(Box::new(DB_CONNECTIONS_ACTIVE.clone()))
         .expect("DB_CONNECTIONS_ACTIVE can be registered");
     REGISTRY
+        .register(Box::new(DB_SYNC_TOTAL.clone()))
+        .expect("DB_SYNC_TOTAL can be registered");
+    REGISTRY
+        .register(Box::new(DB_SYNC_DURATION_SECONDS.clone()))
+        .expect("DB_SYNC_DURATION_SECONDS can be registered");
+    REGISTRY
+        .register(Box::new(DB_SYNC_LAST_SUCCESS_UNIX_SECONDS.clone()))
+        .expect("DB_SYNC_LAST_SUCCESS_UNIX_SECONDS can be registered");
+    REGISTRY
         .register(Box::new(ACTIVITYPUB_ACTIVITIES_RECEIVED.clone()))
         .expect("ACTIVITYPUB_ACTIVITIES_RECEIVED can be registered");
     REGISTRY
@@ -186,4 +211,20 @@ pub fn init_metrics() {
         .expect("ERRORS_TOTAL can be registered");
 
     tracing::info!("Metrics registry initialized");
+}
+
+/// Record a database sync cycle result.
+pub fn observe_db_sync(backend: &str, status: &str, duration: Duration) {
+    DB_SYNC_TOTAL.with_label_values(&[backend, status]).inc();
+    DB_SYNC_DURATION_SECONDS
+        .with_label_values(&[backend, status])
+        .observe(duration.as_secs_f64());
+
+    if status == "success" || status == "duplicate" {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        DB_SYNC_LAST_SUCCESS_UNIX_SECONDS.set(now);
+    }
 }

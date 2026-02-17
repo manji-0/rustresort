@@ -1191,8 +1191,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("activity_processor_test.db");
         let db = Arc::new(Database::connect(&db_path).await.unwrap());
-        let timeline_cache = Arc::new(TimelineCache::new(16));
-        let profile_cache = Arc::new(ProfileCache::new());
+        let timeline_cache = Arc::new(TimelineCache::new(16).await.unwrap());
+        let profile_cache = Arc::new(ProfileCache::new(86400).await.unwrap());
         let http_client = Arc::new(reqwest::Client::new());
 
         let processor = super::ActivityProcessor::new(

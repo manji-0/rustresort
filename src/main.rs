@@ -66,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.storage.backup.enabled {
         spawn_backup_task(state.clone());
     }
+    if config.database.sync.mode != config::DatabaseSyncMode::None {
+        spawn_database_sync_task(state.clone());
+    }
 
     // Start server
     axum::serve(listener, app).await?;
@@ -95,4 +98,57 @@ fn spawn_backup_task(state: AppState) {
     });
 
     tracing::info!("Backup task spawned");
+}
+
+/// Spawn background database sync task
+fn spawn_database_sync_task(state: AppState) {
+    let sync_mode = state.config.database.sync.mode.clone();
+    if sync_mode == config::DatabaseSyncMode::None {
+        tracing::debug!("Database sync mode is none; skipping background sync task spawn");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let configured_interval_secs = state.config.database.sync.interval_seconds;
+        let interval_secs = configured_interval_secs.max(1);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+
+        if configured_interval_secs == 0 {
+            tracing::warn!("database.sync.interval_seconds=0 is invalid; clamped to 1 second");
+        }
+
+        // Consume the immediate first tick to delay initial sync until one interval passes.
+        interval.tick().await;
+
+        match sync_mode {
+            config::DatabaseSyncMode::Turso => loop {
+                interval.tick().await;
+
+                tracing::info!("Running scheduled Turso sync...");
+                match state.db.sync_turso().await {
+                    Ok(()) => tracing::info!("Turso sync completed successfully"),
+                    Err(error) => tracing::error!(%error, "Turso sync failed"),
+                }
+            },
+            config::DatabaseSyncMode::D1 => loop {
+                interval.tick().await;
+
+                tracing::info!("Running scheduled Cloudflare D1 sync...");
+                match rustresort::data::sync_to_d1(
+                    &state.config.database.path,
+                    &state.config.database.sync.d1,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!("Cloudflare D1 sync completed successfully"),
+                    Err(error) => tracing::error!(%error, "Cloudflare D1 sync failed"),
+                }
+            },
+            config::DatabaseSyncMode::None => {
+                unreachable!("database sync task should not be spawned when mode is none")
+            }
+        }
+    });
+
+    tracing::info!("Database sync task spawned");
 }

@@ -55,6 +55,7 @@ impl TestServer {
             },
             database: config::DatabaseConfig {
                 path: db_path.clone(),
+                sync: config::DatabaseSyncConfig::default(),
             },
             storage: config::StorageConfig {
                 media: config::MediaStorageConfig {
