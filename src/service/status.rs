@@ -122,8 +122,7 @@ impl StatusService {
     /// Unfavourite a status
     pub async fn unfavourite(&self, status_uri: &str) -> Result<(), AppError> {
         let status = self.get_by_uri(status_uri).await?;
-        self.db.delete_favourite(&status.id).await?;
-        Ok(())
+        self.unfavourite_loaded(&status).await
     }
 
     /// Bookmark a status
@@ -145,8 +144,7 @@ impl StatusService {
     /// Remove bookmark
     pub async fn unbookmark(&self, status_uri: &str) -> Result<(), AppError> {
         let status = self.get_by_uri(status_uri).await?;
-        self.db.delete_bookmark(&status.id).await?;
-        Ok(())
+        self.unbookmark_loaded(&status).await
     }
 
     /// Repost (boost) a status
@@ -253,7 +251,7 @@ impl StatusService {
     /// Unfavourite by local status ID
     pub async fn unfavourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
-        self.db.delete_favourite(status_id).await?;
+        self.unfavourite_loaded(&status).await?;
         Ok(status)
     }
 
@@ -267,7 +265,7 @@ impl StatusService {
     /// Unbookmark by local status ID
     pub async fn unbookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
-        self.db.delete_bookmark(status_id).await?;
+        self.unbookmark_loaded(&status).await?;
         Ok(status)
     }
 
@@ -282,10 +280,42 @@ impl StatusService {
         Ok(status)
     }
 
+    /// Repost a status by ActivityPub URI
+    pub async fn repost_by_uri(
+        &self,
+        status_uri: &str,
+        repost_uri: &str,
+    ) -> Result<Status, AppError> {
+        let status = self
+            .persist_remote_status(status_uri, PersistedReason::Reposted)
+            .await?;
+        self.db.insert_repost(&status.id, repost_uri).await?;
+        Ok(status)
+    }
+
+    /// Unfavourite preloaded status.
+    pub async fn unfavourite_loaded(&self, status: &Status) -> Result<(), AppError> {
+        self.db.delete_favourite(&status.id).await?;
+        Ok(())
+    }
+
+    /// Unbookmark preloaded status.
+    pub async fn unbookmark_loaded(&self, status: &Status) -> Result<(), AppError> {
+        self.db.delete_bookmark(&status.id).await?;
+        Ok(())
+    }
+
     /// Undo repost for a status by its persisted database ID
     pub async fn unrepost_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
         self.db.delete_repost(status_id).await?;
+        Ok(status)
+    }
+
+    /// Undo repost for a status by URI
+    pub async fn unrepost_by_uri(&self, status_uri: &str) -> Result<Status, AppError> {
+        let status = self.get_by_uri(status_uri).await?;
+        self.db.delete_repost(&status.id).await?;
         Ok(status)
     }
 

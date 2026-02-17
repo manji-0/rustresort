@@ -16,6 +16,71 @@ pub struct Database {
     pool: Pool<Sqlite>,
 }
 
+fn parse_account_address(address: &str) -> Option<(String, String, Option<u16>)> {
+    let (username, authority) = address.split_once('@')?;
+    let parsed = url::Url::parse(&format!("http://{}", authority)).ok()?;
+    let host = parsed.host_str()?;
+    Some((
+        username.to_ascii_lowercase(),
+        host.to_ascii_lowercase(),
+        extract_explicit_port(authority),
+    ))
+}
+
+fn extract_explicit_port(authority: &str) -> Option<u16> {
+    let authority = authority.trim();
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (_, tail) = rest.split_once(']')?;
+        let port_str = tail.strip_prefix(':')?;
+        if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return port_str.parse::<u16>().ok();
+    }
+
+    let (host_part, port_str) = authority.rsplit_once(':')?;
+    if host_part.is_empty()
+        || host_part.contains(':')
+        || port_str.is_empty()
+        || !port_str.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    port_str.parse::<u16>().ok()
+}
+
+fn account_addresses_match(left: &str, right: &str, default_port: Option<u16>) -> bool {
+    let Some((left_user, left_host, left_port)) = parse_account_address(left) else {
+        return left.eq_ignore_ascii_case(right);
+    };
+    let Some((right_user, right_host, right_port)) = parse_account_address(right) else {
+        return left.eq_ignore_ascii_case(right);
+    };
+
+    if left_user != right_user || left_host != right_host {
+        return false;
+    }
+
+    match default_port {
+        Some(port) => left_port.unwrap_or(port) == right_port.unwrap_or(port),
+        None => left_port == right_port,
+    }
+}
+
+fn find_matching_addresses(
+    candidates: &[String],
+    target: &str,
+    default_port: Option<u16>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| account_addresses_match(candidate, target, default_port))
+        .cloned()
+        .collect()
+}
+
 impl Database {
     // =========================================================================
     // Connection
@@ -482,7 +547,7 @@ impl Database {
     /// Insert new follow relationship
     pub async fn insert_follow(&self, follow: &Follow) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO follows (id, target_address, uri, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO follows (id, target_address, uri, created_at) VALUES (?, ?, ?, ?)",
         )
         .bind(&follow.id)
         .bind(&follow.target_address)
@@ -494,12 +559,69 @@ impl Database {
         Ok(())
     }
 
-    /// Delete follow relationship
-    pub async fn delete_follow(&self, target_address: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM follows WHERE target_address = ?")
-            .bind(target_address)
-            .execute(&self.pool)
+    /// Insert follow relationship when no equivalent address exists.
+    ///
+    /// Uses an IMMEDIATE transaction so the equivalence check and insert are atomic.
+    pub async fn insert_follow_if_absent(
+        &self,
+        follow: &Follow,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<bool, AppError> = async {
+            let existing_addresses =
+                sqlx::query_scalar::<_, String>("SELECT target_address FROM follows")
+                    .fetch_all(&mut *conn)
+                    .await?;
+            if existing_addresses
+                .iter()
+                .any(|existing| account_addresses_match(existing, &follow.target_address, default_port))
+            {
+                return Ok(false);
+            }
+
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO follows (id, target_address, uri, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&follow.id)
+            .bind(&follow.target_address)
+            .bind(&follow.uri)
+            .bind(&follow.created_at)
+            .execute(&mut *conn)
             .await?;
+
+            Ok(inserted.rows_affected() > 0)
+        }
+        .await;
+
+        match result {
+            Ok(inserted) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(inserted)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Delete follow relationship
+    pub async fn delete_follow(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_addresses = self.get_all_follow_addresses().await?;
+        let matches = find_matching_addresses(&existing_addresses, target_address, default_port);
+        for existing in matches {
+            sqlx::query("DELETE FROM follows WHERE target_address COLLATE NOCASE = ?")
+                .bind(existing)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }
@@ -521,13 +643,45 @@ impl Database {
     }
 
     /// Delete follower
-    pub async fn delete_follower(&self, follower_address: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM followers WHERE follower_address = ?")
-            .bind(follower_address)
-            .execute(&self.pool)
-            .await?;
+    pub async fn delete_follower(
+        &self,
+        follower_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_addresses = self.get_all_follower_addresses().await?;
+        let matches = find_matching_addresses(&existing_addresses, follower_address, default_port);
+        for existing in matches {
+            sqlx::query("DELETE FROM followers WHERE follower_address COLLATE NOCASE = ?")
+                .bind(existing)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
+    }
+
+    /// Delete follower by follower address and Follow activity URI
+    pub async fn delete_follower_by_address_and_uri(
+        &self,
+        follower_address: &str,
+        follow_uri: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let existing_addresses = self.get_all_follower_addresses().await?;
+        let matches = find_matching_addresses(&existing_addresses, follower_address, default_port);
+        let mut removed = false;
+        for existing in matches {
+            let result = sqlx::query(
+                "DELETE FROM followers WHERE follower_address COLLATE NOCASE = ? AND uri = ?",
+            )
+            .bind(existing)
+            .bind(follow_uri)
+            .execute(&self.pool)
+            .await?;
+            removed |= result.rows_affected() > 0;
+        }
+
+        Ok(removed)
     }
 
     // =========================================================================
@@ -1210,44 +1364,70 @@ impl Database {
     // =========================================================================
 
     /// Block an account
-    pub async fn block_account(&self, target_address: &str) -> Result<(), AppError> {
+    pub async fn block_account(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_blocks =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
+                .fetch_all(&self.pool)
+                .await?;
+        let stored_target_address =
+            find_matching_addresses(&existing_blocks, target_address, default_port)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| target_address.to_string());
+
         let id = EntityId::new().0;
         sqlx::query(
             "INSERT OR REPLACE INTO account_blocks (id, target_address, created_at) VALUES (?, ?, datetime('now'))",
         )
         .bind(&id)
-        .bind(target_address)
+        .bind(&stored_target_address)
         .execute(&self.pool)
         .await?;
 
-        // Also remove any existing follow relationship
-        sqlx::query("DELETE FROM follows WHERE target_address = ?")
-            .bind(target_address)
-            .execute(&self.pool)
-            .await?;
+        // Also remove any existing equivalent follow relationship.
+        self.delete_follow(target_address, default_port).await?;
 
         Ok(())
     }
 
     /// Unblock an account
-    pub async fn unblock_account(&self, target_address: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM account_blocks WHERE target_address = ?")
-            .bind(target_address)
-            .execute(&self.pool)
-            .await?;
+    pub async fn unblock_account(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_blocks =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
+                .fetch_all(&self.pool)
+                .await?;
+        let matches = find_matching_addresses(&existing_blocks, target_address, default_port);
+        for existing in matches {
+            sqlx::query("DELETE FROM account_blocks WHERE target_address COLLATE NOCASE = ?")
+                .bind(existing)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }
 
     /// Check if account is blocked
-    pub async fn is_account_blocked(&self, target_address: &str) -> Result<bool, AppError> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM account_blocks WHERE target_address = ?")
-                .bind(target_address)
-                .fetch_one(&self.pool)
+    pub async fn is_account_blocked(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let existing_blocks =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
+                .fetch_all(&self.pool)
                 .await?;
-
-        Ok(count > 0)
+        Ok(existing_blocks
+            .iter()
+            .any(|existing| account_addresses_match(existing, target_address, default_port)))
     }
 
     /// Get blocked account addresses
@@ -1268,13 +1448,24 @@ impl Database {
         target_address: &str,
         mute_notifications: bool,
         duration: Option<i64>,
+        default_port: Option<u16>,
     ) -> Result<(), AppError> {
+        let existing_mutes =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_mutes")
+                .fetch_all(&self.pool)
+                .await?;
+        let stored_target_address =
+            find_matching_addresses(&existing_mutes, target_address, default_port)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| target_address.to_string());
+
         let id = EntityId::new().0;
         sqlx::query(
             "INSERT OR REPLACE INTO account_mutes (id, target_address, notifications, duration, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
         )
         .bind(&id)
-        .bind(target_address)
+        .bind(&stored_target_address)
         .bind(mute_notifications as i64)
         .bind(duration)
         .execute(&self.pool)
@@ -1284,24 +1475,39 @@ impl Database {
     }
 
     /// Unmute an account
-    pub async fn unmute_account(&self, target_address: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM account_mutes WHERE target_address = ?")
-            .bind(target_address)
-            .execute(&self.pool)
-            .await?;
+    pub async fn unmute_account(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_mutes =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_mutes")
+                .fetch_all(&self.pool)
+                .await?;
+        let matches = find_matching_addresses(&existing_mutes, target_address, default_port);
+        for existing in matches {
+            sqlx::query("DELETE FROM account_mutes WHERE target_address COLLATE NOCASE = ?")
+                .bind(existing)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }
 
     /// Check if account is muted
-    pub async fn is_account_muted(&self, target_address: &str) -> Result<bool, AppError> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM account_mutes WHERE target_address = ?")
-                .bind(target_address)
-                .fetch_one(&self.pool)
+    pub async fn is_account_muted(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let existing_mutes =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_mutes")
+                .fetch_all(&self.pool)
                 .await?;
-
-        Ok(count > 0)
+        Ok(existing_mutes
+            .iter()
+            .any(|existing| account_addresses_match(existing, target_address, default_port)))
     }
 
     /// Get muted account addresses

@@ -119,6 +119,13 @@ impl TimelineCache {
         self.statuses.invalidate(id).await;
     }
 
+    /// Remove status from cache by ActivityPub URI.
+    pub async fn remove_by_uri(&self, uri: &str) {
+        if let Some(status) = self.get_by_uri(uri).await {
+            self.remove(&status.id).await;
+        }
+    }
+
     /// Get home timeline
     ///
     /// Returns statuses from followees, sorted by created_at desc.

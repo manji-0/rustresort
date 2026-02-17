@@ -8,7 +8,33 @@ use axum::{
 use super::accounts::PaginationParams;
 use crate::AppState;
 use crate::auth::CurrentUser;
+use crate::data::Status;
 use crate::error::AppError;
+
+async fn get_notification_status(state: &AppState, status_uri: &str) -> Option<Status> {
+    if let Ok(status) = state.db.get_status_by_uri(status_uri).await {
+        if status.is_some() {
+            return status;
+        }
+    }
+
+    let cached = state.timeline_cache.get_by_uri(status_uri).await?;
+    Some(Status {
+        id: cached.id.clone(),
+        uri: cached.uri.clone(),
+        content: cached.content.clone(),
+        content_warning: None,
+        visibility: cached.visibility.clone(),
+        language: None,
+        account_address: cached.account_address.clone(),
+        is_local: false,
+        in_reply_to_uri: cached.reply_to_uri.clone(),
+        boost_of_uri: cached.boost_of_uri.clone(),
+        persisted_reason: "cache_only".to_string(),
+        created_at: cached.created_at,
+        fetched_at: Some(chrono::Utc::now()),
+    })
+}
 
 /// GET /api/v1/notifications
 pub async fn get_notifications(
@@ -37,7 +63,7 @@ pub async fn get_notifications(
     for notification in notifications {
         // Get status if present
         let status = if let Some(status_uri) = &notification.status_uri {
-            state.db.get_status_by_uri(status_uri).await.ok().flatten()
+            get_notification_status(&state, status_uri).await
         } else {
             None
         };
@@ -112,7 +138,7 @@ pub async fn get_notification(
 
     // Get status if present
     let status = if let Some(status_uri) = &notification.status_uri {
-        state.db.get_status_by_uri(status_uri).await.ok().flatten()
+        get_notification_status(&state, status_uri).await
     } else {
         None
     };

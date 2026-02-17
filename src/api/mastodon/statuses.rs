@@ -28,6 +28,32 @@ pub struct CreateStatusRequest {
     pub language: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct StatusActionParams {
+    pub uri: Option<String>,
+}
+
+fn resolve_action_uri<'a>(
+    id: &'a str,
+    params: &'a StatusActionParams,
+) -> Result<Option<&'a str>, AppError> {
+    if let Some(uri) = params.uri.as_deref() {
+        let trimmed = uri.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::Validation(
+                "uri query parameter cannot be empty".to_string(),
+            ));
+        }
+        return Ok(Some(trimmed));
+    }
+
+    if id.starts_with("http://") || id.starts_with("https://") {
+        return Ok(Some(id));
+    }
+
+    Ok(None)
+}
+
 /// Status source response
 #[derive(Debug, Serialize)]
 struct StatusSourceResponse {
@@ -68,6 +94,29 @@ pub async fn create_status(
         return Err(AppError::Validation("status cannot be empty".to_string()));
     }
 
+    // Resolve reply target if provided.
+    let mut in_reply_to_uri = None;
+    let mut persisted_reason = "own".to_string();
+    if let Some(in_reply_to_id) = req.in_reply_to_id.as_deref() {
+        if let Some(reply_target) = state.db.get_status(in_reply_to_id).await? {
+            in_reply_to_uri = Some(reply_target.uri);
+            if reply_target.is_local {
+                persisted_reason = "reply_to_own".to_string();
+            }
+        } else if let Some(reply_target) = state.db.get_status_by_uri(in_reply_to_id).await? {
+            in_reply_to_uri = Some(reply_target.uri);
+            if reply_target.is_local {
+                persisted_reason = "reply_to_own".to_string();
+            }
+        } else if let Some(cached_target) = state.timeline_cache.get_by_uri(in_reply_to_id).await {
+            in_reply_to_uri = Some(cached_target.uri.clone());
+        } else {
+            return Err(AppError::Validation(
+                "in_reply_to_id does not exist".to_string(),
+            ));
+        }
+    }
+
     // Create status
     let status_id = EntityId::new().0;
     let uri = format!(
@@ -86,9 +135,9 @@ pub async fn create_status(
         language: req.language.or(Some("en".to_string())),
         account_address: String::new(),
         is_local: true,
-        in_reply_to_uri: None,
+        in_reply_to_uri,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -378,6 +427,7 @@ pub async fn favourite_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = StatusService::new(
         state.db.clone(),
@@ -388,8 +438,13 @@ pub async fn favourite_status(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get status and add favourite
-    let status = status_service.favourite_by_id(&id).await?;
+    // Get status and add favourite.
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        status_service.favourite(uri).await?
+    } else {
+        status_service.favourite_by_id(&id).await?
+    };
+    let status_id = status.id.clone();
 
     // Return status with favourited=true
     let response = crate::api::status_to_response(
@@ -398,7 +453,7 @@ pub async fn favourite_status(
         &state.config,
         Some(true),
         Some(false),
-        status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -409,6 +464,7 @@ pub async fn unfavourite_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = StatusService::new(
         state.db.clone(),
@@ -419,8 +475,15 @@ pub async fn unfavourite_status(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get status and remove favourite
-    let status = status_service.unfavourite_by_id(&id).await?;
+    // Get status and remove favourite.
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        let status = status_service.get_by_uri(uri).await?;
+        status_service.unfavourite_loaded(&status).await?;
+        status
+    } else {
+        status_service.unfavourite_by_id(&id).await?
+    };
+    let status_id = status.id.clone();
 
     // Return status with favourited=false
     let response = crate::api::status_to_response(
@@ -429,7 +492,7 @@ pub async fn unfavourite_status(
         &state.config,
         Some(false),
         Some(false),
-        status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -440,6 +503,7 @@ pub async fn reblog_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::EntityId;
 
@@ -461,16 +525,21 @@ pub async fn reblog_status(
         repost_id
     );
 
-    let status = status_service.repost_by_id(&id, &repost_uri).await?;
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        status_service.repost_by_uri(uri, &repost_uri).await?
+    } else {
+        status_service.repost_by_id(&id, &repost_uri).await?
+    };
+    let status_id = status.id.clone();
 
     // Return the original status with reblogged=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        status_service.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&status_id).await.ok(),
         Some(true),
-        status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -481,6 +550,7 @@ pub async fn unreblog_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = StatusService::new(
         state.db.clone(),
@@ -491,17 +561,22 @@ pub async fn unreblog_status(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Remove repost
-    let status = status_service.unrepost_by_id(&id).await?;
+    // Remove repost.
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        status_service.unrepost_by_uri(uri).await?
+    } else {
+        status_service.unrepost_by_id(&id).await?
+    };
+    let status_id = status.id.clone();
 
     // Return status with reblogged=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        status_service.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&status_id).await.ok(),
         Some(false),
-        status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -512,6 +587,7 @@ pub async fn bookmark_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = StatusService::new(
         state.db.clone(),
@@ -522,15 +598,20 @@ pub async fn bookmark_status(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get status and add bookmark
-    let status = status_service.bookmark_by_id(&id).await?;
+    // Get status and add bookmark.
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        status_service.bookmark(uri).await?
+    } else {
+        status_service.bookmark_by_id(&id).await?
+    };
+    let status_id = status.id.clone();
 
     // Return status with bookmarked=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        status_service.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&status_id).await.ok(),
         Some(false),
         Some(true),
     );
@@ -543,6 +624,7 @@ pub async fn unbookmark_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = StatusService::new(
         state.db.clone(),
@@ -553,15 +635,22 @@ pub async fn unbookmark_status(
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Get status and remove bookmark
-    let status = status_service.unbookmark_by_id(&id).await?;
+    // Get status and remove bookmark.
+    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+        let status = status_service.get_by_uri(uri).await?;
+        status_service.unbookmark_loaded(&status).await?;
+        status
+    } else {
+        status_service.unbookmark_by_id(&id).await?
+    };
+    let status_id = status.id.clone();
 
     // Return status with bookmarked=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        status_service.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&status_id).await.ok(),
         Some(false),
         Some(false),
     );

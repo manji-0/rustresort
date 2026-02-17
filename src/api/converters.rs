@@ -53,6 +53,44 @@ pub fn account_to_response(account: &Account, config: &AppConfig) -> AccountResp
     }
 }
 
+fn remote_account_to_response(status: &Status, config: &AppConfig) -> AccountResponse {
+    let placeholder_created_at = chrono::DateTime::from_timestamp(0, 0)
+        .expect("unix epoch timestamp should always be valid");
+    let media_url = &config.storage.media.public_url;
+    let address = status.account_address.trim();
+    let (username, domain) = address
+        .split_once('@')
+        .unwrap_or(("unknown", "unknown.invalid"));
+    let normalized_username = username.to_ascii_lowercase();
+    let normalized_domain = domain.to_ascii_lowercase();
+    let acct = format!("{}@{}", normalized_username, normalized_domain);
+
+    AccountResponse {
+        id: acct.clone(),
+        username: normalized_username.clone(),
+        acct,
+        display_name: normalized_username.clone(),
+        locked: false,
+        bot: false,
+        discoverable: true,
+        group: false,
+        // Remote account creation timestamp is unavailable; use a deterministic placeholder.
+        created_at: placeholder_created_at,
+        note: String::new(),
+        url: format!("https://{}/@{}", normalized_domain, normalized_username),
+        avatar: format!("{}/default-avatar.png", media_url),
+        avatar_static: format!("{}/default-avatar.png", media_url),
+        header: format!("{}/default-header.png", media_url),
+        header_static: format!("{}/default-header.png", media_url),
+        followers_count: 0,
+        following_count: 0,
+        statuses_count: 0,
+        last_status_at: None,
+        emojis: vec![],
+        fields: vec![],
+    }
+}
+
 /// Convert Status to StatusResponse
 pub fn status_to_response(
     status: &Status,
@@ -63,6 +101,11 @@ pub fn status_to_response(
     bookmarked: Option<bool>,
 ) -> StatusResponse {
     let base_url = config.server.base_url();
+    let account_response = if status.is_local || status.account_address.trim().is_empty() {
+        account_to_response(account, config)
+    } else {
+        remote_account_to_response(status, config)
+    };
 
     StatusResponse {
         id: status.id.clone(),
@@ -88,7 +131,7 @@ pub fn status_to_response(
         edited_at: None,
         content: status.content.clone(),
         reblog: None, // TODO: Handle boosts
-        account: account_to_response(account, config),
+        account: account_response,
         media_attachments: vec![], // TODO: Load from database
         mentions: vec![],
         tags: vec![],
@@ -248,5 +291,48 @@ mod tests {
         assert_eq!(response.reblogged, Some(false));
         assert_eq!(response.bookmarked, Some(false));
         assert_eq!(response.account.username, "testuser");
+    }
+
+    #[test]
+    fn test_status_to_response_remote_account_uses_stable_placeholder_created_at() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".to_string(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let status = Status {
+            id: "remote-1".to_string(),
+            uri: "https://remote.example/@alice/123".to_string(),
+            content: "<p>Remote</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "favourited".to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            fetched_at: None,
+        };
+
+        let response = status_to_response(&status, &account, &config, None, None, None);
+
+        assert_eq!(response.account.acct, "alice@remote.example");
+        assert_eq!(
+            response.account.created_at,
+            chrono::DateTime::from_timestamp(0, 0).unwrap()
+        );
     }
 }

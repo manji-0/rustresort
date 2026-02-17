@@ -2,7 +2,9 @@
 
 use super::*;
 use chrono::Utc;
+use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 
 /// Helper to create a test database
 async fn create_test_db() -> (Database, TempDir) {
@@ -108,9 +110,82 @@ async fn test_follow_operations() {
     assert_eq!(addresses[0], "user@example.com");
 
     // Delete follow
-    db.delete_follow("user@example.com").await.unwrap();
+    db.delete_follow("user@example.com", None).await.unwrap();
     let addresses = db.get_all_follow_addresses().await.unwrap();
     assert_eq!(addresses.len(), 0);
+}
+
+#[tokio::test]
+async fn test_insert_follow_if_absent_deduplicates_default_port_variants() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let first = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example:443".to_string(),
+        uri: "https://example.com/follows/default-port-first".to_string(),
+        created_at: Utc::now(),
+    };
+    let second = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example".to_string(),
+        uri: "https://example.com/follows/default-port-second".to_string(),
+        created_at: Utc::now(),
+    };
+
+    let inserted_first = db.insert_follow_if_absent(&first, Some(443)).await.unwrap();
+    let inserted_second = db
+        .insert_follow_if_absent(&second, Some(443))
+        .await
+        .unwrap();
+
+    assert!(inserted_first);
+    assert!(!inserted_second);
+    let addresses = db.get_all_follow_addresses().await.unwrap();
+    assert_eq!(addresses, vec!["alice@remote.example:443".to_string()]);
+}
+
+#[tokio::test]
+async fn test_insert_follow_if_absent_is_atomic_for_equivalent_targets() {
+    let (db, _temp_dir) = create_test_db().await;
+    let db = Arc::new(db);
+    let barrier = Arc::new(Barrier::new(2));
+
+    let db1 = db.clone();
+    let barrier1 = barrier.clone();
+    let task1 = tokio::spawn(async move {
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "alice@remote.example:443".to_string(),
+            uri: "https://example.com/follows/atomic-1".to_string(),
+            created_at: Utc::now(),
+        };
+        barrier1.wait().await;
+        db1.insert_follow_if_absent(&follow, Some(443))
+            .await
+            .unwrap()
+    });
+
+    let db2 = db.clone();
+    let barrier2 = barrier.clone();
+    let task2 = tokio::spawn(async move {
+        let follow = Follow {
+            id: EntityId::new().0,
+            target_address: "alice@remote.example".to_string(),
+            uri: "https://example.com/follows/atomic-2".to_string(),
+            created_at: Utc::now(),
+        };
+        barrier2.wait().await;
+        db2.insert_follow_if_absent(&follow, Some(443))
+            .await
+            .unwrap()
+    });
+
+    let inserted1 = task1.await.unwrap();
+    let inserted2 = task2.await.unwrap();
+    assert_ne!(inserted1, inserted2);
+
+    let addresses = db.get_all_follow_addresses().await.unwrap();
+    assert_eq!(addresses.len(), 1);
 }
 
 #[tokio::test]
@@ -139,9 +214,163 @@ async fn test_follower_operations() {
     assert_eq!(inboxes[0], "https://example.com/inbox");
 
     // Delete follower
-    db.delete_follower("follower@example.com").await.unwrap();
+    db.delete_follower("follower@example.com", None)
+        .await
+        .unwrap();
     let addresses = db.get_all_follower_addresses().await.unwrap();
     assert_eq!(addresses.len(), 0);
+}
+
+#[tokio::test]
+async fn test_delete_follower_matches_missing_default_https_port() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follower = Follower {
+        id: EntityId::new().0,
+        follower_address: "bob@remote.example:443".to_string(),
+        inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+        uri: "https://remote.example/follows/default-port".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follower(&follower).await.unwrap();
+
+    db.delete_follower("bob@remote.example", Some(443))
+        .await
+        .unwrap();
+    let addresses = db.get_all_follower_addresses().await.unwrap();
+    assert!(addresses.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_follower_by_address_and_uri_matches_default_https_port_variant() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follower = Follower {
+        id: EntityId::new().0,
+        follower_address: "bob@remote.example".to_string(),
+        inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
+        uri: "https://remote.example/follows/default-port-uri".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follower(&follower).await.unwrap();
+
+    let removed = db
+        .delete_follower_by_address_and_uri(
+            "bob@remote.example:443",
+            "https://remote.example/follows/default-port-uri",
+            Some(443),
+        )
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let addresses = db.get_all_follower_addresses().await.unwrap();
+    assert!(addresses.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_follow_matches_missing_default_https_port() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example:443".to_string(),
+        uri: "https://example.com/follows/default-port".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    db.delete_follow("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+    let addresses = db.get_all_follow_addresses().await.unwrap();
+    assert!(addresses.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_follow_matches_explicit_default_https_port() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example".to_string(),
+        uri: "https://example.com/follows/no-port".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    db.delete_follow("alice@remote.example:443", Some(443))
+        .await
+        .unwrap();
+    let addresses = db.get_all_follow_addresses().await.unwrap();
+    assert!(addresses.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_follow_does_not_match_non_default_port() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example:80".to_string(),
+        uri: "https://example.com/follows/non-default-port".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    db.delete_follow("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+    let addresses = db.get_all_follow_addresses().await.unwrap();
+    assert_eq!(addresses, vec!["alice@remote.example:80".to_string()]);
+}
+
+#[tokio::test]
+async fn test_block_account_removes_follow_for_default_port_variant() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example:443".to_string(),
+        uri: "https://example.com/follows/block-match".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    db.block_account("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+
+    let follow_addresses = db.get_all_follow_addresses().await.unwrap();
+    assert!(follow_addresses.is_empty());
+    assert!(
+        db.is_account_blocked("alice@remote.example:443", Some(443))
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_mute_unmute_matches_default_port_variant() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.mute_account("alice@remote.example:443", true, None, Some(443))
+        .await
+        .unwrap();
+    assert!(
+        db.is_account_muted("alice@remote.example", Some(443))
+            .await
+            .unwrap()
+    );
+
+    db.unmute_account("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+    assert!(
+        !db.is_account_muted("alice@remote.example:443", Some(443))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

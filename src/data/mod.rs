@@ -9,7 +9,7 @@ mod cache;
 mod database;
 mod models;
 
-pub use cache::{ProfileCache, TimelineCache};
+pub use cache::{CachedAttachment, CachedStatus, ProfileCache, TimelineCache};
 pub use database::Database;
 pub use models::*;
 
