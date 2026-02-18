@@ -349,6 +349,69 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Patch account profile fields by account ID.
+    ///
+    /// Use `None` for omitted fields (no change), and `Some(None)` to clear a field.
+    ///
+    /// # Returns
+    /// `true` if updated, `false` if no matching account row exists.
+    pub async fn patch_account_profile(
+        &self,
+        account_id: &str,
+        display_name: Option<Option<&str>>,
+        note: Option<Option<&str>>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = match (display_name, note) {
+            (Some(display_name), Some(note)) => {
+                sqlx::query(
+                    r#"
+                    UPDATE account
+                    SET display_name = ?, note = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(display_name)
+                .bind(note)
+                .bind(updated_at)
+                .bind(account_id)
+                .execute(&self.pool)
+                .await?
+            }
+            (Some(display_name), None) => {
+                sqlx::query(
+                    r#"
+                    UPDATE account
+                    SET display_name = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(display_name)
+                .bind(updated_at)
+                .bind(account_id)
+                .execute(&self.pool)
+                .await?
+            }
+            (None, Some(note)) => {
+                sqlx::query(
+                    r#"
+                    UPDATE account
+                    SET note = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(note)
+                .bind(updated_at)
+                .bind(account_id)
+                .execute(&self.pool)
+                .await?
+            }
+            (None, None) => return Ok(false),
+        };
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Update account avatar key by account ID.
     ///
     /// # Returns

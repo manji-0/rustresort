@@ -104,20 +104,20 @@ impl AccountService {
     ) -> Result<Account, AppError> {
         let mut account = self.get_account().await?;
 
-        let new_display_name = display_name
-            .map(normalize_optional_text)
-            .unwrap_or_else(|| account.display_name.clone());
-        let new_note = note
-            .map(normalize_optional_text)
-            .unwrap_or_else(|| account.note.clone());
+        let display_name_patch = display_name.map(normalize_optional_text);
+        let note_patch = note.map(normalize_optional_text);
+        if display_name_patch.is_none() && note_patch.is_none() {
+            return Ok(account);
+        }
+
         let updated_at = chrono::Utc::now();
 
         let updated = self
             .db
-            .update_account_profile(
+            .patch_account_profile(
                 &account.id,
-                new_display_name.as_deref(),
-                new_note.as_deref(),
+                display_name_patch.as_ref().map(|value| value.as_deref()),
+                note_patch.as_ref().map(|value| value.as_deref()),
                 updated_at,
             )
             .await?;
@@ -125,8 +125,12 @@ impl AccountService {
             return Err(AppError::NotFound);
         }
 
-        account.display_name = new_display_name;
-        account.note = new_note;
+        if let Some(display_name) = display_name_patch {
+            account.display_name = display_name;
+        }
+        if let Some(note) = note_patch {
+            account.note = note;
+        }
         account.updated_at = updated_at;
         Ok(account)
     }
@@ -318,6 +322,23 @@ mod tests {
             .unwrap();
         assert_eq!(updated.display_name, Some("Display".to_string()));
         assert_eq!(updated.note, Some("bio".to_string()));
+
+        let note_only = service
+            .update_profile(None, Some("updated-note".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(note_only.display_name, Some("Display".to_string()));
+        assert_eq!(note_only.note, Some("updated-note".to_string()));
+
+        let display_only = service
+            .update_profile(Some("updated-display".to_string()), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            display_only.display_name,
+            Some("updated-display".to_string())
+        );
+        assert_eq!(display_only.note, Some("updated-note".to_string()));
 
         let cleared = service
             .update_profile(Some("   ".to_string()), Some("".to_string()))
