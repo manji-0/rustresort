@@ -321,6 +321,86 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Update account profile fields by account ID.
+    ///
+    /// # Returns
+    /// `true` if updated, `false` if no matching account row exists.
+    pub async fn update_account_profile(
+        &self,
+        account_id: &str,
+        display_name: Option<&str>,
+        note: Option<&str>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE account
+            SET display_name = ?, note = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(display_name)
+        .bind(note)
+        .bind(updated_at)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Update account avatar key by account ID.
+    ///
+    /// # Returns
+    /// `true` if updated, `false` if no matching account row exists.
+    pub async fn update_account_avatar_key(
+        &self,
+        account_id: &str,
+        avatar_s3_key: Option<&str>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE account
+            SET avatar_s3_key = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(avatar_s3_key)
+        .bind(updated_at)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Update account header key by account ID.
+    ///
+    /// # Returns
+    /// `true` if updated, `false` if no matching account row exists.
+    pub async fn update_account_header_key(
+        &self,
+        account_id: &str,
+        header_s3_key: Option<&str>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE account
+            SET header_s3_key = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(header_s3_key)
+        .bind(updated_at)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     // =========================================================================
     // Status
     // =========================================================================

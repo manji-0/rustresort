@@ -9,10 +9,11 @@ use crate::error::AppError;
 use crate::storage::MediaStorage;
 
 fn normalize_optional_text(value: String) -> Option<String> {
-    if value.trim().is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(value)
+        Some(trimmed.to_string())
     }
 }
 
@@ -50,7 +51,8 @@ impl AccountService {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
         use rsa::{RsaPrivateKey, RsaPublicKey};
 
-        if username.trim().is_empty() {
+        let username = username.trim();
+        if username.is_empty() {
             return Err(AppError::Validation("username cannot be empty".to_string()));
         }
 
@@ -102,15 +104,30 @@ impl AccountService {
     ) -> Result<Account, AppError> {
         let mut account = self.get_account().await?;
 
-        if let Some(display_name) = display_name {
-            account.display_name = normalize_optional_text(display_name);
-        }
-        if let Some(note) = note {
-            account.note = normalize_optional_text(note);
+        let new_display_name = display_name
+            .map(normalize_optional_text)
+            .unwrap_or_else(|| account.display_name.clone());
+        let new_note = note
+            .map(normalize_optional_text)
+            .unwrap_or_else(|| account.note.clone());
+        let updated_at = chrono::Utc::now();
+
+        let updated = self
+            .db
+            .update_account_profile(
+                &account.id,
+                new_display_name.as_deref(),
+                new_note.as_deref(),
+                updated_at,
+            )
+            .await?;
+        if !updated {
+            return Err(AppError::NotFound);
         }
 
-        account.updated_at = chrono::Utc::now();
-        self.db.upsert_account(&account).await?;
+        account.display_name = new_display_name;
+        account.note = new_note;
+        account.updated_at = updated_at;
         Ok(account)
     }
 
@@ -134,9 +151,17 @@ impl AccountService {
         let image_id = EntityId::new().0;
         let (avatar_s3_key, avatar_url) = self.storage.upload_avatar(&image_id, image_data).await?;
 
+        let updated_at = chrono::Utc::now();
+        let updated = self
+            .db
+            .update_account_avatar_key(&account.id, Some(&avatar_s3_key), updated_at)
+            .await?;
+        if !updated {
+            return Err(AppError::NotFound);
+        }
+
         account.avatar_s3_key = Some(avatar_s3_key.clone());
-        account.updated_at = chrono::Utc::now();
-        self.db.upsert_account(&account).await?;
+        account.updated_at = updated_at;
 
         if let Some(old_key) = previous_key.as_deref().filter(|old| *old != avatar_s3_key) {
             if let Err(error) = self.storage.delete(old_key).await {
@@ -152,6 +177,12 @@ impl AccountService {
     }
 
     /// Update header image
+    ///
+    /// # Arguments
+    /// * `image_data` - Header image data (will be converted to WebP)
+    ///
+    /// # Returns
+    /// Public URL of the new header image
     pub async fn update_header(&self, image_data: Vec<u8>) -> Result<String, AppError> {
         if image_data.is_empty() {
             return Err(AppError::Validation(
@@ -165,9 +196,17 @@ impl AccountService {
         let image_id = EntityId::new().0;
         let (header_s3_key, header_url) = self.storage.upload_header(&image_id, image_data).await?;
 
+        let updated_at = chrono::Utc::now();
+        let updated = self
+            .db
+            .update_account_header_key(&account.id, Some(&header_s3_key), updated_at)
+            .await?;
+        if !updated {
+            return Err(AppError::NotFound);
+        }
+
         account.header_s3_key = Some(header_s3_key.clone());
-        account.updated_at = chrono::Utc::now();
-        self.db.upsert_account(&account).await?;
+        account.updated_at = updated_at;
 
         if let Some(old_key) = previous_key.as_deref().filter(|old| *old != header_s3_key) {
             if let Err(error) = self.storage.delete(old_key).await {
@@ -230,13 +269,27 @@ mod tests {
         let storage = create_test_storage().await;
         let service = AccountService::new(db.clone(), storage);
 
-        let account = service.initialize_account("admin").await.unwrap();
+        let account = service.initialize_account(" admin ").await.unwrap();
         assert_eq!(account.username, "admin");
+        assert_eq!(account.display_name, Some("admin".to_string()));
         assert!(account.private_key_pem.contains("BEGIN PRIVATE KEY"));
         assert!(account.public_key_pem.contains("BEGIN PUBLIC KEY"));
 
         let error = service.initialize_account("another").await.unwrap_err();
         assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn initialize_account_rejects_empty_username() {
+        let (db, _temp_dir) = create_test_db().await;
+        let storage = create_test_storage().await;
+        let service = AccountService::new(db, storage);
+
+        let empty = service.initialize_account("").await.unwrap_err();
+        assert!(matches!(empty, AppError::Validation(_)));
+
+        let whitespace = service.initialize_account("   ").await.unwrap_err();
+        assert!(matches!(whitespace, AppError::Validation(_)));
     }
 
     #[tokio::test]
@@ -260,7 +313,7 @@ mod tests {
         db.upsert_account(&account).await.unwrap();
 
         let updated = service
-            .update_profile(Some("Display".to_string()), Some("bio".to_string()))
+            .update_profile(Some("  Display  ".to_string()), Some("  bio  ".to_string()))
             .await
             .unwrap();
         assert_eq!(updated.display_name, Some("Display".to_string()));
