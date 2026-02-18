@@ -107,6 +107,12 @@ impl StatusService {
     /// - Creates favourite record
     /// - Should trigger Like activity (handled by caller)
     pub async fn favourite(&self, status_uri: &str) -> Result<Status, AppError> {
+        let (status, _) = self.favourite_with_id(status_uri).await?;
+        Ok(status)
+    }
+
+    /// Favourite (like) a status and return favourite row ID.
+    pub async fn favourite_with_id(&self, status_uri: &str) -> Result<(Status, String), AppError> {
         let status = match self.db.get_status_by_uri(status_uri).await? {
             Some(status) => status,
             None => {
@@ -115,8 +121,8 @@ impl StatusService {
             }
         };
 
-        self.db.insert_favourite(&status.id).await?;
-        Ok(status)
+        let favourite_id = self.db.insert_favourite(&status.id).await?;
+        Ok((status, favourite_id))
     }
 
     /// Unfavourite a status
@@ -243,9 +249,18 @@ impl StatusService {
 
     /// Favourite by local status ID
     pub async fn favourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
-        self.db.insert_favourite(status_id).await?;
+        let (status, _) = self.favourite_by_id_with_id(status_id).await?;
         Ok(status)
+    }
+
+    /// Favourite by local status ID and return favourite row ID.
+    pub async fn favourite_by_id_with_id(
+        &self,
+        status_id: &str,
+    ) -> Result<(Status, String), AppError> {
+        let status = self.get(status_id).await?;
+        let favourite_id = self.db.insert_favourite(status_id).await?;
+        Ok((status, favourite_id))
     }
 
     /// Unfavourite by local status ID

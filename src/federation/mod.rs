@@ -17,7 +17,7 @@ mod signature;
 mod webfinger;
 
 pub use activity::{ActivityProcessor, ActivityType};
-pub use delivery::ActivityDelivery;
+pub use delivery::{ActivityDelivery, DeliveryResult};
 pub use key_cache::{CacheStats, PublicKeyCache};
 pub use rate_limit::{RateLimitStats, RateLimiter, extract_domain};
 pub use signature::{fetch_public_key, sign_request, verify_signature};

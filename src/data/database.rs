@@ -69,6 +69,68 @@ fn extract_explicit_port(authority: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
+fn format_host_for_authority(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+fn push_case_insensitive_unique(
+    values: &mut Vec<String>,
+    seen_casefold: &mut HashSet<String>,
+    candidate: String,
+) {
+    if !seen_casefold.insert(candidate.to_ascii_lowercase()) {
+        return;
+    }
+    values.push(candidate);
+}
+
+fn equivalent_account_address_candidates(
+    target_address: &str,
+    default_port: Option<u16>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen_casefold = HashSet::new();
+    push_case_insensitive_unique(
+        &mut candidates,
+        &mut seen_casefold,
+        target_address.to_string(),
+    );
+
+    let Some((username, host, explicit_port)) = parse_account_address(target_address) else {
+        return candidates;
+    };
+    let authority = format_host_for_authority(&host);
+    let without_port = format!("{}@{}", username, authority);
+
+    if let Some(port) = explicit_port {
+        push_case_insensitive_unique(
+            &mut candidates,
+            &mut seen_casefold,
+            format!("{}@{}:{}", username, authority, port),
+        );
+
+        if default_port == Some(port) {
+            push_case_insensitive_unique(&mut candidates, &mut seen_casefold, without_port);
+        }
+    } else {
+        push_case_insensitive_unique(&mut candidates, &mut seen_casefold, without_port);
+
+        if let Some(default_port) = default_port {
+            push_case_insensitive_unique(
+                &mut candidates,
+                &mut seen_casefold,
+                format!("{}@{}:{}", username, authority, default_port),
+            );
+        }
+    }
+
+    candidates
+}
+
 fn account_addresses_match(left: &str, right: &str, default_port: Option<u16>) -> bool {
     let Some((left_user, left_host, left_port)) = parse_account_address(left) else {
         return left.eq_ignore_ascii_case(right);
@@ -550,6 +612,78 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a new status and attach media atomically.
+    pub async fn insert_status_with_media(
+        &self,
+        status: &Status,
+        media_ids: &[String],
+    ) -> Result<(), AppError> {
+        if media_ids.is_empty() {
+            return self.insert_status(status).await;
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            sqlx::query(
+                r#"
+                INSERT INTO statuses (
+                    id, uri, content, content_warning, visibility, language,
+                    account_address, is_local, in_reply_to_uri, boost_of_uri,
+                    persisted_reason, created_at, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&status.id)
+            .bind(&status.uri)
+            .bind(&status.content)
+            .bind(&status.content_warning)
+            .bind(&status.visibility)
+            .bind(&status.language)
+            .bind(&status.account_address)
+            .bind(status.is_local)
+            .bind(&status.in_reply_to_uri)
+            .bind(&status.boost_of_uri)
+            .bind(&status.persisted_reason)
+            .bind(&status.created_at)
+            .bind(&status.fetched_at)
+            .execute(&mut *conn)
+            .await?;
+
+            for media_id in media_ids {
+                let updated = sqlx::query(
+                    "UPDATE media_attachments SET status_id = ? WHERE id = ? AND status_id IS NULL",
+                )
+                .bind(&status.id)
+                .bind(media_id)
+                .execute(&mut *conn)
+                .await?;
+
+                if updated.rows_affected() == 0 {
+                    return Err(AppError::Validation(format!(
+                        "media attachment is unavailable: {}",
+                        media_id
+                    )));
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Update an existing status
     pub async fn update_status(&self, status: &Status) -> Result<(), AppError> {
         sqlx::query(
@@ -766,11 +900,21 @@ impl Database {
         media_id: &str,
         status_id: &str,
     ) -> Result<(), AppError> {
-        sqlx::query("UPDATE media_attachments SET status_id = ? WHERE id = ?")
-            .bind(status_id)
-            .bind(media_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE media_attachments SET status_id = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
+        )
+        .bind(status_id)
+        .bind(media_id)
+        .bind(status_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(AppError::Validation(format!(
+                "media attachment is already attached to another status: {}",
+                media_id
+            )));
+        }
 
         Ok(())
     }
@@ -909,6 +1053,36 @@ impl Database {
                 Err(error)
             }
         }
+    }
+
+    /// Get Follow activity URI for a target address.
+    pub async fn get_follow_uri(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<String>, AppError> {
+        let candidates = equivalent_account_address_candidates(target_address, default_port);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT uri FROM follows WHERE target_address COLLATE NOCASE IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in &candidates {
+                separated.push_bind(candidate);
+            }
+        }
+        query_builder.push(") ORDER BY created_at DESC LIMIT 1");
+
+        let uri = query_builder
+            .build_query_scalar::<String>()
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(uri)
     }
 
     /// Delete follow relationship
@@ -1129,6 +1303,18 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+
+    /// Get favourite record ID for a status.
+    pub async fn get_favourite_id(&self, status_id: &str) -> Result<Option<String>, AppError> {
+        let id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM favourites WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(id)
     }
 
     /// Check if status is favourited
@@ -1394,6 +1580,18 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+
+    /// Get repost activity URI for a status.
+    pub async fn get_repost_uri(&self, status_id: &str) -> Result<Option<String>, AppError> {
+        let uri = sqlx::query_scalar::<_, String>(
+            "SELECT uri FROM reposts WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(uri)
     }
 
     /// Check if status is reposted
@@ -1870,11 +2068,44 @@ impl Database {
         Ok(result)
     }
 
+    /// Insert follow request
+    pub async fn insert_follow_request(
+        &self,
+        requester_address: &str,
+        inbox_uri: &str,
+        uri: &str,
+    ) -> Result<(), AppError> {
+        let id = EntityId::new().0;
+        sqlx::query(
+            "INSERT OR REPLACE INTO follow_requests (id, requester_address, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+        )
+        .bind(&id)
+        .bind(requester_address)
+        .bind(inbox_uri)
+        .bind(uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Accept follow request
-    pub async fn accept_follow_request(&self, requester_address: &str) -> Result<(), AppError> {
-        // Get follow request details
-        if let Some((inbox_uri, uri)) = self.get_follow_request(requester_address).await? {
-            // Move to followers table
+    pub async fn accept_follow_request(&self, requester_address: &str) -> Result<bool, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<bool, AppError> = async {
+            let follow_request = sqlx::query_as::<_, (String, String)>(
+                "SELECT inbox_uri, uri FROM follow_requests WHERE requester_address = ?",
+            )
+            .bind(requester_address)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+            let Some((inbox_uri, uri)) = follow_request else {
+                return Ok(false);
+            };
+
             let follower_id = EntityId::new().0;
             sqlx::query(
                 "INSERT INTO followers (id, follower_address, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
@@ -1883,17 +2114,28 @@ impl Database {
             .bind(requester_address)
             .bind(&inbox_uri)
             .bind(&uri)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
 
-            // Remove from follow_requests
             sqlx::query("DELETE FROM follow_requests WHERE requester_address = ?")
                 .bind(requester_address)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
-        }
 
-        Ok(())
+            Ok(true)
+        }
+        .await;
+
+        match result {
+            Ok(accepted) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(accepted)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Reject follow request
@@ -2002,6 +2244,51 @@ impl Database {
         Ok(())
     }
 
+    /// Add multiple accounts to list atomically
+    pub async fn add_accounts_to_list(
+        &self,
+        list_id: &str,
+        account_addresses: &[String],
+    ) -> Result<(), AppError> {
+        if account_addresses.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            for account_address in account_addresses {
+                let id = EntityId::new().0;
+                sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO list_accounts (id, list_id, account_address, created_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    "#,
+                )
+                .bind(&id)
+                .bind(list_id)
+                .bind(account_address)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Remove account from list
     pub async fn remove_account_from_list(
         &self,
@@ -2016,6 +2303,44 @@ impl Database {
                 .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Remove multiple accounts from list atomically
+    pub async fn remove_accounts_from_list(
+        &self,
+        list_id: &str,
+        account_addresses: &[String],
+    ) -> Result<(), AppError> {
+        if account_addresses.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            for account_address in account_addresses {
+                sqlx::query("DELETE FROM list_accounts WHERE list_id = ? AND account_address = ?")
+                    .bind(list_id)
+                    .bind(account_address)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Get accounts in list

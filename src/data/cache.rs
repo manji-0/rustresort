@@ -750,6 +750,63 @@ impl ProfileCache {
         value
     }
 
+    /// Get profile by actor URI
+    pub async fn get_by_uri(&self, actor_uri: &str) -> Option<Arc<CachedProfile>> {
+        if let Err(error) = self.prune_expired_if_needed().await {
+            tracing::warn!(%error, "Failed to prune profile cache");
+        }
+
+        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
+        let result = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
+                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
+                FROM profiles
+                WHERE uri = ?1
+                  AND fetched_at_ms >= ?2
+                ORDER BY fetched_at_ms DESC
+                LIMIT 1
+                "#,
+                (actor_uri, cutoff),
+            )
+            .await;
+
+        let mut rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to fetch profile cache entry by actor URI");
+                return None;
+            }
+        };
+
+        let value = match rows.next().await {
+            Ok(Some(row)) => match Self::parse_profile_row(&row) {
+                Ok(profile) => Some(Arc::new(profile)),
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to decode profile cache entry");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to iterate profile cache rows");
+                None
+            }
+        };
+
+        use crate::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
+        if value.is_some() {
+            CACHE_HITS_TOTAL.with_label_values(&["profile"]).inc();
+        } else {
+            CACHE_MISSES_TOTAL.with_label_values(&["profile"]).inc();
+        }
+
+        value
+    }
+
     /// Insert or update profile
     pub async fn insert(&self, profile: CachedProfile) {
         let upsert_result = self
@@ -983,5 +1040,21 @@ mod tests {
 
         cache.insert(profile).await;
         assert!(cache.get("alice@example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn profile_get_by_uri_returns_latest_entry() {
+        let cache = ProfileCache::new(60).await.expect("cache init");
+        let mut profile = sample_profile("alice@example.com", Utc::now());
+        profile.uri = "https://example.com/users/alice".to_string();
+
+        cache.insert(profile.clone()).await;
+
+        let fetched = cache
+            .get_by_uri("https://example.com/users/alice")
+            .await
+            .expect("profile should exist");
+        assert_eq!(fetched.address, "alice@example.com");
+        assert_eq!(fetched.uri, profile.uri);
     }
 }

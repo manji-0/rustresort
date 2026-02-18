@@ -15,6 +15,7 @@ pub mod admin;
 pub mod apps;
 pub mod bookmarks;
 pub mod conversations;
+mod federation_delivery;
 pub mod filters;
 pub mod instance;
 pub mod lists;

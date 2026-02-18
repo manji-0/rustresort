@@ -38,11 +38,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Cargo check
-        run: cargo check
+        run: cargo check --locked
 
       - name: Cargo clippy
         run: >
-          cargo clippy -- -D warnings
+          cargo clippy --locked -- -D warnings
           -A clippy::too_many_arguments
           -A clippy::collapsible_if
           -A clippy::needless_borrows_for_generic_args
@@ -68,7 +68,7 @@ jobs:
           fi
 
       - name: Cargo nextest (lib)
-        run: cargo nextest run --lib
+        run: cargo nextest run --locked --lib
 
   e2e:
     name: E2E
@@ -92,7 +92,7 @@ jobs:
 
       - name: Run E2E suites (consolidated)
         run: >
-          cargo nextest run
+          cargo nextest run --locked
           --test e2e_api_coverage
           --test e2e_federation_scenarios
           --test e2e_mastodon_api

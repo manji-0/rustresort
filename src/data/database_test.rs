@@ -395,6 +395,69 @@ async fn test_delete_follow_does_not_match_non_default_port() {
 }
 
 #[tokio::test]
+async fn test_get_follow_uri_matches_case_insensitively() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "Alice@Remote.EXAMPLE".to_string(),
+        uri: "https://example.com/follows/case-insensitive".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    let uri = db
+        .get_follow_uri("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+    assert_eq!(
+        uri,
+        Some("https://example.com/follows/case-insensitive".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_get_follow_uri_matches_default_https_port_variants() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example:443".to_string(),
+        uri: "https://example.com/follows/default-port-uri".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    let uri = db
+        .get_follow_uri("alice@remote.example", Some(443))
+        .await
+        .unwrap();
+    assert_eq!(
+        uri,
+        Some("https://example.com/follows/default-port-uri".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_get_follow_uri_does_not_match_non_default_port_variant() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new().0,
+        target_address: "alice@remote.example".to_string(),
+        uri: "https://example.com/follows/no-port-uri".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    let uri = db
+        .get_follow_uri("alice@remote.example:80", Some(443))
+        .await
+        .unwrap();
+    assert_eq!(uri, None);
+}
+
+#[tokio::test]
 async fn test_block_account_removes_follow_for_default_port_variant() {
     let (db, _temp_dir) = create_test_db().await;
 
@@ -727,4 +790,315 @@ async fn test_settings_operations() {
     db.set_setting(key, "new_value").await.unwrap();
     let retrieved = db.get_setting(key).await.unwrap();
     assert_eq!(retrieved, Some("new_value".to_string()));
+}
+
+#[tokio::test]
+async fn test_list_batch_add_and_remove_accounts() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let list_id = db.create_list("Test List", "list").await.unwrap();
+    let add_accounts = vec![
+        "alice@example.com".to_string(),
+        "bob@example.com".to_string(),
+        "carol@example.com".to_string(),
+    ];
+    db.add_accounts_to_list(&list_id, &add_accounts)
+        .await
+        .unwrap();
+
+    let mut stored = db.get_list_accounts(&list_id).await.unwrap();
+    stored.sort();
+    let mut expected = add_accounts.clone();
+    expected.sort();
+    assert_eq!(stored, expected);
+
+    let remove_accounts = vec![
+        "alice@example.com".to_string(),
+        "carol@example.com".to_string(),
+    ];
+    db.remove_accounts_from_list(&list_id, &remove_accounts)
+        .await
+        .unwrap();
+
+    let remaining = db.get_list_accounts(&list_id).await.unwrap();
+    assert_eq!(remaining, vec!["bob@example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn test_insert_status_with_media_attaches_all_media_atomically() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/with-media".to_string(),
+        content: "<p>Status with media</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+
+    let media_ids = vec![EntityId::new().0, EntityId::new().0];
+    for media_id in &media_ids {
+        db.insert_media(&MediaAttachment {
+            id: media_id.clone(),
+            status_id: None,
+            s3_key: format!("media/{}.png", media_id),
+            thumbnail_s3_key: None,
+            content_type: "image/png".to_string(),
+            file_size: 100,
+            description: None,
+            blurhash: None,
+            width: Some(1),
+            height: Some(1),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    }
+
+    db.insert_status_with_media(&status, &media_ids)
+        .await
+        .unwrap();
+
+    let stored = db.get_status(&status.id).await.unwrap();
+    assert!(stored.is_some());
+
+    for media_id in &media_ids {
+        let media = db.get_media(media_id).await.unwrap().unwrap();
+        assert_eq!(media.status_id, Some(status.id.clone()));
+    }
+}
+
+#[tokio::test]
+async fn test_insert_status_with_media_rolls_back_when_media_missing() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/missing-media".to_string(),
+        content: "<p>Status with missing media</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+
+    let result = db
+        .insert_status_with_media(&status, &[EntityId::new().0])
+        .await;
+    assert!(result.is_err());
+    assert!(db.get_status(&status.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_insert_status_with_media_rolls_back_when_media_already_attached() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let existing_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/existing".to_string(),
+        content: "<p>Existing status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&existing_status).await.unwrap();
+
+    let media_id = EntityId::new().0;
+    db.insert_media(&MediaAttachment {
+        id: media_id.clone(),
+        status_id: Some(existing_status.id.clone()),
+        s3_key: format!("media/{}.png", media_id),
+        thumbnail_s3_key: None,
+        content_type: "image/png".to_string(),
+        file_size: 100,
+        description: None,
+        blurhash: None,
+        width: Some(1),
+        height: Some(1),
+        created_at: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    let new_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/new".to_string(),
+        content: "<p>New status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+
+    let result = db
+        .insert_status_with_media(&new_status, std::slice::from_ref(&media_id))
+        .await;
+    assert!(result.is_err());
+    assert!(db.get_status(&new_status.id).await.unwrap().is_none());
+
+    let media = db.get_media(&media_id).await.unwrap().unwrap();
+    assert_eq!(media.status_id, Some(existing_status.id.clone()));
+}
+
+#[tokio::test]
+async fn test_attach_media_to_status_rejects_reassign_to_another_status() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let first_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/first".to_string(),
+        content: "<p>First status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let second_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/second".to_string(),
+        content: "<p>Second status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&first_status).await.unwrap();
+    db.insert_status(&second_status).await.unwrap();
+
+    let media_id = EntityId::new().0;
+    db.insert_media(&MediaAttachment {
+        id: media_id.clone(),
+        status_id: Some(first_status.id.clone()),
+        s3_key: format!("media/{}.png", media_id),
+        thumbnail_s3_key: None,
+        content_type: "image/png".to_string(),
+        file_size: 100,
+        description: None,
+        blurhash: None,
+        width: Some(1),
+        height: Some(1),
+        created_at: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    let result = db
+        .attach_media_to_status(&media_id, &second_status.id)
+        .await;
+    assert!(result.is_err());
+
+    let media = db.get_media(&media_id).await.unwrap().unwrap();
+    assert_eq!(media.status_id, Some(first_status.id.clone()));
+}
+
+#[tokio::test]
+async fn test_accept_follow_request_moves_to_followers() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.insert_follow_request(
+        "alice@remote.example",
+        "https://remote.example/inbox",
+        "https://remote.example/follows/1",
+    )
+    .await
+    .unwrap();
+
+    let accepted = db
+        .accept_follow_request("alice@remote.example")
+        .await
+        .unwrap();
+    assert!(accepted);
+    assert!(!db.has_follow_request("alice@remote.example").await.unwrap());
+
+    let followers = db.get_all_follower_addresses().await.unwrap();
+    assert_eq!(followers, vec!["alice@remote.example".to_string()]);
+
+    let inboxes = db.get_follower_inboxes().await.unwrap();
+    assert_eq!(inboxes, vec!["https://remote.example/inbox".to_string()]);
+}
+
+#[tokio::test]
+async fn test_accept_follow_request_returns_false_when_missing() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let accepted = db
+        .accept_follow_request("missing@remote.example")
+        .await
+        .unwrap();
+    assert!(!accepted);
+}
+
+#[tokio::test]
+async fn test_accept_follow_request_rolls_back_on_follower_insert_failure() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.insert_follower(&Follower {
+        id: EntityId::new().0,
+        follower_address: "alice@remote.example".to_string(),
+        inbox_uri: "https://existing.example/inbox".to_string(),
+        uri: "https://existing.example/follows/1".to_string(),
+        created_at: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    db.insert_follow_request(
+        "alice@remote.example",
+        "https://remote.example/inbox",
+        "https://remote.example/follows/2",
+    )
+    .await
+    .unwrap();
+
+    let result = db.accept_follow_request("alice@remote.example").await;
+    assert!(result.is_err());
+    assert!(db.has_follow_request("alice@remote.example").await.unwrap());
+
+    let follow_request = db.get_follow_request("alice@remote.example").await.unwrap();
+    assert_eq!(
+        follow_request,
+        Some((
+            "https://remote.example/inbox".to_string(),
+            "https://remote.example/follows/2".to_string()
+        ))
+    );
 }
