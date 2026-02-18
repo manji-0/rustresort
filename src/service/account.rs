@@ -156,11 +156,31 @@ impl AccountService {
         let (avatar_s3_key, avatar_url) = self.storage.upload_avatar(&image_id, image_data).await?;
 
         let updated_at = chrono::Utc::now();
-        let updated = self
+        let updated = match self
             .db
             .update_account_avatar_key(&account.id, Some(&avatar_s3_key), updated_at)
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Err(cleanup_error) = self.storage.delete(&avatar_s3_key).await {
+                    tracing::warn!(
+                        key = %avatar_s3_key,
+                        error = %cleanup_error,
+                        "failed to rollback uploaded avatar after database update error"
+                    );
+                }
+                return Err(error);
+            }
+        };
         if !updated {
+            if let Err(cleanup_error) = self.storage.delete(&avatar_s3_key).await {
+                tracing::warn!(
+                    key = %avatar_s3_key,
+                    error = %cleanup_error,
+                    "failed to rollback uploaded avatar after account not found"
+                );
+            }
             return Err(AppError::NotFound);
         }
 
@@ -201,11 +221,31 @@ impl AccountService {
         let (header_s3_key, header_url) = self.storage.upload_header(&image_id, image_data).await?;
 
         let updated_at = chrono::Utc::now();
-        let updated = self
+        let updated = match self
             .db
             .update_account_header_key(&account.id, Some(&header_s3_key), updated_at)
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Err(cleanup_error) = self.storage.delete(&header_s3_key).await {
+                    tracing::warn!(
+                        key = %header_s3_key,
+                        error = %cleanup_error,
+                        "failed to rollback uploaded header after database update error"
+                    );
+                }
+                return Err(error);
+            }
+        };
         if !updated {
+            if let Err(cleanup_error) = self.storage.delete(&header_s3_key).await {
+                tracing::warn!(
+                    key = %header_s3_key,
+                    error = %cleanup_error,
+                    "failed to rollback uploaded header after account not found"
+                );
+            }
             return Err(AppError::NotFound);
         }
 
