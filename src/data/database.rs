@@ -287,6 +287,40 @@ impl Database {
         Ok(())
     }
 
+    /// Insert the admin account only when the table is empty.
+    ///
+    /// This is atomic at the SQL statement level and prevents races where
+    /// multiple initializers try to create the first account concurrently.
+    ///
+    /// # Returns
+    /// `true` if inserted, `false` if an account already existed.
+    pub async fn insert_account_if_empty(&self, account: &Account) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO account (
+                id, username, display_name, note, avatar_s3_key, header_s3_key,
+                private_key_pem, public_key_pem, created_at, updated_at
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM account)
+            "#,
+        )
+        .bind(&account.id)
+        .bind(&account.username)
+        .bind(&account.display_name)
+        .bind(&account.note)
+        .bind(&account.avatar_s3_key)
+        .bind(&account.header_s3_key)
+        .bind(&account.private_key_pem)
+        .bind(&account.public_key_pem)
+        .bind(&account.created_at)
+        .bind(&account.updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     // =========================================================================
     // Status
     // =========================================================================
