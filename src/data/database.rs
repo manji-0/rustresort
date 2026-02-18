@@ -406,7 +406,9 @@ impl Database {
                 .execute(&self.pool)
                 .await?
             }
-            (None, None) => return Ok(false),
+            // Treat a no-op patch as success. Callers can still decide
+            // whether they want to skip calling this API beforehand.
+            (None, None) => return Ok(true),
         };
 
         Ok(result.rows_affected() == 1)
@@ -416,9 +418,10 @@ impl Database {
     ///
     /// # Returns
     /// `true` if updated, `false` if no matching account row exists.
-    pub async fn update_account_avatar_key(
+    pub async fn update_account_avatar_key_if_matches(
         &self,
         account_id: &str,
+        expected_current_avatar_s3_key: Option<&str>,
         avatar_s3_key: Option<&str>,
         updated_at: DateTime<Utc>,
     ) -> Result<bool, AppError> {
@@ -426,12 +429,13 @@ impl Database {
             r#"
             UPDATE account
             SET avatar_s3_key = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND avatar_s3_key IS ?
             "#,
         )
         .bind(avatar_s3_key)
         .bind(updated_at)
         .bind(account_id)
+        .bind(expected_current_avatar_s3_key)
         .execute(&self.pool)
         .await?;
 
@@ -442,9 +446,10 @@ impl Database {
     ///
     /// # Returns
     /// `true` if updated, `false` if no matching account row exists.
-    pub async fn update_account_header_key(
+    pub async fn update_account_header_key_if_matches(
         &self,
         account_id: &str,
+        expected_current_header_s3_key: Option<&str>,
         header_s3_key: Option<&str>,
         updated_at: DateTime<Utc>,
     ) -> Result<bool, AppError> {
@@ -452,12 +457,13 @@ impl Database {
             r#"
             UPDATE account
             SET header_s3_key = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND header_s3_key IS ?
             "#,
         )
         .bind(header_s3_key)
         .bind(updated_at)
         .bind(account_id)
+        .bind(expected_current_header_s3_key)
         .execute(&self.pool)
         .await?;
 

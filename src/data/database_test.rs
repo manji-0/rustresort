@@ -89,6 +89,35 @@ async fn test_insert_account_if_empty_enforces_singleton() {
 }
 
 #[tokio::test]
+async fn test_patch_account_profile_noop_returns_success() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let account = Account {
+        id: EntityId::new().0,
+        username: "patch-user".to_string(),
+        display_name: Some("Patch User".to_string()),
+        note: Some("original note".to_string()),
+        avatar_s3_key: None,
+        header_s3_key: None,
+        private_key_pem: "private_key".to_string(),
+        public_key_pem: "public_key".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.upsert_account(&account).await.unwrap();
+
+    let updated = db
+        .patch_account_profile(&account.id, None, None, Utc::now())
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let stored = db.get_account().await.unwrap().unwrap();
+    assert_eq!(stored.display_name, Some("Patch User".to_string()));
+    assert_eq!(stored.note, Some("original note".to_string()));
+}
+
+#[tokio::test]
 async fn test_status_crud() {
     let (db, _temp_dir) = create_test_db().await;
 

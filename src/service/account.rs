@@ -48,26 +48,33 @@ impl AccountService {
     /// # Errors
     /// Returns error if account already exists
     pub async fn initialize_account(&self, username: &str) -> Result<Account, AppError> {
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-        use rsa::{RsaPrivateKey, RsaPublicKey};
-
         let username = username.trim();
         if username.is_empty() {
             return Err(AppError::Validation("username cannot be empty".to_string()));
         }
 
-        let mut rng = rand::thread_rng();
-        let private_key =
-            RsaPrivateKey::new(&mut rng, 4096).map_err(|e| AppError::Internal(e.into()))?;
-        let public_key = RsaPublicKey::from(&private_key);
+        // Fast-path guard before expensive key generation.
+        if self.db.get_account().await?.is_some() {
+            return Err(AppError::Validation(
+                "account is already initialized".to_string(),
+            ));
+        }
 
-        let private_key_pem = private_key
-            .to_pkcs8_pem(LineEnding::LF)
+        let (private_key_pem, public_key_pem) =
+            tokio::task::spawn_blocking(|| -> Result<(String, String), anyhow::Error> {
+                use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+                use rsa::{RsaPrivateKey, RsaPublicKey};
+
+                let mut rng = rand::thread_rng();
+                let private_key = RsaPrivateKey::new(&mut rng, 4096)?;
+                let public_key = RsaPublicKey::from(&private_key);
+                let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
+                let public_key_pem = public_key.to_public_key_pem(LineEnding::LF)?;
+                Ok((private_key_pem, public_key_pem))
+            })
+            .await
             .map_err(|e| AppError::Internal(e.into()))?
-            .to_string();
-        let public_key_pem = public_key
-            .to_public_key_pem(LineEnding::LF)
-            .map_err(|e| AppError::Internal(e.into()))?;
+            .map_err(AppError::Internal)?;
 
         let account = Account {
             id: EntityId::new().0,
@@ -138,7 +145,7 @@ impl AccountService {
     /// Update avatar image
     ///
     /// # Arguments
-    /// * `image_data` - Image data (will be converted to WebP)
+    /// * `image_data` - WebP image bytes (conversion is not performed here)
     ///
     /// # Returns
     /// Public URL of the new avatar
@@ -158,7 +165,12 @@ impl AccountService {
         let updated_at = chrono::Utc::now();
         let updated = match self
             .db
-            .update_account_avatar_key(&account.id, Some(&avatar_s3_key), updated_at)
+            .update_account_avatar_key_if_matches(
+                &account.id,
+                previous_key.as_deref(),
+                Some(&avatar_s3_key),
+                updated_at,
+            )
             .await
         {
             Ok(updated) => updated,
@@ -178,10 +190,19 @@ impl AccountService {
                 tracing::warn!(
                     key = %avatar_s3_key,
                     error = %cleanup_error,
-                    "failed to rollback uploaded avatar after account not found"
+                    "failed to rollback uploaded avatar after concurrent update/not found"
                 );
             }
-            return Err(AppError::NotFound);
+            let not_found = match self.db.get_account().await? {
+                Some(current) => current.id != account.id,
+                None => true,
+            };
+            if not_found {
+                return Err(AppError::NotFound);
+            }
+            return Err(AppError::Validation(
+                "avatar changed concurrently; retry".to_string(),
+            ));
         }
 
         account.avatar_s3_key = Some(avatar_s3_key.clone());
@@ -203,7 +224,7 @@ impl AccountService {
     /// Update header image
     ///
     /// # Arguments
-    /// * `image_data` - Header image data (will be converted to WebP)
+    /// * `image_data` - WebP header image bytes (conversion is not performed here)
     ///
     /// # Returns
     /// Public URL of the new header image
@@ -223,7 +244,12 @@ impl AccountService {
         let updated_at = chrono::Utc::now();
         let updated = match self
             .db
-            .update_account_header_key(&account.id, Some(&header_s3_key), updated_at)
+            .update_account_header_key_if_matches(
+                &account.id,
+                previous_key.as_deref(),
+                Some(&header_s3_key),
+                updated_at,
+            )
             .await
         {
             Ok(updated) => updated,
@@ -243,10 +269,19 @@ impl AccountService {
                 tracing::warn!(
                     key = %header_s3_key,
                     error = %cleanup_error,
-                    "failed to rollback uploaded header after account not found"
+                    "failed to rollback uploaded header after concurrent update/not found"
                 );
             }
-            return Err(AppError::NotFound);
+            let not_found = match self.db.get_account().await? {
+                Some(current) => current.id != account.id,
+                None => true,
+            };
+            if not_found {
+                return Err(AppError::NotFound);
+            }
+            return Err(AppError::Validation(
+                "header changed concurrently; retry".to_string(),
+            ));
         }
 
         account.header_s3_key = Some(header_s3_key.clone());
