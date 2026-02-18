@@ -25,6 +25,9 @@ serde_json = "1"
 
 # Database (SQLite only)
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "migrate", "macros"] }
+# NOTE: `turso` sync support currently requires a pre-release line.
+# Revisit and migrate to the next stable release when compatibility is confirmed.
+turso = { version = "0.5.0-pre.12", default-features = false, features = ["sync"] }
 # Note: rusqlite removed to avoid libsqlite3-sys version conflict with sqlx
 # Backup functionality will be implemented using sqlx or alternative approach
 
@@ -32,9 +35,10 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-r
 aws-sdk-s3 = { version = "1.0", default-features = false, features = ["rt-tokio"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["connector-hyper-0-14-x"] }
 hyper-rustls = { version = "0.24.2", default-features = false, features = ["webpki-tokio", "http1", "http2", "tls12"] }
-
-# Cache
-moka = { version = "0.12", features = ["future"] }
+# OpenSSL is only required transitively by `turso` sync (`hyper-tls`/native-tls chain).
+# We use `vendored` for reproducible builds without relying on system OpenSSL.
+# If Turso sync becomes rustls-native, this dependency should be removed.
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Crypto/Signatures
 rsa = "0.9"
@@ -50,6 +54,7 @@ http = "1.0"
 # Utilities
 ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
@@ -70,7 +75,6 @@ lazy_static = "1.4"
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
-tempfile = "3"
 serde_json = "1"
 serde_yaml = "0.9"
 jsonschema = { version = "0.18", default-features = false }

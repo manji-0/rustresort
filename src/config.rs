@@ -50,6 +50,92 @@ impl ServerConfig {
 pub struct DatabaseConfig {
     /// Path to SQLite database file
     pub path: PathBuf,
+    /// Optional database sync configuration
+    #[serde(default)]
+    pub sync: DatabaseSyncConfig,
+}
+
+/// Database sync configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseSyncConfig {
+    /// Sync backend to use
+    #[serde(default)]
+    pub mode: DatabaseSyncMode,
+    /// Sync interval in seconds
+    pub interval_seconds: u64,
+    /// Turso sync configuration
+    #[serde(default)]
+    pub turso: TursoSyncConfig,
+    /// Cloudflare D1 sync configuration
+    #[serde(default)]
+    pub d1: D1SyncConfig,
+}
+
+impl Default for DatabaseSyncConfig {
+    fn default() -> Self {
+        Self {
+            mode: DatabaseSyncMode::None,
+            interval_seconds: 300,
+            turso: TursoSyncConfig::default(),
+            d1: D1SyncConfig::default(),
+        }
+    }
+}
+
+/// Sync backend selector
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseSyncMode {
+    #[default]
+    None,
+    Turso,
+    D1,
+}
+
+/// Turso sync configuration
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TursoSyncConfig {
+    /// Remote Turso/libSQL URL (e.g. libsql://db-name.turso.io)
+    pub remote_url: Option<String>,
+    /// Turso auth token
+    pub auth_token: Option<String>,
+}
+
+/// Cloudflare D1 sync configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct D1SyncConfig {
+    /// D1 database binding/name
+    pub database: Option<String>,
+    /// Run against remote D1 database
+    #[serde(default)]
+    pub remote: bool,
+    /// Optional wrangler config path
+    pub wrangler_config: Option<PathBuf>,
+    /// Optional local snapshot DB path for diff generation
+    ///
+    /// If omitted, `<database.path>.d1-sync-snapshot.db` is used.
+    pub snapshot_path: Option<PathBuf>,
+    /// Number of sync history rows to retain on D1.
+    ///
+    /// Set to 0 to disable pruning.
+    #[serde(default = "default_d1_sync_history_retention_count")]
+    pub history_retention_count: usize,
+}
+
+impl Default for D1SyncConfig {
+    fn default() -> Self {
+        Self {
+            database: None,
+            remote: false,
+            wrangler_config: None,
+            snapshot_path: None,
+            history_retention_count: default_d1_sync_history_retention_count(),
+        }
+    }
+}
+
+fn default_d1_sync_history_retention_count() -> usize {
+    10_000
 }
 
 /// Storage configuration (Cloudflare R2)
@@ -180,6 +266,10 @@ impl AppConfig {
             .set_default("server.host", "127.0.0.1")?
             .set_default("server.port", 8080)?
             .set_default("server.protocol", "http")?
+            .set_default("database.sync.mode", "none")?
+            .set_default("database.sync.interval_seconds", 300)?
+            .set_default("database.sync.d1.remote", false)?
+            .set_default("database.sync.d1.history_retention_count", 10000)?
             .set_default("cache.timeline_max_items", 2000)?
             .set_default("cache.profile_ttl", 86400)?
             .set_default("storage.backup.enabled", false)?

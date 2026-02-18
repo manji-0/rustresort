@@ -22,7 +22,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                      Data Layer                              │
 //! │  - SQLite (sqlx)                                            │
-//! │  - Memory cache (moka)                                      │
+//! │  - Turso in-memory cache                                    │
 //! │  - R2 storage                                               │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
@@ -97,12 +97,54 @@ impl AppState {
 
         // 1. Connect to SQLite database
         let db_path = Path::new(&config.database.path);
-        let db = data::Database::connect(db_path).await?;
+        let turso_sync_options = match config.database.sync.mode {
+            config::DatabaseSyncMode::Turso => {
+                let remote_url = config
+                    .database
+                    .sync
+                    .turso
+                    .remote_url
+                    .clone()
+                    .ok_or_else(|| {
+                        error::AppError::Config(
+                            "database.sync.turso.remote_url is required when database.sync.mode=turso"
+                                .to_string(),
+                        )
+                    })?;
+
+                Some(data::TursoSyncOptions {
+                    remote_url,
+                    auth_token: config.database.sync.turso.auth_token.clone(),
+                })
+            }
+            config::DatabaseSyncMode::D1 => {
+                config
+                    .database
+                    .sync
+                    .d1
+                    .database
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        error::AppError::Config(
+                            "database.sync.d1.database is required and must not be empty when database.sync.mode=d1"
+                                .to_string(),
+                        )
+                    })?;
+
+                data::validate_d1_sync_environment(&config.database.sync.d1)?;
+                None
+            }
+            config::DatabaseSyncMode::None => None,
+        };
+
+        let db = data::Database::connect_with_turso_sync(db_path, turso_sync_options).await?;
         tracing::info!("Database connected");
 
         // 2. Initialize caches
-        let timeline_cache = data::TimelineCache::new(config.cache.timeline_max_items);
-        let profile_cache = data::ProfileCache::new();
+        let timeline_cache = data::TimelineCache::new(config.cache.timeline_max_items).await?;
+        let profile_cache = data::ProfileCache::new(config.cache.profile_ttl).await?;
         tracing::info!("Caches initialized");
 
         // 3. Initialize HTTP client

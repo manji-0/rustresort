@@ -10,6 +10,22 @@
 [database]
 # path = "data/rustresort.db"
 
+[database.sync]
+# mode = "none"                  # none | turso | d1
+# interval_seconds = 300
+
+[database.sync.turso]
+# remote_url = "libsql://your-db.turso.io"
+# auth_token = "your-turso-auth-token"
+
+[database.sync.d1]
+# database = "your-d1-database-name"
+# Requires local CLI tools in PATH: `sqlite3`, `sqldiff`, and `wrangler`.
+# remote = false
+# wrangler_config = "wrangler.toml"
+# snapshot_path = "data/rustresort.d1-sync-snapshot.db"
+# history_retention_count = 10000  # set 0 to disable pruning
+
 [storage]
 [storage.media]
 # For local development with MinIO

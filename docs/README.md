@@ -10,6 +10,7 @@ This directory contains the technical documentation for RustResort.
 | [API.md](API.md) | Mastodon-compatible and ActivityPub endpoint specification |
 | [FEDERATION.md](FEDERATION.md) | Federation behavior and protocol notes |
 | [DATABASE.md](DATABASE.md) | Database schema and storage model |
+| [SYNC_STRATEGY.md](SYNC_STRATEGY.md) | Turso and D1 synchronization strategy and tradeoffs |
 | [DATA_MODEL.md](DATA_MODEL.md) | Domain and API data models |
 | [AUTHENTICATION.md](AUTHENTICATION.md) | Authentication and session model |
 | [RSA_KEY_SPEC.md](RSA_KEY_SPEC.md) | RSA key requirements for signatures |

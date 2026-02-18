@@ -161,6 +161,7 @@ mod tests {
             },
             database: DatabaseConfig {
                 path: "test.db".into(),
+                sync: DatabaseSyncConfig::default(),
             },
             storage: StorageConfig {
                 media: MediaStorageConfig {

@@ -7,13 +7,31 @@ use chrono::{DateTime, Utc};
 use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Instant;
 
 use super::models::*;
 use crate::error::AppError;
 
-/// Database connection pool wrapper
+#[derive(Debug, Clone)]
+pub struct TursoSyncOptions {
+    pub remote_url: String,
+    pub auth_token: Option<String>,
+}
+
+fn map_turso_error(context: &str, error: turso::Error) -> AppError {
+    AppError::Internal(anyhow::anyhow!("{context}: {error}"))
+}
+
+/// Database connection pool wrapper.
+///
+/// # Turso synchronization
+///
+/// Dropping `Database` does not automatically perform a final Turso `push`/`pull`.
+/// If callers need a final sync before shutdown, they should invoke
+/// [`Database::sync_turso`] explicitly and handle any resulting errors.
 pub struct Database {
     pool: Pool<Sqlite>,
+    turso_sync_db: Option<turso::sync::Database>,
 }
 
 fn parse_account_address(address: &str) -> Option<(String, String, Option<u16>)> {
@@ -97,10 +115,57 @@ impl Database {
     /// # Errors
     /// Returns error if connection or migration fails
     pub async fn connect(path: &Path) -> Result<Self, AppError> {
+        Self::connect_with_turso_sync(path, None).await
+    }
+
+    /// Connect to local Turso file database and optional Turso sync backend.
+    pub async fn connect_with_turso_sync(
+        path: &Path,
+        sync: Option<TursoSyncOptions>,
+    ) -> Result<Self, AppError> {
         // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AppError::Database(sqlx::Error::Io(e)))?;
         }
+
+        let db_path = path.to_str().ok_or_else(|| {
+            AppError::Config(format!(
+                "database path must be valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+
+        // Initialize local file through Turso to ensure a Turso-compatible file DB.
+        let local_turso_db = turso::Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| map_turso_error("failed to initialize local Turso file DB", e))?;
+        drop(local_turso_db);
+
+        // Optional Turso sync setup.
+        let turso_sync_db = if let Some(sync_options) = sync {
+            let mut builder = turso::sync::Builder::new_remote(db_path)
+                .with_remote_url(sync_options.remote_url)
+                .bootstrap_if_empty(true);
+
+            if let Some(token) = sync_options.auth_token {
+                builder = builder.with_auth_token(token);
+            }
+
+            let sync_db = builder
+                .build()
+                .await
+                .map_err(|e| map_turso_error("failed to initialize Turso sync database", e))?;
+
+            sync_db
+                .pull()
+                .await
+                .map_err(|e| map_turso_error("failed to pull from Turso sync database", e))?;
+
+            Some(sync_db)
+        } else {
+            None
+        };
 
         // Create connection string
         let connection_string = format!("sqlite:{}?mode=rwc", path.display());
@@ -117,9 +182,64 @@ impl Database {
                 AppError::Internal(anyhow::anyhow!("Migration failed: {}", e))
             })?;
 
+        if let Some(sync_db) = &turso_sync_db {
+            sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .execute(&pool)
+                .await?;
+            sync_db
+                .push()
+                .await
+                .map_err(|e| map_turso_error("failed to push migrations to Turso", e))?;
+        }
+
         tracing::info!("Database connected and migrated successfully");
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            turso_sync_db,
+        })
+    }
+
+    /// Return whether Turso sync backend is configured.
+    pub fn has_turso_sync(&self) -> bool {
+        self.turso_sync_db.is_some()
+    }
+
+    /// Sync local file DB with Turso remote.
+    ///
+    /// This performs `push` first (local writes), then `pull` (remote writes).
+    pub async fn sync_turso(&self) -> Result<(), AppError> {
+        let started = Instant::now();
+        let observe =
+            |status: &str| crate::metrics::observe_db_sync("turso", status, started.elapsed());
+
+        let Some(sync_db) = &self.turso_sync_db else {
+            observe("skipped");
+            return Ok(());
+        };
+
+        if let Err(error) = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+            .execute(&self.pool)
+            .await
+        {
+            observe("error");
+            return Err(error.into());
+        }
+
+        if let Err(error) = sync_db.push().await {
+            observe("error");
+            return Err(map_turso_error("failed to push local DB to Turso", error));
+        }
+        if let Err(error) = sync_db.pull().await {
+            observe("error");
+            return Err(map_turso_error(
+                "failed to pull remote DB from Turso",
+                error,
+            ));
+        }
+
+        observe("success");
+        Ok(())
     }
 
     // =========================================================================
