@@ -4,31 +4,8 @@ use rustresort::{AppState, config};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAL1qEJ6Esenbo474
-9+uZLEdGCjBmx3hsp7hSr8kIDu45Ssg0w/dm1Imey6JOWg+4EXeIteqeMs840VQ4
-RwkQ4CsxtP11wmbqZQYUyzN1D//QaJsw+LUBO5DSWjTcQN2Egp0G4wntmd2SSA/V
-n/uxvKAtuHf3Agkxj9JspBDWthBdAgMBAAECgYBMV2lnWngSl1GumC3kKRItj88f
-fu06XiCjK8Bpt/O8lB7N3mZ1Wl6jMPtF6WpnF3sCwHkBnM1Bs9a6qQwIXWLblFnk
-WcygjRtsecUygZR9OcgDR3iUmMrRcJw9vpgdbklEMmfQoVmfibq0bxgLoQmjmBD3
-e5u5GPHMv2oJJWQdSQJBAOFSueufpOz7q5F7G/f/mGQ3K9vxCgmyHngNepBMYWTU
-WDDmb/ADyg6WP+zsI3YEnWqb24WHmaH7pxaQkI1f5jMCQQDXM8tdJ/zrNeTcp8Lo
-+48KSyqGcLUNcjQUHVTLts5JhfcwKM481SlTy5JKUGFN1ImUD+tPUAR6or+v34I6
-+v8vAkBS0S00xYDA+d+doToudOt2KjEcrgOafLVmOs4Jq4lAniusDYanGT1zDxZ/
-5mtCPX/+ZzrQYX6+YtiPGqOG0vCxAkEApKZuK+IScmuTpPd9+v+tGzUTXjURcS41
-hkZCwHInNr2WuHQgBw8YRZJ1ZQJG0GOSt4POh6ozIxkuDAO4AiRT5QJAMaOkNwxr
-8wOcEsOq4fz1NbwZWopRkXl1Bei82uO5cw9whSTf2xGkIKxnu3gJ11Jnw7POXY2L
-6Ym7721cQmof3w==
------END PRIVATE KEY-----
-"#;
-
-const TEST_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC9ahCehLHp26OO+PfrmSxHRgow
-Zsd4bKe4Uq/JCA7uOUrINMP3ZtSJnsuiTloPuBF3iLXqnjLPONFUOEcJEOArMbT9
-dcJm6mUGFMszdQ//0GibMPi1ATuQ0lo03EDdhIKdBuMJ7ZndkkgP1Z/7sbygLbh3
-9wIJMY/SbKQQ1rYQXQIDAQAB
------END PUBLIC KEY-----
-"#;
+const TEST_PRIVATE_KEY_PEM: &str = include_str!("../fixtures/test_private_key.pem");
+const TEST_PUBLIC_KEY_PEM: &str = include_str!("../fixtures/test_public_key.pem");
 
 /// Test server instance
 pub struct TestServer {
