@@ -14,6 +14,9 @@ use crate::metrics::{
     HTTP_REQUESTS_TOTAL, MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL,
 };
 
+const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES: usize = 40 * 1024 * 1024;
+
 /// Media attachment response
 #[derive(Debug, Serialize)]
 pub struct MediaAttachmentResponse {
@@ -63,7 +66,7 @@ pub async fn upload_media(
     let mut description: Option<String> = None;
 
     // Parse multipart form data
-    while let Some(field) = multipart
+    while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| AppError::Validation(format!("Failed to parse multipart: {}", e)))?
@@ -73,14 +76,38 @@ pub async fn upload_media(
         match field_name.as_str() {
             "file" => {
                 filename = field.file_name().map(|s| s.to_string());
-                content_type = field.content_type().map(|s| s.to_string());
-                file_data = Some(
+                let detected_content_type =
                     field
-                        .bytes()
-                        .await
-                        .map_err(|e| AppError::Validation(format!("Failed to read file: {}", e)))?
-                        .to_vec(),
-                );
+                        .content_type()
+                        .map(|s| s.to_string())
+                        .ok_or(AppError::Validation(
+                            "Missing content type for uploaded file".to_string(),
+                        ))?;
+                let max_size = if detected_content_type.starts_with("image/") {
+                    MAX_IMAGE_UPLOAD_BYTES
+                } else if detected_content_type.starts_with("video/") {
+                    MAX_VIDEO_UPLOAD_BYTES
+                } else {
+                    return Err(AppError::Validation("Unsupported media type".to_string()));
+                };
+
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|e| AppError::Validation(format!("Failed to read file: {}", e)))?
+                {
+                    if bytes.len() + chunk.len() > max_size {
+                        return Err(AppError::Validation(format!(
+                            "File too large: exceeds {} bytes",
+                            max_size
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+
+                content_type = Some(detected_content_type);
+                file_data = Some(bytes);
             }
             "description" => {
                 description = Some(field.text().await.map_err(|e| {
@@ -93,24 +120,9 @@ pub async fn upload_media(
 
     let file_data = file_data.ok_or(AppError::Validation("No file provided".to_string()))?;
     let filename = filename.ok_or(AppError::Validation("No filename provided".to_string()))?;
-    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-
-    // Validate file size (10MB for images, 40MB for videos)
-    let max_size = if content_type.starts_with("image/") {
-        10 * 1024 * 1024 // 10MB
-    } else if content_type.starts_with("video/") {
-        40 * 1024 * 1024 // 40MB
-    } else {
-        return Err(AppError::Validation("Unsupported media type".to_string()));
-    };
-
-    if file_data.len() > max_size {
-        return Err(AppError::Validation(format!(
-            "File too large: {} bytes (max: {} bytes)",
-            file_data.len(),
-            max_size
-        )));
-    }
+    let content_type = content_type.ok_or(AppError::Validation(
+        "Missing content type for uploaded file".to_string(),
+    ))?;
 
     // Validate MIME type
     let supported_types = [

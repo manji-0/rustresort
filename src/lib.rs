@@ -76,6 +76,9 @@ pub struct AppState {
 
     /// HTTP client for federation
     pub http_client: Arc<reqwest::Client>,
+
+    /// Federation inbound rate limiter
+    pub federation_rate_limiter: Arc<federation::RateLimiter>,
 }
 
 impl AppState {
@@ -154,11 +157,14 @@ impl AppState {
             .build()
             .map_err(|e| error::AppError::Internal(e.into()))?;
 
-        // 4. Connect to R2 storage
+        // 4. Initialize federation inbound rate limiter
+        let federation_rate_limiter = federation::RateLimiter::new(None, None);
+
+        // 5. Connect to R2 storage
         let storage = storage::MediaStorage::new(&config.storage.media, &config.cloudflare).await?;
         tracing::info!("Media storage initialized");
 
-        // 5. Initialize backup service
+        // 6. Initialize backup service
         let backup = storage::BackupService::new(
             &config.storage.backup,
             &config.cloudflare,
@@ -167,7 +173,7 @@ impl AppState {
         .await?;
         tracing::info!("Backup service initialized");
 
-        // 6. Fetch followee/follower profiles
+        // 7. Fetch followee/follower profiles
         let follow_addresses = db.get_all_follow_addresses().await?;
         let follower_addresses = db.get_all_follower_addresses().await?;
 
@@ -183,7 +189,7 @@ impl AppState {
             profile_cache.initialize_from_addresses(&follower_addresses, &http_client),
         );
 
-        // 7. Initialize admin user
+        // 8. Initialize admin user
         Self::ensure_admin_user(&db, &config).await?;
 
         tracing::info!("Application state initialized successfully");
@@ -196,6 +202,7 @@ impl AppState {
             storage: Arc::new(storage),
             backup: Arc::new(backup),
             http_client: Arc::new(http_client),
+            federation_rate_limiter: Arc::new(federation_rate_limiter),
         })
     }
 
@@ -306,7 +313,9 @@ impl AppState {
 /// composition consistent across environments.
 pub fn build_router(state: AppState) -> axum::Router {
     use axum::Router;
-    use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+    use tower_http::{
+        compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer,
+    };
 
     let cors_layer = build_cors_layer(&state.config.server);
 
@@ -318,6 +327,7 @@ pub fn build_router(state: AppState) -> axum::Router {
         .nest("/oauth", api::oauth_router(state.clone()))
         .merge(api::activitypub_router())
         .nest("/admin", api::admin_router())
+        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
@@ -328,10 +338,6 @@ pub fn build_router(state: AppState) -> axum::Router {
 fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {
     use axum::http::HeaderValue;
     use tower_http::cors::{Any, CorsLayer};
-
-    if !server.protocol.eq_ignore_ascii_case("https") {
-        return CorsLayer::permissive();
-    }
 
     let allowed_origin = server.base_url();
     match HeaderValue::from_str(&allowed_origin) {

@@ -20,7 +20,9 @@ pub use activity::{ActivityProcessor, ActivityType};
 pub use delivery::{ActivityDelivery, DeliveryResult};
 pub use key_cache::{CacheStats, PublicKeyCache};
 pub use rate_limit::{RateLimitStats, RateLimiter, extract_domain};
-pub use signature::{fetch_public_key, sign_request, verify_signature};
+pub use signature::{
+    fetch_public_key, key_id_matches_actor, parse_signature_header, sign_request, verify_signature,
+};
 pub use webfinger::{
     WebFingerResponse, WebFingerResult, generate_webfinger_response, resolve_webfinger,
 };

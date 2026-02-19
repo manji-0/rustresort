@@ -236,7 +236,7 @@ pub async fn verify_credentials(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "followers"])
         .start_timer();
-    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
+    let followers_count = state.db.count_follower_addresses().await? as i32;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "followers"])
         .inc();
@@ -245,7 +245,7 @@ pub async fn verify_credentials(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "follows"])
         .start_timer();
-    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+    let following_count = state.db.count_follow_addresses().await? as i32;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "follows"])
         .inc();
@@ -299,8 +299,8 @@ pub async fn update_credentials(
     let mut response = crate::api::account_to_response(&account, &state.config);
 
     // Get counts
-    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
-    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+    let followers_count = state.db.count_follower_addresses().await? as i32;
+    let following_count = state.db.count_follow_addresses().await? as i32;
 
     response.followers_count = followers_count;
     response.following_count = following_count;
@@ -325,8 +325,8 @@ pub async fn get_account(
     let mut response = crate::api::account_to_response(&account, &state.config);
 
     // Get counts
-    let followers_count = state.db.get_all_follower_addresses().await?.len() as i32;
-    let following_count = state.db.get_all_follow_addresses().await?.len() as i32;
+    let followers_count = state.db.count_follower_addresses().await? as i32;
+    let following_count = state.db.count_follow_addresses().await? as i32;
 
     response.followers_count = followers_count;
     response.following_count = following_count;

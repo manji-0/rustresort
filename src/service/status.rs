@@ -57,6 +57,18 @@ impl StatusService {
         ))
     }
 
+    /// Persist a local status with optional media and poll atomically.
+    pub async fn persist_local_status_with_media_and_poll(
+        &self,
+        status: &Status,
+        media_ids: &[String],
+        poll: Option<(&[String], i64, bool)>,
+    ) -> Result<(), AppError> {
+        self.db
+            .insert_status_with_media_and_poll(status, media_ids, poll)
+            .await
+    }
+
     /// Get status by ID
     pub async fn get(&self, id: &str) -> Result<Status, AppError> {
         self.db.get_status(id).await?.ok_or(AppError::NotFound)

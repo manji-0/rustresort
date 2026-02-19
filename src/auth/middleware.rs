@@ -318,6 +318,12 @@ pub async fn require_auth(
                 if !has_required_scope(&scope_set, required_scopes) {
                     return Err(AppError::Forbidden);
                 }
+            } else {
+                // Fail closed for unmapped OAuth-protected Mastodon API endpoints.
+                let normalized_path = normalize_mastodon_path(request.uri().path());
+                if normalized_path.starts_with("/v1/") || normalized_path.starts_with("/v2/") {
+                    return Err(AppError::Forbidden);
+                }
             }
 
             request.extensions_mut().insert(build_oauth_session(&state));

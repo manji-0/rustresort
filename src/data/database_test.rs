@@ -1042,6 +1042,237 @@ async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() 
 }
 
 #[tokio::test]
+async fn test_vote_in_poll_rejects_duplicate_option_and_rolls_back_counts() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-duplicate-vote".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .create_poll(&status.id, &["a".to_string(), "b".to_string()], 600, true)
+        .await
+        .unwrap();
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    let option_id = options[0].0.clone();
+
+    let result = db
+        .vote_in_poll(
+            &poll_id,
+            "alice@remote.example",
+            &[option_id.clone(), option_id],
+        )
+        .await;
+    assert!(result.is_err());
+
+    let options_after = db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options_after[0].2, 0);
+    assert_eq!(options_after[1].2, 0);
+    let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
+    assert_eq!(poll_after.4, 0);
+    assert_eq!(poll_after.5, 0);
+}
+
+#[tokio::test]
+async fn test_vote_in_poll_rejects_option_from_other_poll() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status_1 = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-1".to_string(),
+        content: "<p>Poll 1</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let status_2 = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-2".to_string(),
+        content: "<p>Poll 2</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status_1).await.unwrap();
+    db.insert_status(&status_2).await.unwrap();
+
+    let poll_1 = db
+        .create_poll(&status_1.id, &["a".to_string(), "b".to_string()], 600, true)
+        .await
+        .unwrap();
+    let poll_2 = db
+        .create_poll(&status_2.id, &["x".to_string(), "y".to_string()], 600, true)
+        .await
+        .unwrap();
+    let poll_2_options = db.get_poll_options(&poll_2).await.unwrap();
+    let foreign_option_id = poll_2_options[0].0.clone();
+
+    let result = db
+        .vote_in_poll(&poll_1, "bob@remote.example", &[foreign_option_id])
+        .await;
+    assert!(result.is_err());
+
+    let poll_1_after = db.get_poll(&poll_1).await.unwrap().unwrap();
+    let poll_2_after = db.get_poll(&poll_2).await.unwrap().unwrap();
+    assert_eq!(poll_1_after.4, 0);
+    assert_eq!(poll_1_after.5, 0);
+    assert_eq!(poll_2_after.4, 0);
+    assert_eq!(poll_2_after.5, 0);
+}
+
+#[tokio::test]
+async fn test_vote_in_poll_rejects_second_ballot_for_multiple_poll() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-multiple-second-vote".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .create_poll(&status.id, &["a".to_string(), "b".to_string()], 600, true)
+        .await
+        .unwrap();
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    let first_option_id = options[0].0.clone();
+    let second_option_id = options[1].0.clone();
+
+    db.vote_in_poll(
+        &poll_id,
+        "alice@remote.example",
+        std::slice::from_ref(&first_option_id),
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .vote_in_poll(
+            &poll_id,
+            "alice@remote.example",
+            std::slice::from_ref(&second_option_id),
+        )
+        .await;
+    assert!(result.is_err());
+
+    let options_after = db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options_after[0].2, 1);
+    assert_eq!(options_after[1].2, 0);
+    let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
+    assert_eq!(poll_after.4, 1);
+    assert_eq!(poll_after.5, 1);
+}
+
+#[tokio::test]
+async fn test_get_poll_marks_immediately_expired_poll_as_expired() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-immediate-expire".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .create_poll(&status.id, &["yes".to_string(), "no".to_string()], 0, false)
+        .await
+        .unwrap();
+
+    let poll = db.get_poll(&poll_id).await.unwrap().unwrap();
+    assert!(
+        poll.2,
+        "poll should be treated as expired when expires_at <= now"
+    );
+}
+
+#[tokio::test]
+async fn test_vote_in_poll_rejects_when_expires_at_has_passed() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/poll-expired-vote".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .create_poll(&status.id, &["yes".to_string(), "no".to_string()], 0, false)
+        .await
+        .unwrap();
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    let first_option_id = options[0].0.clone();
+
+    let result = db
+        .vote_in_poll(
+            &poll_id,
+            "alice@remote.example",
+            std::slice::from_ref(&first_option_id),
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn test_reserve_idempotency_key_reclaims_stale_pending_reservation() {
     let (db, _temp_dir) = create_test_db().await;
     let endpoint = "/api/v1/statuses";

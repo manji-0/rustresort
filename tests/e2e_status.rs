@@ -232,6 +232,43 @@ async fn test_create_status_with_poll_includes_poll_in_response() {
 }
 
 #[tokio::test]
+async fn test_vote_in_poll_rejects_duplicate_choices() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "poll duplicate vote",
+        "poll": {
+            "options": ["yes", "no"],
+            "expires_in": 600,
+            "multiple": true
+        }
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let poll_id = created["poll"]["id"].as_str().unwrap();
+
+    let vote_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/polls/{}/votes", poll_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "choices": [0, 0] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vote_response.status(), 400);
+}
+
+#[tokio::test]
 async fn test_create_status_with_media_ids_includes_media_attachments_in_response() {
     let server = TestServer::new().await;
     server.create_test_account().await;

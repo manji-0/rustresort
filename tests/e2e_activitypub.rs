@@ -57,6 +57,37 @@ async fn test_inbox_endpoint_rejects_unsigned_activity() {
 }
 
 #[tokio::test]
+async fn test_inbox_rejects_signature_key_id_actor_mismatch() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Follow",
+        "actor": "https://remote.example.com/users/alice",
+        "object": "https://test.example.com/users/testuser"
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/users/testuser/inbox"))
+        .header("Content-Type", "application/activity+json")
+        .header(
+            "Signature",
+            "keyId=\"https://remote.example.com/users/bob#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"Zm9v\"",
+        )
+        .json(&activity)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status() == 401 || response.status() == 403,
+        "Inbox request must be rejected when keyId actor and activity actor differ"
+    );
+}
+
+#[tokio::test]
 async fn test_outbox_endpoint() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -75,6 +106,74 @@ async fn test_outbox_endpoint() {
         assert_eq!(json["type"], "OrderedCollection");
         assert!(json.get("totalItems").is_some());
     }
+}
+
+#[tokio::test]
+async fn test_outbox_excludes_private_and_direct_statuses() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    for visibility in ["public", "unlisted", "private", "direct"] {
+        let status = Status {
+            id: EntityId::new().0,
+            uri: format!(
+                "https://test.example.com/users/testuser/statuses/outbox-{}",
+                visibility
+            ),
+            content: format!("<p>{}</p>", visibility),
+            content_warning: None,
+            visibility: visibility.to_string(),
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        server.state.db.insert_status(&status).await.unwrap();
+    }
+
+    let response = server
+        .client
+        .get(&server.url("/users/testuser/outbox"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+
+    let ordered_items = json["orderedItems"].as_array().unwrap();
+    let object_ids: Vec<String> = ordered_items
+        .iter()
+        .filter_map(|item| item["object"]["id"].as_str().map(ToString::to_string))
+        .collect();
+
+    assert!(
+        object_ids
+            .iter()
+            .any(|id| id.ends_with("/statuses/outbox-public"))
+    );
+    assert!(
+        object_ids
+            .iter()
+            .any(|id| id.ends_with("/statuses/outbox-unlisted"))
+    );
+    assert!(
+        !object_ids
+            .iter()
+            .any(|id| id.ends_with("/statuses/outbox-private"))
+    );
+    assert!(
+        !object_ids
+            .iter()
+            .any(|id| id.ends_with("/statuses/outbox-direct"))
+    );
 }
 
 #[tokio::test]
@@ -238,6 +337,39 @@ async fn test_shared_inbox_rejects_unsigned_activity() {
     assert!(
         response.status() == 401 || response.status() == 403,
         "Unsigned shared inbox request should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_shared_inbox_rejects_signature_key_id_actor_mismatch() {
+    let server = TestServer::new().await;
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Create",
+        "actor": "https://remote.example.com/users/alice",
+        "object": {
+            "type": "Note",
+            "content": "Hello from remote!"
+        }
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/inbox"))
+        .header("Content-Type", "application/activity+json")
+        .header(
+            "Signature",
+            "keyId=\"https://remote.example.com/users/bob#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"Zm9v\"",
+        )
+        .json(&activity)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status() == 401 || response.status() == 403,
+        "Shared inbox request must be rejected when keyId actor and activity actor differ"
     );
 }
 

@@ -1586,8 +1586,9 @@ async fn test_update_scheduled_status() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
+    let scheduled_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
     let update_data = json!({
-        "scheduled_at": "2026-01-15T12:00:00Z"
+        "scheduled_at": scheduled_at
     });
 
     let response = server
