@@ -631,12 +631,12 @@ impl ActivityProcessor {
     /// Handle Update activity (profile update)
     async fn handle_update(
         &self,
-        _activity: serde_json::Value,
-        _actor_uri: &str,
+        activity: serde_json::Value,
+        actor_uri: &str,
     ) -> Result<(), AppError> {
-        // For single-user instance, we mainly care about updates from followees
-        // Profile cache updates would go here in a full implementation
-        // For now, just accept and ignore
+        self.profile_cache
+            .update_from_activity(actor_uri, activity)
+            .await;
         Ok(())
     }
 
@@ -1171,7 +1171,8 @@ impl ActivityProcessor {
 mod tests {
     use super::{extract_follow_target, is_local_follow_target};
     use crate::data::{
-        CachedStatus, Database, EntityId, Follow, Follower, ProfileCache, TimelineCache,
+        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, ProfileCache,
+        TimelineCache,
     };
     use crate::error::AppError;
     use chrono::Utc;
@@ -1181,13 +1182,14 @@ mod tests {
 
     const TEST_PRIVATE_KEY_PEM: &str = include_str!("../../tests/fixtures/test_private_key.pem");
 
-    async fn create_test_processor_with_timeline(
+    async fn create_test_processor_with_timeline_and_profile(
         local_address: &str,
         local_protocol: &str,
     ) -> (
         super::ActivityProcessor,
         Arc<Database>,
         Arc<TimelineCache>,
+        Arc<ProfileCache>,
         TempDir,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -1200,12 +1202,26 @@ mod tests {
         let processor = super::ActivityProcessor::new(
             db.clone(),
             timeline_cache.clone(),
-            profile_cache,
+            profile_cache.clone(),
             http_client,
             local_address.to_string(),
             local_protocol.to_string(),
         );
 
+        (processor, db, timeline_cache, profile_cache, temp_dir)
+    }
+
+    async fn create_test_processor_with_timeline(
+        local_address: &str,
+        local_protocol: &str,
+    ) -> (
+        super::ActivityProcessor,
+        Arc<Database>,
+        Arc<TimelineCache>,
+        TempDir,
+    ) {
+        let (processor, db, timeline_cache, _profile_cache, temp_dir) =
+            create_test_processor_with_timeline_and_profile(local_address, local_protocol).await;
         (processor, db, timeline_cache, temp_dir)
     }
 
@@ -1462,6 +1478,58 @@ mod tests {
 
         let result = processor.handle_follow(activity, actor_uri).await;
         assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn handle_update_applies_profile_cache_updates() {
+        let (processor, _db, _timeline_cache, profile_cache, _temp_dir) =
+            create_test_processor_with_timeline_and_profile("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        profile_cache
+            .insert(CachedProfile {
+                address: "bob@remote.example".to_string(),
+                uri: actor_uri.to_string(),
+                display_name: Some("Bob".to_string()),
+                note: Some("before".to_string()),
+                avatar_url: None,
+                header_url: None,
+                public_key_pem: "old-key".to_string(),
+                inbox_uri: "https://remote.example/inbox-old".to_string(),
+                outbox_uri: Some("https://remote.example/outbox-old".to_string()),
+                followers_count: Some(1),
+                following_count: Some(2),
+                fetched_at: Utc::now(),
+            })
+            .await;
+
+        let activity = json!({
+            "type": "Update",
+            "actor": actor_uri,
+            "object": {
+                "id": actor_uri,
+                "name": "Bob Updated",
+                "summary": "after",
+                "publicKey": {
+                    "publicKeyPem": "new-key"
+                },
+                "inbox": "https://remote.example/inbox-new",
+                "followersCount": 10,
+                "followingCount": 20
+            }
+        });
+
+        processor.handle_update(activity, actor_uri).await.unwrap();
+
+        let updated = profile_cache
+            .get("bob@remote.example")
+            .await
+            .expect("profile should exist");
+        assert_eq!(updated.display_name.as_deref(), Some("Bob Updated"));
+        assert_eq!(updated.note.as_deref(), Some("after"));
+        assert_eq!(updated.public_key_pem, "new-key");
+        assert_eq!(updated.inbox_uri, "https://remote.example/inbox-new");
+        assert_eq!(updated.followers_count, Some(10));
+        assert_eq!(updated.following_count, Some(20));
     }
 
     #[tokio::test]

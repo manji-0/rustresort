@@ -63,6 +63,286 @@ fn ttl_seconds_to_millis(ttl_seconds: u64) -> i64 {
     (bounded_seconds as i64) * 1000
 }
 
+fn extract_url(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(url) => Some(url.to_string()),
+        serde_json::Value::Array(values) => values.iter().find_map(extract_url),
+        serde_json::Value::Object(_) => value
+            .get("url")
+            .and_then(extract_url)
+            .or_else(|| value.get("href").and_then(extract_url)),
+        _ => None,
+    }
+}
+
+fn extract_public_key_pem(actor_document: &serde_json::Value) -> Option<String> {
+    actor_document
+        .get("publicKeyPem")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            actor_document
+                .get("publicKey")
+                .and_then(|value| value.get("publicKeyPem"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_explicit_port_from_domain(domain: &str) -> Option<u16> {
+    let domain = domain.trim();
+
+    if let Some(rest) = domain.strip_prefix('[') {
+        let (_, tail) = rest.split_once(']')?;
+        let port_str = tail.strip_prefix(':')?;
+        if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return port_str.parse::<u16>().ok();
+    }
+
+    let (host_part, port_str) = domain.rsplit_once(':')?;
+    if host_part.is_empty()
+        || host_part.contains(':')
+        || port_str.is_empty()
+        || !port_str.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    port_str.parse::<u16>().ok()
+}
+
+fn webfinger_urls_for_domain(domain: &str, resource: &str) -> Result<Vec<url::Url>, AppError> {
+    url::Url::parse(&format!("http://{}", domain)).map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to parse remote account domain {}: {}",
+            domain, error
+        ))
+    })?;
+
+    let schemes: &[&str] = match extract_explicit_port_from_domain(domain) {
+        Some(80) => &["http"],
+        Some(443) | None => &["https"],
+        Some(_) => &["https", "http"],
+    };
+
+    schemes
+        .iter()
+        .map(|scheme| {
+            let mut url =
+                url::Url::parse(&format!("{}://{}/.well-known/webfinger", scheme, domain))
+                    .map_err(|error| {
+                        AppError::Federation(format!(
+                            "Failed to build WebFinger URL for {}: {}",
+                            domain, error
+                        ))
+                    })?;
+            url.query_pairs_mut().append_pair("resource", resource);
+            Ok(url)
+        })
+        .collect()
+}
+
+fn is_supported_webfinger_link_type(link_type: &str) -> bool {
+    let normalized = link_type.trim().to_ascii_lowercase();
+    normalized.contains("activity+json")
+        || (normalized.contains("ld+json") && normalized.contains("activitystreams"))
+}
+
+fn extract_actor_uri_from_webfinger(webfinger: &serde_json::Value) -> Option<String> {
+    webfinger
+        .get("links")
+        .and_then(|value| value.as_array())
+        .and_then(|links| {
+            links.iter().find_map(|link| {
+                let rel = link.get("rel").and_then(|value| value.as_str())?;
+                if rel != "self" {
+                    return None;
+                }
+                let link_type = link.get("type").and_then(|value| value.as_str())?;
+                if !is_supported_webfinger_link_type(link_type) {
+                    return None;
+                }
+                link.get("href")
+                    .and_then(|value| value.as_str())
+                    .map(|href| href.to_string())
+            })
+        })
+}
+
+fn parse_actor_uri_address(address: &str) -> Option<String> {
+    let parsed = url::Url::parse(address.trim()).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => Some(parsed.to_string()),
+        _ => None,
+    }
+}
+
+async fn discover_actor_uri(
+    http_client: &reqwest::Client,
+    address: &str,
+) -> Result<String, AppError> {
+    if let Some(actor_uri) = parse_actor_uri_address(address) {
+        return Ok(actor_uri);
+    }
+
+    let (username, domain) = address.split_once('@').ok_or_else(|| {
+        AppError::Validation("Invalid account address format for profile cache".to_string())
+    })?;
+
+    if username.is_empty() || domain.is_empty() {
+        return Err(AppError::Validation(
+            "Invalid account address format for profile cache".to_string(),
+        ));
+    }
+
+    let resource = format!("acct:{}@{}", username, domain);
+    let webfinger_urls = webfinger_urls_for_domain(domain, &resource)?;
+    let mut last_error = None;
+
+    for webfinger_url in webfinger_urls {
+        let response = match http_client
+            .get(webfinger_url.clone())
+            .header("Accept", "application/jrd+json, application/json")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(AppError::Federation(format!(
+                    "WebFinger request failed for {} via {}: {}",
+                    resource, webfinger_url, error
+                )));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            last_error = Some(AppError::Federation(format!(
+                "WebFinger request failed for {} via {}: HTTP {}",
+                resource,
+                webfinger_url,
+                response.status()
+            )));
+            continue;
+        }
+
+        let webfinger: serde_json::Value = match response.json().await {
+            Ok(webfinger) => webfinger,
+            Err(error) => {
+                last_error = Some(AppError::Federation(format!(
+                    "Failed to decode WebFinger response for {} via {}: {}",
+                    resource, webfinger_url, error
+                )));
+                continue;
+            }
+        };
+
+        if let Some(actor_uri) = extract_actor_uri_from_webfinger(&webfinger) {
+            return Ok(actor_uri);
+        }
+
+        last_error = Some(AppError::Federation(format!(
+            "WebFinger response for {} via {} did not include an ActivityPub actor URL",
+            resource, webfinger_url
+        )));
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        AppError::Federation(format!(
+            "Failed to discover actor URI from WebFinger for {}",
+            resource
+        ))
+    }))
+}
+
+async fn fetch_actor_document(
+    http_client: &reqwest::Client,
+    actor_uri: &str,
+) -> Result<serde_json::Value, AppError> {
+    let response = http_client
+        .get(actor_uri)
+        .header(
+            "Accept",
+            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!(
+                "Actor fetch failed for {}: {}",
+                actor_uri, error
+            ))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Federation(format!(
+            "Actor fetch failed for {}: HTTP {}",
+            actor_uri,
+            response.status()
+        )));
+    }
+
+    response.json().await.map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to decode actor document {}: {}",
+            actor_uri, error
+        ))
+    })
+}
+
+fn build_cached_profile_from_actor(
+    address: &str,
+    actor_uri: &str,
+    actor_document: &serde_json::Value,
+) -> Option<CachedProfile> {
+    let public_key_pem = extract_public_key_pem(actor_document)?;
+
+    let canonical_actor_uri = actor_document
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(actor_uri)
+        .to_string();
+    let inbox_uri = actor_document
+        .get("inbox")
+        .and_then(|value| value.as_str())?
+        .to_string();
+
+    if url::Url::parse(&canonical_actor_uri).is_err() || url::Url::parse(&inbox_uri).is_err() {
+        return None;
+    }
+
+    Some(CachedProfile {
+        address: address.to_string(),
+        uri: canonical_actor_uri,
+        display_name: actor_document
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        note: actor_document
+            .get("summary")
+            .or_else(|| actor_document.get("note"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        avatar_url: actor_document.get("icon").and_then(extract_url),
+        header_url: actor_document.get("image").and_then(extract_url),
+        public_key_pem,
+        inbox_uri,
+        outbox_uri: actor_document
+            .get("outbox")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        followers_count: actor_document
+            .get("followersCount")
+            .and_then(|value| value.as_u64()),
+        following_count: actor_document
+            .get("followingCount")
+            .and_then(|value| value.as_u64()),
+        fetched_at: Utc::now(),
+    })
+}
+
 // =============================================================================
 // Timeline Cache
 // =============================================================================
@@ -663,6 +943,35 @@ impl ProfileCache {
         })
     }
 
+    async fn get_profiles_by_uri(
+        &self,
+        actor_uri: &str,
+    ) -> Result<Vec<CachedProfile>, turso::Error> {
+        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT
+                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
+                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
+                FROM profiles
+                WHERE uri = ?1
+                  AND fetched_at_ms >= ?2
+                ORDER BY fetched_at_ms DESC
+                "#,
+                (actor_uri, cutoff),
+            )
+            .await?;
+
+        let mut profiles = Vec::new();
+        while let Some(row) = rows.next().await? {
+            profiles.push(Self::parse_profile_row(&row)?);
+        }
+
+        Ok(profiles)
+    }
+
     /// Initialize cache from follow addresses
     ///
     /// Fetches profiles for all followees and followers in parallel.
@@ -674,20 +983,50 @@ impl ProfileCache {
     pub async fn initialize_from_addresses(
         &self,
         addresses: &[String],
-        _http_client: &reqwest::Client,
+        http_client: &reqwest::Client,
     ) {
         // Fetch profiles in parallel (max 10 concurrent)
         use futures::stream::{self, StreamExt};
 
-        stream::iter(addresses)
+        let unique_addresses: Vec<String> = addresses
+            .iter()
+            .map(|address| address.trim())
+            .filter(|address| !address.is_empty())
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        stream::iter(unique_addresses)
             .map(|address| async move {
-                // TODO: Implement WebFinger + Actor fetch
-                // For now, just log that we would fetch
-                tracing::debug!(address = %address, "Would fetch profile");
-                // Placeholder: In real implementation, this would:
-                // 1. Perform WebFinger lookup
-                // 2. Fetch actor JSON
-                // 3. Parse and cache profile
+                let actor_uri = match discover_actor_uri(http_client, &address).await {
+                    Ok(actor_uri) => actor_uri,
+                    Err(error) => {
+                        tracing::warn!(address = %address, %error, "Failed to discover actor URI for profile cache");
+                        return;
+                    }
+                };
+
+                let actor_document = match fetch_actor_document(http_client, &actor_uri).await {
+                    Ok(actor_document) => actor_document,
+                    Err(error) => {
+                        tracing::warn!(address = %address, actor_uri = %actor_uri, %error, "Failed to fetch actor document for profile cache");
+                        return;
+                    }
+                };
+
+                let Some(profile) =
+                    build_cached_profile_from_actor(&address, &actor_uri, &actor_document)
+                else {
+                    tracing::warn!(
+                        address = %address,
+                        actor_uri = %actor_uri,
+                        "Failed to build cached profile from actor document"
+                    );
+                    return;
+                };
+
+                self.insert(profile).await;
             })
             .buffer_unordered(10)
             .collect::<Vec<_>>()
@@ -865,29 +1204,93 @@ impl ProfileCache {
     /// Update profile from ActivityPub Update activity
     ///
     /// Called when receiving Update activity for a known actor.
-    pub async fn update_from_activity(&self, actor_uri: &str, _update_data: serde_json::Value) {
-        let mut rows = match self
-            .conn
-            .query(
-                "SELECT address FROM profiles WHERE uri = ?1 LIMIT 1",
-                [actor_uri],
-            )
-            .await
-        {
-            Ok(rows) => rows,
+    pub async fn update_from_activity(&self, actor_uri: &str, update_data: serde_json::Value) {
+        let existing_profiles = match self.get_profiles_by_uri(actor_uri).await {
+            Ok(existing_profiles) => existing_profiles,
             Err(error) => {
-                tracing::warn!(%error, "Failed to query profile cache by actor URI");
+                tracing::warn!(%error, actor_uri = %actor_uri, "Failed to query profile cache by actor URI");
                 return;
             }
         };
 
-        match rows.next().await {
-            Ok(Some(_)) => {
-                // TODO: Parse update_data and update profile fields
-                tracing::debug!(uri = %actor_uri, "Would update profile from activity");
+        if existing_profiles.is_empty() {
+            return;
+        }
+
+        let actor_object = update_data
+            .get("object")
+            .unwrap_or(&update_data)
+            .as_object()
+            .cloned();
+        let Some(actor_object) = actor_object else {
+            return;
+        };
+
+        if let Some(id) = actor_object.get("id").and_then(|value| value.as_str()) {
+            if id != actor_uri {
+                tracing::warn!(
+                    actor_uri = %actor_uri,
+                    object_id = %id,
+                    "Ignoring Update activity due to mismatched actor object id"
+                );
+                return;
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "Failed to iterate profile cache rows"),
+        }
+
+        let actor_value = serde_json::Value::Object(actor_object.clone());
+
+        for mut updated in existing_profiles {
+            if actor_object.contains_key("name") {
+                updated.display_name = actor_object
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+            }
+
+            if actor_object.contains_key("summary") || actor_object.contains_key("note") {
+                updated.note = actor_object
+                    .get("summary")
+                    .or_else(|| actor_object.get("note"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+            }
+
+            if actor_object.contains_key("icon") {
+                updated.avatar_url = actor_object.get("icon").and_then(extract_url);
+            }
+            if actor_object.contains_key("image") {
+                updated.header_url = actor_object.get("image").and_then(extract_url);
+            }
+
+            if let Some(public_key_pem) = extract_public_key_pem(&actor_value) {
+                updated.public_key_pem = public_key_pem;
+            }
+
+            if let Some(inbox_uri) = actor_object.get("inbox").and_then(|value| value.as_str()) {
+                if url::Url::parse(inbox_uri).is_ok() {
+                    updated.inbox_uri = inbox_uri.to_string();
+                }
+            }
+
+            if actor_object.contains_key("outbox") {
+                updated.outbox_uri = actor_object
+                    .get("outbox")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+            }
+            if actor_object.contains_key("followersCount") {
+                updated.followers_count = actor_object
+                    .get("followersCount")
+                    .and_then(|value| value.as_u64());
+            }
+            if actor_object.contains_key("followingCount") {
+                updated.following_count = actor_object
+                    .get("followingCount")
+                    .and_then(|value| value.as_u64());
+            }
+
+            updated.fetched_at = Utc::now();
+            self.insert(updated).await;
         }
     }
 
@@ -1056,5 +1459,219 @@ mod tests {
             .expect("profile should exist");
         assert_eq!(fetched.address, "alice@example.com");
         assert_eq!(fetched.uri, profile.uri);
+    }
+
+    #[tokio::test]
+    async fn profile_initialize_from_addresses_fetches_webfinger_and_actor() {
+        use axum::{Json, Router, extract::Query, routing::get};
+        use serde::Deserialize;
+        use tokio::net::TcpListener;
+
+        #[derive(Deserialize)]
+        struct WebFingerQuery {
+            resource: String,
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+        let actor_uri = format!("http://{addr}/users/alice");
+        let inbox_uri = format!("http://{addr}/users/alice/inbox");
+
+        let actor_uri_for_webfinger = actor_uri.clone();
+        let app = Router::new()
+            .route(
+                "/.well-known/webfinger",
+                get(move |Query(query): Query<WebFingerQuery>| {
+                    let actor_uri = actor_uri_for_webfinger.clone();
+                    async move {
+                        assert_eq!(query.resource, format!("acct:alice@{addr}"));
+                        Json(serde_json::json!({
+                            "subject": format!("acct:alice@{addr}"),
+                            "links": [{
+                                "rel": "self",
+                                "type": "application/activity+json",
+                                "href": actor_uri,
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/users/alice",
+                get(move || {
+                    let inbox_uri = inbox_uri.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "id": format!("http://{addr}/users/alice"),
+                            "name": "Alice",
+                            "summary": "<p>Hello</p>",
+                            "inbox": inbox_uri,
+                            "outbox": format!("http://{addr}/users/alice/outbox"),
+                            "publicKey": {
+                                "id": format!("http://{addr}/users/alice#main-key"),
+                                "publicKeyPem": "test-public-key"
+                            },
+                            "followersCount": 12,
+                            "followingCount": 34
+                        }))
+                    }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cache = ProfileCache::new(60).await.expect("cache init");
+        let http_client = reqwest::Client::new();
+        cache
+            .initialize_from_addresses(&[format!("alice@{addr}")], &http_client)
+            .await;
+
+        let profile = cache.get(&format!("alice@{addr}")).await.expect("profile");
+        assert_eq!(profile.uri, actor_uri);
+        assert_eq!(
+            profile.inbox_uri,
+            format!("http://{addr}/users/alice/inbox")
+        );
+        assert_eq!(profile.display_name.as_deref(), Some("Alice"));
+        assert_eq!(profile.public_key_pem, "test-public-key");
+        assert_eq!(profile.followers_count, Some(12));
+        assert_eq!(profile.following_count, Some(34));
+    }
+
+    #[tokio::test]
+    async fn profile_update_from_activity_applies_profile_fields() {
+        let cache = ProfileCache::new(60).await.expect("cache init");
+        let mut profile = sample_profile("alice@example.com", Utc::now());
+        profile.uri = "https://remote.example/users/alice".to_string();
+        profile.inbox_uri = "https://remote.example/inbox-old".to_string();
+        profile.public_key_pem = "old-public-key".to_string();
+        cache.insert(profile).await;
+
+        cache
+            .update_from_activity(
+                "https://remote.example/users/alice",
+                serde_json::json!({
+                    "type": "Update",
+                    "object": {
+                        "id": "https://remote.example/users/alice",
+                        "name": "Alice Updated",
+                        "summary": "updated summary",
+                        "icon": { "url": "https://cdn.example/avatar.png" },
+                        "image": { "url": "https://cdn.example/header.png" },
+                        "publicKey": {
+                            "publicKeyPem": "new-public-key"
+                        },
+                        "inbox": "https://remote.example/inbox-new",
+                        "outbox": "https://remote.example/outbox-new",
+                        "followersCount": 99,
+                        "followingCount": 77
+                    }
+                }),
+            )
+            .await;
+
+        let updated = cache
+            .get("alice@example.com")
+            .await
+            .expect("updated profile");
+        assert_eq!(updated.display_name.as_deref(), Some("Alice Updated"));
+        assert_eq!(updated.note.as_deref(), Some("updated summary"));
+        assert_eq!(
+            updated.avatar_url.as_deref(),
+            Some("https://cdn.example/avatar.png")
+        );
+        assert_eq!(
+            updated.header_url.as_deref(),
+            Some("https://cdn.example/header.png")
+        );
+        assert_eq!(updated.public_key_pem, "new-public-key");
+        assert_eq!(updated.inbox_uri, "https://remote.example/inbox-new");
+        assert_eq!(
+            updated.outbox_uri.as_deref(),
+            Some("https://remote.example/outbox-new")
+        );
+        assert_eq!(updated.followers_count, Some(99));
+        assert_eq!(updated.following_count, Some(77));
+    }
+
+    #[tokio::test]
+    async fn profile_update_from_activity_ignores_mismatched_actor_id() {
+        let cache = ProfileCache::new(60).await.expect("cache init");
+        let mut profile = sample_profile("alice@example.com", Utc::now());
+        profile.uri = "https://remote.example/users/alice".to_string();
+        profile.display_name = Some("Alice Before".to_string());
+        profile.inbox_uri = "https://remote.example/inbox-old".to_string();
+        cache.insert(profile).await;
+
+        cache
+            .update_from_activity(
+                "https://remote.example/users/alice",
+                serde_json::json!({
+                    "type": "Update",
+                    "object": {
+                        "id": "https://attacker.example/users/mallory",
+                        "name": "Alice After",
+                        "inbox": "https://attacker.example/inbox"
+                    }
+                }),
+            )
+            .await;
+
+        let unchanged = cache
+            .get("alice@example.com")
+            .await
+            .expect("profile should exist");
+        assert_eq!(unchanged.display_name.as_deref(), Some("Alice Before"));
+        assert_eq!(unchanged.inbox_uri, "https://remote.example/inbox-old");
+        assert_eq!(unchanged.uri, "https://remote.example/users/alice");
+    }
+
+    #[tokio::test]
+    async fn profile_update_from_activity_updates_all_rows_for_same_actor_uri() {
+        let cache = ProfileCache::new(60).await.expect("cache init");
+        let actor_uri = "https://remote.example/users/alice";
+
+        let mut primary = sample_profile("alice@remote.example", Utc::now());
+        primary.uri = actor_uri.to_string();
+        primary.display_name = Some("Before".to_string());
+        primary.inbox_uri = "https://remote.example/inbox-old".to_string();
+        cache.insert(primary).await;
+
+        let mut alias = sample_profile(actor_uri, Utc::now());
+        alias.uri = actor_uri.to_string();
+        alias.display_name = Some("Before".to_string());
+        alias.inbox_uri = "https://remote.example/inbox-old".to_string();
+        cache.insert(alias).await;
+
+        cache
+            .update_from_activity(
+                actor_uri,
+                serde_json::json!({
+                    "type": "Update",
+                    "object": {
+                        "id": actor_uri,
+                        "name": "After",
+                        "inbox": "https://remote.example/inbox-new"
+                    }
+                }),
+            )
+            .await;
+
+        let updated_primary = cache
+            .get("alice@remote.example")
+            .await
+            .expect("primary row");
+        let updated_alias = cache.get(actor_uri).await.expect("alias row");
+        assert_eq!(updated_primary.display_name.as_deref(), Some("After"));
+        assert_eq!(
+            updated_primary.inbox_uri,
+            "https://remote.example/inbox-new"
+        );
+        assert_eq!(updated_alias.display_name.as_deref(), Some("After"));
+        assert_eq!(updated_alias.inbox_uri, "https://remote.example/inbox-new");
     }
 }
