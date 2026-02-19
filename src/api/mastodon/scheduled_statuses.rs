@@ -67,17 +67,20 @@ pub async fn update_scheduled_status(
     Path(id): Path<String>,
     Json(params): Json<UpdateScheduledStatusParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Validate scheduled_at format
-    if chrono::DateTime::parse_from_rfc3339(&params.scheduled_at).is_err() {
-        return Err(AppError::Validation(
-            "Invalid scheduled_at format".to_string(),
+    // Validate scheduled_at format and ensure it is in the future.
+    let scheduled_at = chrono::DateTime::parse_from_rfc3339(params.scheduled_at.trim())
+        .map_err(|_| AppError::Validation("Invalid scheduled_at format".to_string()))?
+        .with_timezone(&chrono::Utc);
+    if scheduled_at <= chrono::Utc::now() {
+        return Err(AppError::Unprocessable(
+            "scheduled_at must be in the future".to_string(),
         ));
     }
 
     // Update the scheduled time
     let updated = state
         .db
-        .update_scheduled_status(&id, &params.scheduled_at)
+        .update_scheduled_status(&id, &scheduled_at.to_rfc3339())
         .await?;
 
     if !updated {

@@ -11,6 +11,8 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use rsa::{RsaPublicKey, pkcs1v15::Signature as Pkcs1v15Signature};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::net::IpAddr;
 
 /// Sign an HTTP request
 ///
@@ -123,6 +125,83 @@ pub struct SignatureHeaders {
     pub digest: Option<String>,
 }
 
+fn is_supported_signature_algorithm(algorithm: &str) -> bool {
+    algorithm.eq_ignore_ascii_case("rsa-sha256") || algorithm.eq_ignore_ascii_case("hs2019")
+}
+
+fn parse_actor_url(raw: &str) -> Result<url::Url, AppError> {
+    let mut parsed = url::Url::parse(raw)
+        .map_err(|_| AppError::Validation("Invalid actor URL in keyId".to_string()))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(AppError::Validation(
+            "Actor URL in keyId must use http or https".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AppError::Validation(
+            "Actor URL in keyId must not include user info".to_string(),
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err(AppError::Validation(
+            "Actor URL in keyId must include a host".to_string(),
+        ));
+    }
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
+fn is_blocked_ip_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
+}
+
+fn validate_remote_actor_url(actor_url: &url::Url) -> Result<(), AppError> {
+    let host = actor_url
+        .host_str()
+        .ok_or_else(|| AppError::Validation("Actor URL in keyId must include a host".to_string()))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(AppError::Validation(
+            "Actor URL host is not allowed".to_string(),
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip_address(ip) {
+            return Err(AppError::Validation(
+                "Actor URL host is not allowed".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true when the actor URL derived from keyId matches activity actor.
+pub fn key_id_matches_actor(key_id: &str, actor_id: &str) -> Result<bool, AppError> {
+    let key_actor = parse_actor_url(key_id)?;
+    let actor = parse_actor_url(actor_id)
+        .map_err(|_| AppError::Validation("Invalid activity actor URL".to_string()))?;
+    Ok(key_actor == actor)
+}
+
 /// Verify an HTTP request signature
 ///
 /// # Arguments
@@ -153,6 +232,20 @@ pub fn verify_signature(
         .map_err(|_| AppError::Validation("Invalid Signature header".to_string()))?;
 
     let parsed = parse_signature_header(signature_header)?;
+    if !is_supported_signature_algorithm(&parsed.algorithm) {
+        return Err(AppError::Validation(
+            "Unsupported signature algorithm".to_string(),
+        ));
+    }
+    let signed_headers: HashSet<&str> = parsed.headers.iter().map(String::as_str).collect();
+    for required_header in ["(request-target)", "host", "date"] {
+        if !signed_headers.contains(required_header) {
+            return Err(AppError::Validation(format!(
+                "Signature must include {} header",
+                required_header
+            )));
+        }
+    }
 
     // 2. Verify Date is recent (within 5 minutes)
     if let Some(date_header) = headers.get("date") {
@@ -177,15 +270,21 @@ pub fn verify_signature(
 
     // 3. If body present, verify Digest
     if let Some(body_data) = body {
-        if let Some(digest_header) = headers.get("digest") {
-            let digest_str = digest_header
-                .to_str()
-                .map_err(|_| AppError::Validation("Invalid Digest header".to_string()))?;
+        if !signed_headers.contains("digest") {
+            return Err(AppError::Validation(
+                "Signature must include digest header for requests with body".to_string(),
+            ));
+        }
+        let digest_header = headers
+            .get("digest")
+            .ok_or_else(|| AppError::Validation("Missing digest header".to_string()))?;
+        let digest_str = digest_header
+            .to_str()
+            .map_err(|_| AppError::Validation("Invalid Digest header".to_string()))?;
 
-            let expected_digest = generate_digest(body_data);
-            if digest_str != expected_digest {
-                return Err(AppError::Validation("Digest mismatch".to_string()));
-            }
+        let expected_digest = generate_digest(body_data);
+        if digest_str != expected_digest {
+            return Err(AppError::Validation("Digest mismatch".to_string()));
         }
     }
 
@@ -287,7 +386,12 @@ pub fn parse_signature_header(header: &str) -> Result<ParsedSignature, AppError>
                 "keyId" => key_id = Some(value.to_string()),
                 "algorithm" => algorithm = Some(value.to_string()),
                 "headers" => {
-                    headers = Some(value.split_whitespace().map(|s| s.to_string()).collect())
+                    headers = Some(
+                        value
+                            .split_whitespace()
+                            .map(|s| s.to_ascii_lowercase())
+                            .collect(),
+                    )
                 }
                 "signature" => signature = Some(value.to_string()),
                 _ => {} // Ignore unknown fields
@@ -328,12 +432,12 @@ pub async fn fetch_public_key(
     key_id: &str,
     http_client: &reqwest::Client,
 ) -> Result<String, AppError> {
-    // Extract actor URL (remove fragment if present)
-    let actor_url = key_id.split('#').next().unwrap_or(key_id);
+    let actor_url = parse_actor_url(key_id)?;
+    validate_remote_actor_url(&actor_url)?;
 
     // Fetch actor document
     let response = http_client
-        .get(actor_url)
+        .get(actor_url.as_str())
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -359,4 +463,163 @@ pub async fn fetch_public_key(
         .ok_or_else(|| AppError::Federation("Missing publicKeyPem in actor".to_string()))?;
 
     Ok(public_key_pem.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    fn generate_test_keypair() -> (String, String) {
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let public_key_pem = public_key.to_public_key_pem(LineEnding::LF).unwrap();
+        (private_key_pem, public_key_pem)
+    }
+
+    #[test]
+    fn verify_signature_requires_digest_header_for_body() {
+        let (private_key_pem, public_key_pem) = generate_test_keypair();
+        let body = br#"{"type":"Create"}"#;
+        let signed = sign_request(
+            "POST",
+            "https://remote.example/inbox",
+            Some(body),
+            &private_key_pem,
+            "https://remote.example/users/alice#main-key",
+        )
+        .unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("remote.example"));
+        headers.insert(
+            "date",
+            HeaderValue::from_str(&signed.date).expect("valid signed date"),
+        );
+        headers.insert(
+            "signature",
+            HeaderValue::from_str(&signed.signature).expect("valid signature header"),
+        );
+        // Intentionally omit Digest header.
+
+        let error = verify_signature("POST", "/inbox", &headers, Some(body), &public_key_pem)
+            .expect_err("digest header must be required");
+        assert!(matches!(
+            error,
+            AppError::Validation(message) if message.contains("Missing digest header")
+        ));
+    }
+
+    #[test]
+    fn verify_signature_requires_digest_to_be_signed_for_body() {
+        let (private_key_pem, public_key_pem) = generate_test_keypair();
+        let body = br#"{"type":"Create"}"#;
+        // Sign a request without body so "digest" is not part of signed headers.
+        let signed = sign_request(
+            "POST",
+            "https://remote.example/inbox",
+            None,
+            &private_key_pem,
+            "https://remote.example/users/alice#main-key",
+        )
+        .unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("remote.example"));
+        headers.insert(
+            "date",
+            HeaderValue::from_str(&signed.date).expect("valid signed date"),
+        );
+        headers.insert(
+            "signature",
+            HeaderValue::from_str(&signed.signature).expect("valid signature header"),
+        );
+        headers.insert(
+            "digest",
+            HeaderValue::from_str(&generate_digest(body)).expect("valid digest"),
+        );
+
+        let error = verify_signature("POST", "/inbox", &headers, Some(body), &public_key_pem)
+            .expect_err("digest must be part of signed headers");
+        assert!(matches!(
+            error,
+            AppError::Validation(message)
+                if message.contains("Signature must include digest header")
+        ));
+    }
+
+    #[test]
+    fn verify_signature_accepts_hs2019_algorithm_token() {
+        let (private_key_pem, public_key_pem) = generate_test_keypair();
+        let body = br#"{"type":"Create"}"#;
+        let signed = sign_request(
+            "POST",
+            "https://remote.example/inbox",
+            Some(body),
+            &private_key_pem,
+            "https://remote.example/users/alice#main-key",
+        )
+        .unwrap();
+        let hs2019_signature =
+            signed
+                .signature
+                .replacen("algorithm=\"rsa-sha256\"", "algorithm=\"hs2019\"", 1);
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("remote.example"));
+        headers.insert(
+            "date",
+            HeaderValue::from_str(&signed.date).expect("valid signed date"),
+        );
+        headers.insert(
+            "digest",
+            HeaderValue::from_str(&generate_digest(body)).expect("valid digest"),
+        );
+        headers.insert(
+            "signature",
+            HeaderValue::from_str(&hs2019_signature).expect("valid signature header"),
+        );
+
+        verify_signature("POST", "/inbox", &headers, Some(body), &public_key_pem)
+            .expect("hs2019 token should be accepted for rsa signatures");
+    }
+
+    #[test]
+    fn key_id_matches_actor_accepts_matching_actor_document_url() {
+        let matches = key_id_matches_actor(
+            "https://remote.example/users/alice#main-key",
+            "https://remote.example/users/alice",
+        )
+        .expect("valid actor URLs");
+        assert!(matches);
+    }
+
+    #[test]
+    fn key_id_matches_actor_rejects_mismatched_actor_document_url() {
+        let matches = key_id_matches_actor(
+            "https://remote.example/users/bob#main-key",
+            "https://remote.example/users/alice",
+        )
+        .expect("valid actor URLs");
+        assert!(!matches);
+    }
+
+    #[tokio::test]
+    async fn fetch_public_key_rejects_localhost_targets() {
+        let client = reqwest::Client::new();
+        let error = fetch_public_key("http://127.0.0.1/users/alice#main-key", &client)
+            .await
+            .expect_err("localhost/private targets must be rejected");
+        assert!(matches!(
+            error,
+            AppError::Validation(message) if message.contains("not allowed")
+        ));
+    }
 }

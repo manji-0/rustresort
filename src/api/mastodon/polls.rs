@@ -5,6 +5,7 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use crate::{AppState, auth::CurrentUser, error::AppError};
 
@@ -81,6 +82,14 @@ pub async fn vote_in_poll(
         return Err(AppError::Validation(
             "At least one choice is required".to_string(),
         ));
+    }
+    let mut seen_choice_indices = HashSet::new();
+    for choice in &params.choices {
+        if !seen_choice_indices.insert(*choice) {
+            return Err(AppError::Validation(
+                "Duplicate choices are not allowed".to_string(),
+            ));
+        }
     }
 
     // Get poll to validate

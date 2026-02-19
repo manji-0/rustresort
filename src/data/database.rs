@@ -22,6 +22,16 @@ fn map_turso_error(context: &str, error: turso::Error) -> AppError {
     AppError::Internal(anyhow::anyhow!("{context}: {error}"))
 }
 
+fn poll_is_expired(expires_at: &str, persisted_expired: i64) -> bool {
+    if persisted_expired != 0 {
+        return true;
+    }
+
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|parsed| parsed.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(true)
+}
+
 /// Database connection pool wrapper.
 ///
 /// # Turso synchronization
@@ -1022,6 +1032,44 @@ impl Database {
         Ok(statuses)
     }
 
+    /// Get statuses safe to expose in ActivityPub outbox.
+    ///
+    /// Outbox must never leak private/direct statuses.
+    pub async fn get_local_outbox_statuses(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = if let Some(max_id) = max_id {
+            sqlx::query_as::<_, Status>(
+                r#"
+                SELECT * FROM statuses
+                WHERE is_local = 1 AND visibility IN ('public', 'unlisted') AND id < ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(max_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Status>(
+                r#"
+                SELECT * FROM statuses
+                WHERE is_local = 1 AND visibility IN ('public', 'unlisted')
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(statuses)
+    }
+
     // =========================================================================
     // Media Attachments
     // =========================================================================
@@ -1142,6 +1190,14 @@ impl Database {
         Ok(addresses)
     }
 
+    /// Count follows.
+    pub async fn count_follow_addresses(&self) -> Result<i64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM follows")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     /// Get all follower addresses
     ///
     /// # Returns
@@ -1154,6 +1210,14 @@ impl Database {
         .await?;
 
         Ok(addresses)
+    }
+
+    /// Count followers.
+    pub async fn count_follower_addresses(&self) -> Result<i64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM followers")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
     }
 
     /// Get follower inbox URIs for activity delivery
@@ -2734,8 +2798,8 @@ impl Database {
             |(id, expires_at, expired, multiple, votes_count, voters_count)| {
                 (
                     id,
-                    expires_at,
-                    expired != 0,
+                    expires_at.clone(),
+                    poll_is_expired(&expires_at, expired),
                     multiple != 0,
                     votes_count,
                     voters_count,
@@ -2760,8 +2824,8 @@ impl Database {
             |(id, expires_at, expired, multiple, votes_count, voters_count)| {
                 (
                     id,
-                    expires_at,
-                    expired != 0,
+                    expires_at.clone(),
+                    poll_is_expired(&expires_at, expired),
                     multiple != 0,
                     votes_count,
                     voters_count,
@@ -2792,23 +2856,53 @@ impl Database {
         voter_address: &str,
         option_ids: &[String],
     ) -> Result<(), AppError> {
-        // Check if poll allows multiple votes
-        let poll = self.get_poll(poll_id).await?.ok_or(AppError::NotFound)?;
-
-        if !poll.2 && option_ids.len() > 1 {
+        if option_ids.is_empty() {
             return Err(AppError::Validation(
-                "Poll does not allow multiple choices".to_string(),
+                "At least one choice is required".to_string(),
             ));
         }
 
-        // Check if already voted (for single-choice polls)
-        if !poll.2 {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            let poll = sqlx::query_as::<_, (String, String, i64, i64, i64, i64)>(
+                "SELECT id, expires_at, expired, multiple, votes_count, voters_count FROM polls WHERE id = ?",
+            )
+            .bind(poll_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(
+                |(id, expires_at, expired, multiple, votes_count, voters_count)| {
+                    (
+                        id,
+                        expires_at.clone(),
+                        poll_is_expired(&expires_at, expired),
+                        multiple != 0,
+                        votes_count,
+                        voters_count,
+                    )
+                },
+            )
+            .ok_or(AppError::NotFound)?;
+
+            if poll.2 {
+                return Err(AppError::Validation("Poll has expired".to_string()));
+            }
+            if !poll.3 && option_ids.len() > 1 {
+                return Err(AppError::Validation(
+                    "Poll does not allow multiple choices".to_string(),
+                ));
+            }
+
+            // A voter can submit at most one ballot per poll.
+            // For multiple-choice polls, the ballot may include multiple options.
             let existing_vote: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM poll_votes WHERE poll_id = ? AND voter_address = ?",
             )
             .bind(poll_id)
             .bind(voter_address)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
 
             if existing_vote > 0 {
@@ -2816,35 +2910,82 @@ impl Database {
                     "Already voted in this poll".to_string(),
                 ));
             }
-        }
 
-        // Record votes
-        for option_id in option_ids {
-            let vote_id = EntityId::new().0;
-            sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO poll_votes (id, poll_id, option_id, voter_address, created_at)
-                VALUES (?, ?, ?, ?, datetime('now'))
-                "#,
-            )
-            .bind(&vote_id)
-            .bind(poll_id)
-            .bind(option_id)
-            .bind(voter_address)
-            .execute(&self.pool)
-            .await?;
-
-            // Update option vote count
-            sqlx::query("UPDATE poll_options SET votes_count = votes_count + 1 WHERE id = ?")
+            for option_id in option_ids {
+                let option_exists: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM poll_options WHERE id = ? AND poll_id = ?",
+                )
                 .bind(option_id)
-                .execute(&self.pool)
+                .bind(poll_id)
+                .fetch_one(&mut *conn)
                 .await?;
+                if option_exists == 0 {
+                    return Err(AppError::Validation("Invalid poll option".to_string()));
+                }
+
+                let vote_id = EntityId::new().0;
+                let inserted = sqlx::query(
+                    r#"
+                    INSERT OR IGNORE INTO poll_votes (id, poll_id, option_id, voter_address, created_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    "#,
+                )
+                .bind(&vote_id)
+                .bind(poll_id)
+                .bind(option_id)
+                .bind(voter_address)
+                .execute(&mut *conn)
+                .await?;
+                if inserted.rows_affected() == 0 {
+                    return Err(AppError::Validation(
+                        "Already voted in this poll".to_string(),
+                    ));
+                }
+
+                let updated = sqlx::query(
+                    "UPDATE poll_options SET votes_count = votes_count + 1 WHERE id = ? AND poll_id = ?",
+                )
+                .bind(option_id)
+                .bind(poll_id)
+                .execute(&mut *conn)
+                .await?;
+                if updated.rows_affected() == 0 {
+                    return Err(AppError::Validation("Invalid poll option".to_string()));
+                }
+            }
+
+            // Update poll totals inside the same transaction.
+            let total_votes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM poll_votes WHERE poll_id = ?")
+                .bind(poll_id)
+                .fetch_one(&mut *conn)
+                .await?;
+            let unique_voters: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT voter_address) FROM poll_votes WHERE poll_id = ?",
+            )
+            .bind(poll_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            sqlx::query("UPDATE polls SET votes_count = ?, voters_count = ? WHERE id = ?")
+                .bind(total_votes)
+                .bind(unique_voters)
+                .bind(poll_id)
+                .execute(&mut *conn)
+                .await?;
+
+            Ok(())
         }
+        .await;
 
-        // Update poll totals
-        self.update_poll_counts(poll_id).await?;
-
-        Ok(())
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Update poll vote counts

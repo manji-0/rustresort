@@ -21,6 +21,17 @@ use crate::metrics::{
     FEDERATION_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };
 
+fn extract_signature_key_id(headers: &HeaderMap) -> Result<String, AppError> {
+    let signature = headers
+        .get("signature")
+        .ok_or(AppError::Unauthorized)?
+        .to_str()
+        .map_err(|_| AppError::Unauthorized)?;
+
+    let parsed = crate::federation::parse_signature_header(signature)?;
+    Ok(parsed.key_id)
+}
+
 /// Create ActivityPub router
 ///
 /// Routes:
@@ -154,15 +165,31 @@ async fn inbox(
         .ok_or_else(|| AppError::Validation("Missing actor field".to_string()))?
         .to_string(); // Clone the string to avoid borrow issues;
 
-    // Fetch the actor's public key
-    let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client).await?;
+    let signature_key_id = extract_signature_key_id(&headers)?;
+    if !crate::federation::key_id_matches_actor(&signature_key_id, &actor_id)? {
+        FEDERATION_REQUESTS_TOTAL
+            .with_label_values(&["inbound", "unauthorized"])
+            .inc();
+        return Err(AppError::Unauthorized);
+    }
+
+    // Fetch the actor's public key from signature keyId.
+    let public_key_pem =
+        crate::federation::fetch_public_key(&signature_key_id, state.http_client.as_ref()).await?;
 
     // Get the request path
     let path = format!("/users/{}/inbox", username);
 
     // Verify the HTTP signature
     crate::federation::verify_signature("POST", &path, &headers, Some(&body), &public_key_pem)?;
+
+    // Apply inbound federation rate limiting only after signature verification
+    // to avoid unauthenticated quota poisoning.
+    let actor_domain = crate::federation::extract_domain(&signature_key_id);
+    state
+        .federation_rate_limiter
+        .check_and_increment(&actor_domain)
+        .await?;
 
     // Record activity type
     if let Some(activity_type) = activity.get("type").and_then(|t| t.as_str()) {
@@ -229,15 +256,28 @@ async fn shared_inbox(
         .ok_or_else(|| AppError::Validation("Missing actor field".to_string()))?
         .to_string(); // Clone the string to avoid borrow issues;
 
-    // Fetch the actor's public key
-    let http_client = reqwest::Client::new();
-    let public_key_pem = crate::federation::fetch_public_key(&actor_id, &http_client).await?;
+    let signature_key_id = extract_signature_key_id(&headers)?;
+    if !crate::federation::key_id_matches_actor(&signature_key_id, &actor_id)? {
+        return Err(AppError::Unauthorized);
+    }
+
+    // Fetch the actor's public key from signature keyId.
+    let public_key_pem =
+        crate::federation::fetch_public_key(&signature_key_id, state.http_client.as_ref()).await?;
 
     // Get the request path
     let path = "/inbox";
 
     // Verify the HTTP signature
     crate::federation::verify_signature("POST", path, &headers, Some(&body), &public_key_pem)?;
+
+    // Apply inbound federation rate limiting only after signature verification
+    // to avoid unauthenticated quota poisoning.
+    let actor_domain = crate::federation::extract_domain(&signature_key_id);
+    state
+        .federation_rate_limiter
+        .check_and_increment(&actor_domain)
+        .await?;
 
     // Verify we have at least one account on this instance
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -273,32 +313,53 @@ async fn outbox(
 
     match account {
         Some(acc) if acc.username == username => {
-            // Get public statuses from database
-            let statuses = state.db.get_local_statuses(20, None).await?;
+            // Get outbox-safe statuses from database.
+            // ActivityPub outbox must not expose private/direct posts.
+            let statuses = state.db.get_local_outbox_statuses(20, None).await?;
 
             let base_url = state.config.server.base_url();
             let outbox_url = format!("{}/users/{}/outbox", base_url, username);
+            let followers_url = format!("{}/users/{}/followers", base_url, username);
+            let public_audience = "https://www.w3.org/ns/activitystreams#Public";
 
             // Build OrderedCollection
             let items: Vec<serde_json::Value> = statuses
                 .iter()
                 .map(|status| {
+                    let (to, cc) = match status.visibility.as_str() {
+                        "unlisted" => (
+                            serde_json::json!([followers_url.clone()]),
+                            serde_json::json!([public_audience]),
+                        ),
+                        _ => (
+                            serde_json::json!([public_audience]),
+                            serde_json::json!([followers_url.clone()]),
+                        ),
+                    };
+                    let mut object = serde_json::json!({
+                        "type": "Note",
+                        "id": status.uri.clone(),
+                        "attributedTo": format!("{}/users/{}", base_url, username),
+                        "content": status.content.clone(),
+                        "published": status.created_at.to_rfc3339(),
+                        "to": to,
+                        "cc": cc
+                    });
+                    if let Some(summary) = &status.content_warning {
+                        object["summary"] = serde_json::json!(summary);
+                        object["sensitive"] = serde_json::json!(true);
+                    }
+                    if let Some(in_reply_to) = &status.in_reply_to_uri {
+                        object["inReplyTo"] = serde_json::json!(in_reply_to);
+                    }
                     serde_json::json!({
                         "type": "Create",
                         "id": format!("{}/activity", status.uri),
                         "actor": format!("{}/users/{}", base_url, username),
                         "published": status.created_at.to_rfc3339(),
-                        "to": ["https://www.w3.org/ns/activitystreams#Public"],
-                        "cc": [format!("{}/users/{}/followers", base_url, username)],
-                        "object": {
-                            "type": "Note",
-                            "id": status.uri.clone(),
-                            "attributedTo": format!("{}/users/{}", base_url, username),
-                            "content": status.content.clone(),
-                            "published": status.created_at.to_rfc3339(),
-                            "to": ["https://www.w3.org/ns/activitystreams#Public"],
-                            "cc": [format!("{}/users/{}/followers", base_url, username)]
-                        }
+                        "to": object["to"].clone(),
+                        "cc": object["cc"].clone(),
+                        "object": object
                     })
                 })
                 .collect();

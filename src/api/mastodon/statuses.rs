@@ -470,9 +470,13 @@ pub async fn create_status(
         let db_timer = DB_QUERY_DURATION_SECONDS
             .with_label_values(&["INSERT", "statuses"])
             .start_timer();
-        state
-            .db
-            .insert_status_with_media_and_poll(
+        let status_service = StatusService::new(
+            state.db.clone(),
+            state.timeline_cache.clone(),
+            state.storage.clone(),
+        );
+        status_service
+            .persist_local_status_with_media_and_poll(
                 &status,
                 &media_ids,
                 poll.as_ref()
