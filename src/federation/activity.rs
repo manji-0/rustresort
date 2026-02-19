@@ -1179,6 +1179,24 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIICdgIBADANBgkqhkiG9w0BAQEFAASCAmAwggJcAgEAAoGBAL1qEJ6Esenbo474
+9+uZLEdGCjBmx3hsp7hSr8kIDu45Ssg0w/dm1Imey6JOWg+4EXeIteqeMs840VQ4
+RwkQ4CsxtP11wmbqZQYUyzN1D//QaJsw+LUBO5DSWjTcQN2Egp0G4wntmd2SSA/V
+n/uxvKAtuHf3Agkxj9JspBDWthBdAgMBAAECgYBMV2lnWngSl1GumC3kKRItj88f
+fu06XiCjK8Bpt/O8lB7N3mZ1Wl6jMPtF6WpnF3sCwHkBnM1Bs9a6qQwIXWLblFnk
+WcygjRtsecUygZR9OcgDR3iUmMrRcJw9vpgdbklEMmfQoVmfibq0bxgLoQmjmBD3
+e5u5GPHMv2oJJWQdSQJBAOFSueufpOz7q5F7G/f/mGQ3K9vxCgmyHngNepBMYWTU
+WDDmb/ADyg6WP+zsI3YEnWqb24WHmaH7pxaQkI1f5jMCQQDXM8tdJ/zrNeTcp8Lo
++48KSyqGcLUNcjQUHVTLts5JhfcwKM481SlTy5JKUGFN1ImUD+tPUAR6or+v34I6
++v8vAkBS0S00xYDA+d+doToudOt2KjEcrgOafLVmOs4Jq4lAniusDYanGT1zDxZ/
+5mtCPX/+ZzrQYX6+YtiPGqOG0vCxAkEApKZuK+IScmuTpPd9+v+tGzUTXjURcS41
+hkZCwHInNr2WuHQgBw8YRZJ1ZQJG0GOSt4POh6ozIxkuDAO4AiRT5QJAMaOkNwxr
+8wOcEsOq4fz1NbwZWopRkXl1Bei82uO5cw9whSTf2xGkIKxnu3gJ11Jnw7POXY2L
+6Ym7721cQmof3w==
+-----END PRIVATE KEY-----
+"#;
+
     async fn create_test_processor_with_timeline(
         local_address: &str,
         local_protocol: &str,
@@ -1395,6 +1413,54 @@ mod tests {
         processor.handle_follow(activity, actor_uri).await.unwrap();
         let follower_addresses = db.get_all_follower_addresses().await.unwrap();
         assert_eq!(follower_addresses, vec!["bob@remote.example".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn handle_follow_sends_accept_when_delivery_is_configured() {
+        use axum::{Router, routing::post};
+        use http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_for_route = deliveries.clone();
+        let app = Router::new().route(
+            "/users/bob/inbox",
+            post(move || {
+                let deliveries = deliveries_for_route.clone();
+                async move {
+                    deliveries.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::ACCEPTED
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let delivery = Arc::new(crate::federation::ActivityDelivery::new(
+            Arc::new(reqwest::Client::new()),
+            "https://example.com/users/alice".to_string(),
+            "https://example.com/users/alice#main-key".to_string(),
+            TEST_PRIVATE_KEY_PEM.to_string(),
+        ));
+        let processor = processor.with_delivery(delivery);
+
+        let actor_uri = format!("http://{addr}/users/bob");
+        let activity = json!({
+            "type": "Follow",
+            "id": format!("{actor_uri}/follows/1"),
+            "actor": actor_uri,
+            "object": "https://example.com/users/alice"
+        });
+
+        processor.handle_follow(activity, &actor_uri).await.unwrap();
+
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

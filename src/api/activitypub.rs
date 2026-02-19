@@ -13,8 +13,10 @@ use axum::{
     routing::{get, post},
 };
 use http::HeaderMap;
+use std::sync::Arc;
 
 use crate::AppState;
+use crate::data::Account;
 use crate::error::AppError;
 use crate::metrics::{
     ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUEST_DURATION_SECONDS,
@@ -30,6 +32,34 @@ fn extract_signature_key_id(headers: &HeaderMap) -> Result<String, AppError> {
 
     let parsed = crate::federation::parse_signature_header(signature)?;
     Ok(parsed.key_id)
+}
+
+fn build_activity_processor(
+    state: &AppState,
+    account: &Account,
+) -> crate::federation::ActivityProcessor {
+    let local_address = format!("{}@{}", account.username, state.config.server.domain);
+    let actor_uri = format!(
+        "{}/users/{}",
+        state.config.server.base_url(),
+        account.username
+    );
+    let delivery = Arc::new(crate::federation::ActivityDelivery::new(
+        state.http_client.clone(),
+        actor_uri.clone(),
+        format!("{actor_uri}#main-key"),
+        account.private_key_pem.clone(),
+    ));
+
+    crate::federation::ActivityProcessor::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+        state.http_client.clone(),
+        local_address,
+        state.config.server.protocol.clone(),
+    )
+    .with_delivery(delivery)
 }
 
 /// Create ActivityPub router
@@ -143,9 +173,10 @@ async fn inbox(
 
     // Verify username exists
     let account = state.db.get_account().await?;
-    if account.is_none() || account.as_ref().unwrap().username != username {
-        return Err(AppError::NotFound);
-    }
+    let account = match account {
+        Some(account) if account.username == username => account,
+        _ => return Err(AppError::NotFound),
+    };
 
     // Check for Signature header first (reject unsigned requests immediately)
     if headers.get("signature").is_none() {
@@ -199,20 +230,7 @@ async fn inbox(
     }
 
     // Process the activity
-    let local_address = format!(
-        "{}@{}",
-        account.as_ref().unwrap().username,
-        state.config.server.domain
-    );
-
-    let processor = crate::federation::ActivityProcessor::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.profile_cache.clone(),
-        state.http_client.clone(),
-        local_address,
-        state.config.server.protocol.clone(),
-    );
+    let processor = build_activity_processor(&state, &account);
 
     processor.process(activity, &actor_id).await?;
 
@@ -283,16 +301,7 @@ async fn shared_inbox(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Process the activity
-    let local_address = format!("{}@{}", account.username, state.config.server.domain);
-
-    let processor = crate::federation::ActivityProcessor::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.profile_cache.clone(),
-        state.http_client.clone(),
-        local_address,
-        state.config.server.protocol.clone(),
-    );
+    let processor = build_activity_processor(&state, &account);
 
     processor.process(activity, &actor_id).await?;
 
