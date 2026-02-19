@@ -9,6 +9,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha256};
+
 use super::models::*;
 use crate::error::AppError;
 
@@ -175,6 +178,99 @@ fn parse_json_value(raw: Option<String>) -> Option<serde_json::Value> {
     raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
 }
 
+const OAUTH_ACCESS_TOKEN_HASH_PREFIX: &str = "sha256:";
+const OAUTH_ACCESS_TOKEN_HASH_ENCODED_LEN: usize = 43;
+const OAUTH_ACCESS_TOKEN_HASH_DECODED_LEN: usize = 32;
+const OAUTH_ACCESS_TOKEN_HASH_MIGRATION_SETTING_KEY: &str =
+    "oauth_tokens_access_token_hash_migration";
+const OAUTH_ACCESS_TOKEN_HASH_MIGRATION_DONE: &str = "done";
+
+fn hash_oauth_access_token(access_token: &str) -> String {
+    let digest = Sha256::digest(access_token.as_bytes());
+    format!(
+        "{}{}",
+        OAUTH_ACCESS_TOKEN_HASH_PREFIX,
+        URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+fn is_hashed_oauth_access_token(stored_access_token: &str) -> bool {
+    let Some(encoded_digest) = stored_access_token.strip_prefix(OAUTH_ACCESS_TOKEN_HASH_PREFIX)
+    else {
+        return false;
+    };
+
+    if encoded_digest.len() != OAUTH_ACCESS_TOKEN_HASH_ENCODED_LEN
+        || !encoded_digest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return false;
+    }
+
+    URL_SAFE_NO_PAD
+        .decode(encoded_digest)
+        .map(|bytes| bytes.len() == OAUTH_ACCESS_TOKEN_HASH_DECODED_LEN)
+        .unwrap_or(false)
+}
+
+async fn migrate_legacy_oauth_tokens(pool: &Pool<Sqlite>) -> Result<(), AppError> {
+    let migration_state =
+        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+            .bind(OAUTH_ACCESS_TOKEN_HASH_MIGRATION_SETTING_KEY)
+            .fetch_optional(pool)
+            .await?;
+
+    if migration_state.as_deref() == Some(OAUTH_ACCESS_TOKEN_HASH_MIGRATION_DONE) {
+        return Ok(());
+    }
+
+    let legacy_rows =
+        sqlx::query_as::<_, (String, String)>("SELECT id, access_token FROM oauth_tokens")
+            .fetch_all(pool)
+            .await?;
+
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut migrated_count = 0usize;
+
+    for (id, stored_access_token) in legacy_rows {
+        if is_hashed_oauth_access_token(&stored_access_token) {
+            continue;
+        }
+
+        let hashed_access_token = hash_oauth_access_token(&stored_access_token);
+        sqlx::query("UPDATE oauth_tokens SET access_token = ? WHERE id = ?")
+            .bind(&hashed_access_token)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        migrated_count += 1;
+    }
+
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(OAUTH_ACCESS_TOKEN_HASH_MIGRATION_SETTING_KEY)
+    .bind(OAUTH_ACCESS_TOKEN_HASH_MIGRATION_DONE)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    if migrated_count > 0 {
+        tracing::info!(
+            migrated_count,
+            "Migrated legacy OAuth access tokens to hashed storage"
+        );
+    }
+
+    Ok(())
+}
+
 impl Database {
     // =========================================================================
     // Connection
@@ -257,6 +353,7 @@ impl Database {
                 tracing::error!("Migration failed: {}", e);
                 AppError::Internal(anyhow::anyhow!("Migration failed: {}", e))
             })?;
+        migrate_legacy_oauth_tokens(&pool).await?;
 
         if let Some(sync_db) = &turso_sync_db {
             sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
@@ -2053,6 +2150,7 @@ impl Database {
 
     /// Insert OAuth token
     pub async fn insert_oauth_token(&self, token: &OAuthToken) -> Result<(), AppError> {
+        let access_token_hash = hash_oauth_access_token(&token.access_token);
         sqlx::query(
             r#"
             INSERT INTO oauth_tokens (
@@ -2062,7 +2160,7 @@ impl Database {
         )
         .bind(&token.id)
         .bind(&token.app_id)
-        .bind(&token.access_token)
+        .bind(&access_token_hash)
         .bind(&token.grant_type)
         .bind(&token.scopes)
         .bind(&token.created_at)
@@ -2078,10 +2176,11 @@ impl Database {
         &self,
         access_token: &str,
     ) -> Result<Option<OAuthToken>, AppError> {
+        let access_token_hash = hash_oauth_access_token(access_token);
         let token = sqlx::query_as::<_, OAuthToken>(
             "SELECT * FROM oauth_tokens WHERE access_token = ? AND revoked = 0",
         )
-        .bind(access_token)
+        .bind(&access_token_hash)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -2090,8 +2189,9 @@ impl Database {
 
     /// Revoke OAuth token
     pub async fn revoke_oauth_token(&self, access_token: &str) -> Result<(), AppError> {
+        let access_token_hash = hash_oauth_access_token(access_token);
         sqlx::query("UPDATE oauth_tokens SET revoked = 1 WHERE access_token = ?")
-            .bind(access_token)
+            .bind(&access_token_hash)
             .execute(&self.pool)
             .await?;
 
