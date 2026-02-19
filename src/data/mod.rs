@@ -10,7 +10,7 @@ mod database;
 mod models;
 mod sync;
 
-pub use cache::{CachedAttachment, CachedStatus, ProfileCache, TimelineCache};
+pub use cache::{CachedAttachment, CachedProfile, CachedStatus, ProfileCache, TimelineCache};
 pub use database::{Database, TursoSyncOptions};
 pub use models::*;
 pub use sync::{sync_to_d1, validate_d1_sync_environment};

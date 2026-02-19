@@ -6,6 +6,9 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::federation_delivery::{
+    build_delivery, resolve_remote_actor_and_inbox, spawn_best_effort_delivery,
+};
 use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
@@ -448,13 +451,26 @@ pub async fn follow_account(
         created_at: Utc::now(),
     };
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    state
+    let inserted = state
         .db
         .insert_follow_if_absent(&follow, default_port)
         .await?;
 
-    // TODO: Actually send Follow activity via federation delivery.
-    // state.federation.send_follow(&account, &target_address).await?;
+    if inserted {
+        let state_for_delivery = state.clone();
+        let account_for_delivery = account.clone();
+        let follow_uri = follow.uri.clone();
+        let target_address_for_delivery = target_address.clone();
+        spawn_best_effort_delivery("follow", async move {
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
+                    .await?;
+            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+            delivery
+                .send_follow_with_id(&follow_uri, &target_actor_uri, &target_inbox_uri)
+                .await
+        });
+    }
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -505,18 +521,39 @@ pub async fn unfollow_account(
     let target_address = resolve_target_address(&state, &id).await?;
 
     // Get our account
-    let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let follow_uri = state
+        .db
+        .get_follow_uri(&target_address, default_port)
+        .await?;
 
     // Remove follow relationship from DB.
-    let default_port = default_port_for_protocol(&state.config.server.protocol);
     state
         .db
         .delete_follow(&target_address, default_port)
         .await?;
 
-    // Send Undo Follow activity via ActivityPub
-    // TODO: Actually send Undo activity and remove the follow relationship
-    // state.federation.send_unfollow(&account, &target_address).await?;
+    if let Some(follow_uri) = follow_uri {
+        let state_for_delivery = state.clone();
+        let account_for_delivery = account.clone();
+        let target_address_for_delivery = target_address.clone();
+        spawn_best_effort_delivery("unfollow", async move {
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
+                    .await?;
+            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+            delivery
+                .send_undo_to_inbox_with_type_and_object(
+                    &follow_uri,
+                    Some("Follow"),
+                    Some(&target_actor_uri),
+                    &target_inbox_uri,
+                )
+                .await
+        });
+    }
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -967,11 +1004,22 @@ pub async fn authorize_follow_request(
     use crate::api::dto::RelationshipResponse;
 
     let requester_address = id.clone();
+    let (inbox_uri, follow_activity_uri) = state
+        .db
+        .get_follow_request(&requester_address)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Accept the follow request (moves to followers table)
-    state.db.accept_follow_request(&requester_address).await?;
+    if !state.db.accept_follow_request(&requester_address).await? {
+        return Err(AppError::NotFound);
+    }
 
-    // TODO: Send Accept activity via ActivityPub
+    let delivery = build_delivery(&state, &account_for_delivery);
+    spawn_best_effort_delivery("authorize_follow_request", async move {
+        delivery.send_accept(&follow_activity_uri, &inbox_uri).await
+    });
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -1003,13 +1051,26 @@ pub async fn reject_follow_request(
     use crate::api::dto::RelationshipResponse;
 
     let requester_address = id.clone();
+    let follow_request = state.db.get_follow_request(&requester_address).await?;
+    let account_for_delivery = if follow_request.is_some() {
+        Some(state.db.get_account().await?.ok_or(AppError::NotFound)?)
+    } else {
+        None
+    };
 
     // Remove from follow_requests
     if !state.db.reject_follow_request(&requester_address).await? {
         return Err(AppError::NotFound);
     }
 
-    // TODO: Send Reject activity via ActivityPub
+    if let (Some((inbox_uri, follow_activity_uri)), Some(account_for_delivery)) =
+        (follow_request, account_for_delivery)
+    {
+        let delivery = build_delivery(&state, &account_for_delivery);
+        spawn_best_effort_delivery("reject_follow_request", async move {
+            delivery.send_reject(&follow_activity_uri, &inbox_uri).await
+        });
+    }
 
     // Return relationship response
     let relationship = RelationshipResponse {

@@ -174,7 +174,22 @@ pub async fn upload_media(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["INSERT", "media"])
         .start_timer();
-    state.db.insert_media(&media).await?;
+    if let Err(error) = state.db.insert_media(&media).await {
+        db_timer.observe_duration();
+        tracing::warn!(
+            s3_key = %s3_key,
+            %error,
+            "Media metadata insert failed; deleting uploaded object"
+        );
+        if let Err(cleanup_error) = state.storage.delete(&s3_key).await {
+            tracing::warn!(
+                s3_key = %s3_key,
+                %cleanup_error,
+                "Failed to cleanup uploaded media object after DB insert failure"
+            );
+        }
+        return Err(error);
+    }
     DB_QUERIES_TOTAL
         .with_label_values(&["INSERT", "media"])
         .inc();

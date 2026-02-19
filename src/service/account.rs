@@ -8,6 +8,11 @@ use crate::data::{Account, Database, EntityId};
 use crate::error::AppError;
 use crate::storage::MediaStorage;
 
+#[cfg(test)]
+const ACCOUNT_KEY_BITS: usize = 2048;
+#[cfg(not(test))]
+const ACCOUNT_KEY_BITS: usize = 4096;
+
 fn normalize_optional_text(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -66,7 +71,7 @@ impl AccountService {
                 use rsa::{RsaPrivateKey, RsaPublicKey};
 
                 let mut rng = rand::thread_rng();
-                let private_key = RsaPrivateKey::new(&mut rng, 4096)?;
+                let private_key = RsaPrivateKey::new(&mut rng, ACCOUNT_KEY_BITS)?;
                 let public_key = RsaPublicKey::from(&private_key);
                 let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
                 let public_key_pem = public_key.to_public_key_pem(LineEnding::LF)?;

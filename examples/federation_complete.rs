@@ -2,8 +2,8 @@
 //!
 //! This example demonstrates how to set up and use all Phase 2 federation features.
 
-use rustresort::data::{Database, ProfileCache, TimelineCache};
-use rustresort::federation::{ActivityDelivery, ActivityProcessor, PublicKeyCache, RateLimiter};
+use rustresort::data::{ProfileCache, TimelineCache};
+use rustresort::federation::{ActivityDelivery, PublicKeyCache, RateLimiter};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("In production, initialize Database with a real connection pool.\n");
 
     let timeline_cache = Arc::new(TimelineCache::new(1000));
-    let profile_cache = Arc::new(ProfileCache::new());
+    let profile_cache = Arc::new(ProfileCache::new(3600).await?);
 
     // 2. Set up public key cache
     let key_cache = Arc::new(PublicKeyCache::new(

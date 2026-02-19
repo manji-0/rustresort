@@ -55,6 +55,29 @@ async fn test_create_status_with_auth() {
 }
 
 #[tokio::test]
+async fn test_create_status_rejects_invalid_visibility() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "Hello, world!",
+        "visibility": "friends-only"
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
 async fn test_get_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -93,6 +116,62 @@ async fn test_get_status() {
         let json: Value = response.json().await.unwrap();
         assert_eq!(json["id"], status.id);
     }
+}
+
+#[tokio::test]
+async fn test_private_status_is_hidden_from_public_status_endpoints() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "Private note",
+        "visibility": "private"
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let status_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), 404);
+
+    let context_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/context", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(context_response.status(), 404);
+
+    let reblogged_by_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/reblogged_by", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reblogged_by_response.status(), 404);
+
+    let favourited_by_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/favourited_by", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(favourited_by_response.status(), 404);
 }
 
 #[tokio::test]
@@ -389,6 +468,112 @@ async fn test_create_reply_status_accepts_cache_only_remote_target() {
         .expect("reply should be persisted");
     assert_eq!(reply.in_reply_to_uri, Some(remote_uri.to_string()));
     assert_eq!(reply.persisted_reason, "own");
+}
+
+#[tokio::test]
+async fn test_create_reply_status_delivers_to_remote_reply_target_inbox_without_followers() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, CachedStatus};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn record_inbox_delivery(
+        State(counter): State<Arc<AtomicUsize>>,
+        _body: String,
+    ) -> StatusCode {
+        counter.fetch_add(1, Ordering::SeqCst);
+        StatusCode::ACCEPTED
+    }
+
+    let inbox_delivery_count = Arc::new(AtomicUsize::new(0));
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(inbox_delivery_count.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    let remote_status_uri = format!("{}/users/alice/statuses/reply-target", remote_base_url);
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: remote_address.to_string(),
+            uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: remote_status_uri.clone(),
+            uri: remote_status_uri.clone(),
+            content: "<p>Remote status</p>".to_string(),
+            account_address: remote_address.to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+        })
+        .await;
+
+    let payload = serde_json::json!({
+        "status": "Replying to remote status",
+        "visibility": "public",
+        "in_reply_to_id": remote_status_uri
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+
+    let mut delivered = false;
+    for _ in 0..600 {
+        if inbox_delivery_count.load(Ordering::SeqCst) > 0 {
+            delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        delivered,
+        "expected outbound Create delivery to include remote reply target inbox"
+    );
 }
 
 #[tokio::test]

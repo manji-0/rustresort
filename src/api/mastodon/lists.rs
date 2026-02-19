@@ -216,11 +216,8 @@ pub async fn add_list_accounts(
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
 
-    // Add each account to the list
-    for account_id in req.account_ids {
-        // For single-user instance, account_id is the account address
-        state.db.add_account_to_list(&id, &account_id).await?;
-    }
+    // For single-user instance, account_id is the account address
+    state.db.add_accounts_to_list(&id, &req.account_ids).await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -236,10 +233,10 @@ pub async fn delete_list_accounts(
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
 
-    // Remove each account from the list
-    for account_id in req.account_ids {
-        state.db.remove_account_from_list(&id, &account_id).await?;
-    }
+    state
+        .db
+        .remove_accounts_from_list(&id, &req.account_ids)
+        .await?;
 
     Ok(Json(serde_json::json!({})))
 }

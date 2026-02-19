@@ -42,6 +42,35 @@ fn unique_inbox_targets(inbox_uris: Vec<String>) -> Vec<String> {
     targets
 }
 
+fn audience_for_visibility(actor_uri: &str, visibility: &str) -> (Vec<String>, Vec<String>) {
+    let public_audience = "https://www.w3.org/ns/activitystreams#Public".to_string();
+    let followers_audience = format!("{}/followers", actor_uri);
+
+    match visibility {
+        "public" => (vec![public_audience], vec![followers_audience]),
+        "unlisted" => (vec![followers_audience], vec![public_audience]),
+        "private" => (vec![followers_audience], Vec::new()),
+        "direct" => (Vec::new(), Vec::new()),
+        _ => (vec![public_audience], vec![followers_audience]),
+    }
+}
+
+fn build_undo_object(
+    activity_uri: &str,
+    activity_type: Option<&str>,
+    activity_object: Option<&str>,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_string(), serde_json::json!(activity_uri));
+    if let Some(activity_type) = activity_type {
+        object.insert("type".to_string(), serde_json::json!(activity_type));
+    }
+    if let Some(activity_object) = activity_object {
+        object.insert("object".to_string(), serde_json::json!(activity_object));
+    }
+    serde_json::Value::Object(object)
+}
+
 impl ActivityDelivery {
     /// Create new delivery service
     pub fn new(
@@ -209,19 +238,32 @@ impl ActivityDelivery {
             crate::data::EntityId::new().0
         );
 
-        let activity = builder::follow(&follow_id, &self.actor_uri, target_actor_uri);
+        self.send_follow_with_id(&follow_id, target_actor_uri, target_inbox_uri)
+            .await?;
 
-        // 2. Deliver to inbox
+        // 3. Return activity URI
+        Ok(follow_id)
+    }
+
+    /// Send Follow activity with explicit activity URI.
+    pub async fn send_follow_with_id(
+        &self,
+        follow_activity_uri: &str,
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let activity = builder::follow(follow_activity_uri, &self.actor_uri, target_actor_uri);
+
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
         tracing::info!(
-            "Sent Follow to {} for {}",
+            "Sent Follow {} to {} for {}",
+            follow_activity_uri,
             target_inbox_uri,
             target_actor_uri
         );
 
-        // 3. Return activity URI
-        Ok(follow_id)
+        Ok(())
     }
 
     /// Send Accept activity (for follow request)
@@ -261,6 +303,38 @@ impl ActivityDelivery {
         Ok(())
     }
 
+    /// Send Reject activity (for follow request rejection)
+    pub async fn send_reject(
+        &self,
+        follow_activity_uri: &str,
+        follower_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let reject_id = format!(
+            "{}/reject/{}",
+            self.actor_uri,
+            crate::data::EntityId::new().0
+        );
+
+        let activity = builder::reject(
+            &reject_id,
+            &self.actor_uri,
+            serde_json::json!({
+                "type": "Follow",
+                "id": follow_activity_uri
+            }),
+        );
+
+        self.deliver_to_inbox(follower_inbox_uri, activity).await?;
+
+        tracing::info!(
+            "Sent Reject to {} for Follow {}",
+            follower_inbox_uri,
+            follow_activity_uri
+        );
+
+        Ok(())
+    }
+
     /// Send Create activity (for new status)
     ///
     /// # Arguments
@@ -271,6 +345,11 @@ impl ActivityDelivery {
         status: &crate::data::Status,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
+        let (to_audience, cc_audience) =
+            audience_for_visibility(&self.actor_uri, status.visibility.as_str());
+        let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
+        let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
+
         // 1. Build Note object
         let note = if let Some(ref in_reply_to) = status.in_reply_to_uri {
             builder::note_reply(
@@ -279,8 +358,8 @@ impl ActivityDelivery {
                 &status.content,
                 &status.created_at.to_rfc3339(),
                 in_reply_to,
-                vec!["https://www.w3.org/ns/activitystreams#Public"],
-                vec![&format!("{}/followers", self.actor_uri)],
+                note_to.clone(),
+                note_cc.clone(),
             )
         } else {
             builder::note(
@@ -288,8 +367,8 @@ impl ActivityDelivery {
                 &self.actor_uri,
                 &status.content,
                 &status.created_at.to_rfc3339(),
-                vec!["https://www.w3.org/ns/activitystreams#Public"],
-                vec![&format!("{}/followers", self.actor_uri)],
+                note_to.clone(),
+                note_cc.clone(),
             )
         };
 
@@ -299,13 +378,7 @@ impl ActivityDelivery {
             self.actor_uri,
             crate::data::EntityId::new().0
         );
-        let activity = builder::create(
-            &create_id,
-            &self.actor_uri,
-            note,
-            vec!["https://www.w3.org/ns/activitystreams#Public"],
-            vec![&format!("{}/followers", self.actor_uri)],
-        );
+        let activity = builder::create(&create_id, &self.actor_uri, note, note_to, note_cc);
 
         // 3. Deliver to inboxes
         self.deliver_to_followers(activity, inbox_uris).await
@@ -315,6 +388,7 @@ impl ActivityDelivery {
     pub async fn send_delete(
         &self,
         object_uri: &str,
+        object_visibility: &str,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         // Build and deliver Delete activity
@@ -323,7 +397,15 @@ impl ActivityDelivery {
             self.actor_uri,
             crate::data::EntityId::new().0
         );
-        let activity = builder::delete(&delete_id, &self.actor_uri, object_uri);
+        let (to_audience, cc_audience) =
+            audience_for_visibility(&self.actor_uri, object_visibility);
+        let activity = builder::delete(
+            &delete_id,
+            &self.actor_uri,
+            object_uri,
+            to_audience.iter().map(String::as_str).collect(),
+            cc_audience.iter().map(String::as_str).collect(),
+        );
 
         self.deliver_to_followers(activity, inbox_uris).await
     }
@@ -336,12 +418,30 @@ impl ActivityDelivery {
     ) -> Result<String, AppError> {
         // Build and deliver Like activity
         let like_id = format!("{}/like/{}", self.actor_uri, crate::data::EntityId::new().0);
-        let activity = builder::like(&like_id, &self.actor_uri, status_uri);
+        self.send_like_with_id(&like_id, status_uri, target_inbox_uri)
+            .await?;
+        Ok(like_id)
+    }
+
+    /// Send Like activity with explicit activity URI.
+    pub async fn send_like_with_id(
+        &self,
+        like_activity_uri: &str,
+        status_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let activity = builder::like(like_activity_uri, &self.actor_uri, status_uri);
 
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
-        tracing::info!("Sent Like to {} for {}", target_inbox_uri, status_uri);
-        Ok(like_id)
+        tracing::info!(
+            "Sent Like {} to {} for {}",
+            like_activity_uri,
+            target_inbox_uri,
+            status_uri
+        );
+
+        Ok(())
     }
 
     /// Send Undo activity
@@ -350,26 +450,69 @@ impl ActivityDelivery {
         activity_uri: &str,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
+        self.send_undo_with_type(activity_uri, None, inbox_uris)
+            .await
+    }
+
+    /// Send Undo activity with optional object type.
+    pub async fn send_undo_with_type(
+        &self,
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
         // Build and deliver Undo activity
         let undo_id = format!("{}/undo/{}", self.actor_uri, crate::data::EntityId::new().0);
-
-        // We need to wrap the original activity
-        // For simplicity, just reference it by ID
-        let activity = builder::undo(
-            &undo_id,
-            &self.actor_uri,
-            serde_json::json!({
-                "id": activity_uri
-            }),
-        );
+        let object = build_undo_object(activity_uri, activity_type, None);
+        let activity = builder::undo(&undo_id, &self.actor_uri, object);
 
         self.deliver_to_followers(activity, inbox_uris).await
+    }
+
+    /// Send Undo activity to a single inbox.
+    pub async fn send_undo_to_inbox(
+        &self,
+        activity_uri: &str,
+        inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        self.send_undo_to_inbox_with_type(activity_uri, None, inbox_uri)
+            .await
+    }
+
+    /// Send Undo activity to a single inbox with optional object type.
+    pub async fn send_undo_to_inbox_with_type(
+        &self,
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        self.send_undo_to_inbox_with_type_and_object(activity_uri, activity_type, None, inbox_uri)
+            .await
+    }
+
+    /// Send Undo activity to a single inbox with optional object type and target object.
+    pub async fn send_undo_to_inbox_with_type_and_object(
+        &self,
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        activity_object: Option<&str>,
+        inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let undo_id = format!("{}/undo/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let object = build_undo_object(activity_uri, activity_type, activity_object);
+        let activity = builder::undo(&undo_id, &self.actor_uri, object);
+
+        self.deliver_to_inbox(inbox_uri, activity).await?;
+
+        tracing::info!("Sent Undo {} to {}", activity_uri, inbox_uri);
+        Ok(())
     }
 
     /// Send Announce activity (boost)
     pub async fn send_announce(
         &self,
         status_uri: &str,
+        status_visibility: &str,
         inbox_uris: Vec<String>,
     ) -> Result<String, AppError> {
         // Build Announce activity
@@ -378,18 +521,9 @@ impl ActivityDelivery {
             self.actor_uri,
             crate::data::EntityId::new().0
         );
-        let activity = builder::announce(
-            &announce_id,
-            &self.actor_uri,
-            status_uri,
-            vec![
-                "https://www.w3.org/ns/activitystreams#Public",
-                &format!("{}/followers", self.actor_uri),
-            ],
-        );
-
-        // Deliver to followers
-        let results = self.deliver_to_followers(activity, inbox_uris).await;
+        let results = self
+            .send_announce_with_id(&announce_id, status_uri, status_visibility, inbox_uris)
+            .await;
 
         // Check if at least one delivery succeeded
         if results.iter().any(|r| r.success) {
@@ -398,6 +532,27 @@ impl ActivityDelivery {
         } else {
             Err(AppError::Federation("All deliveries failed".to_string()))
         }
+    }
+
+    /// Send Announce activity with explicit activity URI.
+    pub async fn send_announce_with_id(
+        &self,
+        announce_activity_uri: &str,
+        status_uri: &str,
+        status_visibility: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let (to_audience, cc_audience) =
+            audience_for_visibility(&self.actor_uri, status_visibility);
+        let activity = builder::announce(
+            announce_activity_uri,
+            &self.actor_uri,
+            status_uri,
+            to_audience.iter().map(String::as_str).collect(),
+            cc_audience.iter().map(String::as_str).collect(),
+        );
+
+        self.deliver_to_followers(activity, inbox_uris).await
     }
 }
 
@@ -450,6 +605,17 @@ pub mod builder {
         })
     }
 
+    /// Build a Reject activity.
+    pub fn reject(id: &str, actor: &str, object: Value) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Reject",
+            "id": id,
+            "actor": actor,
+            "object": object
+        })
+    }
+
     /// Build a Create activity
     ///
     /// # Arguments
@@ -477,7 +643,7 @@ pub mod builder {
     /// * `id` - Activity ID (unique URI)
     /// * `actor` - Actor URI (deleter)
     /// * `object` - Object URI being deleted
-    pub fn delete(id: &str, actor: &str, object: &str) -> Value {
+    pub fn delete(id: &str, actor: &str, object: &str, to: Vec<&str>, cc: Vec<&str>) -> Value {
         serde_json::json!({
             "@context": "https://www.w3.org/ns/activitystreams",
             "type": "Delete",
@@ -487,7 +653,8 @@ pub mod builder {
                 "type": "Tombstone",
                 "id": object
             },
-            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            "to": to,
+            "cc": cc
         })
     }
 
@@ -513,8 +680,9 @@ pub mod builder {
     /// * `id` - Activity ID (unique URI)
     /// * `actor` - Actor URI (announcer)
     /// * `object` - Object URI being announced (status)
-    /// * `to` - Recipients (usually public + followers)
-    pub fn announce(id: &str, actor: &str, object: &str, to: Vec<&str>) -> Value {
+    /// * `to` - Recipients
+    /// * `cc` - Secondary recipients
+    pub fn announce(id: &str, actor: &str, object: &str, to: Vec<&str>, cc: Vec<&str>) -> Value {
         serde_json::json!({
             "@context": "https://www.w3.org/ns/activitystreams",
             "type": "Announce",
@@ -522,6 +690,7 @@ pub mod builder {
             "actor": actor,
             "object": object,
             "to": to,
+            "cc": cc,
             "published": chrono::Utc::now().to_rfc3339()
         })
     }
@@ -618,7 +787,7 @@ pub mod builder {
 
 #[cfg(test)]
 mod tests {
-    use super::unique_inbox_targets;
+    use super::{audience_for_visibility, build_undo_object, unique_inbox_targets};
 
     #[test]
     fn unique_inbox_targets_keeps_distinct_personal_inboxes_on_same_domain() {
@@ -660,5 +829,45 @@ mod tests {
     fn unique_inbox_targets_handles_empty_input() {
         let targets = unique_inbox_targets(vec![]);
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn audience_for_visibility_public_targets_public_then_followers() {
+        let (to, cc) = audience_for_visibility("https://example.com/users/alice", "public");
+        assert_eq!(to, vec!["https://www.w3.org/ns/activitystreams#Public"]);
+        assert_eq!(cc, vec!["https://example.com/users/alice/followers"]);
+    }
+
+    #[test]
+    fn audience_for_visibility_unlisted_targets_followers_then_public_cc() {
+        let (to, cc) = audience_for_visibility("https://example.com/users/alice", "unlisted");
+        assert_eq!(to, vec!["https://example.com/users/alice/followers"]);
+        assert_eq!(cc, vec!["https://www.w3.org/ns/activitystreams#Public"]);
+    }
+
+    #[test]
+    fn audience_for_visibility_private_targets_only_followers() {
+        let (to, cc) = audience_for_visibility("https://example.com/users/alice", "private");
+        assert_eq!(to, vec!["https://example.com/users/alice/followers"]);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn audience_for_visibility_direct_targets_empty_audience() {
+        let (to, cc) = audience_for_visibility("https://example.com/users/alice", "direct");
+        assert!(to.is_empty());
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn build_undo_object_includes_type_id_and_optional_object_target() {
+        let undo_object = build_undo_object(
+            "https://local.example/follow/1",
+            Some("Follow"),
+            Some("https://remote.example/users/alice"),
+        );
+        assert_eq!(undo_object["type"], "Follow");
+        assert_eq!(undo_object["id"], "https://local.example/follow/1");
+        assert_eq!(undo_object["object"], "https://remote.example/users/alice");
     }
 }
