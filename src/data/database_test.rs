@@ -968,6 +968,96 @@ async fn test_insert_status_with_media_rolls_back_when_media_already_attached() 
 }
 
 #[tokio::test]
+async fn test_insert_status_with_media_and_poll_persists_poll_atomically() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/with-poll".to_string(),
+        content: "<p>Status with poll</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let poll_options = vec!["yes".to_string(), "no".to_string()];
+
+    db.insert_status_with_media_and_poll(&status, &[], Some((&poll_options, 600, false)))
+        .await
+        .unwrap();
+
+    let stored = db.get_status(&status.id).await.unwrap();
+    assert!(stored.is_some());
+    let poll = db.get_poll_by_status_id(&status.id).await.unwrap();
+    assert!(poll.is_some());
+    let poll_id = poll.unwrap().0;
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[0].1, "yes");
+    assert_eq!(options[1].1, "no");
+}
+
+#[tokio::test]
+async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/with-poll-missing-media".to_string(),
+        content: "<p>Status with poll and missing media</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let poll_options = vec!["a".to_string(), "b".to_string()];
+
+    let result = db
+        .insert_status_with_media_and_poll(
+            &status,
+            &[EntityId::new().0],
+            Some((&poll_options, 600, false)),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(db.get_status(&status.id).await.unwrap().is_none());
+    assert!(
+        db.get_poll_by_status_id(&status.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_reserve_idempotency_key_reclaims_stale_pending_reservation() {
+    let (db, _temp_dir) = create_test_db().await;
+    let endpoint = "/api/v1/statuses";
+    let key = "stale-pending-key";
+
+    assert!(db.reserve_idempotency_key(endpoint, key).await.unwrap());
+    assert!(!db.reserve_idempotency_key(endpoint, key).await.unwrap());
+
+    db.backdate_pending_idempotency_key_for_test(endpoint, key, 10)
+        .await
+        .unwrap();
+
+    assert!(db.reserve_idempotency_key(endpoint, key).await.unwrap());
+}
+
+#[tokio::test]
 async fn test_attach_media_to_status_rejects_reassign_to_another_status() {
     let (db, _temp_dir) = create_test_db().await;
 
