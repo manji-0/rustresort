@@ -39,16 +39,10 @@ fn build_activity_processor(
     account: &Account,
 ) -> crate::federation::ActivityProcessor {
     let local_address = format!("{}@{}", account.username, state.config.server.domain);
-    let actor_uri = format!(
-        "{}/users/{}",
-        state.config.server.base_url(),
-        account.username
-    );
-    let delivery = Arc::new(crate::federation::ActivityDelivery::new(
+    let delivery = Arc::new(crate::federation::build_local_delivery(
         state.http_client.clone(),
-        actor_uri.clone(),
-        format!("{actor_uri}#main-key"),
-        account.private_key_pem.clone(),
+        &state.config.server.base_url(),
+        account,
     ));
 
     crate::federation::ActivityProcessor::new(

@@ -16,20 +16,18 @@ struct DiscoveredRemoteActor {
 }
 
 pub fn local_actor_uri(state: &AppState, username: &str) -> String {
-    format!("{}/users/{}", state.config.server.base_url(), username)
+    crate::federation::local_actor_uri(&state.config.server.base_url(), username)
 }
 
 pub fn local_key_id(actor_uri: &str) -> String {
-    format!("{}#main-key", actor_uri)
+    crate::federation::local_key_id(actor_uri)
 }
 
 pub fn build_delivery(state: &AppState, account: &Account) -> ActivityDelivery {
-    let actor_uri = local_actor_uri(state, &account.username);
-    ActivityDelivery::new(
+    crate::federation::build_local_delivery(
         state.http_client.clone(),
-        actor_uri.clone(),
-        local_key_id(&actor_uri),
-        account.private_key_pem.clone(),
+        &state.config.server.base_url(),
+        account,
     )
 }
 

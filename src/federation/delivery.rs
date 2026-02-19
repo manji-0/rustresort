@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::data::Account;
 use crate::error::AppError;
 
 /// Activity delivery service
@@ -20,6 +21,28 @@ pub struct ActivityDelivery {
     key_id: String,
     /// Private key for signing
     private_key_pem: String,
+}
+
+pub fn local_actor_uri(base_url: &str, username: &str) -> String {
+    format!("{base_url}/users/{username}")
+}
+
+pub fn local_key_id(actor_uri: &str) -> String {
+    format!("{actor_uri}#main-key")
+}
+
+pub fn build_local_delivery(
+    http_client: Arc<reqwest::Client>,
+    base_url: &str,
+    account: &Account,
+) -> ActivityDelivery {
+    let actor_uri = local_actor_uri(base_url, &account.username);
+    ActivityDelivery::new(
+        http_client,
+        actor_uri.clone(),
+        local_key_id(&actor_uri),
+        account.private_key_pem.clone(),
+    )
 }
 
 /// Deduplicate identical inbox URIs while keeping distinct personal inboxes.
