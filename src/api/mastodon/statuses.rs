@@ -2,8 +2,10 @@
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::accounts::PaginationParams;
@@ -21,6 +23,25 @@ use crate::metrics::{
 use crate::service::StatusService;
 
 const DEFAULT_VISIBILITY: &str = "public";
+const CREATE_STATUS_IDEMPOTENCY_ENDPOINT: &str = "/api/v1/statuses";
+const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 256;
+const MIN_POLL_OPTIONS: usize = 2;
+const MAX_POLL_OPTIONS: usize = 4;
+const MAX_POLL_OPTION_CHARS: usize = 50;
+const MIN_POLL_EXPIRES_IN_SECONDS: i64 = 300;
+const MAX_POLL_EXPIRES_IN_SECONDS: i64 = 2_629_746;
+const IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS: u64 = 5_000;
+const IDEMPOTENCY_PENDING_RETRY_DELAY_MS: u64 = 50;
+
+#[derive(Debug, Deserialize)]
+pub struct CreateStatusPollRequest {
+    pub options: Vec<String>,
+    pub expires_in: i64,
+    #[serde(default)]
+    pub multiple: bool,
+    #[serde(default, rename = "hide_totals")]
+    pub _hide_totals: bool,
+}
 
 /// Status creation request
 #[derive(Debug, Deserialize)]
@@ -28,6 +49,9 @@ pub struct CreateStatusRequest {
     pub status: Option<String>,
     pub media_ids: Option<Vec<String>>,
     pub in_reply_to_id: Option<String>,
+    pub quoted_status_id: Option<String>,
+    pub poll: Option<CreateStatusPollRequest>,
+    pub scheduled_at: Option<String>,
     pub sensitive: Option<bool>,
     pub spoiler_text: Option<String>,
     pub visibility: Option<String>,
@@ -86,6 +110,119 @@ fn normalize_visibility_input(raw_visibility: Option<String>) -> Result<String, 
     }
 }
 
+#[derive(Debug)]
+struct NormalizedCreatePoll {
+    options: Vec<String>,
+    expires_in: i64,
+    multiple: bool,
+}
+
+fn normalize_poll_input(
+    raw_poll: Option<CreateStatusPollRequest>,
+) -> Result<Option<NormalizedCreatePoll>, AppError> {
+    let Some(poll) = raw_poll else {
+        return Ok(None);
+    };
+
+    let options: Vec<String> = poll
+        .options
+        .into_iter()
+        .map(|option| option.trim().to_string())
+        .collect();
+    if !(MIN_POLL_OPTIONS..=MAX_POLL_OPTIONS).contains(&options.len()) {
+        return Err(AppError::Validation(format!(
+            "poll options must be between {} and {}",
+            MIN_POLL_OPTIONS, MAX_POLL_OPTIONS
+        )));
+    }
+    if options.iter().any(|option| option.is_empty()) {
+        return Err(AppError::Validation(
+            "poll options must not be empty".to_string(),
+        ));
+    }
+    if options
+        .iter()
+        .any(|option| option.chars().count() > MAX_POLL_OPTION_CHARS)
+    {
+        return Err(AppError::Validation(format!(
+            "poll option must be at most {} characters",
+            MAX_POLL_OPTION_CHARS
+        )));
+    }
+    if poll.expires_in < MIN_POLL_EXPIRES_IN_SECONDS {
+        return Err(AppError::Validation(format!(
+            "poll expires_in must be at least {} seconds",
+            MIN_POLL_EXPIRES_IN_SECONDS
+        )));
+    }
+    if poll.expires_in > MAX_POLL_EXPIRES_IN_SECONDS {
+        return Err(AppError::Validation(format!(
+            "poll expires_in must be at most {} seconds",
+            MAX_POLL_EXPIRES_IN_SECONDS
+        )));
+    }
+
+    Ok(Some(NormalizedCreatePoll {
+        options,
+        expires_in: poll.expires_in,
+        multiple: poll.multiple,
+    }))
+}
+
+fn normalize_scheduled_at(raw_scheduled_at: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(raw_scheduled_at) = raw_scheduled_at else {
+        return Ok(None);
+    };
+
+    let scheduled_at = chrono::DateTime::parse_from_rfc3339(raw_scheduled_at.trim())
+        .map_err(|_| AppError::Validation("scheduled_at must be RFC3339".to_string()))?
+        .with_timezone(&Utc);
+    if scheduled_at <= Utc::now() {
+        return Err(AppError::Unprocessable(
+            "scheduled_at must be in the future".to_string(),
+        ));
+    }
+
+    Ok(Some(scheduled_at.to_rfc3339()))
+}
+
+fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppError> {
+    let Some(raw) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+
+    let key = raw
+        .to_str()
+        .map_err(|_| AppError::Validation("Idempotency-Key must be ASCII".to_string()))?
+        .trim();
+
+    if key.is_empty() {
+        return Err(AppError::Validation(
+            "Idempotency-Key must not be empty".to_string(),
+        ));
+    }
+    if key.len() > MAX_IDEMPOTENCY_KEY_LENGTH {
+        return Err(AppError::Validation(format!(
+            "Idempotency-Key must be at most {} characters",
+            MAX_IDEMPOTENCY_KEY_LENGTH
+        )));
+    }
+
+    Ok(Some(key.to_string()))
+}
+
+fn media_type_from_content_type(content_type: &str) -> &'static str {
+    if content_type.starts_with("image/") {
+        "image"
+    } else if content_type.starts_with("video/") {
+        "video"
+    } else if content_type.starts_with("audio/") {
+        "audio"
+    } else {
+        "unknown"
+    }
+}
+
 /// Status source response
 #[derive(Debug, Serialize)]
 struct StatusSourceResponse {
@@ -98,184 +235,422 @@ struct StatusSourceResponse {
 pub async fn create_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
+    headers: HeaderMap,
     Json(req): Json<CreateStatusRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, Status};
-    use chrono::Utc;
 
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&["POST", "/api/v1/statuses"])
         .start_timer();
 
-    // Get account
-    let db_timer = DB_QUERY_DURATION_SECONDS
-        .with_label_values(&["SELECT", "accounts"])
-        .start_timer();
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    DB_QUERIES_TOTAL
-        .with_label_values(&["SELECT", "accounts"])
-        .inc();
-    db_timer.observe_duration();
+    let idempotency_key = extract_idempotency_key(&headers)?;
+    let mut reserved_idempotency_key: Option<String> = None;
+    if let Some(key) = idempotency_key.as_deref() {
+        if let Some(cached_response) = state
+            .db
+            .get_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
+            .await?
+        {
+            HTTP_REQUESTS_TOTAL
+                .with_label_values(&["POST", "/api/v1/statuses", "200"])
+                .inc();
+            return Ok(Json(cached_response));
+        }
 
-    // Validate
-    let content = req
-        .status
-        .ok_or(AppError::Validation("status is required".to_string()))?;
-    if content.is_empty() {
-        return Err(AppError::Validation("status cannot be empty".to_string()));
+        if state
+            .db
+            .reserve_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
+            .await?
+        {
+            reserved_idempotency_key = Some(key.to_string());
+        } else {
+            let wait_deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_millis(IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS);
+            loop {
+                if let Some(cached_response) = state
+                    .db
+                    .get_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
+                    .await?
+                {
+                    HTTP_REQUESTS_TOTAL
+                        .with_label_values(&["POST", "/api/v1/statuses", "200"])
+                        .inc();
+                    return Ok(Json(cached_response));
+                }
+                if state
+                    .db
+                    .reserve_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
+                    .await?
+                {
+                    reserved_idempotency_key = Some(key.to_string());
+                    break;
+                }
+                if tokio::time::Instant::now() >= wait_deadline {
+                    return Err(AppError::Unprocessable(
+                        "request with the same Idempotency-Key is still being processed"
+                            .to_string(),
+                    ));
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    IDEMPOTENCY_PENDING_RETRY_DELAY_MS,
+                ))
+                .await;
+            }
+        }
     }
 
-    // Resolve reply target if provided.
-    let mut in_reply_to_uri = None;
-    let mut reply_target_account_address = None;
-    let mut persisted_reason = "own".to_string();
-    if let Some(in_reply_to_id) = req.in_reply_to_id.as_deref() {
-        if let Some(reply_target) = state.db.get_status(in_reply_to_id).await? {
-            in_reply_to_uri = Some(reply_target.uri.clone());
-            if reply_target.is_local {
-                persisted_reason = "reply_to_own".to_string();
-            } else if !reply_target.account_address.is_empty() {
-                reply_target_account_address = Some(reply_target.account_address);
-            }
-        } else if let Some(reply_target) = state.db.get_status_by_uri(in_reply_to_id).await? {
-            in_reply_to_uri = Some(reply_target.uri.clone());
-            if reply_target.is_local {
-                persisted_reason = "reply_to_own".to_string();
-            } else if !reply_target.account_address.is_empty() {
-                reply_target_account_address = Some(reply_target.account_address);
-            }
-        } else if let Some(cached_target) = state.timeline_cache.get_by_uri(in_reply_to_id).await {
-            in_reply_to_uri = Some(cached_target.uri.clone());
-            if !cached_target.account_address.is_empty() {
-                reply_target_account_address = Some(cached_target.account_address.clone());
-            }
-        } else {
-            return Err(AppError::Validation(
-                "in_reply_to_id does not exist".to_string(),
+    let response_result: Result<serde_json::Value, AppError> = async {
+        // Get account
+        let db_timer = DB_QUERY_DURATION_SECONDS
+            .with_label_values(&["SELECT", "accounts"])
+            .start_timer();
+        let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+        DB_QUERIES_TOTAL
+            .with_label_values(&["SELECT", "accounts"])
+            .inc();
+        db_timer.observe_duration();
+
+        let CreateStatusRequest {
+            status,
+            media_ids,
+            in_reply_to_id,
+            quoted_status_id,
+            poll,
+            scheduled_at,
+            sensitive: _,
+            spoiler_text,
+            visibility,
+            language,
+        } = req;
+
+        let visibility = normalize_visibility_input(visibility)?;
+        let poll = normalize_poll_input(poll)?;
+        let scheduled_at = normalize_scheduled_at(scheduled_at)?;
+        let media_ids = media_ids.unwrap_or_default();
+
+        if poll.is_some() && !media_ids.is_empty() {
+            return Err(AppError::Unprocessable(
+                "poll and media_ids cannot be used together".to_string(),
             ));
         }
-    }
 
-    // Create status
-    let status_id = EntityId::new().0;
-    let uri = format!(
-        "{}/users/{}/statuses/{}",
-        state.config.server.base_url(),
-        account.username,
-        status_id
-    );
+        if quoted_status_id
+            .as_deref()
+            .is_some_and(|quoted_status_id| !quoted_status_id.trim().is_empty())
+        {
+            return Err(AppError::Validation(
+                "quoted_status_id parameter is not supported".to_string(),
+            ));
+        }
 
-    let status = Status {
-        id: status_id.clone(),
-        uri: uri.clone(),
-        content: format!("<p>{}</p>", html_escape::encode_text(&content)),
-        content_warning: req.spoiler_text,
-        visibility: normalize_visibility_input(req.visibility)?,
-        language: req.language.or(Some("en".to_string())),
-        account_address: String::new(),
-        is_local: true,
-        in_reply_to_uri,
-        boost_of_uri: None,
-        persisted_reason,
-        created_at: Utc::now(),
-        fetched_at: None,
-    };
+        let content = status.unwrap_or_default().trim().to_string();
+        let has_textual_payload = !content.is_empty();
+        if !has_textual_payload && media_ids.is_empty() && poll.is_none() {
+            return Err(AppError::Validation(
+                "one of status, media_ids, or poll is required".to_string(),
+            ));
+        }
 
-    let should_federate_create = should_federate_to_followers(&status.visibility);
-    let create_delivery_targets = if should_federate_create {
-        match state.db.get_follower_inboxes().await {
-            Ok(follower_inboxes) => follower_inboxes,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "Skipping follower fan-out prefetch for Create delivery"
-                );
-                Vec::new()
+        // Resolve reply target if provided.
+        let mut in_reply_to_uri = None;
+        let mut reply_target_account_address = None;
+        let mut persisted_reason = "own".to_string();
+        if let Some(in_reply_to_id) = in_reply_to_id.as_deref() {
+            if let Some(reply_target) = state.db.get_status(in_reply_to_id).await? {
+                in_reply_to_uri = Some(reply_target.uri.clone());
+                if reply_target.is_local {
+                    persisted_reason = "reply_to_own".to_string();
+                } else if !reply_target.account_address.is_empty() {
+                    reply_target_account_address = Some(reply_target.account_address);
+                }
+            } else if let Some(reply_target) = state.db.get_status_by_uri(in_reply_to_id).await? {
+                in_reply_to_uri = Some(reply_target.uri.clone());
+                if reply_target.is_local {
+                    persisted_reason = "reply_to_own".to_string();
+                } else if !reply_target.account_address.is_empty() {
+                    reply_target_account_address = Some(reply_target.account_address);
+                }
+            } else if let Some(cached_target) =
+                state.timeline_cache.get_by_uri(in_reply_to_id).await
+            {
+                in_reply_to_uri = Some(cached_target.uri.clone());
+                if !cached_target.account_address.is_empty() {
+                    reply_target_account_address = Some(cached_target.account_address.clone());
+                }
+            } else {
+                return Err(AppError::Validation(
+                    "in_reply_to_id does not exist".to_string(),
+                ));
             }
         }
-    } else {
-        Vec::new()
-    };
 
-    let media_ids = req.media_ids.unwrap_or_default();
+        if let Some(scheduled_at) = scheduled_at {
+            let media_ids_json = if media_ids.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&media_ids).map_err(|error| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "failed to serialize scheduled media_ids: {error}"
+                    ))
+                })?)
+            };
+            let poll_options_json = match &poll {
+                Some(poll) => Some(serde_json::to_string(&poll.options).map_err(|error| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "failed to serialize scheduled poll options: {error}"
+                    ))
+                })?),
+                None => None,
+            };
 
-    // Save to database
-    let db_timer = DB_QUERY_DURATION_SECONDS
-        .with_label_values(&["INSERT", "statuses"])
-        .start_timer();
-    state
-        .db
-        .insert_status_with_media(&status, &media_ids)
-        .await?;
-    DB_QUERIES_TOTAL
-        .with_label_values(&["INSERT", "statuses"])
-        .inc();
-    db_timer.observe_duration();
-
-    // Update posts total metric
-    POSTS_TOTAL.inc();
-
-    if should_federate_create {
-        let delivery = build_delivery(&state, &account);
-        let state_for_delivery = state.clone();
-        let status_for_delivery = status.clone();
-        let reply_target_account_address_for_delivery = reply_target_account_address;
-        spawn_best_effort_batch_delivery("create_status", async move {
-            let mut delivery_targets = create_delivery_targets;
-
-            if let Some(reply_target_account_address) = reply_target_account_address_for_delivery {
-                match resolve_remote_actor_and_inbox(
-                    &state_for_delivery,
-                    &reply_target_account_address,
+            let scheduled_id = state
+                .db
+                .create_scheduled_status(
+                    &scheduled_at,
+                    &content,
+                    &visibility,
+                    spoiler_text.as_deref(),
+                    in_reply_to_id.as_deref(),
+                    media_ids_json.as_deref(),
+                    poll_options_json.as_deref(),
+                    poll.as_ref().map(|poll| poll.expires_in),
+                    poll.as_ref().is_some_and(|poll| poll.multiple),
                 )
-                .await
-                {
-                    Ok((_, reply_target_inbox_uri)) => {
-                        delivery_targets.push(reply_target_inbox_uri);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            reply_target_account_address = %reply_target_account_address,
-                            %error,
-                            "Failed to resolve reply target inbox for Create delivery"
-                        );
-                    }
+                .await?;
+            return state
+                .db
+                .get_scheduled_status(&scheduled_id)
+                .await?
+                .ok_or(AppError::NotFound);
+        }
+
+        let status_id = EntityId::new().0;
+        let uri = format!(
+            "{}/users/{}/statuses/{}",
+            state.config.server.base_url(),
+            account.username,
+            status_id
+        );
+
+        let status = Status {
+            id: status_id.clone(),
+            uri: uri.clone(),
+            content: format!("<p>{}</p>", html_escape::encode_text(&content)),
+            content_warning: spoiler_text.clone(),
+            visibility: visibility.clone(),
+            language: language.or(Some("en".to_string())),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri,
+            boost_of_uri: None,
+            persisted_reason,
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+
+        let should_federate_create = should_federate_to_followers(&status.visibility);
+        let create_delivery_targets = if should_federate_create {
+            match state.db.get_follower_inboxes().await {
+                Ok(follower_inboxes) => follower_inboxes,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Skipping follower fan-out prefetch for Create delivery"
+                    );
+                    Vec::new()
                 }
             }
+        } else {
+            Vec::new()
+        };
 
-            if delivery_targets.is_empty() {
-                tracing::debug!("Skipping outbound Create delivery because no targets were found");
-                return Vec::new();
+        // Save to database
+        let db_timer = DB_QUERY_DURATION_SECONDS
+            .with_label_values(&["INSERT", "statuses"])
+            .start_timer();
+        state
+            .db
+            .insert_status_with_media_and_poll(
+                &status,
+                &media_ids,
+                poll.as_ref()
+                    .map(|poll| (poll.options.as_slice(), poll.expires_in, poll.multiple)),
+            )
+            .await?;
+        DB_QUERIES_TOTAL
+            .with_label_values(&["INSERT", "statuses"])
+            .inc();
+        db_timer.observe_duration();
+
+        // Update posts total metric
+        POSTS_TOTAL.inc();
+
+        if should_federate_create {
+            let delivery = build_delivery(&state, &account);
+            let state_for_delivery = state.clone();
+            let status_for_delivery = status.clone();
+            let reply_target_account_address_for_delivery = reply_target_account_address;
+            spawn_best_effort_batch_delivery("create_status", async move {
+                let mut delivery_targets = create_delivery_targets;
+
+                if let Some(reply_target_account_address) =
+                    reply_target_account_address_for_delivery
+                {
+                    match resolve_remote_actor_and_inbox(
+                        &state_for_delivery,
+                        &reply_target_account_address,
+                    )
+                    .await
+                    {
+                        Ok((_, reply_target_inbox_uri)) => {
+                            delivery_targets.push(reply_target_inbox_uri);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                reply_target_account_address = %reply_target_account_address,
+                                %error,
+                                "Failed to resolve reply target inbox for Create delivery"
+                            );
+                        }
+                    }
+                }
+
+                if delivery_targets.is_empty() {
+                    tracing::debug!(
+                        "Skipping outbound Create delivery because no targets were found"
+                    );
+                    return Vec::new();
+                }
+
+                delivery
+                    .send_create(&status_for_delivery, delivery_targets)
+                    .await
+            });
+        } else if !should_federate_create {
+            tracing::debug!(
+                visibility = %status.visibility,
+                "Skipping outbound Create delivery for non-public visibility"
+            );
+        }
+
+        let media_attachments_value = if !media_ids.is_empty() {
+            let media_attachments = state.db.get_media_by_status(&status.id).await?;
+            let values: Vec<serde_json::Value> = media_attachments
+                .into_iter()
+                .map(|attachment| {
+                    let media_url = format!(
+                        "{}/{}",
+                        state.config.storage.media.public_url, attachment.s3_key
+                    );
+                    let preview_url = attachment
+                        .thumbnail_s3_key
+                        .as_ref()
+                        .map(|key| format!("{}/{}", state.config.storage.media.public_url, key))
+                        .unwrap_or_else(|| media_url.clone());
+                    serde_json::json!({
+                        "id": attachment.id,
+                        "type": media_type_from_content_type(&attachment.content_type),
+                        "url": media_url,
+                        "preview_url": preview_url,
+                        "remote_url": serde_json::Value::Null,
+                        "text_url": serde_json::Value::Null,
+                        "meta": serde_json::Value::Null,
+                        "description": attachment.description,
+                        "blurhash": attachment.blurhash,
+                    })
+                })
+                .collect();
+            Some(serde_json::Value::Array(values))
+        } else {
+            None
+        };
+
+        let poll_value = if poll.is_some() {
+            if let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
+                state.db.get_poll_by_status_id(&status.id).await?
+            {
+                let options = state.db.get_poll_options(&poll_id).await?;
+                let options_response: Vec<serde_json::Value> = options
+                    .into_iter()
+                    .map(|(_, title, option_votes_count)| {
+                        serde_json::json!({
+                            "title": title,
+                            "votes_count": option_votes_count,
+                        })
+                    })
+                    .collect();
+                Some(serde_json::json!({
+                    "id": poll_id,
+                    "expires_at": expires_at,
+                    "expired": expired,
+                    "multiple": multiple,
+                    "votes_count": votes_count,
+                    "voters_count": voters_count,
+                    "voted": false,
+                    "own_votes": [],
+                    "options": options_response,
+                    "emojis": [],
+                }))
+            } else {
+                None
             }
+        } else {
+            None
+        };
 
-            delivery
-                .send_create(&status_for_delivery, delivery_targets)
-                .await
-        });
-    } else if !should_federate_create {
-        tracing::debug!(
-            visibility = %status.visibility,
-            "Skipping outbound Create delivery for non-public visibility"
+        let response = crate::api::status_to_response(
+            &status,
+            &account,
+            &state.config,
+            Some(false),
+            Some(false),
+            Some(false),
         );
+        let mut response_value = serde_json::to_value(response).map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize status response: {error}"
+            ))
+        })?;
+        if let Some(obj) = response_value.as_object_mut() {
+            if let Some(media_attachments_value) = media_attachments_value {
+                obj.insert("media_attachments".to_string(), media_attachments_value);
+            }
+            if let Some(poll_value) = poll_value {
+                obj.insert("poll".to_string(), poll_value);
+            }
+        }
+        Ok(response_value)
     }
+    .await;
 
-    // Convert to API response
-    let response = crate::api::status_to_response(
-        &status,
-        &account,
-        &state.config,
-        Some(false),
-        Some(false),
-        Some(false),
-    );
+    let response_value = match response_result {
+        Ok(response_value) => response_value,
+        Err(error) => {
+            if let Some(key) = reserved_idempotency_key.as_deref() {
+                let _ = state
+                    .db
+                    .clear_pending_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(key) = reserved_idempotency_key.as_deref() {
+        state
+            .db
+            .store_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key, &response_value)
+            .await?;
+    }
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
         .with_label_values(&["POST", "/api/v1/statuses", "200"])
         .inc();
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    Ok(Json(response_value))
 }
 
 /// GET /api/v1/statuses/:id

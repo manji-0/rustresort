@@ -175,6 +175,318 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
 }
 
 #[tokio::test]
+async fn test_create_status_rejects_poll_and_media_together() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "poll and media",
+        "media_ids": ["media_1"],
+        "poll": {
+            "options": ["a", "b"],
+            "expires_in": 600
+        }
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 422);
+}
+
+#[tokio::test]
+async fn test_create_status_with_poll_includes_poll_in_response() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "poll response",
+        "poll": {
+            "options": ["yes", "no"],
+            "expires_in": 600
+        }
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json["poll"].is_object());
+    assert!(json["poll"]["options"].is_array());
+    assert_eq!(json["poll"]["options"][0]["title"], "yes");
+}
+
+#[tokio::test]
+async fn test_create_status_with_media_ids_includes_media_attachments_in_response() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, MediaAttachment};
+
+    let media = MediaAttachment {
+        id: EntityId::new().0,
+        status_id: None,
+        s3_key: "media/test-image.webp".to_string(),
+        thumbnail_s3_key: None,
+        content_type: "image/webp".to_string(),
+        file_size: 1234,
+        description: Some("image".to_string()),
+        blurhash: None,
+        width: Some(64),
+        height: Some(64),
+        created_at: Utc::now(),
+    };
+    server.state.db.insert_media(&media).await.unwrap();
+
+    let status_data = serde_json::json!({
+        "status": "media response",
+        "media_ids": [media.id]
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json["media_attachments"].is_array());
+    assert_eq!(json["media_attachments"][0]["id"], media.id);
+}
+
+#[tokio::test]
+async fn test_create_status_with_scheduled_at_returns_scheduled_status() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let scheduled_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+    let status_data = serde_json::json!({
+        "status": "Schedule me",
+        "scheduled_at": scheduled_at,
+        "visibility": "public"
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json["id"].as_str().is_some());
+    assert_eq!(json["params"]["text"], "Schedule me");
+    assert_eq!(json["scheduled_at"], scheduled_at);
+
+    let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+    assert!(statuses.is_empty());
+}
+
+#[tokio::test]
+async fn test_create_status_with_scheduled_poll_returns_poll_options_array() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let scheduled_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+    let status_data = serde_json::json!({
+        "status": "Schedule me with poll",
+        "scheduled_at": scheduled_at,
+        "visibility": "public",
+        "poll": {
+            "options": ["A", "B"],
+            "expires_in": 600,
+            "multiple": false
+        }
+    });
+
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json["params"]["poll"]["options"].is_array());
+    assert_eq!(json["params"]["poll"]["options"][0], "A");
+}
+
+#[tokio::test]
+async fn test_create_status_is_idempotent_with_idempotency_key() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status_data = serde_json::json!({
+        "status": "Idempotent post",
+        "visibility": "public"
+    });
+
+    let first_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Idempotency-Key", "same-key")
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), 200);
+    let first_json: Value = first_response.json().await.unwrap();
+    let first_id = first_json["id"].as_str().unwrap().to_string();
+
+    let second_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Idempotency-Key", "same-key")
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), 200);
+    let second_json: Value = second_response.json().await.unwrap();
+    let second_id = second_json["id"].as_str().unwrap().to_string();
+
+    assert_eq!(first_id, second_id);
+    let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+    assert_eq!(statuses.len(), 1);
+}
+
+#[tokio::test]
+async fn test_create_status_is_idempotent_with_concurrent_requests() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let url = server.url("/api/v1/statuses");
+    let client = server.client.clone();
+    let payload = serde_json::json!({
+        "status": "Concurrent idempotent post",
+        "visibility": "public"
+    });
+
+    let request_1 = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Idempotency-Key", "same-key-concurrent")
+        .json(&payload)
+        .send();
+    let request_2 = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Idempotency-Key", "same-key-concurrent")
+        .json(&payload)
+        .send();
+
+    let (response_1, response_2) = tokio::join!(request_1, request_2);
+    let response_1 = response_1.unwrap();
+    let response_2 = response_2.unwrap();
+    assert_eq!(response_1.status(), 200);
+    assert_eq!(response_2.status(), 200);
+
+    let json_1: Value = response_1.json().await.unwrap();
+    let json_2: Value = response_2.json().await.unwrap();
+    assert_eq!(json_1["id"], json_2["id"]);
+
+    let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+    assert_eq!(statuses.len(), 1);
+}
+
+#[tokio::test]
+async fn test_create_status_idempotency_recovers_after_pending_is_cleared() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let endpoint = "/api/v1/statuses";
+    let key = "pending-cleared-key";
+    assert!(
+        server
+            .state
+            .db
+            .reserve_idempotency_key(endpoint, key)
+            .await
+            .unwrap()
+    );
+
+    let db = server.state.db.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+        db.clear_pending_idempotency_key(endpoint, key)
+            .await
+            .unwrap();
+    });
+
+    let payload = serde_json::json!({
+        "status": "Recovered idempotency request",
+        "visibility": "public"
+    });
+    let response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Idempotency-Key", key)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+    assert_eq!(statuses.len(), 1);
+}
+
+#[tokio::test]
+async fn test_create_status_rejects_quoted_status_id_parameter() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let quote_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "Quote",
+            "quoted_status_id": "https://remote.example/users/alice/statuses/1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(quote_response.status(), 400);
+}
+
+#[tokio::test]
 async fn test_delete_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;

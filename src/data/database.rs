@@ -161,6 +161,10 @@ fn find_matching_addresses(
         .collect()
 }
 
+fn parse_json_value(raw: Option<String>) -> Option<serde_json::Value> {
+    raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+}
+
 impl Database {
     // =========================================================================
     // Connection
@@ -618,7 +622,18 @@ impl Database {
         status: &Status,
         media_ids: &[String],
     ) -> Result<(), AppError> {
-        if media_ids.is_empty() {
+        self.insert_status_with_media_and_poll(status, media_ids, None)
+            .await
+    }
+
+    /// Insert a new status with optional media and poll atomically.
+    pub async fn insert_status_with_media_and_poll(
+        &self,
+        status: &Status,
+        media_ids: &[String],
+        poll: Option<(&[String], i64, bool)>,
+    ) -> Result<(), AppError> {
+        if media_ids.is_empty() && poll.is_none() {
             return self.insert_status(status).await;
         }
 
@@ -665,6 +680,39 @@ impl Database {
                         "media attachment is unavailable: {}",
                         media_id
                     )));
+                }
+            }
+
+            if let Some((poll_options, expires_in, multiple)) = poll {
+                let poll_id = EntityId::new().0;
+                let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
+                sqlx::query(
+                    r#"
+                    INSERT INTO polls (id, status_id, expires_at, expired, multiple, votes_count, voters_count, created_at)
+                    VALUES (?, ?, ?, 0, ?, 0, 0, datetime('now'))
+                    "#,
+                )
+                .bind(&poll_id)
+                .bind(&status.id)
+                .bind(expires_at.to_rfc3339())
+                .bind(multiple as i64)
+                .execute(&mut *conn)
+                .await?;
+
+                for (index, option) in poll_options.iter().enumerate() {
+                    let option_id = EntityId::new().0;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO poll_options (id, poll_id, title, votes_count, option_index, created_at)
+                        VALUES (?, ?, ?, 0, ?, datetime('now'))
+                        "#,
+                    )
+                    .bind(&option_id)
+                    .bind(&poll_id)
+                    .bind(option)
+                    .bind(index as i64)
+                    .execute(&mut *conn)
+                    .await?;
                 }
             }
 
@@ -715,6 +763,132 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
+
+        Ok(())
+    }
+
+    /// Get a cached idempotency response for an endpoint and key.
+    pub async fn get_idempotency_response(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let response_json = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT response_json FROM idempotency_keys WHERE endpoint = ? AND key = ?",
+        )
+        .bind(endpoint)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        response_json
+            .map(|raw| {
+                serde_json::from_str::<serde_json::Value>(&raw).map_err(|error| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "failed to deserialize idempotency response: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    /// Try to reserve an idempotency key for processing.
+    ///
+    /// Returns `true` when this request successfully reserved the key and should
+    /// proceed, or `false` when another request already owns/owned the key.
+    pub async fn reserve_idempotency_key(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO idempotency_keys (endpoint, key, response_json, created_at)
+            VALUES (?, ?, NULL, datetime('now'))
+            ON CONFLICT(endpoint, key) DO UPDATE
+            SET response_json = NULL, created_at = datetime('now')
+            WHERE idempotency_keys.response_json IS NULL
+              AND idempotency_keys.created_at < datetime('now', '-5 minutes')
+            "#,
+        )
+        .bind(endpoint)
+        .bind(idempotency_key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Store an idempotency response payload for an endpoint and key.
+    pub async fn store_idempotency_response(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let response_json = serde_json::to_string(response).map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize idempotency response: {error}"
+            ))
+        })?;
+
+        let result = sqlx::query(
+            "UPDATE idempotency_keys SET response_json = ? WHERE endpoint = ? AND key = ?",
+        )
+        .bind(&response_json)
+        .bind(endpoint)
+        .bind(idempotency_key)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT OR IGNORE INTO idempotency_keys (endpoint, key, response_json) VALUES (?, ?, ?)",
+            )
+            .bind(endpoint)
+            .bind(idempotency_key)
+            .bind(&response_json)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete a pending idempotency reservation with no stored response.
+    pub async fn clear_pending_idempotency_key(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "DELETE FROM idempotency_keys WHERE endpoint = ? AND key = ? AND response_json IS NULL",
+        )
+        .bind(endpoint)
+        .bind(idempotency_key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn backdate_pending_idempotency_key_for_test(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+        minutes: i64,
+    ) -> Result<(), AppError> {
+        let modifier = format!("-{} minutes", minutes);
+        sqlx::query(
+            "UPDATE idempotency_keys SET created_at = datetime('now', ?) WHERE endpoint = ? AND key = ? AND response_json IS NULL",
+        )
+        .bind(modifier)
+        .bind(endpoint)
+        .bind(idempotency_key)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -2570,6 +2744,32 @@ impl Database {
         ))
     }
 
+    /// Get poll by status ID
+    pub async fn get_poll_by_status_id(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+        let result = sqlx::query_as::<_, (String, String, i64, i64, i64, i64)>(
+            "SELECT id, expires_at, expired, multiple, votes_count, voters_count FROM polls WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(
+            |(id, expires_at, expired, multiple, votes_count, voters_count)| {
+                (
+                    id,
+                    expires_at,
+                    expired != 0,
+                    multiple != 0,
+                    votes_count,
+                    voters_count,
+                )
+            },
+        ))
+    }
+
     /// Get poll options
     pub async fn get_poll_options(
         &self,
@@ -2751,6 +2951,8 @@ impl Database {
         .await?;
 
         if let Some(row) = result {
+            let media_ids = parse_json_value(row.get::<Option<String>, _>("media_ids"));
+            let poll_options = parse_json_value(row.get::<Option<String>, _>("poll_options"));
             Ok(Some(serde_json::json!({
                 "id": row.get::<String, _>("id"),
                 "scheduled_at": row.get::<String, _>("scheduled_at"),
@@ -2759,10 +2961,10 @@ impl Database {
                     "visibility": row.get::<String, _>("visibility"),
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
-                    "media_ids": row.get::<Option<String>, _>("media_ids"),
-                    "poll": if row.get::<Option<String>, _>("poll_options").is_some() {
+                    "media_ids": media_ids,
+                    "poll": if poll_options.is_some() {
                         Some(serde_json::json!({
-                            "options": row.get::<Option<String>, _>("poll_options"),
+                            "options": poll_options,
                             "expires_in": row.get::<Option<i64>, _>("poll_expires_in"),
                             "multiple": row.get::<i64, _>("poll_multiple") != 0,
                         }))
@@ -2797,6 +2999,8 @@ impl Database {
 
         let mut results = Vec::new();
         for row in rows {
+            let media_ids = parse_json_value(row.get::<Option<String>, _>("media_ids"));
+            let poll_options = parse_json_value(row.get::<Option<String>, _>("poll_options"));
             results.push(serde_json::json!({
                 "id": row.get::<String, _>("id"),
                 "scheduled_at": row.get::<String, _>("scheduled_at"),
@@ -2805,10 +3009,10 @@ impl Database {
                     "visibility": row.get::<String, _>("visibility"),
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
-                    "media_ids": row.get::<Option<String>, _>("media_ids"),
-                    "poll": if row.get::<Option<String>, _>("poll_options").is_some() {
+                    "media_ids": media_ids,
+                    "poll": if poll_options.is_some() {
                         Some(serde_json::json!({
-                            "options": row.get::<Option<String>, _>("poll_options"),
+                            "options": poll_options,
                             "expires_in": row.get::<Option<i64>, _>("poll_expires_in"),
                             "multiple": row.get::<i64, _>("poll_multiple") != 0,
                         }))
