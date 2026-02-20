@@ -760,13 +760,30 @@ pub async fn block_account(
 
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
+    let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Store block in database
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    state
+    let newly_blocked = state
         .db
         .block_account(&target_address, default_port)
         .await?;
+
+    if newly_blocked {
+        let state_for_delivery = state.clone();
+        let account_for_delivery = account_for_delivery.clone();
+        let target_address_for_delivery = target_address.clone();
+        spawn_best_effort_delivery("block", async move {
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
+                    .await?;
+            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+            delivery
+                .send_block(&target_actor_uri, &target_inbox_uri)
+                .await?;
+            Ok(())
+        });
+    }
 
     // Return relationship response
     let relationship = RelationshipResponse {
@@ -799,13 +816,35 @@ pub async fn unblock_account(
 
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
+    let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Remove block from database
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    state
+    let unblocked = state
         .db
         .unblock_account(&target_address, default_port)
         .await?;
+
+    if unblocked {
+        let state_for_delivery = state.clone();
+        let account_for_delivery = account_for_delivery.clone();
+        let target_address_for_delivery = target_address.clone();
+        spawn_best_effort_delivery("unblock", async move {
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
+                    .await?;
+            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+            let block_activity_uri = delivery.block_activity_uri_for_target(&target_actor_uri);
+            delivery
+                .send_undo_to_inbox_with_type_and_object(
+                    &block_activity_uri,
+                    Some("Block"),
+                    Some(&target_actor_uri),
+                    &target_inbox_uri,
+                )
+                .await
+        });
+    }
 
     // Return relationship response
     let relationship = RelationshipResponse {

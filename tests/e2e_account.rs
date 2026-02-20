@@ -512,6 +512,304 @@ async fn test_block_account_matches_default_https_port_variants() {
 }
 
 #[tokio::test]
+async fn test_block_and_unblock_account_deliver_outbound_activities() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    #[derive(Clone)]
+    struct InboxCounters {
+        blocks: Arc<AtomicUsize>,
+        undo_blocks: Arc<AtomicUsize>,
+    }
+
+    async fn record_inbox_delivery(
+        State(counters): State<InboxCounters>,
+        body: String,
+    ) -> StatusCode {
+        if let Ok(activity) = serde_json::from_str::<Value>(&body) {
+            match activity.get("type").and_then(|value| value.as_str()) {
+                Some("Block") => {
+                    counters.blocks.fetch_add(1, Ordering::SeqCst);
+                }
+                Some("Undo")
+                    if activity
+                        .get("object")
+                        .and_then(|value| value.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("Block") =>
+                {
+                    counters.undo_blocks.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    let counters = InboxCounters {
+        blocks: Arc::new(AtomicUsize::new(0)),
+        undo_blocks: Arc::new(AtomicUsize::new(0)),
+    };
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(counters.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let target_address = "alice@remote.example";
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: target_address.to_string(),
+            uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let block_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(block_response.status().is_success());
+
+    let mut block_delivered = false;
+    for _ in 0..600 {
+        if counters.blocks.load(Ordering::SeqCst) > 0 {
+            block_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(block_delivered, "expected outbound Block delivery");
+
+    let unblock_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(unblock_response.status().is_success());
+
+    let mut undo_delivered = false;
+    for _ in 0..600 {
+        if counters.undo_blocks.load(Ordering::SeqCst) > 0 {
+            undo_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(undo_delivered, "expected outbound Undo(Block) delivery");
+}
+
+#[tokio::test]
+async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delivery() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn record_inbox_delivery(
+        State(counter): State<Arc<AtomicUsize>>,
+        body: String,
+    ) -> StatusCode {
+        if let Ok(activity) = serde_json::from_str::<Value>(&body) {
+            if activity.get("type").and_then(|value| value.as_str()) == Some("Block") {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    let block_delivery_count = Arc::new(AtomicUsize::new(0));
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(block_delivery_count.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let target_address = "alice@remote.example";
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: target_address.to_string(),
+            uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let first_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(first_response.status().is_success());
+
+    let mut first_delivery_observed = false;
+    for _ in 0..600 {
+        if block_delivery_count.load(Ordering::SeqCst) > 0 {
+            first_delivery_observed = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        first_delivery_observed,
+        "expected initial outbound Block delivery"
+    );
+
+    sleep(Duration::from_millis(100)).await;
+    let before_second_block = block_delivery_count.load(Ordering::SeqCst);
+
+    let second_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(second_response.status().is_success());
+
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        block_delivery_count.load(Ordering::SeqCst),
+        before_second_block,
+        "unexpected duplicate outbound Block delivery"
+    );
+}
+
+#[tokio::test]
+async fn test_unblock_account_without_existing_block_skips_outbound_undo_delivery() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn record_inbox_delivery(
+        State(counter): State<Arc<AtomicUsize>>,
+        _body: String,
+    ) -> StatusCode {
+        counter.fetch_add(1, Ordering::SeqCst);
+        StatusCode::ACCEPTED
+    }
+
+    let inbox_delivery_count = Arc::new(AtomicUsize::new(0));
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(inbox_delivery_count.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let target_address = "alice@remote.example";
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: target_address.to_string(),
+            uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let unblock_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(unblock_response.status().is_success());
+
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        inbox_delivery_count.load(Ordering::SeqCst),
+        0,
+        "unexpected outbound delivery for unblock without existing block"
+    );
+}
+
+#[tokio::test]
 async fn test_mute_account_matches_default_https_port_variants() {
     let server = TestServer::new().await;
     server.create_test_account().await;
