@@ -2,6 +2,7 @@
 
 use super::*;
 use chrono::Utc;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -14,10 +15,228 @@ async fn create_test_db() -> (Database, TempDir) {
     (db, temp_dir)
 }
 
+fn test_db_connection_string(temp_dir: &TempDir) -> String {
+    format!(
+        "sqlite:{}?mode=rw",
+        temp_dir.path().join("test.db").display()
+    )
+}
+
+fn test_oauth_app() -> OAuthApp {
+    OAuthApp {
+        id: EntityId::new().0,
+        name: "Test App".to_string(),
+        website: None,
+        redirect_uri: "https://example.com/callback".to_string(),
+        client_id: EntityId::new().0,
+        client_secret: EntityId::new().0,
+        scopes: "read write".to_string(),
+        created_at: Utc::now(),
+    }
+}
+
+fn test_oauth_token(app_id: &str, access_token: &str) -> OAuthToken {
+    OAuthToken {
+        id: EntityId::new().0,
+        app_id: app_id.to_string(),
+        access_token: access_token.to_string(),
+        grant_type: "authorization_code".to_string(),
+        scopes: "read write".to_string(),
+        created_at: Utc::now(),
+        revoked: false,
+    }
+}
+
+async fn oauth_hash_migration_state(pool: &SqlitePool) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'oauth_tokens_access_token_hash_migration'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn test_database_connection() {
     let (_db, _temp_dir) = create_test_db().await;
     // Connection successful if we get here without panicking
+}
+
+#[tokio::test]
+async fn test_oauth_token_storage_hashes_access_token_and_lookup_uses_plain_token() {
+    let (db, temp_dir) = create_test_db().await;
+
+    let app = test_oauth_app();
+    db.insert_oauth_app(&app).await.unwrap();
+
+    let raw_access_token = "plain-oauth-token";
+    let token = test_oauth_token(&app.id, raw_access_token);
+    db.insert_oauth_token(&token).await.unwrap();
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let stored_access_token =
+        sqlx::query_scalar::<_, String>("SELECT access_token FROM oauth_tokens WHERE id = ?")
+            .bind(&token.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_ne!(stored_access_token, raw_access_token);
+    assert!(stored_access_token.starts_with("sha256:"));
+
+    let looked_up = db.get_oauth_token(raw_access_token).await.unwrap();
+    assert!(looked_up.is_some());
+    assert_eq!(looked_up.unwrap().id, token.id);
+    assert!(
+        db.get_oauth_token(&stored_access_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_oauth_token_migration_hashes_existing_plaintext_rows_on_reconnect() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    let db = Database::connect(&db_path).await.unwrap();
+    let app = test_oauth_app();
+    db.insert_oauth_app(&app).await.unwrap();
+    drop(db);
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+
+    let legacy_token = test_oauth_token(&app.id, "legacy-plaintext-token");
+    sqlx::query(
+        r#"
+        INSERT INTO oauth_tokens (
+            id, app_id, access_token, grant_type, scopes, created_at, revoked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&legacy_token.id)
+    .bind(&legacy_token.app_id)
+    .bind(&legacy_token.access_token)
+    .bind(&legacy_token.grant_type)
+    .bind(&legacy_token.scopes)
+    .bind(&legacy_token.created_at)
+    .bind(legacy_token.revoked)
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(pool);
+
+    let db = Database::connect(&db_path).await.unwrap();
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let migrated_access_token =
+        sqlx::query_scalar::<_, String>("SELECT access_token FROM oauth_tokens WHERE id = ?")
+            .bind(&legacy_token.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_ne!(migrated_access_token, legacy_token.access_token);
+    assert!(migrated_access_token.starts_with("sha256:"));
+
+    let looked_up = db
+        .get_oauth_token(&legacy_token.access_token)
+        .await
+        .unwrap();
+    assert!(looked_up.is_some());
+    assert_eq!(looked_up.unwrap().id, legacy_token.id);
+    assert_eq!(oauth_hash_migration_state(&pool).await, "done");
+}
+
+#[tokio::test]
+async fn test_oauth_token_migration_rehashes_fake_sha256_prefixed_plaintext() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    let db = Database::connect(&db_path).await.unwrap();
+    let app = test_oauth_app();
+    db.insert_oauth_app(&app).await.unwrap();
+    drop(db);
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+
+    let fake_prefixed_plaintext = "sha256:not-a-real-base64url-digest";
+    let legacy_token = test_oauth_token(&app.id, fake_prefixed_plaintext);
+    sqlx::query(
+        r#"
+        INSERT INTO oauth_tokens (
+            id, app_id, access_token, grant_type, scopes, created_at, revoked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&legacy_token.id)
+    .bind(&legacy_token.app_id)
+    .bind(&legacy_token.access_token)
+    .bind(&legacy_token.grant_type)
+    .bind(&legacy_token.scopes)
+    .bind(&legacy_token.created_at)
+    .bind(legacy_token.revoked)
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(pool);
+
+    let db = Database::connect(&db_path).await.unwrap();
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let migrated_access_token =
+        sqlx::query_scalar::<_, String>("SELECT access_token FROM oauth_tokens WHERE id = ?")
+            .bind(&legacy_token.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_ne!(migrated_access_token, fake_prefixed_plaintext);
+    assert!(migrated_access_token.starts_with("sha256:"));
+
+    let looked_up = db.get_oauth_token(fake_prefixed_plaintext).await.unwrap();
+    assert!(looked_up.is_some());
+    assert_eq!(looked_up.unwrap().id, legacy_token.id);
+    assert_eq!(oauth_hash_migration_state(&pool).await, "done");
+}
+
+#[tokio::test]
+async fn test_oauth_token_revoke_works_with_hashed_storage() {
+    let (db, temp_dir) = create_test_db().await;
+
+    let app = test_oauth_app();
+    db.insert_oauth_app(&app).await.unwrap();
+
+    let raw_access_token = "revokable-token";
+    let token = test_oauth_token(&app.id, raw_access_token);
+    db.insert_oauth_token(&token).await.unwrap();
+
+    db.revoke_oauth_token(raw_access_token).await.unwrap();
+    assert!(
+        db.get_oauth_token(raw_access_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let revoked = sqlx::query_scalar::<_, i64>("SELECT revoked FROM oauth_tokens WHERE id = ?")
+        .bind(&token.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revoked, 1);
 }
 
 #[tokio::test]
