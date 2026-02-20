@@ -5,21 +5,46 @@
 
 use std::sync::Arc;
 
-use crate::data::{Database, MediaAttachment, PersistedReason, Status, TimelineCache};
+use crate::data::{Database, EntityId, MediaAttachment, PersistedReason, Status, TimelineCache};
 use crate::error::AppError;
 use crate::storage::MediaStorage;
+
+const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_BYTES: usize = 40 * 1024 * 1024;
+
+fn media_file_extension_from_content_type(content_type: &str) -> &'static str {
+    match content_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        _ => "bin",
+    }
+}
 
 /// Status service
 pub struct StatusService {
     db: Arc<Database>,
     cache: Arc<TimelineCache>,
     storage: Arc<MediaStorage>,
+    base_url: String,
 }
 
 impl StatusService {
     /// Create new status service
-    pub fn new(db: Arc<Database>, cache: Arc<TimelineCache>, storage: Arc<MediaStorage>) -> Self {
-        Self { db, cache, storage }
+    pub fn new(
+        db: Arc<Database>,
+        cache: Arc<TimelineCache>,
+        storage: Arc<MediaStorage>,
+        base_url: String,
+    ) -> Self {
+        Self {
+            db,
+            cache,
+            storage,
+            base_url,
+        }
     }
 
     // =========================================================================
@@ -45,16 +70,59 @@ impl StatusService {
     /// - Triggers federation delivery (via returned status)
     pub async fn create(
         &self,
-        _content: String,
-        _content_warning: Option<String>,
-        _visibility: String,
-        _language: Option<String>,
-        _in_reply_to_uri: Option<String>,
-        _media_ids: Vec<String>,
+        content: String,
+        content_warning: Option<String>,
+        visibility: String,
+        language: Option<String>,
+        in_reply_to_uri: Option<String>,
+        media_ids: Vec<String>,
     ) -> Result<Status, AppError> {
-        Err(AppError::NotImplemented(
-            "status creation via service is not implemented yet".to_string(),
-        ))
+        let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
+
+        let normalized_visibility = visibility.trim().to_ascii_lowercase();
+        if !matches!(
+            normalized_visibility.as_str(),
+            "public" | "unlisted" | "private" | "direct"
+        ) {
+            return Err(AppError::Validation(
+                "visibility must be one of: public, unlisted, private, direct".to_string(),
+            ));
+        }
+
+        let content = content.trim().to_string();
+        if content.is_empty() && media_ids.is_empty() {
+            return Err(AppError::Validation(
+                "status content or media is required".to_string(),
+            ));
+        }
+
+        let status_id = EntityId::new().0;
+        let uri = format!(
+            "{}/users/{}/statuses/{}",
+            self.base_url.trim_end_matches('/'),
+            account.username,
+            status_id
+        );
+        let status = Status {
+            id: status_id,
+            uri,
+            content: format!("<p>{}</p>", html_escape::encode_text(&content)),
+            content_warning,
+            visibility: normalized_visibility,
+            language: language.or(Some("en".to_string())),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: chrono::Utc::now(),
+            fetched_at: None,
+        };
+
+        self.persist_local_status_with_media_and_poll(&status, &media_ids, None)
+            .await?;
+
+        Ok(status)
     }
 
     /// Persist a local status with optional media and poll atomically.
@@ -174,17 +242,21 @@ impl StatusService {
     ///
     /// # Returns
     /// The repost status (Announce wrapper)
-    pub async fn repost(&self, _status_uri: &str) -> Result<Status, AppError> {
-        Err(AppError::NotImplemented(
-            "repost via service is not implemented yet".to_string(),
-        ))
+    pub async fn repost(&self, status_uri: &str) -> Result<Status, AppError> {
+        let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
+        let repost_id = EntityId::new().0;
+        let repost_uri = format!(
+            "{}/users/{}/statuses/{}/activity",
+            self.base_url.trim_end_matches('/'),
+            account.username,
+            repost_id
+        );
+        self.repost_by_uri(status_uri, &repost_uri).await
     }
 
     /// Undo repost
-    pub async fn unrepost(&self, _status_uri: &str) -> Result<(), AppError> {
-        Err(AppError::NotImplemented(
-            "unrepost via service is not implemented yet".to_string(),
-        ))
+    pub async fn unrepost(&self, status_uri: &str) -> Result<(), AppError> {
+        self.unrepost_by_uri(status_uri).await.map(|_| ())
     }
 
     // =========================================================================
@@ -202,13 +274,80 @@ impl StatusService {
     /// Created media attachment (not yet attached to status)
     pub async fn upload_media(
         &self,
-        _data: Vec<u8>,
-        _content_type: String,
-        _description: Option<String>,
+        data: Vec<u8>,
+        content_type: String,
+        description: Option<String>,
     ) -> Result<MediaAttachment, AppError> {
-        Err(AppError::NotImplemented(
-            "media upload via service is not implemented yet".to_string(),
-        ))
+        if data.is_empty() {
+            return Err(AppError::Validation("media data is required".to_string()));
+        }
+
+        let normalized_content_type = content_type.trim().to_ascii_lowercase();
+        let supported_types = [
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+            "video/mp4",
+        ];
+        if !supported_types.contains(&normalized_content_type.as_str()) {
+            return Err(AppError::Validation(format!(
+                "unsupported media type: {}",
+                content_type
+            )));
+        }
+
+        let max_size = if normalized_content_type.starts_with("image/") {
+            MAX_IMAGE_UPLOAD_BYTES
+        } else if normalized_content_type.starts_with("video/") {
+            MAX_VIDEO_UPLOAD_BYTES
+        } else {
+            return Err(AppError::Validation(format!(
+                "unsupported media type: {}",
+                content_type
+            )));
+        };
+        if data.len() > max_size {
+            return Err(AppError::Validation(format!(
+                "media file too large: exceeds {} bytes",
+                max_size
+            )));
+        }
+
+        let media_id = EntityId::new().0;
+        let extension = media_file_extension_from_content_type(&normalized_content_type);
+        let s3_key = format!("media/{}.{}", media_id, extension);
+        let file_size = data.len() as i64;
+        self.storage
+            .upload(&s3_key, data, &normalized_content_type)
+            .await?;
+
+        let media = MediaAttachment {
+            id: media_id,
+            status_id: None,
+            s3_key: s3_key.clone(),
+            thumbnail_s3_key: None,
+            content_type: normalized_content_type,
+            file_size,
+            description,
+            blurhash: None,
+            width: None,
+            height: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        if let Err(error) = self.db.insert_media(&media).await {
+            if let Err(cleanup_error) = self.storage.delete(&s3_key).await {
+                tracing::warn!(
+                    key = %s3_key,
+                    error = %cleanup_error,
+                    "failed to cleanup uploaded media after metadata insert error"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(media)
     }
 
     // =========================================================================
@@ -359,5 +498,178 @@ impl StatusService {
     /// Check whether status is reposted
     pub async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError> {
         self.db.is_reposted(status_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    use crate::data::{Account, EntityId};
+
+    async fn create_test_db() -> (Arc<Database>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("service-status.db");
+        let db = Database::connect(&db_path).await.unwrap();
+        (Arc::new(db), temp_dir)
+    }
+
+    async fn create_test_storage() -> Arc<MediaStorage> {
+        let media = crate::config::MediaStorageConfig {
+            bucket: "test-media-bucket".to_string(),
+            public_url: "https://media.test.example.com".to_string(),
+        };
+        let cloudflare = crate::config::CloudflareConfig {
+            account_id: "test-account".to_string(),
+            r2_access_key_id: "test-access-key".to_string(),
+            r2_secret_access_key: "test-secret-key".to_string(),
+        };
+
+        Arc::new(MediaStorage::new(&media, &cloudflare).await.unwrap())
+    }
+
+    async fn seed_account(db: &Database, username: &str) {
+        let account = Account {
+            id: EntityId::new().0,
+            username: username.to_string(),
+            display_name: Some(username.to_string()),
+            note: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private-key".to_string(),
+            public_key_pem: "public-key".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        db.upsert_account(&account).await.unwrap();
+    }
+
+    async fn create_service(db: Arc<Database>) -> StatusService {
+        let cache = Arc::new(TimelineCache::new(64).await.unwrap());
+        let storage = create_test_storage().await;
+        StatusService::new(db, cache, storage, "https://test.example.com".to_string())
+    }
+
+    #[tokio::test]
+    async fn create_persists_local_status() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let status = service
+            .create(
+                "hello".to_string(),
+                Some("cw".to_string()),
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert!(status.uri.ends_with(&format!("/statuses/{}", status.id)));
+        assert_eq!(status.visibility, "public");
+        assert_eq!(status.content, "<p>hello</p>");
+
+        let persisted = db.get_status(&status.id).await.unwrap().unwrap();
+        assert_eq!(persisted.uri, status.uri);
+        assert_eq!(persisted.content, "<p>hello</p>");
+        assert!(persisted.is_local);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_input() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db).await;
+
+        let invalid_visibility = service
+            .create(
+                "hello".to_string(),
+                None,
+                "friends-only".to_string(),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(invalid_visibility, AppError::Validation(_)));
+
+        let empty_content = service
+            .create(
+                "   ".to_string(),
+                None,
+                "public".to_string(),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(empty_content, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn repost_and_unrepost_roundtrip_by_uri() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let status = Status {
+            id: EntityId::new().0,
+            uri: "https://remote.example/users/alice/statuses/1".to_string(),
+            content: "<p>remote</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let reposted = service.repost(&status.uri).await.unwrap();
+        assert_eq!(reposted.id, status.id);
+        assert!(db.is_reposted(&status.id).await.unwrap());
+
+        service.unrepost(&status.uri).await.unwrap();
+        assert!(!db.is_reposted(&status.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_media_rejects_invalid_payload_before_upload() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db).await;
+
+        let empty = service
+            .upload_media(Vec::new(), "image/png".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(empty, AppError::Validation(_)));
+
+        let unsupported = service
+            .upload_media(vec![1, 2, 3], "text/plain".to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(unsupported, AppError::Validation(_)));
+
+        let oversized = service
+            .upload_media(
+                vec![0_u8; 10 * 1024 * 1024 + 1],
+                "image/png".to_string(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(oversized, AppError::Validation(_)));
     }
 }

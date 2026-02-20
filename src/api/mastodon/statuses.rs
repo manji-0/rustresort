@@ -474,6 +474,7 @@ pub async fn create_status(
             state.db.clone(),
             state.timeline_cache.clone(),
             state.storage.clone(),
+            state.config.server.base_url().to_string(),
         );
         status_service
             .persist_local_status_with_media_and_poll(
@@ -671,6 +672,7 @@ pub async fn get_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get status from database
@@ -732,6 +734,7 @@ pub async fn delete_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get status to verify it exists and is local
@@ -920,6 +923,7 @@ pub async fn favourite_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
@@ -978,6 +982,7 @@ pub async fn unfavourite_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
@@ -1051,24 +1056,32 @@ pub async fn reblog_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Create repost record
-    let repost_id = EntityId::new().0;
-    let repost_uri = format!(
-        "{}/users/{}/statuses/{}/activity",
-        state.config.server.base_url(),
-        account.username,
-        repost_id
-    );
-
-    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
-        status_service.repost_by_uri(uri, &repost_uri).await?
+    let action_uri = resolve_action_uri(&id, &params)?;
+    let (status, repost_uri) = if let Some(uri) = action_uri {
+        let status = status_service.repost(uri).await?;
+        let repost_uri = state.db.get_repost_uri(&status.id).await?.ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "repost URI missing after creating repost activity"
+            ))
+        })?;
+        (status, repost_uri)
     } else {
-        status_service.repost_by_id(&id, &repost_uri).await?
+        // Create repost record
+        let repost_id = EntityId::new().0;
+        let repost_uri = format!(
+            "{}/users/{}/statuses/{}/activity",
+            state.config.server.base_url(),
+            account.username,
+            repost_id
+        );
+        let status = status_service.repost_by_id(&id, &repost_uri).await?;
+        (status, repost_uri)
     };
     let status_id = status.id.clone();
 
@@ -1130,19 +1143,21 @@ pub async fn unreblog_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
+    let action_uri = resolve_action_uri(&id, &params)?;
+    let status = if let Some(uri) = action_uri {
         status_service.get_by_uri(uri).await?
     } else {
         status_service.get(&id).await?
     };
     let repost_uri = state.db.get_repost_uri(&status.id).await?;
-    if let Some(uri) = resolve_action_uri(&id, &params)? {
-        status_service.unrepost_by_uri(uri).await?;
+    if let Some(uri) = action_uri {
+        status_service.unrepost(uri).await?;
     } else {
         status_service.unrepost_by_id(&id).await?;
     }
@@ -1200,6 +1215,7 @@ pub async fn bookmark_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
@@ -1237,6 +1253,7 @@ pub async fn unbookmark_status(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.config.server.base_url().to_string(),
     );
 
     // Get account
