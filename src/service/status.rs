@@ -142,12 +142,142 @@ impl StatusService {
         self.db.get_status(id).await?.ok_or(AppError::NotFound)
     }
 
+    /// Try to get status by ID.
+    pub async fn find(&self, id: &str) -> Result<Option<Status>, AppError> {
+        self.db.get_status(id).await
+    }
+
     /// Get status by URI
     pub async fn get_by_uri(&self, uri: &str) -> Result<Status, AppError> {
         self.db
             .get_status_by_uri(uri)
             .await?
             .ok_or(AppError::NotFound)
+    }
+
+    /// Try to get status by URI.
+    pub async fn find_by_uri(&self, uri: &str) -> Result<Option<Status>, AppError> {
+        self.db.get_status_by_uri(uri).await
+    }
+
+    /// Update an existing status record.
+    pub async fn update_loaded(&self, status: &Status) -> Result<(), AppError> {
+        self.db.update_status(status).await
+    }
+
+    /// Get media attachments linked to a status.
+    pub async fn get_media_by_status(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<MediaAttachment>, AppError> {
+        self.db.get_media_by_status(status_id).await
+    }
+
+    /// Get poll metadata for a status if present.
+    pub async fn get_poll_by_status_id(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+        self.db.get_poll_by_status_id(status_id).await
+    }
+
+    /// Get poll options for a poll.
+    pub async fn get_poll_options(
+        &self,
+        poll_id: &str,
+    ) -> Result<Vec<(String, String, i64)>, AppError> {
+        self.db.get_poll_options(poll_id).await
+    }
+
+    /// Get favourite activity ID for a status if favourited.
+    pub async fn get_favourite_id(&self, status_id: &str) -> Result<Option<String>, AppError> {
+        self.db.get_favourite_id(status_id).await
+    }
+
+    /// Get repost activity URI for a status if reposted.
+    pub async fn get_repost_uri(&self, status_id: &str) -> Result<Option<String>, AppError> {
+        self.db.get_repost_uri(status_id).await
+    }
+
+    /// Get a cached idempotency response payload if present.
+    pub async fn get_idempotency_response(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        self.db
+            .get_idempotency_response(endpoint, idempotency_key)
+            .await
+    }
+
+    /// Try to reserve an idempotency key for processing.
+    pub async fn reserve_idempotency_key(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, AppError> {
+        self.db
+            .reserve_idempotency_key(endpoint, idempotency_key)
+            .await
+    }
+
+    /// Store idempotency response payload.
+    pub async fn store_idempotency_response(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        self.db
+            .store_idempotency_response(endpoint, idempotency_key, response)
+            .await
+    }
+
+    /// Clear pending idempotency reservation for a key.
+    pub async fn clear_pending_idempotency_key(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+    ) -> Result<(), AppError> {
+        self.db
+            .clear_pending_idempotency_key(endpoint, idempotency_key)
+            .await
+    }
+
+    /// Create scheduled status payload.
+    pub async fn create_scheduled_status(
+        &self,
+        scheduled_at: &str,
+        status_text: &str,
+        visibility: &str,
+        content_warning: Option<&str>,
+        in_reply_to_id: Option<&str>,
+        media_ids: Option<&str>,
+        poll_options: Option<&str>,
+        poll_expires_in: Option<i64>,
+        poll_multiple: bool,
+    ) -> Result<String, AppError> {
+        self.db
+            .create_scheduled_status(
+                scheduled_at,
+                status_text,
+                visibility,
+                content_warning,
+                in_reply_to_id,
+                media_ids,
+                poll_options,
+                poll_expires_in,
+                poll_multiple,
+            )
+            .await
+    }
+
+    /// Get scheduled status response payload by ID.
+    pub async fn get_scheduled_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        self.db.get_scheduled_status(id).await
     }
 
     /// Delete status

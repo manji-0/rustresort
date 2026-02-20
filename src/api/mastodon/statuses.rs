@@ -20,7 +20,7 @@ use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
     HTTP_REQUESTS_TOTAL, POSTS_TOTAL,
 };
-use crate::service::StatusService;
+use crate::service::{AccountService, StatusService};
 
 const DEFAULT_VISIBILITY: &str = "public";
 const CREATE_STATUS_IDEMPOTENCY_ENDPOINT: &str = "/api/v1/statuses";
@@ -223,6 +223,19 @@ fn media_type_from_content_type(content_type: &str) -> &'static str {
     }
 }
 
+fn build_status_service(state: &AppState) -> StatusService {
+    StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+        state.config.server.base_url().to_string(),
+    )
+}
+
+fn build_account_service(state: &AppState) -> AccountService {
+    AccountService::new(state.db.clone(), state.storage.clone())
+}
+
 /// Status source response
 #[derive(Debug, Serialize)]
 struct StatusSourceResponse {
@@ -244,12 +257,12 @@ pub async fn create_status(
     let _timer = HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&["POST", "/api/v1/statuses"])
         .start_timer();
+    let status_service = build_status_service(&state);
 
     let idempotency_key = extract_idempotency_key(&headers)?;
     let mut reserved_idempotency_key: Option<String> = None;
     if let Some(key) = idempotency_key.as_deref() {
-        if let Some(cached_response) = state
-            .db
+        if let Some(cached_response) = status_service
             .get_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
             .await?
         {
@@ -259,8 +272,7 @@ pub async fn create_status(
             return Ok(Json(cached_response));
         }
 
-        if state
-            .db
+        if status_service
             .reserve_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
             .await?
         {
@@ -269,8 +281,7 @@ pub async fn create_status(
             let wait_deadline = tokio::time::Instant::now()
                 + tokio::time::Duration::from_millis(IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS);
             loop {
-                if let Some(cached_response) = state
-                    .db
+                if let Some(cached_response) = status_service
                     .get_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
                     .await?
                 {
@@ -279,8 +290,7 @@ pub async fn create_status(
                         .inc();
                     return Ok(Json(cached_response));
                 }
-                if state
-                    .db
+                if status_service
                     .reserve_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
                     .await?
                 {
@@ -302,11 +312,14 @@ pub async fn create_status(
     }
 
     let response_result: Result<serde_json::Value, AppError> = async {
+        let account_service = build_account_service(&state);
+        let status_service = build_status_service(&state);
+
         // Get account
         let db_timer = DB_QUERY_DURATION_SECONDS
             .with_label_values(&["SELECT", "accounts"])
             .start_timer();
-        let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+        let account = account_service.get_account().await?;
         DB_QUERIES_TOTAL
             .with_label_values(&["SELECT", "accounts"])
             .inc();
@@ -358,14 +371,14 @@ pub async fn create_status(
         let mut reply_target_account_address = None;
         let mut persisted_reason = "own".to_string();
         if let Some(in_reply_to_id) = in_reply_to_id.as_deref() {
-            if let Some(reply_target) = state.db.get_status(in_reply_to_id).await? {
+            if let Some(reply_target) = status_service.find(in_reply_to_id).await? {
                 in_reply_to_uri = Some(reply_target.uri.clone());
                 if reply_target.is_local {
                     persisted_reason = "reply_to_own".to_string();
                 } else if !reply_target.account_address.is_empty() {
                     reply_target_account_address = Some(reply_target.account_address);
                 }
-            } else if let Some(reply_target) = state.db.get_status_by_uri(in_reply_to_id).await? {
+            } else if let Some(reply_target) = status_service.find_by_uri(in_reply_to_id).await? {
                 in_reply_to_uri = Some(reply_target.uri.clone());
                 if reply_target.is_local {
                     persisted_reason = "reply_to_own".to_string();
@@ -405,8 +418,7 @@ pub async fn create_status(
                 None => None,
             };
 
-            let scheduled_id = state
-                .db
+            let scheduled_id = status_service
                 .create_scheduled_status(
                     &scheduled_at,
                     &content,
@@ -419,8 +431,7 @@ pub async fn create_status(
                     poll.as_ref().is_some_and(|poll| poll.multiple),
                 )
                 .await?;
-            return state
-                .db
+            return status_service
                 .get_scheduled_status(&scheduled_id)
                 .await?
                 .ok_or(AppError::NotFound);
@@ -452,7 +463,7 @@ pub async fn create_status(
 
         let should_federate_create = should_federate_to_followers(&status.visibility);
         let create_delivery_targets = if should_federate_create {
-            match state.db.get_follower_inboxes().await {
+            match account_service.get_follower_inboxes().await {
                 Ok(follower_inboxes) => follower_inboxes,
                 Err(error) => {
                     tracing::warn!(
@@ -470,12 +481,6 @@ pub async fn create_status(
         let db_timer = DB_QUERY_DURATION_SECONDS
             .with_label_values(&["INSERT", "statuses"])
             .start_timer();
-        let status_service = StatusService::new(
-            state.db.clone(),
-            state.timeline_cache.clone(),
-            state.storage.clone(),
-            state.config.server.base_url().to_string(),
-        );
         status_service
             .persist_local_status_with_media_and_poll(
                 &status,
@@ -541,7 +546,7 @@ pub async fn create_status(
         }
 
         let media_attachments_value = if !media_ids.is_empty() {
-            let media_attachments = state.db.get_media_by_status(&status.id).await?;
+            let media_attachments = status_service.get_media_by_status(&status.id).await?;
             let values: Vec<serde_json::Value> = media_attachments
                 .into_iter()
                 .map(|attachment| {
@@ -574,9 +579,9 @@ pub async fn create_status(
 
         let poll_value = if poll.is_some() {
             if let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
-                state.db.get_poll_by_status_id(&status.id).await?
+                status_service.get_poll_by_status_id(&status.id).await?
             {
-                let options = state.db.get_poll_options(&poll_id).await?;
+                let options = status_service.get_poll_options(&poll_id).await?;
                 let options_response: Vec<serde_json::Value> = options
                     .into_iter()
                     .map(|(_, title, option_votes_count)| {
@@ -634,8 +639,7 @@ pub async fn create_status(
         Ok(response_value) => response_value,
         Err(error) => {
             if let Some(key) = reserved_idempotency_key.as_deref() {
-                let _ = state
-                    .db
+                let _ = status_service
                     .clear_pending_idempotency_key(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key)
                     .await;
             }
@@ -644,8 +648,7 @@ pub async fn create_status(
     };
 
     if let Some(key) = reserved_idempotency_key.as_deref() {
-        state
-            .db
+        status_service
             .store_idempotency_response(CREATE_STATUS_IDEMPOTENCY_ENDPOINT, key, &response_value)
             .await?;
     }
@@ -668,12 +671,7 @@ pub async fn get_status(
         .with_label_values(&["GET", "/api/v1/statuses/:id"])
         .start_timer();
 
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get status from database
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -690,7 +688,7 @@ pub async fn get_status(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
@@ -730,12 +728,7 @@ pub async fn delete_status(
         .with_label_values(&["DELETE", "/api/v1/statuses/:id"])
         .start_timer();
 
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get status to verify it exists and is local
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -751,7 +744,7 @@ pub async fn delete_status(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
@@ -769,7 +762,7 @@ pub async fn delete_status(
 
     let should_federate_delete = should_federate_to_followers(&status.visibility);
     if should_federate_delete {
-        match state.db.get_follower_inboxes().await {
+        match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                 let delivery = build_delivery(&state, &account);
                 let status_uri = status.uri.clone();
@@ -822,13 +815,14 @@ pub async fn get_status_context(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::ContextResponse;
+    let status_service = build_status_service(&state);
 
     // Get the status to verify it exists
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
     ensure_public_visibility_for_public_endpoint(&status.visibility)?;
 
     // Get account
-    let _account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let _account = build_account_service(&state).get_account().await?;
 
     // TODO: Implement proper reply tree traversal
     // For now, return empty ancestors and descendants
@@ -850,8 +844,10 @@ pub async fn get_reblogged_by(
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get the status to verify it exists
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
     ensure_public_visibility_for_public_endpoint(&status.visibility)?;
 
     // For single-user instance, only the owner can reblog
@@ -868,17 +864,19 @@ pub async fn get_favourited_by(
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get the status to verify it exists
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
     ensure_public_visibility_for_public_endpoint(&status.visibility)?;
 
     // For single-user instance, only the owner can favourite
     // Check if the status is favourited by the owner
-    let is_favourited = state.db.is_favourited(&id).await?;
+    let is_favourited = status_service.is_favourited(&id).await?;
 
     if is_favourited {
         // Return the owner's account
-        let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+        let account = build_account_service(&state).get_account().await?;
 
         let account_response = crate::api::account_to_response(&account, &state.config);
         Ok(Json(vec![serde_json::to_value(account_response).unwrap()]))
@@ -894,8 +892,10 @@ pub async fn get_status_source(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get the status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Only allow getting source for local statuses
     if !status.is_local {
@@ -919,15 +919,10 @@ pub async fn favourite_status(
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // Get status and add favourite.
     let (status, favourite_id) = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -978,32 +973,27 @@ pub async fn unfavourite_status(
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
         status_service.get_by_uri(uri).await?
     } else {
         status_service.get(&id).await?
     };
-    let like_activity_uri = state
-        .db
-        .get_favourite_id(&status.id)
-        .await?
-        .map(|favourite_id| {
-            format!(
-                "{}/like/{}",
-                local_actor_uri(&state, &account.username),
-                favourite_id
-            )
-        });
+    let like_activity_uri =
+        status_service
+            .get_favourite_id(&status.id)
+            .await?
+            .map(|favourite_id| {
+                format!(
+                    "{}/like/{}",
+                    local_actor_uri(&state, &account.username),
+                    favourite_id
+                )
+            });
     status_service.unfavourite_loaded(&status).await?;
     let status_id = status.id.clone();
 
@@ -1052,24 +1042,22 @@ pub async fn reblog_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::EntityId;
 
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     let action_uri = resolve_action_uri(&id, &params)?;
     let (status, repost_uri) = if let Some(uri) = action_uri {
         let status = status_service.repost(uri).await?;
-        let repost_uri = state.db.get_repost_uri(&status.id).await?.ok_or_else(|| {
-            AppError::Internal(anyhow::anyhow!(
-                "repost URI missing after creating repost activity"
-            ))
-        })?;
+        let repost_uri = status_service
+            .get_repost_uri(&status.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!(
+                    "repost URI missing after creating repost activity"
+                ))
+            })?;
         (status, repost_uri)
     } else {
         // Create repost record
@@ -1087,7 +1075,7 @@ pub async fn reblog_status(
 
     let should_federate_reblog = should_federate_to_followers(&status.visibility);
     if should_federate_reblog {
-        match state.db.get_follower_inboxes().await {
+        match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                 let delivery = build_delivery(&state, &account);
                 let announce_activity_uri = repost_uri.clone();
@@ -1139,15 +1127,10 @@ pub async fn unreblog_status(
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     let action_uri = resolve_action_uri(&id, &params)?;
     let status = if let Some(uri) = action_uri {
@@ -1155,7 +1138,7 @@ pub async fn unreblog_status(
     } else {
         status_service.get(&id).await?
     };
-    let repost_uri = state.db.get_repost_uri(&status.id).await?;
+    let repost_uri = status_service.get_repost_uri(&status.id).await?;
     if let Some(uri) = action_uri {
         status_service.unrepost(uri).await?;
     } else {
@@ -1166,7 +1149,7 @@ pub async fn unreblog_status(
     if let Some(repost_uri) = repost_uri {
         let should_federate_unreblog = should_federate_to_followers(&status.visibility);
         if should_federate_unreblog {
-            match state.db.get_follower_inboxes().await {
+            match build_account_service(&state).get_follower_inboxes().await {
                 Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                     let delivery = build_delivery(&state, &account);
                     spawn_best_effort_batch_delivery("unreblog_status", async move {
@@ -1211,15 +1194,10 @@ pub async fn bookmark_status(
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // Get status and add bookmark.
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -1249,15 +1227,10 @@ pub async fn unbookmark_status(
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.config.server.base_url().to_string(),
-    );
+    let status_service = build_status_service(&state);
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // Get status and remove bookmark.
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -1302,8 +1275,10 @@ pub async fn update_status(
     Path(id): Path<String>,
     Json(req): Json<UpdateStatusRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get the status
-    let mut status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let mut status = status_service.get(&id).await?;
 
     // Only allow editing local statuses
     if !status.is_local {
@@ -1311,7 +1286,7 @@ pub async fn update_status(
     }
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // Update fields if provided
     if let Some(content) = req.status {
@@ -1329,16 +1304,16 @@ pub async fn update_status(
 
     // Save updated status
     // Note: In a full implementation, we would create a new version in an edit_history table.
-    state.db.update_status(&status).await?;
+    status_service.update_loaded(&status).await?;
 
     // Return updated status
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1353,11 +1328,13 @@ pub async fn get_status_history(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get the status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // For now, return only the current version
     // In a full implementation, we would query an edit_history table
@@ -1382,8 +1359,10 @@ pub async fn pin_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Only allow pinning local statuses
     if !status.is_local {
@@ -1393,7 +1372,7 @@ pub async fn pin_status(
     }
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // TODO: Store pinned status in database
     // For now, just return the status with pinned=true
@@ -1401,9 +1380,9 @@ pub async fn pin_status(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1418,11 +1397,13 @@ pub async fn unpin_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // TODO: Remove pinned status from database
     // For now, just return the status with pinned=false
@@ -1430,9 +1411,9 @@ pub async fn unpin_status(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1448,11 +1429,13 @@ pub async fn mute_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // TODO: Store muted conversation in database
     // For now, just return the status with muted=true
@@ -1460,9 +1443,9 @@ pub async fn mute_status(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1477,11 +1460,13 @@ pub async fn unmute_status(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let status_service = build_status_service(&state);
+
     // Get status
-    let status = state.db.get_status(&id).await?.ok_or(AppError::NotFound)?;
+    let status = status_service.get(&id).await?;
 
     // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account = build_account_service(&state).get_account().await?;
 
     // TODO: Remove muted conversation from database
     // For now, just return the status with muted=false
@@ -1489,9 +1474,9 @@ pub async fn unmute_status(
         &status,
         &account,
         &state.config,
-        state.db.is_favourited(&id).await.ok(),
+        status_service.is_favourited(&id).await.ok(),
         Some(false),
-        state.db.is_bookmarked(&id).await.ok(),
+        status_service.is_bookmarked(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
