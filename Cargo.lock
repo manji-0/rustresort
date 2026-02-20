@@ -3529,6 +3529,7 @@ dependencies = [
 name = "rustresort"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ammonia",
  "anyhow",
  "aws-sdk-s3",

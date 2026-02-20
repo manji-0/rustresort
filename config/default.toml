@@ -37,6 +37,11 @@ bucket = "rustresort-backup"
 interval_seconds = 86400  # 24 hours
 retention_count = 7
 
+[storage.backup.encryption]
+enabled = false
+# Base64-encoded 32-byte AES-256-GCM key
+# key = "base64-encoded-32-byte-key"
+
 [cloudflare]
 account_id = "your-account-id"
 r2_access_key_id = "your-access-key-id"

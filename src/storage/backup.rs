@@ -3,14 +3,97 @@
 //! Handles automatic and manual database backups.
 //! Uses SQLite's online backup API for safe backups.
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use aws_sdk_s3::Client as S3Client;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::BackupStorageConfig;
 use crate::error::AppError;
 use crate::storage::build_r2_http_client;
+
+const AES_256_KEY_BYTES: usize = 32;
+const AES_GCM_NONCE_BYTES: usize = 12;
+const ENCRYPTED_BACKUP_SUFFIX: &str = ".enc";
+
+fn parse_backup_encryption_key(config: &BackupStorageConfig) -> Result<Option<Vec<u8>>, AppError> {
+    if !config.encryption.enabled {
+        return Ok(None);
+    }
+
+    let raw_key = config
+        .encryption
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Config(
+                "storage.backup.encryption.key is required when backup encryption is enabled"
+                    .to_string(),
+            )
+        })?;
+
+    let key = BASE64_STANDARD.decode(raw_key).map_err(|_| {
+        AppError::Config(
+            "storage.backup.encryption.key must be valid base64-encoded bytes".to_string(),
+        )
+    })?;
+    if key.len() != AES_256_KEY_BYTES {
+        return Err(AppError::Config(format!(
+            "storage.backup.encryption.key must decode to {} bytes",
+            AES_256_KEY_BYTES
+        )));
+    }
+
+    Ok(Some(key))
+}
+
+fn encrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
+        AppError::Encryption(format!(
+            "invalid backup encryption key length (expected {} bytes)",
+            AES_256_KEY_BYTES
+        ))
+    })?;
+
+    let mut nonce = [0_u8; AES_GCM_NONCE_BYTES];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let nonce_value = Nonce::from_slice(&nonce);
+    let ciphertext = cipher
+        .encrypt(nonce_value, data)
+        .map_err(|_| AppError::Encryption("backup encryption failed".to_string()))?;
+
+    let mut out = Vec::with_capacity(AES_GCM_NONCE_BYTES + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    if data.len() <= AES_GCM_NONCE_BYTES {
+        return Err(AppError::Encryption(
+            "encrypted backup payload is too short".to_string(),
+        ));
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
+        AppError::Encryption(format!(
+            "invalid backup encryption key length (expected {} bytes)",
+            AES_256_KEY_BYTES
+        ))
+    })?;
+
+    let (nonce, ciphertext) = data.split_at(AES_GCM_NONCE_BYTES);
+    let nonce_value = Nonce::from_slice(nonce);
+    cipher
+        .decrypt(nonce_value, ciphertext)
+        .map_err(|_| AppError::Encryption("backup decryption failed".to_string()))
+}
 
 /// Backup service for SQLite database
 ///
@@ -81,6 +164,7 @@ impl BackupService {
             .build();
 
         let client = S3Client::from_conf(s3_config);
+        let encryption_key = parse_backup_encryption_key(config)?;
 
         Ok(Self {
             client,
@@ -88,7 +172,7 @@ impl BackupService {
             db_path,
             interval: Duration::from_secs(config.interval_seconds),
             retention_count: config.retention_count,
-            encryption_key: None, // TODO: Implement encryption
+            encryption_key,
         })
     }
 
@@ -130,16 +214,16 @@ impl BackupService {
 
         tracing::debug!(size = data.len(), "Database read successfully");
 
-        // 2. Optionally encrypt (TODO: implement encryption)
-        let backup_data = if self.encryption_key.is_some() {
-            // self.encrypt(&data)?
-            data // For now, skip encryption
+        // 2. Optionally encrypt
+        let encrypt_backup = self.encryption_key.is_some();
+        let backup_data = if let Some(key) = self.encryption_key.as_deref() {
+            self.encrypt(key, &data)?
         } else {
             data
         };
 
         // 3. Upload to R2
-        let key = self.upload_backup(backup_data).await?;
+        let key = self.upload_backup(backup_data, encrypt_backup).await?;
 
         // 4. Cleanup old backups
         if let Err(e) = self.cleanup_old_backups().await {
@@ -177,10 +261,8 @@ impl BackupService {
     ///
     /// # Returns
     /// nonce (12 bytes) + ciphertext
-    fn encrypt(&self, _data: &[u8]) -> Result<Vec<u8>, AppError> {
-        Err(AppError::NotImplemented(
-            "backup encryption is not implemented yet".to_string(),
-        ))
+    fn encrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+        encrypt_backup_payload(key, data)
     }
 
     /// Decrypt backup data
@@ -190,10 +272,8 @@ impl BackupService {
     ///
     /// # Returns
     /// Decrypted data
-    fn decrypt(&self, _data: &[u8]) -> Result<Vec<u8>, AppError> {
-        Err(AppError::NotImplemented(
-            "backup decryption is not implemented yet".to_string(),
-        ))
+    fn decrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+        decrypt_backup_payload(key, data)
     }
 
     /// Upload backup to R2
@@ -203,18 +283,32 @@ impl BackupService {
     ///
     /// # Returns
     /// S3 key of the uploaded file
-    async fn upload_backup(&self, data: Vec<u8>) -> Result<String, AppError> {
+    async fn upload_backup(&self, data: Vec<u8>, encrypted: bool) -> Result<String, AppError> {
         use aws_sdk_s3::primitives::ByteStream;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let key = format!("backups/rustresort_{}.db", timestamp);
+        let suffix = if encrypted {
+            format!("db{}", ENCRYPTED_BACKUP_SUFFIX)
+        } else {
+            "db".to_string()
+        };
+        let key = format!("backups/rustresort_{}.{}", timestamp, suffix);
 
-        self.client
+        let mut request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(ByteStream::from(data))
-            .content_type("application/x-sqlite3")
+            .body(ByteStream::from(data));
+        request = if encrypted {
+            request
+                .content_type("application/octet-stream")
+                .metadata("encryption", "aes-256-gcm-v1")
+        } else {
+            request.content_type("application/x-sqlite3")
+        };
+
+        request
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("Backup upload failed: {}", e)))?;
@@ -313,12 +407,83 @@ impl BackupService {
 
         let bytes = data.into_bytes().to_vec();
 
-        // Decrypt if encrypted
-        if self.encryption_key.is_some() {
-            // self.decrypt(&bytes)
-            Ok(bytes) // For now, skip decryption
+        if key.ends_with(ENCRYPTED_BACKUP_SUFFIX) {
+            let encryption_key = self.encryption_key.as_deref().ok_or_else(|| {
+                AppError::Encryption(
+                    "backup is encrypted but no backup encryption key is configured".to_string(),
+                )
+            })?;
+            self.decrypt(encryption_key, &bytes)
         } else {
             Ok(bytes)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AES_256_KEY_BYTES, decrypt_backup_payload, encrypt_backup_payload,
+        parse_backup_encryption_key,
+    };
+    use crate::config::{BackupEncryptionConfig, BackupStorageConfig};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+    fn backup_config(enabled: bool, key: Option<String>) -> BackupStorageConfig {
+        BackupStorageConfig {
+            enabled: false,
+            bucket: "test-backup".to_string(),
+            interval_seconds: 86400,
+            retention_count: 7,
+            encryption: BackupEncryptionConfig { enabled, key },
+        }
+    }
+
+    #[test]
+    fn parse_backup_encryption_key_accepts_valid_base64_32byte_key() {
+        let key_bytes = vec![7_u8; AES_256_KEY_BYTES];
+        let config = backup_config(true, Some(BASE64_STANDARD.encode(&key_bytes)));
+
+        let parsed = parse_backup_encryption_key(&config).unwrap().unwrap();
+        assert_eq!(parsed, key_bytes);
+    }
+
+    #[test]
+    fn parse_backup_encryption_key_rejects_missing_key_when_enabled() {
+        let config = backup_config(true, None);
+        let error = parse_backup_encryption_key(&config).unwrap_err();
+        assert!(matches!(error, crate::error::AppError::Config(_)));
+    }
+
+    #[test]
+    fn parse_backup_encryption_key_rejects_non_base64() {
+        let config = backup_config(true, Some("not-base64".to_string()));
+        let error = parse_backup_encryption_key(&config).unwrap_err();
+        assert!(matches!(error, crate::error::AppError::Config(_)));
+    }
+
+    #[test]
+    fn parse_backup_encryption_key_rejects_wrong_length() {
+        let short_key = BASE64_STANDARD.encode([1_u8; 16]);
+        let config = backup_config(true, Some(short_key));
+        let error = parse_backup_encryption_key(&config).unwrap_err();
+        assert!(matches!(error, crate::error::AppError::Config(_)));
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip_succeeds() {
+        let key = vec![9_u8; AES_256_KEY_BYTES];
+        let payload = b"sqlite backup payload".to_vec();
+
+        let encrypted = encrypt_backup_payload(&key, &payload).unwrap();
+        let decrypted = decrypt_backup_payload(&key, &encrypted).unwrap();
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn decrypt_rejects_short_payload() {
+        let key = vec![9_u8; AES_256_KEY_BYTES];
+        let error = decrypt_backup_payload(&key, &[0_u8; 8]).unwrap_err();
+        assert!(matches!(error, crate::error::AppError::Encryption(_)));
     }
 }

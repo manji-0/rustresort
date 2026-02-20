@@ -166,6 +166,19 @@ pub struct BackupStorageConfig {
     pub interval_seconds: u64,
     /// Number of backup generations to keep
     pub retention_count: usize,
+    /// Optional client-side backup encryption.
+    #[serde(default)]
+    pub encryption: BackupEncryptionConfig,
+}
+
+/// Backup encryption configuration
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BackupEncryptionConfig {
+    /// Enable AES-256-GCM encryption for backup payloads.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base64-encoded 32-byte encryption key.
+    pub key: Option<String>,
 }
 
 /// Cloudflare credentials
@@ -275,6 +288,7 @@ impl AppConfig {
             .set_default("storage.backup.enabled", false)?
             .set_default("storage.backup.interval_seconds", 86400)?
             .set_default("storage.backup.retention_count", 7)?
+            .set_default("storage.backup.encryption.enabled", false)?
             .set_default("auth.session_max_age", 604800)?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "pretty")?

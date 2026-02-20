@@ -38,6 +38,11 @@
 # interval_seconds = 86400
 # retention_count = 7
 
+[storage.backup.encryption]
+# enabled = false
+# Base64-encoded 32-byte AES-256-GCM key
+# key = "base64-encoded-32-byte-key"
+
 [cloudflare]
 # For local development with MinIO, use these settings:
 # account_id = "minioadmin"

@@ -44,6 +44,7 @@ impl TestServer {
                     bucket: "test-backup".to_string(),
                     interval_seconds: 86400,
                     retention_count: 7,
+                    encryption: config::BackupEncryptionConfig::default(),
                 },
             },
             cloudflare: config::CloudflareConfig {

@@ -45,6 +45,7 @@ rsa = "0.9"
 sha2 = "0.10"
 base64 = "0.21"
 hmac = "0.12"
+aes-gcm = "0.10"
 rand = "0.8"
 
 # HTTP client
