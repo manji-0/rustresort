@@ -1350,9 +1350,13 @@ mod tests {
     #[test]
     fn profile_ttl_conversion_is_bounded() {
         assert_eq!(ttl_seconds_to_millis(1), 1000);
+        let max_ttl_seconds = (i64::MAX as u64) / 1000;
         let bounded = ttl_seconds_to_millis(u64::MAX);
         assert!(bounded > 0);
-        assert!(bounded <= i64::MAX);
+        assert_eq!(bounded, ttl_seconds_to_millis(max_ttl_seconds));
+        if max_ttl_seconds < u64::MAX {
+            assert_eq!(bounded, ttl_seconds_to_millis(max_ttl_seconds + 1));
+        }
     }
 
     #[tokio::test]

@@ -10,9 +10,9 @@ use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 use crate::metrics::{
-    DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
-    HTTP_REQUESTS_TOTAL, MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL,
+    HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL, MEDIA_BYTES_UPLOADED, MEDIA_UPLOADS_TOTAL,
 };
+use crate::service::StatusService;
 
 const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES: usize = 40 * 1024 * 1024;
@@ -52,16 +52,12 @@ pub async fn upload_media(
     CurrentUser(_session): CurrentUser,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::data::{EntityId, MediaAttachment};
-    use chrono::Utc;
-
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&["POST", "/api/v1/media"])
         .start_timer();
 
     let mut file_data: Option<Vec<u8>> = None;
-    let mut filename: Option<String> = None;
     let mut content_type: Option<String> = None;
     let mut description: Option<String> = None;
 
@@ -75,7 +71,6 @@ pub async fn upload_media(
 
         match field_name.as_str() {
             "file" => {
-                filename = field.file_name().map(|s| s.to_string());
                 let detected_content_type =
                     field
                         .content_type()
@@ -119,7 +114,6 @@ pub async fn upload_media(
     }
 
     let file_data = file_data.ok_or(AppError::Validation("No file provided".to_string()))?;
-    let filename = filename.ok_or(AppError::Validation("No filename provided".to_string()))?;
     let content_type = content_type.ok_or(AppError::Validation(
         "Missing content type for uploaded file".to_string(),
     ))?;
@@ -140,76 +134,35 @@ pub async fn upload_media(
         )));
     }
 
-    // Generate media ID
-    let media_id = EntityId::new().0;
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+        state.config.server.base_url().to_string(),
+    );
+    let media = status_service
+        .upload_media(file_data, content_type, description)
+        .await?;
+
+    let url = state.storage.get_public_url(&media.s3_key);
+    let thumbnail_url = media
+        .thumbnail_s3_key
+        .as_ref()
+        .map(|thumb_key| state.storage.get_public_url(thumb_key))
+        .unwrap_or_else(|| url.clone());
+
+    // Update media metrics
+    MEDIA_UPLOADS_TOTAL.inc();
+    MEDIA_BYTES_UPLOADED.inc_by(media.file_size as f64);
 
     // Determine media type
-    let media_type = if content_type.starts_with("image/") {
+    let media_type = if media.content_type.starts_with("image/") {
         "image"
-    } else if content_type.starts_with("video/") {
+    } else if media.content_type.starts_with("video/") {
         "video"
     } else {
         "unknown"
     };
-
-    // Generate file path for R2 storage
-    let file_extension = filename.split('.').last().unwrap_or("bin");
-    let s3_key = format!("media/{}.{}", media_id, file_extension);
-
-    // Upload to R2 storage
-    let url = state
-        .storage
-        .upload(&s3_key, file_data.clone(), &content_type)
-        .await
-        .map_err(|e| AppError::Storage(format!("Failed to upload media: {}", e)))?;
-
-    // TODO: Generate thumbnail for images
-    let thumbnail_s3_key = None;
-    let thumbnail_url = url.clone();
-
-    // Create media attachment record
-    let media = MediaAttachment {
-        id: media_id.clone(),
-        status_id: None, // Not yet attached to a status
-        s3_key: s3_key.clone(),
-        thumbnail_s3_key,
-        content_type: content_type.clone(),
-        file_size: file_data.len() as i64,
-        description: description.clone(),
-        blurhash: None, // TODO: Generate blurhash
-        width: None,    // TODO: Extract image/video dimensions
-        height: None,
-        created_at: Utc::now(),
-    };
-
-    // Save to database
-    let db_timer = DB_QUERY_DURATION_SECONDS
-        .with_label_values(&["INSERT", "media"])
-        .start_timer();
-    if let Err(error) = state.db.insert_media(&media).await {
-        db_timer.observe_duration();
-        tracing::warn!(
-            s3_key = %s3_key,
-            %error,
-            "Media metadata insert failed; deleting uploaded object"
-        );
-        if let Err(cleanup_error) = state.storage.delete(&s3_key).await {
-            tracing::warn!(
-                s3_key = %s3_key,
-                %cleanup_error,
-                "Failed to cleanup uploaded media object after DB insert failure"
-            );
-        }
-        return Err(error);
-    }
-    DB_QUERIES_TOTAL
-        .with_label_values(&["INSERT", "media"])
-        .inc();
-    db_timer.observe_duration();
-
-    // Update media metrics
-    MEDIA_UPLOADS_TOTAL.inc();
-    MEDIA_BYTES_UPLOADED.inc_by(file_data.len() as f64);
 
     // Return response
     let response = MediaAttachmentResponse {
