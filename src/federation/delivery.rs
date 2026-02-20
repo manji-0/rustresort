@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha256};
+
 use crate::data::Account;
 use crate::error::AppError;
 
@@ -92,6 +95,12 @@ fn build_undo_object(
         object.insert("object".to_string(), serde_json::json!(activity_object));
     }
     serde_json::Value::Object(object)
+}
+
+fn block_activity_uri(actor_uri: &str, target_actor_uri: &str) -> String {
+    let digest = Sha256::digest(target_actor_uri.as_bytes());
+    let suffix = URL_SAFE_NO_PAD.encode(digest);
+    format!("{}/block/{}", actor_uri, suffix)
 }
 
 impl ActivityDelivery {
@@ -282,6 +291,44 @@ impl ActivityDelivery {
         tracing::info!(
             "Sent Follow {} to {} for {}",
             follow_activity_uri,
+            target_inbox_uri,
+            target_actor_uri
+        );
+
+        Ok(())
+    }
+
+    /// Compute deterministic Block activity URI for a target actor.
+    pub fn block_activity_uri_for_target(&self, target_actor_uri: &str) -> String {
+        block_activity_uri(&self.actor_uri, target_actor_uri)
+    }
+
+    /// Send Block activity.
+    pub async fn send_block(
+        &self,
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<String, AppError> {
+        let block_activity_uri = self.block_activity_uri_for_target(target_actor_uri);
+        self.send_block_with_id(&block_activity_uri, target_actor_uri, target_inbox_uri)
+            .await?;
+        Ok(block_activity_uri)
+    }
+
+    /// Send Block activity with explicit activity URI.
+    pub async fn send_block_with_id(
+        &self,
+        block_activity_uri: &str,
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let activity = builder::block(block_activity_uri, &self.actor_uri, target_actor_uri);
+
+        self.deliver_to_inbox(target_inbox_uri, activity).await?;
+
+        tracing::info!(
+            "Sent Block {} to {} for {}",
+            block_activity_uri,
             target_inbox_uri,
             target_actor_uri
         );
@@ -612,6 +659,17 @@ pub mod builder {
         })
     }
 
+    /// Build a Block activity.
+    pub fn block(id: &str, actor: &str, object: &str) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Block",
+            "id": id,
+            "actor": actor,
+            "object": object
+        })
+    }
+
     /// Build an Accept activity
     ///
     /// # Arguments
@@ -810,7 +868,9 @@ pub mod builder {
 
 #[cfg(test)]
 mod tests {
-    use super::{audience_for_visibility, build_undo_object, unique_inbox_targets};
+    use super::{
+        audience_for_visibility, block_activity_uri, build_undo_object, unique_inbox_targets,
+    };
 
     #[test]
     fn unique_inbox_targets_keeps_distinct_personal_inboxes_on_same_domain() {
@@ -892,5 +952,33 @@ mod tests {
         assert_eq!(undo_object["type"], "Follow");
         assert_eq!(undo_object["id"], "https://local.example/follow/1");
         assert_eq!(undo_object["object"], "https://remote.example/users/alice");
+    }
+
+    #[test]
+    fn block_activity_uri_is_deterministic_and_target_specific() {
+        let actor_uri = "https://local.example/users/alice";
+        let target_a = "https://remote.example/users/bob";
+        let target_b = "https://remote.example/users/carol";
+
+        let first = block_activity_uri(actor_uri, target_a);
+        let second = block_activity_uri(actor_uri, target_a);
+        let third = block_activity_uri(actor_uri, target_b);
+
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+        assert!(first.starts_with("https://local.example/users/alice/block/"));
+    }
+
+    #[test]
+    fn builder_block_has_activitypub_fields() {
+        let activity = super::builder::block(
+            "https://local.example/block/1",
+            "https://local.example/users/alice",
+            "https://remote.example/users/bob",
+        );
+        assert_eq!(activity["type"], "Block");
+        assert_eq!(activity["id"], "https://local.example/block/1");
+        assert_eq!(activity["actor"], "https://local.example/users/alice");
+        assert_eq!(activity["object"], "https://remote.example/users/bob");
     }
 }

@@ -2207,30 +2207,30 @@ impl Database {
         &self,
         target_address: &str,
         default_port: Option<u16>,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let existing_blocks =
             sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
                 .fetch_all(&self.pool)
                 .await?;
-        let stored_target_address =
+        let existing_match =
             find_matching_addresses(&existing_blocks, target_address, default_port)
                 .into_iter()
-                .next()
-                .unwrap_or_else(|| target_address.to_string());
-
-        let id = EntityId::new().0;
-        sqlx::query(
-            "INSERT OR REPLACE INTO account_blocks (id, target_address, created_at) VALUES (?, ?, datetime('now'))",
-        )
-        .bind(&id)
-        .bind(&stored_target_address)
-        .execute(&self.pool)
-        .await?;
+                .next();
+        if existing_match.is_none() {
+            let id = EntityId::new().0;
+            sqlx::query(
+                "INSERT INTO account_blocks (id, target_address, created_at) VALUES (?, ?, datetime('now'))",
+            )
+            .bind(&id)
+            .bind(target_address)
+            .execute(&self.pool)
+            .await?;
+        }
 
         // Also remove any existing equivalent follow relationship.
         self.delete_follow(target_address, default_port).await?;
 
-        Ok(())
+        Ok(existing_match.is_none())
     }
 
     /// Unblock an account
@@ -2238,20 +2238,23 @@ impl Database {
         &self,
         target_address: &str,
         default_port: Option<u16>,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let existing_blocks =
             sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
                 .fetch_all(&self.pool)
                 .await?;
         let matches = find_matching_addresses(&existing_blocks, target_address, default_port);
+        let mut removed = false;
         for existing in matches {
-            sqlx::query("DELETE FROM account_blocks WHERE target_address COLLATE NOCASE = ?")
-                .bind(existing)
-                .execute(&self.pool)
-                .await?;
+            let result =
+                sqlx::query("DELETE FROM account_blocks WHERE target_address COLLATE NOCASE = ?")
+                    .bind(existing)
+                    .execute(&self.pool)
+                    .await?;
+            removed |= result.rows_affected() > 0;
         }
 
-        Ok(())
+        Ok(removed)
     }
 
     /// Check if account is blocked

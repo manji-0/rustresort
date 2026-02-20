@@ -688,9 +688,11 @@ async fn test_block_account_removes_follow_for_default_port_variant() {
     };
     db.insert_follow(&follow).await.unwrap();
 
-    db.block_account("alice@remote.example", Some(443))
-        .await
-        .unwrap();
+    assert!(
+        db.block_account("alice@remote.example", Some(443))
+            .await
+            .unwrap()
+    );
 
     let follow_addresses = db.get_all_follow_addresses().await.unwrap();
     assert!(follow_addresses.is_empty());
@@ -699,6 +701,25 @@ async fn test_block_account_removes_follow_for_default_port_variant() {
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_block_account_returns_false_when_address_variant_already_blocked() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    assert!(
+        db.block_account("alice@remote.example", Some(443))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.block_account("alice@remote.example:443", Some(443))
+            .await
+            .unwrap()
+    );
+
+    let blocked_accounts = db.get_blocked_accounts(10).await.unwrap();
+    assert_eq!(blocked_accounts, vec!["alice@remote.example".to_string()]);
 }
 
 #[tokio::test]
