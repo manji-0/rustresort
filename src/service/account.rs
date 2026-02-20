@@ -42,6 +42,11 @@ impl AccountService {
         self.db.get_account().await?.ok_or(AppError::NotFound)
     }
 
+    /// Get follower inbox URIs for outbound federation fan-out.
+    pub async fn get_follower_inboxes(&self) -> Result<Vec<String>, AppError> {
+        self.db.get_follower_inboxes().await
+    }
+
     /// Initialize the admin account
     ///
     /// Creates a new account with generated RSA keypair.
