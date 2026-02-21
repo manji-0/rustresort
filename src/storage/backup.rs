@@ -21,7 +21,7 @@ const AES_GCM_NONCE_BYTES: usize = 12;
 const ENCRYPTED_BACKUP_SUFFIX: &str = ".enc";
 
 fn parse_backup_encryption_key(config: &BackupStorageConfig) -> Result<Option<Vec<u8>>, AppError> {
-    if !config.encryption.enabled {
+    if !config.enabled || !config.encryption.enabled {
         return Ok(None);
     }
 
@@ -429,20 +429,27 @@ mod tests {
     use crate::config::{BackupEncryptionConfig, BackupStorageConfig};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
-    fn backup_config(enabled: bool, key: Option<String>) -> BackupStorageConfig {
+    fn backup_config(
+        backup_enabled: bool,
+        encryption_enabled: bool,
+        key: Option<String>,
+    ) -> BackupStorageConfig {
         BackupStorageConfig {
-            enabled: false,
+            enabled: backup_enabled,
             bucket: "test-backup".to_string(),
             interval_seconds: 86400,
             retention_count: 7,
-            encryption: BackupEncryptionConfig { enabled, key },
+            encryption: BackupEncryptionConfig {
+                enabled: encryption_enabled,
+                key,
+            },
         }
     }
 
     #[test]
     fn parse_backup_encryption_key_accepts_valid_base64_32byte_key() {
         let key_bytes = vec![7_u8; AES_256_KEY_BYTES];
-        let config = backup_config(true, Some(BASE64_STANDARD.encode(&key_bytes)));
+        let config = backup_config(true, true, Some(BASE64_STANDARD.encode(&key_bytes)));
 
         let parsed = parse_backup_encryption_key(&config).unwrap().unwrap();
         assert_eq!(parsed, key_bytes);
@@ -450,14 +457,14 @@ mod tests {
 
     #[test]
     fn parse_backup_encryption_key_rejects_missing_key_when_enabled() {
-        let config = backup_config(true, None);
+        let config = backup_config(true, true, None);
         let error = parse_backup_encryption_key(&config).unwrap_err();
         assert!(matches!(error, crate::error::AppError::Config(_)));
     }
 
     #[test]
     fn parse_backup_encryption_key_rejects_non_base64() {
-        let config = backup_config(true, Some("not-base64".to_string()));
+        let config = backup_config(true, true, Some("not-base64".to_string()));
         let error = parse_backup_encryption_key(&config).unwrap_err();
         assert!(matches!(error, crate::error::AppError::Config(_)));
     }
@@ -465,9 +472,16 @@ mod tests {
     #[test]
     fn parse_backup_encryption_key_rejects_wrong_length() {
         let short_key = BASE64_STANDARD.encode([1_u8; 16]);
-        let config = backup_config(true, Some(short_key));
+        let config = backup_config(true, true, Some(short_key));
         let error = parse_backup_encryption_key(&config).unwrap_err();
         assert!(matches!(error, crate::error::AppError::Config(_)));
+    }
+
+    #[test]
+    fn parse_backup_encryption_key_ignores_encryption_when_backup_is_disabled() {
+        let config = backup_config(false, true, Some("not-base64".to_string()));
+        let parsed = parse_backup_encryption_key(&config).unwrap();
+        assert!(parsed.is_none());
     }
 
     #[test]
