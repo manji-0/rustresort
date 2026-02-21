@@ -181,3 +181,205 @@ async fn test_timeline_with_since_id() {
         assert!(json.is_array());
     }
 }
+
+#[tokio::test]
+async fn test_muted_thread_is_hidden_from_public_timeline() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/thread-root".to_string(),
+        content: "<p>Thread root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let reply = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/thread-reply".to_string(),
+        content: "<p>Thread reply</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let other = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/other-thread".to_string(),
+        content: "<p>Other thread</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+    server.state.db.insert_status(&reply).await.unwrap();
+    server.state.db.insert_status(&other).await.unwrap();
+
+    let mute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mute_response.status(), 200);
+
+    let timeline_response = server
+        .client
+        .get(&server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+    let timeline_status = timeline_response.status();
+    let timeline_body = timeline_response.text().await.unwrap();
+    assert_eq!(timeline_status, 200, "timeline body: {}", timeline_body);
+    let timeline: Value = serde_json::from_str(&timeline_body).unwrap();
+    let ids: Vec<String> = timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+
+    assert!(!ids.contains(&root.id));
+    assert!(!ids.contains(&reply.id));
+    assert!(ids.contains(&other.id));
+}
+
+#[tokio::test]
+async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let base_time = Utc::now();
+    let visible_a = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/visible-a".to_string(),
+        content: "<p>Visible A</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+    let visible_b = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/visible-b".to_string(),
+        content: "<p>Visible B</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + Duration::seconds(1),
+        fetched_at: None,
+    };
+    let muted_root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/muted-root".to_string(),
+        content: "<p>Muted root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + Duration::seconds(2),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&visible_a).await.unwrap();
+    server.state.db.insert_status(&visible_b).await.unwrap();
+    server.state.db.insert_status(&muted_root).await.unwrap();
+
+    let mut mute_target_id = String::new();
+    for index in 0..21 {
+        let reply = Status {
+            id: EntityId::new().0,
+            uri: format!("https://test.example.com/status/muted-reply-{index}"),
+            content: format!("<p>Muted reply {index}</p>"),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: Some(muted_root.uri.clone()),
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: base_time + Duration::seconds((index + 3) as i64),
+            fetched_at: None,
+        };
+        mute_target_id = reply.id.clone();
+        server.state.db.insert_status(&reply).await.unwrap();
+    }
+
+    let mute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/mute", mute_target_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mute_response.status(), 200);
+
+    let timeline_response = server
+        .client
+        .get(&server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+    let timeline_status = timeline_response.status();
+    let timeline_body = timeline_response.text().await.unwrap();
+    assert_eq!(timeline_status, 200, "timeline body: {}", timeline_body);
+    let timeline: Value = serde_json::from_str(&timeline_body).unwrap();
+
+    let ids: Vec<String> = timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&visible_a.id));
+    assert!(ids.contains(&visible_b.id));
+    assert!(!ids.contains(&muted_root.id));
+    assert!(!ids.contains(&mute_target_id));
+}

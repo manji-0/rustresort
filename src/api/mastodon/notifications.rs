@@ -76,6 +76,8 @@ pub async fn get_notifications(
                 None,
                 None,
                 None,
+                None,
+                None,
             ))
         } else {
             None
@@ -148,6 +150,8 @@ pub async fn get_notification(
             &status,
             &account,
             &state.config,
+            None,
+            None,
             None,
             None,
             None,

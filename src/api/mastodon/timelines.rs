@@ -70,7 +70,9 @@ pub async fn home_timeline(
                 &state.config,
                 Some(item.favourited),
                 Some(item.reblogged),
+                None,
                 Some(item.bookmarked),
+                None,
             );
             serde_json::to_value(response).unwrap()
         })
@@ -132,7 +134,9 @@ pub async fn public_timeline(
                 &state.config,
                 Some(item.favourited),
                 Some(item.reblogged),
+                None,
                 Some(item.bookmarked),
+                None,
             );
             serde_json::to_value(response).unwrap()
         })

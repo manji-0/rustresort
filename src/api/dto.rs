@@ -59,7 +59,9 @@ pub struct StatusResponse {
     pub poll: Option<serde_json::Value>,
     pub favourited: Option<bool>,
     pub reblogged: Option<bool>,
+    pub muted: Option<bool>,
     pub bookmarked: Option<bool>,
+    pub pinned: Option<bool>,
 }
 
 /// Media attachment response

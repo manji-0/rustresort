@@ -98,7 +98,9 @@ pub fn status_to_response(
     config: &AppConfig,
     favourited: Option<bool>,
     reblogged: Option<bool>,
+    muted: Option<bool>,
     bookmarked: Option<bool>,
+    pinned: Option<bool>,
 ) -> StatusResponse {
     let base_url = config.server.base_url();
     let account_response = if status.is_local || status.account_address.trim().is_empty() {
@@ -140,7 +142,9 @@ pub fn status_to_response(
         poll: None,
         favourited,
         reblogged,
+        muted,
         bookmarked,
+        pinned,
     }
 }
 
@@ -281,6 +285,8 @@ mod tests {
             Some(true),
             Some(false),
             Some(false),
+            Some(false),
+            Some(false),
         );
 
         assert_eq!(response.id, "456");
@@ -291,7 +297,9 @@ mod tests {
         assert!(response.sensitive);
         assert_eq!(response.favourited, Some(true));
         assert_eq!(response.reblogged, Some(false));
+        assert_eq!(response.muted, Some(false));
         assert_eq!(response.bookmarked, Some(false));
+        assert_eq!(response.pinned, Some(false));
         assert_eq!(response.account.username, "testuser");
     }
 
@@ -329,12 +337,17 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None);
+        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
 
         assert_eq!(response.account.acct, "alice@remote.example");
         assert_eq!(
             response.account.created_at,
             chrono::DateTime::from_timestamp(0, 0).unwrap()
         );
+        assert_eq!(response.favourited, None);
+        assert_eq!(response.reblogged, None);
+        assert_eq!(response.muted, None);
+        assert_eq!(response.bookmarked, None);
+        assert_eq!(response.pinned, None);
     }
 }

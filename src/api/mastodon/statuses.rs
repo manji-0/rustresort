@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
 
 use super::accounts::PaginationParams;
 use super::federation_delivery::{
@@ -32,6 +33,8 @@ const MIN_POLL_EXPIRES_IN_SECONDS: i64 = 300;
 const MAX_POLL_EXPIRES_IN_SECONDS: i64 = 2_629_746;
 const IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS: u64 = 5_000;
 const IDEMPOTENCY_PENDING_RETRY_DELAY_MS: u64 = 50;
+const MAX_STATUS_CONTEXT_ANCESTORS: usize = 40;
+const MAX_STATUS_CONTEXT_DESCENDANTS: usize = 40;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateStatusPollRequest {
@@ -234,6 +237,56 @@ fn build_status_service(state: &AppState) -> StatusService {
 
 fn build_account_service(state: &AppState) -> AccountService {
     AccountService::new(state.db.clone(), state.storage.clone())
+}
+
+fn status_response_without_interaction_state(
+    state: &AppState,
+    account: &crate::data::Account,
+    status: &crate::data::Status,
+) -> crate::api::StatusResponse {
+    crate::api::status_to_response(status, account, &state.config, None, None, None, None, None)
+}
+
+fn status_content_to_source_text(content: &str) -> String {
+    // Convert common block separators before tag stripping so paragraph and line
+    // boundaries are preserved in source text output.
+    let normalized = content
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("</p>", "\n\n")
+        .replace("<p>", "");
+
+    let mut without_tags = String::with_capacity(normalized.len());
+    let mut in_tag = false;
+    for ch in normalized.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => without_tags.push(ch),
+            _ => {}
+        }
+    }
+
+    let decoded = html_escape::decode_html_entities(without_tags.trim()).into_owned();
+    let mut lines = decoded.lines().map(str::trim_end).peekable();
+    let mut output = String::new();
+    let mut previous_blank = false;
+    while let Some(line) = lines.next() {
+        let is_blank = line.trim().is_empty();
+        if is_blank {
+            if !previous_blank && lines.peek().is_some() {
+                output.push('\n');
+            }
+        } else {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(line);
+        }
+        previous_blank = is_blank;
+    }
+    output.trim().to_string()
 }
 
 /// Status source response
@@ -617,6 +670,8 @@ pub async fn create_status(
             Some(false),
             Some(false),
             Some(false),
+            Some(false),
+            Some(false),
         );
         let mut response_value = serde_json::to_value(response).map_err(|error| {
             AppError::Internal(anyhow::anyhow!(
@@ -694,20 +749,8 @@ pub async fn get_status(
         .inc();
     db_timer.observe_duration();
 
-    // Check if favourited/reblogged/bookmarked
-    let favourited = status_service.is_favourited(&id).await.ok();
-    let reblogged = status_service.is_reposted(&id).await.ok();
-    let bookmarked = status_service.is_bookmarked(&id).await.ok();
-
     // Convert to API response
-    let response = crate::api::status_to_response(
-        &status,
-        &account,
-        &state.config,
-        favourited,
-        reblogged,
-        bookmarked,
-    );
+    let response = status_response_without_interaction_state(&state, &account, &status);
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -799,6 +842,8 @@ pub async fn delete_status(
         Some(false),
         Some(false),
         Some(false),
+        Some(false),
+        Some(false),
     );
 
     // Record successful request
@@ -822,17 +867,77 @@ pub async fn get_status_context(
     ensure_public_visibility_for_public_endpoint(&status.visibility)?;
 
     // Get account
-    let _account = build_account_service(&state).get_account().await?;
+    let account = build_account_service(&state).get_account().await?;
 
-    // TODO: Implement proper reply tree traversal
-    // For now, return empty ancestors and descendants
-    // In a full implementation, we would:
-    // 1. Traverse up the reply chain to get ancestors
-    // 2. Query for statuses that reply to this one for descendants
+    let mut ancestors = Vec::new();
+    let mut seen_ancestors = HashSet::new();
+    let mut current_parent_uri = status.in_reply_to_uri.clone();
+    while let Some(parent_uri) = current_parent_uri {
+        if ancestors.len() >= MAX_STATUS_CONTEXT_ANCESTORS {
+            break;
+        }
+        if !seen_ancestors.insert(parent_uri.clone()) {
+            break;
+        }
+
+        let Some(parent_status) = status_service.find_by_uri(&parent_uri).await? else {
+            break;
+        };
+        if !should_federate_to_followers(&parent_status.visibility) {
+            break;
+        }
+
+        current_parent_uri = parent_status.in_reply_to_uri.clone();
+        ancestors.push(parent_status);
+    }
+    ancestors.reverse();
+
+    let mut descendants = Vec::new();
+    let mut queue = VecDeque::new();
+    let mut seen_descendants = HashSet::new();
+    queue.push_back(status.uri.clone());
+    seen_descendants.insert(status.uri.clone());
+
+    'descendant_scan: while let Some(parent_uri) = queue.pop_front() {
+        let remaining = MAX_STATUS_CONTEXT_DESCENDANTS.saturating_sub(descendants.len());
+        if remaining == 0 {
+            break;
+        }
+        let replies = status_service
+            .get_replies_limited(&parent_uri, remaining)
+            .await?;
+        for reply in replies {
+            if descendants.len() >= MAX_STATUS_CONTEXT_DESCENDANTS {
+                break 'descendant_scan;
+            }
+            if !should_federate_to_followers(&reply.visibility) {
+                continue;
+            }
+            if !seen_descendants.insert(reply.uri.clone()) {
+                continue;
+            }
+            queue.push_back(reply.uri.clone());
+            descendants.push(reply);
+        }
+    }
+
+    let mut ancestor_responses = Vec::with_capacity(ancestors.len());
+    for ancestor in &ancestors {
+        ancestor_responses.push(status_response_without_interaction_state(
+            &state, &account, ancestor,
+        ));
+    }
+
+    let mut descendant_responses = Vec::with_capacity(descendants.len());
+    for descendant in &descendants {
+        descendant_responses.push(status_response_without_interaction_state(
+            &state, &account, descendant,
+        ));
+    }
 
     let context = ContextResponse {
-        ancestors: vec![],
-        descendants: vec![],
+        ancestors: ancestor_responses,
+        descendants: descendant_responses,
     };
 
     Ok(Json(serde_json::to_value(context).unwrap()))
@@ -905,7 +1010,7 @@ pub async fn get_status_source(
     // Return the source
     let source = StatusSourceResponse {
         id: status.id.clone(),
-        text: status.content.clone(),
+        text: status_content_to_source_text(&status.content),
         spoiler_text: status.content_warning.unwrap_or_default(),
     };
 
@@ -960,7 +1065,9 @@ pub async fn favourite_status(
         &state.config,
         Some(true),
         Some(false),
+        status_service.is_muted(&status_id).await.ok(),
         status_service.is_bookmarked(&status_id).await.ok(),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1027,7 +1134,9 @@ pub async fn unfavourite_status(
         &state.config,
         Some(false),
         Some(false),
+        status_service.is_muted(&status_id).await.ok(),
         status_service.is_bookmarked(&status_id).await.ok(),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1114,7 +1223,9 @@ pub async fn reblog_status(
         &state.config,
         status_service.is_favourited(&status_id).await.ok(),
         Some(true),
+        status_service.is_muted(&status_id).await.ok(),
         status_service.is_bookmarked(&status_id).await.ok(),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1181,7 +1292,9 @@ pub async fn unreblog_status(
         &state.config,
         status_service.is_favourited(&status_id).await.ok(),
         Some(false),
+        status_service.is_muted(&status_id).await.ok(),
         status_service.is_bookmarked(&status_id).await.ok(),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1213,8 +1326,10 @@ pub async fn bookmark_status(
         &account,
         &state.config,
         status_service.is_favourited(&status_id).await.ok(),
-        Some(false),
+        status_service.is_reposted(&status_id).await.ok(),
+        status_service.is_muted(&status_id).await.ok(),
         Some(true),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1248,8 +1363,10 @@ pub async fn unbookmark_status(
         &account,
         &state.config,
         status_service.is_favourited(&status_id).await.ok(),
+        status_service.is_reposted(&status_id).await.ok(),
+        status_service.is_muted(&status_id).await.ok(),
         Some(false),
-        Some(false),
+        status_service.is_pinned(&status_id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1267,8 +1384,6 @@ pub struct UpdateStatusRequest {
 /// PUT /api/v1/statuses/:id
 /// Edit an existing status
 ///
-/// Note: For simplicity in single-user instance, this creates a new version
-/// without preserving full edit history.
 pub async fn update_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
@@ -1279,6 +1394,7 @@ pub async fn update_status(
 
     // Get the status
     let mut status = status_service.get(&id).await?;
+    let previous_status = status.clone();
 
     // Only allow editing local statuses
     if !status.is_local {
@@ -1289,22 +1405,33 @@ pub async fn update_status(
     let account = build_account_service(&state).get_account().await?;
 
     // Update fields if provided
+    let mut changed = false;
+
     if let Some(content) = req.status {
         if !content.is_empty() {
-            status.content = format!("<p>{}</p>", html_escape::encode_text(&content));
+            let next_content = format!("<p>{}</p>", html_escape::encode_text(&content));
+            if status.content != next_content {
+                status.content = next_content;
+                changed = true;
+            }
         }
     }
 
     if let Some(spoiler_text) = req.spoiler_text {
-        status.content_warning = Some(spoiler_text);
+        if status.content_warning.as_deref() != Some(spoiler_text.as_str()) {
+            status.content_warning = Some(spoiler_text);
+            changed = true;
+        }
     }
 
     // TODO: Handle media_ids updates
     // For now, we skip media updates as it requires more complex logic
 
-    // Save updated status
-    // Note: In a full implementation, we would create a new version in an edit_history table.
-    status_service.update_loaded(&status).await?;
+    if changed {
+        status_service
+            .update_with_edit_snapshot(&previous_status, &status)
+            .await?;
+    }
 
     // Return updated status
     let response = crate::api::status_to_response(
@@ -1312,8 +1439,10 @@ pub async fn update_status(
         &account,
         &state.config,
         status_service.is_favourited(&id).await.ok(),
-        Some(false),
+        status_service.is_reposted(&id).await.ok(),
+        status_service.is_muted(&id).await.ok(),
         status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_pinned(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1322,8 +1451,6 @@ pub async fn update_status(
 /// GET /api/v1/statuses/:id/history
 /// Get edit history for a status
 ///
-/// For single-user instance without full edit history tracking,
-/// this returns only the current version.
 pub async fn get_status_history(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1332,28 +1459,43 @@ pub async fn get_status_history(
 
     // Get the status
     let status = status_service.get(&id).await?;
+    if !status.is_local {
+        return Err(AppError::Forbidden);
+    }
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
 
-    // For now, return only the current version
-    // In a full implementation, we would query an edit_history table
+    let edits = status_service.get_edit_history(&id, 40).await?;
+    let current_revision_created_at = edits
+        .first()
+        .map(|(_, _, _, created_at)| (*created_at).max(status.created_at))
+        .unwrap_or(status.created_at);
     let current_version = serde_json::json!({
         "content": status.content,
-        "spoiler_text": status.content_warning.unwrap_or_default(),
-        "sensitive": false,
-        "created_at": status.created_at.to_rfc3339(),
+        "spoiler_text": status.content_warning.clone().unwrap_or_default(),
+        "sensitive": status.content_warning.is_some(),
+        "created_at": current_revision_created_at.to_rfc3339(),
         "account": crate::api::account_to_response(&account, &state.config),
     });
 
-    Ok(Json(vec![current_version]))
+    let mut history = vec![current_version];
+    for (_, content, content_warning, created_at) in edits {
+        history.push(serde_json::json!({
+            "content": content,
+            "spoiler_text": content_warning.clone().unwrap_or_default(),
+            "sensitive": content_warning.is_some(),
+            "created_at": created_at.to_rfc3339(),
+            "account": crate::api::account_to_response(&account, &state.config),
+        }));
+    }
+
+    Ok(Json(history))
 }
 
 /// POST /api/v1/statuses/:id/pin
 /// Pin a status to profile
 ///
-/// For single-user instance, this is a no-op that returns success.
-/// Pinned statuses are not currently tracked in the database.
 pub async fn pin_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
@@ -1361,8 +1503,8 @@ pub async fn pin_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = build_status_service(&state);
 
-    // Get status
-    let status = status_service.get(&id).await?;
+    // Get status and store pinned marker
+    let status = status_service.pin_by_id(&id).await?;
 
     // Only allow pinning local statuses
     if !status.is_local {
@@ -1374,15 +1516,15 @@ pub async fn pin_status(
     // Get account
     let account = build_account_service(&state).get_account().await?;
 
-    // TODO: Store pinned status in database
-    // For now, just return the status with pinned=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
         status_service.is_favourited(&id).await.ok(),
-        Some(false),
+        status_service.is_reposted(&id).await.ok(),
+        status_service.is_muted(&id).await.ok(),
         status_service.is_bookmarked(&id).await.ok(),
+        Some(true),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1391,7 +1533,6 @@ pub async fn pin_status(
 /// POST /api/v1/statuses/:id/unpin
 /// Unpin a status from profile
 ///
-/// For single-user instance, this is a no-op that returns success.
 pub async fn unpin_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
@@ -1399,21 +1540,21 @@ pub async fn unpin_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = build_status_service(&state);
 
-    // Get status
-    let status = status_service.get(&id).await?;
+    // Get status and remove pinned marker
+    let status = status_service.unpin_by_id(&id).await?;
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
 
-    // TODO: Remove pinned status from database
-    // For now, just return the status with pinned=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
         status_service.is_favourited(&id).await.ok(),
-        Some(false),
+        status_service.is_reposted(&id).await.ok(),
+        status_service.is_muted(&id).await.ok(),
         status_service.is_bookmarked(&id).await.ok(),
+        Some(false),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1422,8 +1563,6 @@ pub async fn unpin_status(
 /// POST /api/v1/statuses/:id/mute
 /// Mute notifications from a conversation
 ///
-/// For single-user instance, this is a no-op that returns success.
-/// Conversation muting is not currently tracked.
 pub async fn mute_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
@@ -1431,21 +1570,21 @@ pub async fn mute_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = build_status_service(&state);
 
-    // Get status
-    let status = status_service.get(&id).await?;
+    // Get status and persist muted conversation marker
+    let status = status_service.mute_by_id(&id).await?;
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
 
-    // TODO: Store muted conversation in database
-    // For now, just return the status with muted=true
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
         status_service.is_favourited(&id).await.ok(),
-        Some(false),
+        status_service.is_reposted(&id).await.ok(),
+        Some(true),
         status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_pinned(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1454,7 +1593,6 @@ pub async fn mute_status(
 /// POST /api/v1/statuses/:id/unmute
 /// Unmute notifications from a conversation
 ///
-/// For single-user instance, this is a no-op that returns success.
 pub async fn unmute_status(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
@@ -1462,21 +1600,21 @@ pub async fn unmute_status(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = build_status_service(&state);
 
-    // Get status
-    let status = status_service.get(&id).await?;
+    // Get status and remove muted conversation marker
+    let status = status_service.unmute_by_id(&id).await?;
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
 
-    // TODO: Remove muted conversation from database
-    // For now, just return the status with muted=false
     let response = crate::api::status_to_response(
         &status,
         &account,
         &state.config,
         status_service.is_favourited(&id).await.ok(),
+        status_service.is_reposted(&id).await.ok(),
         Some(false),
         status_service.is_bookmarked(&id).await.ok(),
+        status_service.is_pinned(&id).await.ok(),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))

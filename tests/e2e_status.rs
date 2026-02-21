@@ -702,6 +702,467 @@ async fn test_status_context() {
 }
 
 #[tokio::test]
+async fn test_status_context_includes_ancestors_and_descendants() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/root".to_string(),
+        content: "<p>Root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let middle = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/middle".to_string(),
+        content: "<p>Middle</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let leaf = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/leaf".to_string(),
+        content: "<p>Leaf</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(middle.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+    server.state.db.insert_status(&middle).await.unwrap();
+    server.state.db.insert_status(&leaf).await.unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/context", middle.id)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+
+    let ancestors = json["ancestors"].as_array().unwrap();
+    let descendants = json["descendants"].as_array().unwrap();
+    assert_eq!(ancestors.len(), 1);
+    assert_eq!(descendants.len(), 1);
+    assert_eq!(ancestors[0]["id"], root.id);
+    assert_eq!(descendants[0]["id"], leaf.id);
+}
+
+#[tokio::test]
+async fn test_status_context_limits_descendants() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let base_time = Utc::now();
+    let root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/context-limit-root".to_string(),
+        content: "<p>Root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+
+    let mut expected_ids = Vec::new();
+    for index in 0..50 {
+        let descendant = Status {
+            id: EntityId::new().0,
+            uri: format!("https://test.example.com/status/context-limit-descendant-{index}"),
+            content: format!("<p>Descendant {index}</p>"),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: Some(root.uri.clone()),
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: base_time + Duration::seconds((index + 1) as i64),
+            fetched_at: None,
+        };
+        if index < 40 {
+            expected_ids.push(descendant.id.clone());
+        }
+        server.state.db.insert_status(&descendant).await.unwrap();
+    }
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/context", root.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let json: Value = response.json().await.unwrap();
+    let descendants = json["descendants"].as_array().unwrap();
+    assert_eq!(descendants.len(), 40);
+    let returned_ids: Vec<String> = descendants
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert_eq!(returned_ids, expected_ids);
+}
+
+#[tokio::test]
+async fn test_status_source_returns_plain_text() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_payload = serde_json::json!({
+        "status": "Hello <tag>",
+        "spoiler_text": "cw"
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&create_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let source_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/source", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source_response.status(), 200);
+
+    let source: Value = source_response.json().await.unwrap();
+    assert_eq!(source["text"], "Hello <tag>");
+    assert_eq!(source["spoiler_text"], "cw");
+}
+
+#[tokio::test]
+async fn test_status_history_contains_previous_version_after_edit() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_payload = serde_json::json!({
+        "status": "v1",
+        "visibility": "public"
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&create_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let update_payload = serde_json::json!({
+        "status": "v2",
+        "spoiler_text": "updated"
+    });
+    let update_response = server
+        .client
+        .put(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&update_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+
+    let history_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/history", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), 200);
+    let history: Value = history_response.json().await.unwrap();
+    let items = history.as_array().unwrap();
+    assert!(items.len() >= 2);
+    assert!(items.iter().any(|item| item["content"] == "<p>v1</p>"));
+    assert!(items.iter().any(|item| item["content"] == "<p>v2</p>"));
+    let first_created_at =
+        chrono::DateTime::parse_from_rfc3339(items[0]["created_at"].as_str().unwrap()).unwrap();
+    let second_created_at =
+        chrono::DateTime::parse_from_rfc3339(items[1]["created_at"].as_str().unwrap()).unwrap();
+    assert!(
+        first_created_at >= second_created_at,
+        "history should be returned in non-increasing revision timestamp order"
+    );
+}
+
+#[tokio::test]
+async fn test_status_history_rejects_remote_status() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let remote_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/users/alice/statuses/remote-history".to_string(),
+        content: "<p>Remote status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "timeline".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&remote_status).await.unwrap();
+
+    let history_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/history", remote_status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), 403);
+}
+
+#[tokio::test]
+async fn test_pin_and_mute_state_persists_across_reads() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_payload = serde_json::json!({
+        "status": "pin and mute me",
+        "visibility": "public"
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&create_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let pin_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin_response.status(), 200);
+    let pin_json: Value = pin_response.json().await.unwrap();
+    assert_eq!(pin_json["pinned"], true);
+
+    let mute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/mute", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mute_response.status(), 200);
+    let mute_json: Value = mute_response.json().await.unwrap();
+    assert_eq!(mute_json["muted"], true);
+
+    let read_after_set = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read_after_set.status(), 200);
+    let set_json: Value = read_after_set.json().await.unwrap();
+    assert!(set_json["favourited"].is_null());
+    assert!(set_json["reblogged"].is_null());
+    assert!(set_json["pinned"].is_null());
+    assert!(set_json["muted"].is_null());
+    assert!(set_json["bookmarked"].is_null());
+
+    let unpin_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/unpin", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpin_response.status(), 200);
+    let unpin_json: Value = unpin_response.json().await.unwrap();
+    assert_eq!(unpin_json["pinned"], false);
+
+    let unmute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/unmute", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unmute_response.status(), 200);
+    let unmute_json: Value = unmute_response.json().await.unwrap();
+    assert_eq!(unmute_json["muted"], false);
+
+    let read_after_clear = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read_after_clear.status(), 200);
+    let cleared_json: Value = read_after_clear.json().await.unwrap();
+    assert!(cleared_json["favourited"].is_null());
+    assert!(cleared_json["reblogged"].is_null());
+    assert!(cleared_json["pinned"].is_null());
+    assert!(cleared_json["muted"].is_null());
+    assert!(cleared_json["bookmarked"].is_null());
+}
+
+#[tokio::test]
+async fn test_muting_reply_marks_whole_thread_as_muted() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/thread-muted-root".to_string(),
+        content: "<p>Root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let reply = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/thread-muted-reply".to_string(),
+        content: "<p>Reply</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+    server.state.db.insert_status(&reply).await.unwrap();
+
+    let mute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mute_response.status(), 200);
+
+    let root_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", &root.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root_response.status(), 200);
+    let root_json: Value = root_response.json().await.unwrap();
+    assert!(root_json["muted"].is_null());
+
+    let reply_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", &reply.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply_response.status(), 200);
+    let reply_json: Value = reply_response.json().await.unwrap();
+    assert!(reply_json["muted"].is_null());
+    assert!(server.state.db.is_thread_muted(&root.uri).await.unwrap());
+
+    let unmute_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/unmute", &root.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unmute_response.status(), 200);
+
+    let root_after_unmute = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}", &root.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root_after_unmute.status(), 200);
+    let root_after_unmute_json: Value = root_after_unmute.json().await.unwrap();
+    assert!(root_after_unmute_json["muted"].is_null());
+    assert!(!server.state.db.is_thread_muted(&root.uri).await.unwrap());
+}
+
+#[tokio::test]
 async fn test_create_reply_status_persists_reply_metadata() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Status};
