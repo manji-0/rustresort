@@ -288,6 +288,8 @@ async fn test_create_status_with_media_ids_includes_media_attachments_in_respons
         blurhash: None,
         width: Some(64),
         height: Some(64),
+        focus_x: None,
+        focus_y: None,
         created_at: Utc::now(),
     };
     server.state.db.insert_media(&media).await.unwrap();

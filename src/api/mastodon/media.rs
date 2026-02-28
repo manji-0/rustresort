@@ -54,6 +54,31 @@ fn format_media_focus(focus_x: Option<f64>, focus_y: Option<f64>) -> Option<Stri
     }
 }
 
+fn build_original_media_meta(
+    width: Option<i32>,
+    height: Option<i32>,
+    focus_x: Option<f64>,
+    focus_y: Option<f64>,
+) -> Option<MediaMetaInfo> {
+    let focus = format_media_focus(focus_x, focus_y);
+    if width.is_none() && height.is_none() && focus.is_none() {
+        return None;
+    }
+
+    let size = width.zip(height).map(|(w, h)| format!("{}x{}", w, h));
+    let aspect = width
+        .zip(height)
+        .and_then(|(w, h)| (h != 0).then_some(w as f64 / h as f64));
+
+    Some(MediaMetaInfo {
+        width,
+        height,
+        size,
+        aspect,
+        focus,
+    })
+}
+
 fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
     let (x_raw, y_raw) = raw
         .split_once(',')
@@ -201,15 +226,12 @@ pub async fn upload_media(
         remote_url: None,
         text_url: None,
         meta: MediaMeta {
-            original: media.width.and_then(|w| {
-                media.height.map(|h| MediaMetaInfo {
-                    width: Some(w),
-                    height: Some(h),
-                    size: Some(format!("{}x{}", w, h)),
-                    aspect: Some(w as f64 / h as f64),
-                    focus: format_media_focus(media.focus_x, media.focus_y),
-                })
-            }),
+            original: build_original_media_meta(
+                media.width,
+                media.height,
+                media.focus_x,
+                media.focus_y,
+            ),
             small: None,
         },
         description: media.description,
@@ -271,15 +293,12 @@ pub async fn get_media(
         remote_url: None,
         text_url: None,
         meta: MediaMeta {
-            original: media.width.and_then(|w| {
-                media.height.map(|h| MediaMetaInfo {
-                    width: Some(w),
-                    height: Some(h),
-                    size: Some(format!("{}x{}", w, h)),
-                    aspect: Some(w as f64 / h as f64),
-                    focus: format_media_focus(media.focus_x, media.focus_y),
-                })
-            }),
+            original: build_original_media_meta(
+                media.width,
+                media.height,
+                media.focus_x,
+                media.focus_y,
+            ),
             small: None,
         },
         description: media.description,
@@ -371,7 +390,7 @@ pub struct UpdateMediaRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_media_focus, parse_media_focus};
+    use super::{build_original_media_meta, format_media_focus, parse_media_focus};
 
     #[test]
     fn parse_media_focus_accepts_valid_values() {
@@ -390,5 +409,16 @@ mod tests {
     fn format_media_focus_returns_none_if_incomplete() {
         assert_eq!(format_media_focus(Some(0.0), None), None);
         assert_eq!(format_media_focus(None, Some(0.0)), None);
+    }
+
+    #[test]
+    fn build_original_media_meta_includes_focus_without_dimensions() {
+        let meta = build_original_media_meta(None, None, Some(0.25), Some(-0.5))
+            .expect("focus-only metadata should be returned");
+        assert_eq!(meta.width, None);
+        assert_eq!(meta.height, None);
+        assert_eq!(meta.size, None);
+        assert_eq!(meta.aspect, None);
+        assert_eq!(meta.focus.as_deref(), Some("0.250,-0.500"));
     }
 }

@@ -1444,8 +1444,9 @@ pub async fn update_status(
             .await?
             .into_iter()
             .map(|media| media.id)
-            .collect::<Vec<_>>();
-        if current_media_ids != normalized_media_ids {
+            .collect::<HashSet<_>>();
+        let requested_media_ids = normalized_media_ids.iter().cloned().collect::<HashSet<_>>();
+        if current_media_ids != requested_media_ids {
             status_service
                 .replace_media_for_status(&id, &normalized_media_ids)
                 .await?;

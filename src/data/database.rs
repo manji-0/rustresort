@@ -1430,8 +1430,7 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         } else {
-            let placeholders = std::iter::repeat("?")
-                .take(media_ids.len())
+            let placeholders = std::iter::repeat_n("?", media_ids.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
