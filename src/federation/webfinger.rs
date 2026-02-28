@@ -28,11 +28,10 @@ fn parse_actor_uri_address(address: &str) -> Option<String> {
 fn parse_account_address(address: &str) -> Result<(String, String), AppError> {
     let trimmed = address.trim();
     let without_prefix = trimmed.strip_prefix("acct:").unwrap_or(trimmed);
-    let (username, domain) = without_prefix
-        .split_once('@')
-        .ok_or_else(|| AppError::Validation("address must be in user@domain format".to_string()))?;
-
-    if username.is_empty() || domain.is_empty() {
+    let mut segments = without_prefix.split('@');
+    let username = segments.next().unwrap_or_default();
+    let domain = segments.next().unwrap_or_default();
+    if username.is_empty() || domain.is_empty() || segments.next().is_some() {
         return Err(AppError::Validation(
             "address must be in user@domain format".to_string(),
         ));
@@ -450,7 +449,7 @@ pub struct ParsedActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_webfinger_response, parse_actor};
+    use super::{generate_webfinger_response, parse_account_address, parse_actor};
 
     #[test]
     fn generate_webfinger_response_contains_activitypub_self_link() {
@@ -514,5 +513,24 @@ mod tests {
             crate::error::AppError::Federation(message)
                 if message.contains("publicKeyPem")
         ));
+    }
+
+    #[test]
+    fn parse_account_address_rejects_multiple_at_signs() {
+        let error =
+            parse_account_address("alice@trusted.example@attacker.tld").expect_err("invalid");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Validation(message)
+                if message.contains("user@domain format")
+        ));
+    }
+
+    #[test]
+    fn parse_account_address_accepts_acct_prefix() {
+        let (username, domain) =
+            parse_account_address("acct:alice@trusted.example").expect("valid address");
+        assert_eq!(username, "alice");
+        assert_eq!(domain, "trusted.example");
     }
 }
