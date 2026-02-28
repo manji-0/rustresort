@@ -18,7 +18,7 @@ use crate::auth::CurrentUser;
 use crate::error::AppError;
 
 const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
-
+const OAUTH_ACCESS_TOKEN_TTL_SECONDS: i64 = 7_200;
 /// App registration request
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
@@ -69,6 +69,7 @@ pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
     pub scope: String,
+    pub expires_in: i64,
     pub created_at: i64,
 }
 
@@ -578,13 +579,15 @@ pub async fn create_token(
     let access_token = EntityId::new().0;
 
     // Create token
+    let issued_at = Utc::now();
     let token = OAuthToken {
         id: token_id.clone(),
         app_id: app.id.clone(),
         access_token: access_token.clone(),
         grant_type: req.grant_type.clone(),
         scopes,
-        created_at: Utc::now(),
+        created_at: issued_at,
+        expires_at: issued_at + chrono::Duration::seconds(OAUTH_ACCESS_TOKEN_TTL_SECONDS),
         revoked: false,
     };
 
@@ -596,6 +599,7 @@ pub async fn create_token(
         access_token: token.access_token,
         token_type: "Bearer".to_string(),
         scope: token.scopes,
+        expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS,
         created_at: token.created_at.timestamp(),
     };
 

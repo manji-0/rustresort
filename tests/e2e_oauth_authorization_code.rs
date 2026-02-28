@@ -1,7 +1,7 @@
 mod common;
 
 use common::TestServer;
-use reqwest::{StatusCode, header::LOCATION};
+use reqwest::{StatusCode, header::LOCATION, header::SET_COOKIE};
 use serde_json::json;
 use url::Url;
 
@@ -27,6 +27,51 @@ async fn create_app_with_redirect(server: &TestServer, redirect_uri: &str) -> se
     response.json().await.unwrap()
 }
 
+fn extract_confirm_token(authorize_response: &reqwest::Response) -> String {
+    authorize_response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let raw = value.to_str().ok()?;
+            let cookie_pair = raw.split(';').next()?;
+            let (name, _) = cookie_pair.split_once('=')?;
+            name.strip_prefix("oauth_authorize_confirm_")
+                .map(ToString::to_string)
+        })
+        .expect("missing oauth authorize confirm cookie")
+}
+
+async fn authorize_with_consent(
+    no_redirect_client: &reqwest::Client,
+    server: &TestServer,
+    session_token: &str,
+    params: &[(&str, &str)],
+) -> reqwest::Response {
+    let consent_response = no_redirect_client
+        .get(server.url("/oauth/authorize"))
+        .bearer_auth(session_token)
+        .query(params)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(consent_response.status(), StatusCode::OK);
+    let confirm_token = extract_confirm_token(&consent_response);
+
+    no_redirect_client
+        .get(server.url("/oauth/authorize"))
+        .bearer_auth(session_token)
+        .header(
+            "Cookie",
+            format!("oauth_authorize_confirm_{}=1", confirm_token),
+        )
+        .query(params)
+        .query(&[("approve", "true"), ("confirm", confirm_token.as_str())])
+        .send()
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn test_authorization_code_flow_works_and_prevents_replay() {
     let server = TestServer::new().await;
@@ -38,19 +83,19 @@ async fn test_authorization_code_flow_works_and_prevents_replay() {
         .build()
         .unwrap();
 
-    let authorize_response = no_redirect_client
-        .get(server.url("/oauth/authorize"))
-        .bearer_auth(&session_token)
-        .query(&[
+    let authorize_response = authorize_with_consent(
+        &no_redirect_client,
+        &server,
+        &session_token,
+        &[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
             ("redirect_uri", "https://client.example/callback"),
             ("scope", "read write"),
             ("state", "abc123"),
-        ])
-        .send()
-        .await
-        .unwrap();
+        ],
+    )
+    .await;
     assert_eq!(authorize_response.status(), StatusCode::SEE_OTHER);
 
     let location = authorize_response
@@ -110,17 +155,17 @@ async fn test_authorization_code_token_rejects_redirect_uri_mismatch() {
         .build()
         .unwrap();
 
-    let authorize_response = no_redirect_client
-        .get(server.url("/oauth/authorize"))
-        .bearer_auth(&session_token)
-        .query(&[
+    let authorize_response = authorize_with_consent(
+        &no_redirect_client,
+        &server,
+        &session_token,
+        &[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
             ("redirect_uri", "https://client.example/callback"),
-        ])
-        .send()
-        .await
-        .unwrap();
+        ],
+    )
+    .await;
     assert_eq!(authorize_response.status(), StatusCode::SEE_OTHER);
 
     let location = authorize_response
@@ -195,18 +240,18 @@ async fn test_authorize_redirect_keeps_fragment_and_sets_query_code() {
         .build()
         .unwrap();
 
-    let authorize_response = no_redirect_client
-        .get(server.url("/oauth/authorize"))
-        .bearer_auth(&session_token)
-        .query(&[
+    let authorize_response = authorize_with_consent(
+        &no_redirect_client,
+        &server,
+        &session_token,
+        &[
             ("response_type", "code"),
             ("client_id", app["client_id"].as_str().unwrap()),
             ("redirect_uri", "https://client.example/callback#frag"),
             ("state", "st"),
-        ])
-        .send()
-        .await
-        .unwrap();
+        ],
+    )
+    .await;
     assert_eq!(authorize_response.status(), StatusCode::SEE_OTHER);
 
     let location = authorize_response

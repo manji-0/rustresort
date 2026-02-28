@@ -2404,8 +2404,8 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO oauth_tokens (
-                id, app_id, access_token, grant_type, scopes, created_at, revoked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, app_id, access_token, grant_type, scopes, created_at, expires_at, revoked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&token.id)
@@ -2414,6 +2414,7 @@ impl Database {
         .bind(&token.grant_type)
         .bind(&token.scopes)
         .bind(&token.created_at)
+        .bind(&token.expires_at)
         .bind(token.revoked)
         .execute(&self.pool)
         .await?;
@@ -2427,10 +2428,12 @@ impl Database {
         access_token: &str,
     ) -> Result<Option<OAuthToken>, AppError> {
         let access_token_hash = hash_oauth_access_token(access_token);
+        let now = Utc::now();
         let token = sqlx::query_as::<_, OAuthToken>(
-            "SELECT * FROM oauth_tokens WHERE access_token = ? AND revoked = 0",
+            "SELECT * FROM oauth_tokens WHERE access_token = ? AND revoked = 0 AND expires_at > ?",
         )
         .bind(&access_token_hash)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
 

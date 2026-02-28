@@ -43,6 +43,7 @@ fn test_oauth_token(app_id: &str, access_token: &str) -> OAuthToken {
         grant_type: "authorization_code".to_string(),
         scopes: "read write".to_string(),
         created_at: Utc::now(),
+        expires_at: Utc::now() + chrono::Duration::hours(1),
         revoked: false,
     }
 }
@@ -115,8 +116,8 @@ async fn test_oauth_token_migration_hashes_existing_plaintext_rows_on_reconnect(
     sqlx::query(
         r#"
         INSERT INTO oauth_tokens (
-            id, app_id, access_token, grant_type, scopes, created_at, revoked
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, app_id, access_token, grant_type, scopes, created_at, expires_at, revoked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&legacy_token.id)
@@ -125,6 +126,7 @@ async fn test_oauth_token_migration_hashes_existing_plaintext_rows_on_reconnect(
     .bind(&legacy_token.grant_type)
     .bind(&legacy_token.scopes)
     .bind(&legacy_token.created_at)
+    .bind(&legacy_token.expires_at)
     .bind(legacy_token.revoked)
     .execute(&pool)
     .await
@@ -173,8 +175,8 @@ async fn test_oauth_token_migration_rehashes_fake_sha256_prefixed_plaintext() {
     sqlx::query(
         r#"
         INSERT INTO oauth_tokens (
-            id, app_id, access_token, grant_type, scopes, created_at, revoked
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, app_id, access_token, grant_type, scopes, created_at, expires_at, revoked
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&legacy_token.id)
@@ -183,6 +185,7 @@ async fn test_oauth_token_migration_rehashes_fake_sha256_prefixed_plaintext() {
     .bind(&legacy_token.grant_type)
     .bind(&legacy_token.scopes)
     .bind(&legacy_token.created_at)
+    .bind(&legacy_token.expires_at)
     .bind(legacy_token.revoked)
     .execute(&pool)
     .await
@@ -237,6 +240,26 @@ async fn test_oauth_token_revoke_works_with_hashed_storage() {
         .await
         .unwrap();
     assert_eq!(revoked, 1);
+}
+
+#[tokio::test]
+async fn test_oauth_token_lookup_rejects_expired_tokens() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let app = test_oauth_app();
+    db.insert_oauth_app(&app).await.unwrap();
+
+    let raw_access_token = "expired-token";
+    let mut token = test_oauth_token(&app.id, raw_access_token);
+    token.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    db.insert_oauth_token(&token).await.unwrap();
+
+    assert!(
+        db.get_oauth_token(raw_access_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
