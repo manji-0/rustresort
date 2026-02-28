@@ -1207,7 +1207,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
     let base_time = Utc::now();
 
     let old_public = Status {
-        id: EntityId::new().0,
+        id: "200".to_string(),
         uri: "https://example.com/status/tag-old".to_string(),
         content: "<p>Old #Rust post</p>".to_string(),
         content_warning: None,
@@ -1222,7 +1222,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         fetched_at: None,
     };
     let new_public = Status {
-        id: EntityId::new().0,
+        id: "300".to_string(),
         uri: "https://example.com/status/tag-new".to_string(),
         content: "<p>New #rust and #RustLang post</p>".to_string(),
         content_warning: None,
@@ -1237,7 +1237,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         fetched_at: None,
     };
     let private_status = Status {
-        id: EntityId::new().0,
+        id: "400".to_string(),
         uri: "https://example.com/status/tag-private".to_string(),
         content: "<p>Private #RUST post</p>".to_string(),
         content_warning: None,
