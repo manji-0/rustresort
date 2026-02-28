@@ -2321,6 +2321,16 @@ impl Database {
         Ok(app)
     }
 
+    /// Get OAuth app by app ID
+    pub async fn get_oauth_app_by_id(&self, app_id: &str) -> Result<Option<OAuthApp>, AppError> {
+        let app = sqlx::query_as::<_, OAuthApp>("SELECT * FROM oauth_apps WHERE id = ?")
+            .bind(app_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(app)
+    }
+
     /// Insert OAuth authorization code
     pub async fn insert_oauth_authorization_code(
         &self,
