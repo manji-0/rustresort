@@ -170,7 +170,7 @@ fn is_blocked_ip_address(ip: IpAddr) -> bool {
     }
 }
 
-fn validate_remote_actor_url(actor_url: &url::Url) -> Result<(), AppError> {
+async fn validate_remote_actor_url(actor_url: &url::Url) -> Result<(), AppError> {
     let host = actor_url
         .host_str()
         .ok_or_else(|| AppError::Validation("Actor URL in keyId must include a host".to_string()))?
@@ -189,6 +189,30 @@ fn validate_remote_actor_url(actor_url: &url::Url) -> Result<(), AppError> {
                 "Actor URL host is not allowed".to_string(),
             ));
         }
+    }
+
+    let port = actor_url.port_or_known_default().ok_or_else(|| {
+        AppError::Validation("Actor URL in keyId must include a known default port".to_string())
+    })?;
+    let mut resolved_any = false;
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Failed to resolve actor host {}: {}", host, error))
+        })?;
+    for address in resolved {
+        resolved_any = true;
+        if is_blocked_ip_address(address.ip()) {
+            return Err(AppError::Validation(
+                "Actor URL host is not allowed".to_string(),
+            ));
+        }
+    }
+    if !resolved_any {
+        return Err(AppError::Federation(format!(
+            "Actor host did not resolve to any IP addresses: {}",
+            host
+        )));
     }
 
     Ok(())
@@ -433,7 +457,7 @@ pub async fn fetch_public_key(
     http_client: &reqwest::Client,
 ) -> Result<String, AppError> {
     let actor_url = parse_actor_url(key_id)?;
-    validate_remote_actor_url(&actor_url)?;
+    validate_remote_actor_url(&actor_url).await?;
 
     // Fetch actor document
     let response = http_client
