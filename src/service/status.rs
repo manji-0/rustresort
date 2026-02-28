@@ -165,6 +165,17 @@ impl StatusService {
         self.db.update_status(status).await
     }
 
+    /// Persist status update with atomic edit-history snapshot.
+    pub async fn update_with_edit_snapshot(
+        &self,
+        previous: &Status,
+        updated: &Status,
+    ) -> Result<(), AppError> {
+        self.db
+            .update_status_with_edit_snapshot(previous, updated)
+            .await
+    }
+
     /// Get media attachments linked to a status.
     pub async fn get_media_by_status(
         &self,
@@ -197,6 +208,51 @@ impl StatusService {
     /// Get repost activity URI for a status if reposted.
     pub async fn get_repost_uri(&self, status_id: &str) -> Result<Option<String>, AppError> {
         self.db.get_repost_uri(status_id).await
+    }
+
+    /// Get direct replies for a status URI.
+    pub async fn get_replies(&self, in_reply_to_uri: &str) -> Result<Vec<Status>, AppError> {
+        self.db.get_status_replies(in_reply_to_uri).await
+    }
+
+    /// Get direct replies for a status URI, capped at `limit`.
+    pub async fn get_replies_limited(
+        &self,
+        in_reply_to_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<Status>, AppError> {
+        self.db
+            .get_status_replies_limited(in_reply_to_uri, limit)
+            .await
+    }
+
+    /// Persist an edit-history snapshot for a status.
+    pub async fn insert_edit_snapshot(&self, status: &Status) -> Result<(), AppError> {
+        self.db
+            .insert_status_edit(
+                &status.id,
+                &status.content,
+                status.content_warning.as_deref(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Get edit-history snapshots for a status.
+    pub async fn get_edit_history(
+        &self,
+        status_id: &str,
+        limit: usize,
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        )>,
+        AppError,
+    > {
+        self.db.get_status_edits(status_id, limit).await
     }
 
     /// Get a cached idempotency response payload if present.
@@ -615,6 +671,46 @@ impl StatusService {
         Ok(status)
     }
 
+    /// Pin status by local status ID.
+    pub async fn pin_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        if !status.is_local {
+            return Err(AppError::Validation(
+                "Can only pin own statuses".to_string(),
+            ));
+        }
+        self.db.insert_status_pin(status_id).await?;
+        Ok(status)
+    }
+
+    /// Unpin status by local status ID.
+    pub async fn unpin_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        if !status.is_local {
+            return Err(AppError::Validation(
+                "Can only pin own statuses".to_string(),
+            ));
+        }
+        self.db.delete_status_pin(status_id).await?;
+        Ok(status)
+    }
+
+    /// Mute conversation by status ID.
+    pub async fn mute_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
+        self.db.insert_muted_thread(&thread_uri).await?;
+        Ok(status)
+    }
+
+    /// Unmute conversation by status ID.
+    pub async fn unmute_by_id(&self, status_id: &str) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
+        self.db.delete_muted_thread(&thread_uri).await?;
+        Ok(status)
+    }
+
     /// Check whether status is favourited
     pub async fn is_favourited(&self, status_id: &str) -> Result<bool, AppError> {
         self.db.is_favourited(status_id).await
@@ -628,6 +724,23 @@ impl StatusService {
     /// Check whether status is reposted
     pub async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError> {
         self.db.is_reposted(status_id).await
+    }
+
+    /// Check whether status conversation is muted.
+    pub async fn is_muted(&self, status_id: &str) -> Result<bool, AppError> {
+        let status = self.get(status_id).await?;
+        self.is_muted_loaded(&status).await
+    }
+
+    /// Check whether preloaded status conversation is muted.
+    pub async fn is_muted_loaded(&self, status: &Status) -> Result<bool, AppError> {
+        let thread_uri = self.db.resolve_thread_root_uri(status).await?;
+        self.db.is_thread_muted(&thread_uri).await
+    }
+
+    /// Check whether status is pinned.
+    pub async fn is_pinned(&self, status_id: &str) -> Result<bool, AppError> {
+        self.db.is_status_pinned(status_id).await
     }
 }
 

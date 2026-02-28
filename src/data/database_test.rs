@@ -893,6 +893,143 @@ async fn test_repost_operations() {
 }
 
 #[tokio::test]
+async fn test_status_pin_and_mute_operations() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let root = Status {
+        id: "pin-mute-root".to_string(),
+        uri: "https://example.com/status/pin-mute-root".to_string(),
+        content: "<p>Pin and mute root</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let reply = Status {
+        id: "pin-mute-reply".to_string(),
+        uri: "https://example.com/status/pin-mute-reply".to_string(),
+        content: "<p>Pin and mute reply</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&root).await.unwrap();
+    db.insert_status(&reply).await.unwrap();
+
+    let reply_thread_uri = db.resolve_thread_root_uri(&reply).await.unwrap();
+    assert_eq!(reply_thread_uri, root.uri);
+
+    assert!(!db.is_status_pinned(&root.id).await.unwrap());
+    assert!(!db.is_thread_muted(&root.uri).await.unwrap());
+
+    db.insert_status_pin(&root.id).await.unwrap();
+    db.insert_muted_thread(&root.uri).await.unwrap();
+
+    assert!(db.is_status_pinned(&root.id).await.unwrap());
+    assert!(db.is_thread_muted(&root.uri).await.unwrap());
+
+    db.delete_status_pin(&root.id).await.unwrap();
+    db.delete_muted_thread(&root.uri).await.unwrap();
+
+    assert!(!db.is_status_pinned(&root.id).await.unwrap());
+    assert!(!db.is_thread_muted(&root.uri).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_status_reply_lookup_and_edit_history_operations() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let parent = Status {
+        id: "parent-status".to_string(),
+        uri: "https://example.com/status/parent".to_string(),
+        content: "<p>Parent</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let child_a = Status {
+        id: "child-a".to_string(),
+        uri: "https://example.com/status/child-a".to_string(),
+        content: "<p>Child A</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(parent.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let child_b = Status {
+        id: "child-b".to_string(),
+        uri: "https://example.com/status/child-b".to_string(),
+        content: "<p>Child B</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(parent.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&parent).await.unwrap();
+    db.insert_status(&child_a).await.unwrap();
+    db.insert_status(&child_b).await.unwrap();
+
+    let replies = db.get_status_replies(&parent.uri).await.unwrap();
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0].id, "child-a");
+    assert_eq!(replies[1].id, "child-b");
+    let limited_replies = db.get_status_replies_limited(&parent.uri, 1).await.unwrap();
+    assert_eq!(limited_replies.len(), 1);
+    assert_eq!(limited_replies[0].id, "child-a");
+
+    db.insert_status_edit(&parent.id, "<p>Parent v1</p>", None)
+        .await
+        .unwrap();
+    db.insert_status_edit(&parent.id, "<p>Parent v2</p>", Some("cw"))
+        .await
+        .unwrap();
+    let edits = db.get_status_edits(&parent.id, 10).await.unwrap();
+    assert_eq!(edits.len(), 2);
+    assert!(
+        edits
+            .iter()
+            .any(|(_, content, _, _)| content == "<p>Parent v1</p>")
+    );
+    assert!(
+        edits
+            .iter()
+            .any(|(_, content, _, _)| content == "<p>Parent v2</p>")
+    );
+}
+
+#[tokio::test]
 async fn test_bookmarked_statuses_order_and_cursor_by_bookmark_time() {
     let (db, _temp_dir) = create_test_db().await;
 

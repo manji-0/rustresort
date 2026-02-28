@@ -2,7 +2,7 @@
 //!
 //! Handles timeline retrieval from database and cache-backed metadata.
 
-use std::sync::Arc;
+use std::{collections::HashSet, future::Future, sync::Arc};
 
 use crate::data::{Database, ProfileCache, Status, TimelineCache};
 use crate::error::AppError;
@@ -13,6 +13,9 @@ pub struct TimelineService {
     timeline_cache: Arc<TimelineCache>,
     profile_cache: Arc<ProfileCache>,
 }
+
+const TIMELINE_MUTE_OVERFETCH_MULTIPLIER: usize = 3;
+const TIMELINE_MUTE_OVERFETCH_MAX_LIMIT: usize = 200;
 
 impl TimelineService {
     /// Create new timeline service
@@ -45,9 +48,20 @@ impl TimelineService {
         max_id: Option<&str>,
         min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
+        let min_id = min_id.map(str::to_string);
         let statuses = self
-            .db
-            .get_local_statuses_in_window(limit, max_id, min_id)
+            .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
+                let min_id = min_id.clone();
+                async move {
+                    self.db
+                        .get_local_statuses_in_window(
+                            fetch_limit,
+                            cursor.as_deref(),
+                            min_id.as_deref(),
+                        )
+                        .await
+                }
+            })
             .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
@@ -69,7 +83,17 @@ impl TimelineService {
         // Single-user instance currently stores local statuses only,
         // so local_only doesn't change query behavior yet.
         let _ = local_only;
-        let statuses = self.db.get_local_public_statuses(limit, max_id).await?;
+        let statuses = self
+            .collect_visible_statuses(
+                limit,
+                max_id.map(str::to_string),
+                |fetch_limit, cursor| async move {
+                    self.db
+                        .get_local_public_statuses(fetch_limit, cursor.as_deref())
+                        .await
+                },
+            )
+            .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
 
@@ -104,7 +128,17 @@ impl TimelineService {
         limit: usize,
         max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        let statuses = self.db.get_favourited_statuses(limit, max_id).await?;
+        let statuses = self
+            .collect_visible_statuses(
+                limit,
+                max_id.map(str::to_string),
+                |fetch_limit, cursor| async move {
+                    self.db
+                        .get_favourited_statuses(fetch_limit, cursor.as_deref())
+                        .await
+                },
+            )
+            .await?;
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
 
@@ -128,7 +162,17 @@ impl TimelineService {
         limit: usize,
         max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        let statuses = self.db.get_bookmarked_statuses(limit, max_id).await?;
+        let statuses = self
+            .collect_visible_statuses(
+                limit,
+                max_id.map(str::to_string),
+                |fetch_limit, cursor| async move {
+                    self.db
+                        .get_bookmarked_statuses(fetch_limit, cursor.as_deref())
+                        .await
+                },
+            )
+            .await?;
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
 
@@ -191,6 +235,82 @@ impl TimelineService {
                 reblogged: false,
             })
             .collect())
+    }
+
+    async fn collect_visible_statuses<F, Fut>(
+        &self,
+        limit: usize,
+        initial_max_id: Option<String>,
+        mut fetch_page: F,
+    ) -> Result<Vec<Status>, AppError>
+    where
+        F: FnMut(usize, Option<String>) -> Fut,
+        Fut: Future<Output = Result<Vec<Status>, AppError>>,
+    {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let muted_thread_uris = self.db.get_muted_thread_uris().await?;
+        if muted_thread_uris.is_empty() {
+            return fetch_page(limit, initial_max_id).await;
+        }
+
+        let fetch_limit = limit
+            .saturating_mul(TIMELINE_MUTE_OVERFETCH_MULTIPLIER)
+            .max(limit)
+            .min(TIMELINE_MUTE_OVERFETCH_MAX_LIMIT);
+        let mut cursor = initial_max_id;
+        let mut visible = Vec::with_capacity(limit);
+
+        loop {
+            let statuses = fetch_page(fetch_limit, cursor.clone()).await?;
+            if statuses.is_empty() {
+                break;
+            }
+
+            let fetched_count = statuses.len();
+            cursor = statuses.last().map(|status| status.id.clone());
+
+            let filtered = self
+                .filter_muted_threads_with_uris(statuses, &muted_thread_uris)
+                .await?;
+            for status in filtered {
+                visible.push(status);
+                if visible.len() >= limit {
+                    return Ok(visible);
+                }
+            }
+
+            if fetched_count < fetch_limit || cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(visible)
+    }
+
+    async fn filter_muted_threads_with_uris(
+        &self,
+        statuses: Vec<Status>,
+        muted_thread_uris: &HashSet<String>,
+    ) -> Result<Vec<Status>, AppError> {
+        if statuses.is_empty() {
+            return Ok(statuses);
+        }
+        if muted_thread_uris.is_empty() {
+            return Ok(statuses);
+        }
+
+        let mut visible = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
+            if !muted_thread_uris.contains(&thread_uri) {
+                visible.push(status);
+            }
+        }
+
+        Ok(visible)
     }
 }
 

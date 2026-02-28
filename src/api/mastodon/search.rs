@@ -116,7 +116,9 @@ pub async fn search_v2(
                             &state.config,
                             Some(false), // favourited
                             Some(false), // reblogged
+                            Some(false), // muted
                             Some(false), // bookmarked
+                            Some(false), // pinned
                         );
                         statuses.push(serde_json::to_value(status_response).unwrap_or_default());
                     }

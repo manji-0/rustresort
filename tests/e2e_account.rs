@@ -108,6 +108,55 @@ async fn test_account_statuses() {
 }
 
 #[tokio::test]
+async fn test_account_statuses_include_pinned_state() {
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_payload = serde_json::json!({
+        "status": "pin me in account timeline",
+        "visibility": "public"
+    });
+    let create_response = server
+        .client
+        .post(&server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&create_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let pin_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin_response.status(), 200);
+
+    let statuses_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(statuses_response.status(), 200);
+    let statuses: Value = statuses_response.json().await.unwrap();
+    let items = statuses.as_array().unwrap();
+
+    let pinned_item = items
+        .iter()
+        .find(|item| item["id"].as_str() == Some(status_id))
+        .expect("created status should appear in account statuses");
+    assert_eq!(pinned_item["pinned"], true);
+}
+
+#[tokio::test]
 async fn test_account_followers() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;

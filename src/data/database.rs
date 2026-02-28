@@ -667,6 +667,68 @@ impl Database {
         Ok(status)
     }
 
+    /// Resolve thread root URI by walking the reply chain from a status.
+    ///
+    /// Returns the top-most known ancestor URI, or an unknown parent URI when
+    /// the chain leaves local persistence.
+    pub async fn resolve_thread_root_uri(&self, status: &Status) -> Result<String, AppError> {
+        let mut thread_uri = status.uri.clone();
+        let mut current_parent_uri = status.in_reply_to_uri.clone();
+        let mut seen = HashSet::from([status.uri.clone()]);
+
+        while let Some(parent_uri) = current_parent_uri {
+            if !seen.insert(parent_uri.clone()) {
+                break;
+            }
+            thread_uri = parent_uri.clone();
+
+            let Some(parent_status) = self.get_status_by_uri(&parent_uri).await? else {
+                break;
+            };
+            current_parent_uri = parent_status.in_reply_to_uri;
+        }
+
+        Ok(thread_uri)
+    }
+
+    /// Get replies for a given parent status URI.
+    pub async fn get_status_replies(&self, in_reply_to_uri: &str) -> Result<Vec<Status>, AppError> {
+        let replies = sqlx::query_as::<_, Status>(
+            r#"
+            SELECT * FROM statuses
+            WHERE in_reply_to_uri = ?
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(in_reply_to_uri)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(replies)
+    }
+
+    /// Get replies for a given parent status URI, capped at `limit`.
+    pub async fn get_status_replies_limited(
+        &self,
+        in_reply_to_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<Status>, AppError> {
+        let replies = sqlx::query_as::<_, Status>(
+            r#"
+            SELECT * FROM statuses
+            WHERE in_reply_to_uri = ?
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(in_reply_to_uri)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(replies)
+    }
+
     /// Get multiple statuses by URIs (batch operation to avoid N+1)
     pub async fn get_statuses_by_uris(&self, uris: &[String]) -> Result<Vec<Status>, AppError> {
         if uris.is_empty() {
@@ -862,6 +924,116 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Atomically snapshot previous status content then apply updated fields.
+    pub async fn update_status_with_edit_snapshot(
+        &self,
+        previous: &Status,
+        updated: &Status,
+    ) -> Result<(), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            let edit_id = EntityId::new().0;
+            sqlx::query(
+                r#"
+                INSERT INTO status_edits (id, status_id, content, content_warning, created_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                "#,
+            )
+            .bind(edit_id)
+            .bind(&previous.id)
+            .bind(&previous.content)
+            .bind(&previous.content_warning)
+            .execute(&mut *conn)
+            .await?;
+
+            let update_result = sqlx::query(
+                r#"
+                UPDATE statuses
+                SET content = ?, content_warning = ?, visibility = ?, language = ?,
+                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(&updated.content)
+            .bind(&updated.content_warning)
+            .bind(&updated.visibility)
+            .bind(&updated.language)
+            .bind(&updated.in_reply_to_uri)
+            .bind(&updated.boost_of_uri)
+            .bind(&updated.persisted_reason)
+            .bind(&updated.fetched_at)
+            .bind(&updated.id)
+            .execute(&mut *conn)
+            .await?;
+            if update_result.rows_affected() != 1 {
+                return Err(AppError::NotFound);
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Insert a status edit-history snapshot.
+    pub async fn insert_status_edit(
+        &self,
+        status_id: &str,
+        content: &str,
+        content_warning: Option<&str>,
+    ) -> Result<String, AppError> {
+        let edit_id = EntityId::new().0;
+        sqlx::query(
+            r#"
+            INSERT INTO status_edits (id, status_id, content, content_warning, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            "#,
+        )
+        .bind(&edit_id)
+        .bind(status_id)
+        .bind(content)
+        .bind(content_warning)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(edit_id)
+    }
+
+    /// Get status edit-history snapshots ordered by newest first.
+    pub async fn get_status_edits(
+        &self,
+        status_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<String>, DateTime<Utc>)>, AppError> {
+        let edits = sqlx::query_as::<_, (String, String, Option<String>, DateTime<Utc>)>(
+            r#"
+            SELECT id, content, content_warning, created_at
+            FROM status_edits
+            WHERE status_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(status_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(edits)
     }
 
     /// Delete status by ID
@@ -1937,6 +2109,84 @@ impl Database {
             .await?;
 
         Ok(count > 0)
+    }
+
+    /// Insert status pin marker.
+    pub async fn insert_status_pin(&self, status_id: &str) -> Result<(), AppError> {
+        let id = EntityId::new().0;
+        sqlx::query(
+            "INSERT OR IGNORE INTO pinned_statuses (id, status_id, created_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(&id)
+        .bind(status_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete status pin marker.
+    pub async fn delete_status_pin(&self, status_id: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM pinned_statuses WHERE status_id = ?")
+            .bind(status_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Check whether status is pinned.
+    pub async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pinned_statuses WHERE status_id = ?")
+                .bind(status_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(count > 0)
+    }
+
+    /// Insert conversation mute marker for a thread URI.
+    pub async fn insert_muted_thread(&self, thread_uri: &str) -> Result<(), AppError> {
+        let id = EntityId::new().0;
+        sqlx::query(
+            "INSERT OR IGNORE INTO muted_conversations (id, thread_uri, created_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(&id)
+        .bind(thread_uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete conversation mute marker for a thread URI.
+    pub async fn delete_muted_thread(&self, thread_uri: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM muted_conversations WHERE thread_uri = ?")
+            .bind(thread_uri)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Check whether thread URI is muted.
+    pub async fn is_thread_muted(&self, thread_uri: &str) -> Result<bool, AppError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM muted_conversations WHERE thread_uri = ?")
+                .bind(thread_uri)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(count > 0)
+    }
+
+    /// Get all muted thread URIs.
+    pub async fn get_muted_thread_uris(&self) -> Result<HashSet<String>, AppError> {
+        let uris = sqlx::query_scalar::<_, String>("SELECT thread_uri FROM muted_conversations")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(uris.into_iter().collect())
     }
 
     // =========================================================================

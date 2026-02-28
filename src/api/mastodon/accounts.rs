@@ -355,14 +355,20 @@ pub async fn account_statuses(
         .await?;
 
     // Convert to API responses
-    let responses: Vec<_> = statuses
-        .iter()
-        .map(|status| {
-            let response =
-                crate::api::status_to_response(status, &account, &state.config, None, None, None);
-            serde_json::to_value(response).unwrap()
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(statuses.len());
+    for status in &statuses {
+        let response = crate::api::status_to_response(
+            status,
+            &account,
+            &state.config,
+            None,
+            None,
+            None,
+            None,
+            state.db.is_status_pinned(&status.id).await.ok(),
+        );
+        responses.push(serde_json::to_value(response).unwrap());
+    }
 
     Ok(Json(responses))
 }
