@@ -112,33 +112,13 @@ async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
 }
 
 async fn send_validated_get(
+    http_client: &reqwest::Client,
     url: &url::Url,
     accept_header: &str,
 ) -> Result<reqwest::Response, AppError> {
-    let (host, _port, resolved_addrs) = resolve_allowed_remote_addrs(url).await?;
-    if host.parse::<IpAddr>().is_ok() {
-        return reqwest::Client::new()
-            .get(url.clone())
-            .header("Accept", accept_header)
-            .send()
-            .await
-            .map_err(|error| {
-                AppError::Federation(format!("Request failed for {}: {}", url, error))
-            });
-    }
+    let _ = resolve_allowed_remote_addrs(url).await?;
 
-    let mut client_builder = reqwest::Client::builder();
-    for address in resolved_addrs {
-        client_builder = client_builder.resolve(&host, address);
-    }
-    let client = client_builder.build().map_err(|error| {
-        AppError::Federation(format!(
-            "Failed to construct pinned DNS client for {}: {}",
-            url, error
-        ))
-    })?;
-
-    client
+    http_client
         .get(url.clone())
         .header("Accept", accept_header)
         .send()
@@ -404,7 +384,7 @@ fn extract_url(value: &serde_json::Value) -> Option<String> {
 }
 
 async fn discover_actor_uri(
-    _http_client: &reqwest::Client,
+    http_client: &reqwest::Client,
     username: &str,
     domain: &str,
 ) -> Result<String, AppError> {
@@ -414,6 +394,7 @@ async fn discover_actor_uri(
 
     for webfinger_url in webfinger_urls {
         let response = match send_validated_get(
+            http_client,
             &webfinger_url,
             "application/jrd+json, application/json",
         )
@@ -551,13 +532,14 @@ fn is_supported_webfinger_link_type(link_type: &str) -> bool {
 }
 
 async fn fetch_actor_document(
-    _http_client: &reqwest::Client,
+    http_client: &reqwest::Client,
     actor_uri: &str,
 ) -> Result<serde_json::Value, AppError> {
     let actor_url = url::Url::parse(actor_uri).map_err(|error| {
         AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
     })?;
     let response = send_validated_get(
+        http_client,
         &actor_url,
         "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
     )
