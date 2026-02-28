@@ -2602,6 +2602,24 @@ impl Database {
             .any(|existing| account_addresses_match(existing, target_address, default_port)))
     }
 
+    /// Get mute notifications preference for an account.
+    pub async fn get_account_mute_notifications(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<bool>, AppError> {
+        let existing_mutes = sqlx::query_as::<_, (String, i64)>(
+            "SELECT target_address, notifications FROM account_mutes",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(existing_mutes
+            .into_iter()
+            .find(|(existing, _)| account_addresses_match(existing, target_address, default_port))
+            .map(|(_, notifications)| notifications != 0))
+    }
+
     /// Get muted account addresses
     pub async fn get_muted_accounts(&self, limit: usize) -> Result<Vec<String>, AppError> {
         let addresses = sqlx::query_scalar::<_, String>(

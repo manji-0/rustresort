@@ -499,6 +499,34 @@ async fn test_get_relationships_matches_default_port_equivalent_follow_requests(
 }
 
 #[tokio::test]
+async fn test_get_relationships_returns_persisted_mute_notifications_flag() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .mute_account("alice@remote.example:443", false, None, Some(443))
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", "alice@remote.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["muting"], true);
+    assert_eq!(body[0]["muting_notifications"], false);
+}
+
+#[tokio::test]
 async fn test_search_accounts() {
     let server = TestServer::new().await;
     server.create_test_account().await;

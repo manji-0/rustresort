@@ -737,6 +737,11 @@ pub async fn get_relationships(
             .db
             .is_account_muted(&target_address, default_port)
             .await?;
+        let muting_notifications = state
+            .db
+            .get_account_mute_notifications(&target_address, default_port)
+            .await?
+            .unwrap_or(false);
         let requested = state
             .db
             .has_follow_request_with_default_port(&target_address, default_port)
@@ -749,7 +754,7 @@ pub async fn get_relationships(
             blocking,
             blocked_by: false,
             muting,
-            muting_notifications: muting,
+            muting_notifications,
             requested,
             domain_blocking: false,
             showing_reblogs: !blocking,
