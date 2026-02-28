@@ -242,7 +242,7 @@ fn build_session_cookie(session_token: &str, secure: bool) -> Cookie<'static> {
         .path("/")
         .http_only(true)
         .secure(secure)
-        .same_site(SameSite::Strict)
+        .same_site(SameSite::Lax)
         .build()
 }
 
@@ -352,7 +352,7 @@ mod tests {
         let cookie = build_session_cookie("token", true);
         assert_eq!(cookie.secure(), Some(true));
         assert_eq!(cookie.http_only(), Some(true));
-        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+        assert_eq!(cookie.same_site(), Some(SameSite::Lax));
     }
 
     #[test]

@@ -320,7 +320,7 @@ impl AppConfig {
     fn validate(&self) -> Result<(), crate::error::AppError> {
         const MIN_SESSION_SECRET_BYTES: usize = 32;
 
-        if self.auth.session_secret.as_bytes().len() < MIN_SESSION_SECRET_BYTES {
+        if self.auth.session_secret.len() < MIN_SESSION_SECRET_BYTES {
             return Err(crate::error::AppError::Config(format!(
                 "auth.session_secret must be at least {} bytes",
                 MIN_SESSION_SECRET_BYTES
