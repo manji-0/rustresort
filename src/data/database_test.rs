@@ -1280,6 +1280,41 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
 }
 
 #[tokio::test]
+async fn test_insert_status_indexes_markup_wrapped_hashtags() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: "350".to_string(),
+        uri: "https://example.com/status/tag-markup".to_string(),
+        content: "<p>#<span>Rust</span> and #<a href=\"https://example.com/tags/rustlang\">RustLang</a></p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let rust = db
+        .get_statuses_by_hashtag_in_window("rust", 10, None, None)
+        .await
+        .unwrap();
+    let rustlang = db
+        .get_statuses_by_hashtag_in_window("rustlang", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(rust.len(), 1);
+    assert_eq!(rustlang.len(), 1);
+    assert_eq!(rust[0].id, status.id);
+    assert_eq!(rustlang[0].id, status.id);
+}
+
+#[tokio::test]
 async fn test_database_connect_backfills_missing_status_hashtag_rows() {
     let (db, temp_dir) = create_test_db().await;
 
@@ -1509,6 +1544,7 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
             &list_id,
             &local_address,
             &local_account_id,
+            Some(443),
             10,
             None,
             None,
@@ -1554,6 +1590,7 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
             &list_id,
             &local_address,
             &local_account_id,
+            Some(443),
             10,
             None,
             None,
@@ -1562,6 +1599,69 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
         .unwrap();
     let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
     assert!(ids.contains(&local_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_query_matches_default_port_equivalent_remote_addresses() {
+    let (db, _temp_dir) = create_test_db().await;
+    let list_id = db
+        .create_list("List timeline default-port", "list")
+        .await
+        .unwrap();
+    let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "01HLOCALACCOUNTID".to_string();
+    db.add_accounts_to_list(&list_id, &[String::from("alice@remote.example")])
+        .await
+        .unwrap();
+
+    let matching_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-default-port-match".to_string(),
+        content: "<p>Remote status from default-port equivalent address</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example:443".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let unrelated_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-default-port-unrelated".to_string(),
+        content: "<p>Unrelated remote status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "bob@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&matching_status).await.unwrap();
+    db.insert_status(&unrelated_status).await.unwrap();
+
+    let statuses = db
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            Some(443),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
+    assert!(ids.contains(&matching_status.id));
+    assert!(!ids.contains(&unrelated_status.id));
 }
 
 #[tokio::test]

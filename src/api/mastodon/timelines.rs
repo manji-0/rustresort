@@ -210,6 +210,11 @@ pub async fn list_timeline(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let local_account_address = format!("{}@{}", account.username, state.config.server.domain);
     let local_account_id = account.id.clone();
+    let default_port = match state.config.server.protocol.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
 
     let limit = params.limit.unwrap_or(20).min(40);
     let timeline_service = TimelineService::new(
@@ -222,6 +227,7 @@ pub async fn list_timeline(
             &list_id,
             &local_account_address,
             &local_account_id,
+            default_port,
             limit,
             params.max_id.as_deref(),
             params.min_id.as_deref(),

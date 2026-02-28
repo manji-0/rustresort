@@ -45,6 +45,25 @@ fn is_hashtag_boundary(previous: Option<char>) -> bool {
         .unwrap_or(true)
 }
 
+fn skip_html_tag(content: &str, start: usize) -> Option<usize> {
+    if !content[start..].starts_with('<') {
+        return None;
+    }
+
+    let mut quoted = None;
+    for (offset, ch) in content[start + 1..].char_indices() {
+        match (quoted, ch) {
+            (Some(quote), _) if ch == quote => quoted = None,
+            (Some(_), _) => {}
+            (None, '"') | (None, '\'') => quoted = Some(ch),
+            (None, '>') => return Some(start + 1 + offset + ch.len_utf8()),
+            (None, _) => {}
+        }
+    }
+
+    None
+}
+
 fn extract_hashtags_from_content(content: &str) -> Vec<String> {
     let mut hashtags = Vec::new();
     let mut seen = HashSet::new();
@@ -61,12 +80,31 @@ fn extract_hashtags_from_content(content: &str) -> Vec<String> {
         }
 
         let mut tag = String::new();
-        while let Some((_, next_char)) = chars.peek().copied() {
-            if !is_hashtag_char(next_char) {
+        let mut cursor = index + ch.len_utf8();
+        loop {
+            let Some(next_char) = content[cursor..].chars().next() else {
+                break;
+            };
+            if is_hashtag_char(next_char) {
+                tag.push(next_char.to_ascii_lowercase());
+                cursor += next_char.len_utf8();
+                continue;
+            }
+            if next_char == '<' {
+                if let Some(after_tag) = skip_html_tag(content, cursor) {
+                    cursor = after_tag;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        while let Some((peek_index, _)) = chars.peek().copied() {
+            if peek_index < cursor {
+                chars.next();
+            } else {
                 break;
             }
-            tag.push(next_char.to_ascii_lowercase());
-            chars.next();
         }
 
         if !tag.is_empty() && seen.insert(tag.clone()) {
@@ -1611,6 +1649,7 @@ impl Database {
         list_id: &str,
         local_account_address: &str,
         local_account_id: &str,
+        default_port: Option<u16>,
         limit: usize,
         max_id: Option<&str>,
         min_id: Option<&str>,
@@ -1619,125 +1658,76 @@ impl Database {
             return Ok(Vec::new());
         }
 
-        let statuses = match (max_id, min_id) {
-            (Some(max_id), Some(min_id)) => {
-                sqlx::query_as::<_, Status>(
-                    r#"
-                    SELECT DISTINCT s.*
-                    FROM statuses s
-                    INNER JOIN list_accounts la ON la.list_id = ?
-                    WHERE (
-                        (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (
-                            s.is_local = 1 AND s.account_address = ''
-                            AND (
-                                la.account_address = ? COLLATE NOCASE
-                                OR la.account_address = ?
-                            )
-                        )
-                    )
-                      AND s.id < ?
-                      AND s.id > ?
-                    ORDER BY s.id DESC
-                    LIMIT ?
-                    "#,
-                )
-                .bind(list_id)
-                .bind(local_account_address)
-                .bind(local_account_id)
-                .bind(max_id)
-                .bind(min_id)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (Some(max_id), None) => {
-                sqlx::query_as::<_, Status>(
-                    r#"
-                    SELECT DISTINCT s.*
-                    FROM statuses s
-                    INNER JOIN list_accounts la ON la.list_id = ?
-                    WHERE (
-                        (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (
-                            s.is_local = 1 AND s.account_address = ''
-                            AND (
-                                la.account_address = ? COLLATE NOCASE
-                                OR la.account_address = ?
-                            )
-                        )
-                    )
-                      AND s.id < ?
-                    ORDER BY s.id DESC
-                    LIMIT ?
-                    "#,
-                )
-                .bind(list_id)
-                .bind(local_account_address)
-                .bind(local_account_id)
-                .bind(max_id)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, Some(min_id)) => {
-                sqlx::query_as::<_, Status>(
-                    r#"
-                    SELECT DISTINCT s.*
-                    FROM statuses s
-                    INNER JOIN list_accounts la ON la.list_id = ?
-                    WHERE (
-                        (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (
-                            s.is_local = 1 AND s.account_address = ''
-                            AND (
-                                la.account_address = ? COLLATE NOCASE
-                                OR la.account_address = ?
-                            )
-                        )
-                    )
-                      AND s.id > ?
-                    ORDER BY s.id DESC
-                    LIMIT ?
-                    "#,
-                )
-                .bind(list_id)
-                .bind(local_account_address)
-                .bind(local_account_id)
-                .bind(min_id)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            (None, None) => {
-                sqlx::query_as::<_, Status>(
-                    r#"
-                    SELECT DISTINCT s.*
-                    FROM statuses s
-                    INNER JOIN list_accounts la ON la.list_id = ?
-                    WHERE (
-                        (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (
-                            s.is_local = 1 AND s.account_address = ''
-                            AND (
-                                la.account_address = ? COLLATE NOCASE
-                                OR la.account_address = ?
-                            )
-                        )
-                    )
-                    ORDER BY s.id DESC
-                    LIMIT ?
-                    "#,
-                )
-                .bind(list_id)
-                .bind(local_account_address)
-                .bind(local_account_id)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        let list_accounts = self.get_list_accounts(list_id).await?;
+        if list_accounts.is_empty() {
+            return Ok(Vec::new());
+        }
 
+        let mut include_local_statuses = false;
+        let mut remote_candidates = Vec::new();
+        let mut seen_remote = HashSet::new();
+
+        for account_address in list_accounts {
+            if account_address.eq_ignore_ascii_case(local_account_address)
+                || account_address == local_account_id
+            {
+                include_local_statuses = true;
+                continue;
+            }
+
+            for candidate in equivalent_account_address_candidates(&account_address, default_port) {
+                let lowered = candidate.to_ascii_lowercase();
+                if seen_remote.insert(lowered.clone()) {
+                    remote_candidates.push(lowered);
+                }
+            }
+        }
+
+        if remote_candidates.is_empty() && !include_local_statuses {
+            return Ok(Vec::new());
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT DISTINCT s.* FROM statuses s WHERE (");
+        let mut has_clause = false;
+
+        if !remote_candidates.is_empty() {
+            has_clause = true;
+            query_builder.push("(s.account_address <> '' AND LOWER(s.account_address) IN (");
+            {
+                let mut separated = query_builder.separated(", ");
+                for candidate in remote_candidates {
+                    separated.push_bind(candidate);
+                }
+            }
+            query_builder.push("))");
+        }
+
+        if include_local_statuses {
+            if has_clause {
+                query_builder.push(" OR ");
+            }
+            query_builder.push("(s.is_local = 1 AND s.account_address = '')");
+        }
+
+        query_builder.push(")");
+
+        if let Some(max_id) = max_id {
+            query_builder.push(" AND s.id < ");
+            query_builder.push_bind(max_id);
+        }
+        if let Some(min_id) = min_id {
+            query_builder.push(" AND s.id > ");
+            query_builder.push_bind(min_id);
+        }
+
+        query_builder.push(" ORDER BY s.id DESC LIMIT ");
+        query_builder.push_bind(limit as i64);
+
+        let statuses = query_builder
+            .build_query_as::<Status>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(statuses)
     }
 
