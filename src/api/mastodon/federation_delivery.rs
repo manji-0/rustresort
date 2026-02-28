@@ -18,11 +18,17 @@ struct DiscoveredRemoteActor {
     actor_document: serde_json::Value,
 }
 
+fn is_shared_ipv4_space(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
 fn is_blocked_ip_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 || v4.is_private()
+                || is_shared_ipv4_space(v4)
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
@@ -791,6 +797,16 @@ mod tests {
         let error = validate_remote_fetch_url(&url)
             .await
             .expect_err("loopback URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_shared_ipv4_space() {
+        let url = url::Url::parse("http://100.100.100.200/users/alice")
+            .expect("shared-space URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("shared-space URL must be rejected");
         assert!(matches!(error, AppError::Validation(_)));
     }
 
