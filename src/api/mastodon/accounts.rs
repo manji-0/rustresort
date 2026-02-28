@@ -26,6 +26,19 @@ pub struct PaginationParams {
     pub limit: Option<usize>,
 }
 
+/// Account statuses timeline query parameters
+#[derive(Debug, Deserialize)]
+pub struct AccountStatusesParams {
+    pub max_id: Option<String>,
+    pub since_id: Option<String>,
+    pub min_id: Option<String>,
+    pub limit: Option<usize>,
+    pub exclude_reblogs: Option<bool>,
+    pub exclude_replies: Option<bool>,
+    pub only_media: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
 /// Update credentials request
 #[derive(Debug, Deserialize)]
 pub struct UpdateCredentialsRequest {
@@ -338,7 +351,7 @@ pub async fn get_account(
 pub async fn account_statuses(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<AccountStatusesParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -347,27 +360,57 @@ pub async fn account_statuses(
         return Err(AppError::NotFound);
     }
 
-    // Get local statuses
+    // Get local statuses in pagination window.
     let limit = params.limit.unwrap_or(20).min(40);
+    let only_pinned = params.pinned.unwrap_or(false);
+    let exclude_reblogs = params.exclude_reblogs.unwrap_or(false);
+    let exclude_replies = params.exclude_replies.unwrap_or(false);
+    let only_media = params.only_media.unwrap_or(false);
+    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
+    let has_filters = only_pinned || exclude_reblogs || exclude_replies || only_media;
+    let fetch_limit = if has_filters {
+        limit.saturating_mul(5).min(200)
+    } else {
+        limit
+    };
+
     let statuses = state
         .db
-        .get_local_statuses(limit, params.max_id.as_deref())
+        .get_local_statuses_in_window(fetch_limit, params.max_id.as_deref(), effective_min_id)
         .await?;
 
-    // Convert to API responses
-    let mut responses = Vec::with_capacity(statuses.len());
-    for status in &statuses {
+    // Convert to API responses with optional filters.
+    let mut responses = Vec::with_capacity(limit);
+    for status in statuses {
+        if exclude_reblogs && status.boost_of_uri.is_some() {
+            continue;
+        }
+        if exclude_replies && status.in_reply_to_uri.is_some() {
+            continue;
+        }
+
+        let is_pinned = state.db.is_status_pinned(&status.id).await?;
+        if only_pinned && !is_pinned {
+            continue;
+        }
+        if only_media && state.db.get_media_by_status(&status.id).await?.is_empty() {
+            continue;
+        }
+
         let response = crate::api::status_to_response(
-            status,
+            &status,
             &account,
             &state.config,
             None,
             None,
             None,
             None,
-            state.db.is_status_pinned(&status.id).await.ok(),
+            Some(is_pinned),
         );
         responses.push(serde_json::to_value(response).unwrap());
+        if responses.len() >= limit {
+            break;
+        }
     }
 
     Ok(Json(responses))
