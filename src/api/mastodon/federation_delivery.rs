@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::AppState;
@@ -26,6 +27,10 @@ fn is_blocked_ip_address(ip: IpAddr) -> bool {
                 || v4.is_multicast()
         }
         IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip_address(IpAddr::V4(mapped_v4));
+            }
+
             v6.is_loopback()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
@@ -35,7 +40,9 @@ fn is_blocked_ip_address(ip: IpAddr) -> bool {
     }
 }
 
-async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
+async fn resolve_allowed_remote_addrs(
+    url: &url::Url,
+) -> Result<(String, u16, Vec<SocketAddr>), AppError> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(AppError::Validation(
             "Remote URL must use http or https".to_string(),
@@ -47,11 +54,16 @@ async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
         ));
     }
 
-    let host = url
+    let raw_host = url
         .host_str()
         .ok_or_else(|| AppError::Validation("Remote URL must include a host".to_string()))?
         .trim_end_matches('.')
         .to_ascii_lowercase();
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&raw_host)
+        .to_string();
 
     if host == "localhost" || host.ends_with(".localhost") {
         return Err(AppError::Validation(
@@ -70,28 +82,68 @@ async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
     let port = url.port_or_known_default().ok_or_else(|| {
         AppError::Validation("Remote URL must include a known default port".to_string())
     })?;
-    let mut resolved_any = false;
+    let mut resolved_addrs = Vec::new();
     let resolved = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|error| {
             AppError::Federation(format!("Failed to resolve remote host {}: {}", host, error))
         })?;
     for address in resolved {
-        resolved_any = true;
         if is_blocked_ip_address(address.ip()) {
             return Err(AppError::Validation(
                 "Remote URL host is not allowed".to_string(),
             ));
         }
+        resolved_addrs.push(address);
     }
-    if !resolved_any {
+    if resolved_addrs.is_empty() {
         return Err(AppError::Federation(format!(
             "Remote host did not resolve to any IP addresses: {}",
             host
         )));
     }
 
+    Ok((host, port, resolved_addrs))
+}
+
+async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
+    let _ = resolve_allowed_remote_addrs(url).await?;
     Ok(())
+}
+
+async fn send_validated_get(
+    url: &url::Url,
+    accept_header: &str,
+) -> Result<reqwest::Response, AppError> {
+    let (host, _port, resolved_addrs) = resolve_allowed_remote_addrs(url).await?;
+    if host.parse::<IpAddr>().is_ok() {
+        return reqwest::Client::new()
+            .get(url.clone())
+            .header("Accept", accept_header)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Federation(format!("Request failed for {}: {}", url, error))
+            });
+    }
+
+    let mut client_builder = reqwest::Client::builder();
+    for address in resolved_addrs {
+        client_builder = client_builder.resolve(&host, address);
+    }
+    let client = client_builder.build().map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to construct pinned DNS client for {}: {}",
+            url, error
+        ))
+    })?;
+
+    client
+        .get(url.clone())
+        .header("Accept", accept_header)
+        .send()
+        .await
+        .map_err(|error| AppError::Federation(format!("Request failed for {}: {}", url, error)))
 }
 
 async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Result<(), AppError> {
@@ -130,13 +182,11 @@ pub async fn resolve_remote_actor_and_inbox(
     let address = address.trim();
 
     if let Some(profile) = state.profile_cache.get(address).await {
-        validate_actor_and_inbox_urls(&profile.uri, &profile.inbox_uri).await?;
         return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
     }
 
     if let Some(actor_uri_address) = parse_actor_uri_address(address) {
         if let Some(profile) = state.profile_cache.get_by_uri(&actor_uri_address).await {
-            validate_actor_and_inbox_urls(&profile.uri, &profile.inbox_uri).await?;
             return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
         }
     }
@@ -354,7 +404,7 @@ fn extract_url(value: &serde_json::Value) -> Option<String> {
 }
 
 async fn discover_actor_uri(
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     username: &str,
     domain: &str,
 ) -> Result<String, AppError> {
@@ -363,15 +413,11 @@ async fn discover_actor_uri(
     let mut last_error = None;
 
     for webfinger_url in webfinger_urls {
-        if let Err(error) = validate_remote_fetch_url(&webfinger_url).await {
-            last_error = Some(error);
-            continue;
-        }
-        let response = match http_client
-            .get(webfinger_url.clone())
-            .header("Accept", "application/jrd+json, application/json")
-            .send()
-            .await
+        let response = match send_validated_get(
+            &webfinger_url,
+            "application/jrd+json, application/json",
+        )
+        .await
         {
             Ok(response) => response,
             Err(error) => {
@@ -505,28 +551,18 @@ fn is_supported_webfinger_link_type(link_type: &str) -> bool {
 }
 
 async fn fetch_actor_document(
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
     actor_uri: &str,
 ) -> Result<serde_json::Value, AppError> {
     let actor_url = url::Url::parse(actor_uri).map_err(|error| {
         AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
     })?;
-    validate_remote_fetch_url(&actor_url).await?;
-
-    let response = http_client
-        .get(actor_url)
-        .header(
-            "Accept",
-            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
-        )
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Federation(format!(
-                "Actor fetch failed for {}: {}",
-                actor_uri, error
-            ))
-        })?;
+    let response = send_validated_get(
+        &actor_url,
+        "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+    )
+    .await
+    .map_err(|error| AppError::Federation(format!("Actor fetch failed for {}: {}", actor_uri, error)))?;
 
     if !response.status().is_success() {
         return Err(AppError::Federation(format!(
@@ -747,6 +783,16 @@ mod tests {
         let error = validate_remote_fetch_url(&url)
             .await
             .expect_err("localhost URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_ipv4_mapped_ipv6_loopback() {
+        let url = url::Url::parse("http://[::ffff:7f00:1]/users/alice")
+            .expect("ipv4-mapped ipv6 URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("ipv4-mapped loopback URL must be rejected");
         assert!(matches!(error, AppError::Validation(_)));
     }
 }
