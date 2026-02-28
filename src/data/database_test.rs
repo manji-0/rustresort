@@ -1801,6 +1801,64 @@ async fn test_replace_status_media_detaches_and_attaches_expected_media() {
 }
 
 #[tokio::test]
+async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_status() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let media_id = EntityId::new().0;
+    db.insert_media(&MediaAttachment {
+        id: media_id.clone(),
+        status_id: None,
+        s3_key: format!("media/{}.png", media_id),
+        thumbnail_s3_key: None,
+        content_type: "image/png".to_string(),
+        file_size: 100,
+        description: None,
+        blurhash: None,
+        width: Some(1),
+        height: Some(1),
+        focus_x: None,
+        focus_y: None,
+        created_at: Utc::now(),
+    })
+    .await
+    .unwrap();
+
+    let previous = Status {
+        id: "missing-status-id".to_string(),
+        uri: "https://example.com/status/missing".to_string(),
+        content: "<p>before</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let mut updated = previous.clone();
+    updated.content = "<p>after</p>".to_string();
+
+    let error = db
+        .update_status_with_edit_snapshot_and_media(
+            &previous,
+            &updated,
+            Some(std::slice::from_ref(&media_id)),
+        )
+        .await
+        .expect_err("missing status should fail");
+    assert!(matches!(
+        error,
+        crate::error::AppError::NotFound | crate::error::AppError::Database(_)
+    ));
+
+    let media = db.get_media(&media_id).await.unwrap().unwrap();
+    assert_eq!(media.status_id, None);
+}
+
+#[tokio::test]
 async fn test_accept_follow_request_moves_to_followers() {
     let (db, _temp_dir) = create_test_db().await;
 

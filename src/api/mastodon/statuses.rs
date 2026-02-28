@@ -1406,6 +1406,7 @@ pub async fn update_status(
 
     // Update fields if provided
     let mut changed = false;
+    let mut media_ids_to_replace: Option<Vec<String>> = None;
 
     if let Some(content) = req.status {
         if !content.is_empty() {
@@ -1447,16 +1448,18 @@ pub async fn update_status(
             .collect::<HashSet<_>>();
         let requested_media_ids = normalized_media_ids.iter().cloned().collect::<HashSet<_>>();
         if current_media_ids != requested_media_ids {
-            status_service
-                .replace_media_for_status(&id, &normalized_media_ids)
-                .await?;
+            media_ids_to_replace = Some(normalized_media_ids);
             changed = true;
         }
     }
 
     if changed {
         status_service
-            .update_with_edit_snapshot(&previous_status, &status)
+            .update_with_edit_snapshot_and_media(
+                &previous_status,
+                &status,
+                media_ids_to_replace.as_deref(),
+            )
             .await?;
     }
 

@@ -176,6 +176,18 @@ impl StatusService {
             .await
     }
 
+    /// Persist status update with atomic edit snapshot and optional media replacement.
+    pub async fn update_with_edit_snapshot_and_media(
+        &self,
+        previous: &Status,
+        updated: &Status,
+        media_ids: Option<&[String]>,
+    ) -> Result<(), AppError> {
+        self.db
+            .update_status_with_edit_snapshot_and_media(previous, updated, media_ids)
+            .await
+    }
+
     /// Get media attachments linked to a status.
     pub async fn get_media_by_status(
         &self,
