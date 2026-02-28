@@ -16,6 +16,7 @@ use super::federation_delivery::{
 };
 use crate::AppState;
 use crate::auth::CurrentUser;
+use crate::data::PersistedReason;
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
@@ -1086,7 +1087,9 @@ pub async fn unfavourite_status(
     let account = build_account_service(&state).get_account().await?;
 
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
-        status_service.get_by_uri(uri).await?
+        status_service
+            .ensure_remote_status_persisted(uri, PersistedReason::Favourited)
+            .await?
     } else {
         status_service.get(&id).await?
     };
@@ -1245,7 +1248,9 @@ pub async fn unreblog_status(
 
     let action_uri = resolve_action_uri(&id, &params)?;
     let status = if let Some(uri) = action_uri {
-        status_service.get_by_uri(uri).await?
+        status_service
+            .ensure_remote_status_persisted(uri, PersistedReason::Reposted)
+            .await?
     } else {
         status_service.get(&id).await?
     };
@@ -1349,7 +1354,9 @@ pub async fn unbookmark_status(
 
     // Get status and remove bookmark.
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
-        let status = status_service.get_by_uri(uri).await?;
+        let status = status_service
+            .ensure_remote_status_persisted(uri, PersistedReason::Bookmarked)
+            .await?;
         status_service.unbookmark_loaded(&status).await?;
         status
     } else {
