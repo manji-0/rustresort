@@ -5,6 +5,7 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use super::federation_delivery::{
     build_delivery, resolve_remote_actor_and_inbox, spawn_best_effort_delivery,
@@ -207,6 +208,29 @@ async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, Ap
     Err(AppError::Validation(
         "Invalid account ID format".to_string(),
     ))
+}
+
+fn build_remote_account_stub(address: &str) -> serde_json::Value {
+    let username = address.split('@').next().unwrap_or(address);
+    let domain = address.split('@').nth(1).unwrap_or("");
+    serde_json::json!({
+        "id": address,
+        "username": username,
+        "acct": address,
+        "display_name": "",
+        "note": "",
+        "url": if domain.is_empty() {
+            "".to_string()
+        } else {
+            format!("https://{}", domain)
+        },
+        "avatar": "",
+        "header": "",
+        "followers_count": 0,
+        "following_count": 0,
+        "statuses_count": 0,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 /// GET /api/v1/accounts/verify_credentials
@@ -589,9 +613,21 @@ pub async fn get_relationships(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    // Get following and follower addresses
-    let _following_addresses = state.db.get_all_follow_addresses().await?;
-    let _follower_addresses = state.db.get_all_follower_addresses().await?;
+    let following_set: HashSet<String> = state
+        .db
+        .get_all_follow_addresses()
+        .await?
+        .into_iter()
+        .filter_map(|address| normalize_account_address(&address).ok())
+        .collect();
+    let follower_set: HashSet<String> = state
+        .db
+        .get_all_follower_addresses()
+        .await?
+        .into_iter()
+        .filter_map(|address| normalize_account_address(&address).ok())
+        .collect();
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     let ids: Vec<String> = raw_query
         .as_deref()
@@ -611,20 +647,53 @@ pub async fn get_relationships(
     // Create relationship responses for each requested ID
     let mut relationships = vec![];
     for id in ids {
-        // For single-user instance, we check if the ID matches our account
-        let _account = state.db.get_account().await?;
+        let target_address = match resolve_target_address(&state, &id).await {
+            Ok(address) => address,
+            Err(_) => {
+                let relationship = RelationshipResponse {
+                    id: id.clone(),
+                    following: false,
+                    followed_by: false,
+                    blocking: false,
+                    blocked_by: false,
+                    muting: false,
+                    muting_notifications: false,
+                    requested: false,
+                    domain_blocking: false,
+                    showing_reblogs: true,
+                    endorsed: false,
+                    notifying: false,
+                    note: String::new(),
+                };
+                relationships.push(serde_json::to_value(relationship).unwrap());
+                continue;
+            }
+        };
+        let normalized_target = normalize_account_address(&target_address)
+            .unwrap_or_else(|_| target_address.to_ascii_lowercase());
+        let following = following_set.contains(&normalized_target);
+        let followed_by = follower_set.contains(&normalized_target);
+        let blocking = state
+            .db
+            .is_account_blocked(&target_address, default_port)
+            .await?;
+        let muting = state
+            .db
+            .is_account_muted(&target_address, default_port)
+            .await?;
+        let requested = state.db.has_follow_request(&target_address).await?;
 
         let relationship = RelationshipResponse {
             id: id.clone(),
-            following: false,   // TODO: Check if we follow this account
-            followed_by: false, // TODO: Check if this account follows us
-            blocking: false,
+            following,
+            followed_by,
+            blocking,
             blocked_by: false,
-            muting: false,
-            muting_notifications: false,
-            requested: false,
+            muting,
+            muting_notifications: muting,
+            requested,
             domain_blocking: false,
-            showing_reblogs: true,
+            showing_reblogs: !blocking,
             endorsed: false,
             notifying: false,
             note: String::new(),
@@ -709,23 +778,33 @@ pub async fn create_account(
 
 /// GET /api/v1/accounts/:id/lists
 /// Get lists that contain the specified account
-///
-/// For single-user instance, this returns an empty array
-/// as list functionality is not yet implemented.
 pub async fn get_account_lists(
     State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Verify account exists
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let target_address = resolve_target_address(&state, &id).await?;
+    let normalized_target = normalize_account_address(&target_address)?;
+    let all_lists = state.db.get_all_lists().await?;
+    let mut matched_lists = Vec::new();
 
-    if account.id != id {
-        return Err(AppError::NotFound);
+    for (list_id, title, replies_policy) in all_lists {
+        let accounts = state.db.get_list_accounts(&list_id).await?;
+        let contains_target = accounts.into_iter().any(|address| {
+            normalize_account_address(&address)
+                .map(|normalized| normalized == normalized_target)
+                .unwrap_or(false)
+        });
+        if contains_target {
+            matched_lists.push(serde_json::json!({
+                "id": list_id,
+                "title": title,
+                "replies_policy": replies_policy,
+            }));
+        }
     }
 
-    // Lists not yet implemented, return empty array
-    Ok(Json(vec![]))
+    Ok(Json(matched_lists))
 }
 
 /// GET /api/v1/accounts/:id/identity_proofs
@@ -975,11 +1054,12 @@ pub async fn get_blocks(
     // Get blocked account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
 
-    let _addresses = state.db.get_blocked_accounts(limit).await?;
-
-    // For now, return empty array as we don't have remote account info
-    // TODO: Fetch full account info for each blocked account
-    Ok(Json(vec![]))
+    let addresses = state.db.get_blocked_accounts(limit).await?;
+    let accounts = addresses
+        .iter()
+        .map(|address| build_remote_account_stub(address))
+        .collect();
+    Ok(Json(accounts))
 }
 
 /// GET /api/v1/mutes
@@ -992,11 +1072,12 @@ pub async fn get_mutes(
     // Get muted account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
 
-    let _addresses = state.db.get_muted_accounts(limit).await?;
-
-    // For now, return empty array as we don't have remote account info
-    // TODO: Fetch full account info for each muted account
-    Ok(Json(vec![]))
+    let addresses = state.db.get_muted_accounts(limit).await?;
+    let accounts = addresses
+        .iter()
+        .map(|address| build_remote_account_stub(address))
+        .collect();
+    Ok(Json(accounts))
 }
 
 /// GET /api/v1/follow_requests
@@ -1009,11 +1090,12 @@ pub async fn get_follow_requests(
     // Get follow requests from database
     let limit = params.limit.unwrap_or(40).min(80);
 
-    let _addresses = state.db.get_follow_request_addresses(limit).await?;
-
-    // For now, return empty array as we don't have remote account info
-    // TODO: Fetch full account info for each requester
-    Ok(Json(vec![]))
+    let addresses = state.db.get_follow_request_addresses(limit).await?;
+    let accounts = addresses
+        .iter()
+        .map(|address| build_remote_account_stub(address))
+        .collect();
+    Ok(Json(accounts))
 }
 
 /// GET /api/v1/follow_requests/:id
@@ -1030,13 +1112,7 @@ pub async fn get_follow_request(
         return Err(AppError::NotFound);
     }
 
-    // TODO: Fetch full account info for the requester
-    // For now, return a minimal account object
-    Ok(Json(serde_json::json!({
-        "id": id,
-        "username": requester_address.split('@').next().unwrap_or(&requester_address),
-        "acct": requester_address,
-    })))
+    Ok(Json(build_remote_account_stub(&requester_address)))
 }
 
 /// POST /api/v1/follow_requests/:id/authorize
