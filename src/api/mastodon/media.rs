@@ -44,6 +44,34 @@ pub struct MediaMetaInfo {
     pub height: Option<i32>,
     pub size: Option<String>,
     pub aspect: Option<f64>,
+    pub focus: Option<String>,
+}
+
+fn format_media_focus(focus_x: Option<f64>, focus_y: Option<f64>) -> Option<String> {
+    match (focus_x, focus_y) {
+        (Some(x), Some(y)) => Some(format!("{:.3},{:.3}", x, y)),
+        _ => None,
+    }
+}
+
+fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
+    let (x_raw, y_raw) = raw
+        .split_once(',')
+        .ok_or_else(|| AppError::Validation("focus must be in `x,y` format".to_string()))?;
+    let x = x_raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| AppError::Validation("focus x must be a valid float".to_string()))?;
+    let y = y_raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| AppError::Validation("focus y must be a valid float".to_string()))?;
+    if !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y) {
+        return Err(AppError::Validation(
+            "focus values must be between -1.0 and 1.0".to_string(),
+        ));
+    }
+    Ok((x, y))
 }
 
 /// POST /api/v1/media
@@ -179,6 +207,7 @@ pub async fn upload_media(
                     height: Some(h),
                     size: Some(format!("{}x{}", w, h)),
                     aspect: Some(w as f64 / h as f64),
+                    focus: format_media_focus(media.focus_x, media.focus_y),
                 })
             }),
             small: None,
@@ -248,6 +277,7 @@ pub async fn get_media(
                     height: Some(h),
                     size: Some(format!("{}x{}", w, h)),
                     aspect: Some(w as f64 / h as f64),
+                    focus: format_media_focus(media.focus_x, media.focus_y),
                 })
             }),
             small: None,
@@ -274,8 +304,17 @@ pub async fn update_media(
         media.description = Some(description);
     }
 
-    // TODO: Handle focus point update
-    // Focus point format: "x,y" where x and y are floats between -1.0 and 1.0
+    if let Some(focus) = req.focus {
+        let trimmed = focus.trim();
+        if trimmed.is_empty() {
+            media.focus_x = None;
+            media.focus_y = None;
+        } else {
+            let (focus_x, focus_y) = parse_media_focus(trimmed)?;
+            media.focus_x = Some(focus_x);
+            media.focus_y = Some(focus_y);
+        }
+    }
 
     // Update in database
     state.db.update_media(&media).await?;
@@ -312,6 +351,7 @@ pub async fn update_media(
                     height: Some(h),
                     size: Some(format!("{}x{}", w, h)),
                     aspect: Some(w as f64 / h as f64),
+                    focus: format_media_focus(media.focus_x, media.focus_y),
                 })
             }),
             small: None,
@@ -327,4 +367,28 @@ pub async fn update_media(
 pub struct UpdateMediaRequest {
     pub description: Option<String>,
     pub focus: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_media_focus, parse_media_focus};
+
+    #[test]
+    fn parse_media_focus_accepts_valid_values() {
+        let (x, y) = parse_media_focus("0.25,-0.5").expect("valid focus");
+        assert!((x - 0.25).abs() < f64::EPSILON);
+        assert!((y + 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_media_focus_rejects_out_of_range_values() {
+        let error = parse_media_focus("1.1,0").expect_err("focus outside range must fail");
+        assert!(matches!(error, crate::error::AppError::Validation(_)));
+    }
+
+    #[test]
+    fn format_media_focus_returns_none_if_incomplete() {
+        assert_eq!(format_media_focus(Some(0.0), None), None);
+        assert_eq!(format_media_focus(None, Some(0.0)), None);
+    }
 }

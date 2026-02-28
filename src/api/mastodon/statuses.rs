@@ -1424,8 +1424,34 @@ pub async fn update_status(
         }
     }
 
-    // TODO: Handle media_ids updates
-    // For now, we skip media updates as it requires more complex logic
+    if let Some(media_ids) = req.media_ids {
+        let mut normalized_media_ids = Vec::with_capacity(media_ids.len());
+        let mut seen_media_ids = HashSet::new();
+        for media_id in media_ids {
+            let trimmed = media_id.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::Validation(
+                    "media_ids must not contain empty values".to_string(),
+                ));
+            }
+            if seen_media_ids.insert(trimmed.to_string()) {
+                normalized_media_ids.push(trimmed.to_string());
+            }
+        }
+
+        let current_media_ids = status_service
+            .get_media_by_status(&id)
+            .await?
+            .into_iter()
+            .map(|media| media.id)
+            .collect::<Vec<_>>();
+        if current_media_ids != normalized_media_ids {
+            status_service
+                .replace_media_for_status(&id, &normalized_media_ids)
+                .await?;
+            changed = true;
+        }
+    }
 
     if changed {
         status_service

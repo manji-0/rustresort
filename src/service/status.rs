@@ -184,6 +184,15 @@ impl StatusService {
         self.db.get_media_by_status(status_id).await
     }
 
+    /// Replace all media attachments associated with a status.
+    pub async fn replace_media_for_status(
+        &self,
+        status_id: &str,
+        media_ids: &[String],
+    ) -> Result<(), AppError> {
+        self.db.replace_status_media(status_id, media_ids).await
+    }
+
     /// Get poll metadata for a status if present.
     pub async fn get_poll_by_status_id(
         &self,
@@ -519,6 +528,8 @@ impl StatusService {
             blurhash: None,
             width: None,
             height: None,
+            focus_x: None,
+            focus_y: None,
             created_at: chrono::Utc::now(),
         };
 
