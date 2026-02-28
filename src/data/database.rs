@@ -1457,7 +1457,7 @@ impl Database {
                       AND s.visibility = 'public'
                       AND s.id < ?
                       AND s.id > ?
-                    ORDER BY s.created_at DESC, s.id DESC
+                    ORDER BY s.id DESC
                     LIMIT ?
                     "#,
                 )
@@ -1478,7 +1478,7 @@ impl Database {
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
                       AND s.id < ?
-                    ORDER BY s.created_at DESC, s.id DESC
+                    ORDER BY s.id DESC
                     LIMIT ?
                     "#,
                 )
@@ -1498,7 +1498,7 @@ impl Database {
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
                       AND s.id > ?
-                    ORDER BY s.created_at DESC, s.id DESC
+                    ORDER BY s.id DESC
                     LIMIT ?
                     "#,
                 )
@@ -1517,7 +1517,7 @@ impl Database {
                     INNER JOIN hashtags h ON h.id = sh.hashtag_id
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
-                    ORDER BY s.created_at DESC, s.id DESC
+                    ORDER BY s.id DESC
                     LIMIT ?
                     "#,
                 )
@@ -1536,6 +1536,7 @@ impl Database {
         &self,
         list_id: &str,
         local_account_address: &str,
+        local_account_id: &str,
         limit: usize,
         max_id: Option<&str>,
         min_id: Option<&str>,
@@ -1553,7 +1554,13 @@ impl Database {
                     INNER JOIN list_accounts la ON la.list_id = ?
                     WHERE (
                         (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (s.is_local = 1 AND s.account_address = '' AND la.account_address = ? COLLATE NOCASE)
+                        OR (
+                            s.is_local = 1 AND s.account_address = ''
+                            AND (
+                                la.account_address = ? COLLATE NOCASE
+                                OR la.account_address = ?
+                            )
+                        )
                     )
                       AND s.id < ?
                       AND s.id > ?
@@ -1563,6 +1570,7 @@ impl Database {
                 )
                 .bind(list_id)
                 .bind(local_account_address)
+                .bind(local_account_id)
                 .bind(max_id)
                 .bind(min_id)
                 .bind(limit as i64)
@@ -1577,7 +1585,13 @@ impl Database {
                     INNER JOIN list_accounts la ON la.list_id = ?
                     WHERE (
                         (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (s.is_local = 1 AND s.account_address = '' AND la.account_address = ? COLLATE NOCASE)
+                        OR (
+                            s.is_local = 1 AND s.account_address = ''
+                            AND (
+                                la.account_address = ? COLLATE NOCASE
+                                OR la.account_address = ?
+                            )
+                        )
                     )
                       AND s.id < ?
                     ORDER BY s.id DESC
@@ -1586,6 +1600,7 @@ impl Database {
                 )
                 .bind(list_id)
                 .bind(local_account_address)
+                .bind(local_account_id)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -1599,7 +1614,13 @@ impl Database {
                     INNER JOIN list_accounts la ON la.list_id = ?
                     WHERE (
                         (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (s.is_local = 1 AND s.account_address = '' AND la.account_address = ? COLLATE NOCASE)
+                        OR (
+                            s.is_local = 1 AND s.account_address = ''
+                            AND (
+                                la.account_address = ? COLLATE NOCASE
+                                OR la.account_address = ?
+                            )
+                        )
                     )
                       AND s.id > ?
                     ORDER BY s.id DESC
@@ -1608,6 +1629,7 @@ impl Database {
                 )
                 .bind(list_id)
                 .bind(local_account_address)
+                .bind(local_account_id)
                 .bind(min_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -1621,7 +1643,13 @@ impl Database {
                     INNER JOIN list_accounts la ON la.list_id = ?
                     WHERE (
                         (s.account_address <> '' AND la.account_address = s.account_address COLLATE NOCASE)
-                        OR (s.is_local = 1 AND s.account_address = '' AND la.account_address = ? COLLATE NOCASE)
+                        OR (
+                            s.is_local = 1 AND s.account_address = ''
+                            AND (
+                                la.account_address = ? COLLATE NOCASE
+                                OR la.account_address = ?
+                            )
+                        )
                     )
                     ORDER BY s.id DESC
                     LIMIT ?
@@ -1629,6 +1657,7 @@ impl Database {
                 )
                 .bind(list_id)
                 .bind(local_account_address)
+                .bind(local_account_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?

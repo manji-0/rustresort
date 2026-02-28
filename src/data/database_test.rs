@@ -1280,6 +1280,83 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
 }
 
 #[tokio::test]
+async fn test_tag_timeline_query_uses_id_aligned_cursors() {
+    let (db, _temp_dir) = create_test_db().await;
+    let base_time = Utc::now();
+
+    let newest_by_id = Status {
+        id: "300".to_string(),
+        uri: "https://example.com/status/tag-300".to_string(),
+        content: "<p>#Rust id300</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+    let middle_by_id = Status {
+        id: "200".to_string(),
+        uri: "https://example.com/status/tag-200".to_string(),
+        content: "<p>#Rust id200</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(10),
+        fetched_at: None,
+    };
+    let oldest_by_id = Status {
+        id: "100".to_string(),
+        uri: "https://example.com/status/tag-100".to_string(),
+        content: "<p>#Rust id100</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(20),
+        fetched_at: None,
+    };
+
+    db.insert_status(&newest_by_id).await.unwrap();
+    db.insert_status(&middle_by_id).await.unwrap();
+    db.insert_status(&oldest_by_id).await.unwrap();
+
+    let first_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, None, None)
+        .await
+        .unwrap();
+    let first_ids: Vec<String> = first_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(first_ids, vec!["300".to_string(), "200".to_string()]);
+
+    let older_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, Some("200"), None)
+        .await
+        .unwrap();
+    let older_ids: Vec<String> = older_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(older_ids, vec!["100".to_string()]);
+
+    let newer_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, None, Some("200"))
+        .await
+        .unwrap();
+    let newer_ids: Vec<String> = newer_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(newer_ids, vec!["300".to_string()]);
+}
+
+#[tokio::test]
 async fn test_update_status_refreshes_hashtag_index() {
     let (db, _temp_dir) = create_test_db().await;
     let mut status = Status {
@@ -1327,6 +1404,7 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
     let (db, _temp_dir) = create_test_db().await;
     let list_id = db.create_list("List timeline", "list").await.unwrap();
     let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "local-account-id".to_string();
     let remote_address = "alice@example.com".to_string();
     db.add_accounts_to_list(&list_id, &[local_address.clone(), remote_address.clone()])
         .await
@@ -1384,7 +1462,14 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
     db.insert_status(&unrelated_status).await.unwrap();
 
     let statuses = db
-        .get_list_timeline_statuses_in_window(&list_id, &local_address, 10, None, None)
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            10,
+            None,
+            None,
+        )
         .await
         .unwrap();
     let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
@@ -1392,6 +1477,48 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
     assert!(ids.contains(&local_status.id));
     assert!(ids.contains(&remote_status.id));
     assert!(!ids.contains(&unrelated_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_query_matches_local_account_id_entries() {
+    let (db, _temp_dir) = create_test_db().await;
+    let list_id = db.create_list("List timeline by id", "list").await.unwrap();
+    let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "01HLOCALACCOUNTID".to_string();
+    db.add_accounts_to_list(&list_id, std::slice::from_ref(&local_account_id))
+        .await
+        .unwrap();
+
+    let local_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/list-local-by-id".to_string(),
+        content: "<p>Local status by id list member</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&local_status).await.unwrap();
+
+    let statuses = db
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
+    assert!(ids.contains(&local_status.id));
 }
 
 #[tokio::test]

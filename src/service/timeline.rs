@@ -131,23 +131,27 @@ impl TimelineService {
         &self,
         list_id: &str,
         local_account_address: &str,
+        local_account_id: &str,
         limit: usize,
         max_id: Option<&str>,
         min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
         let list_id = list_id.to_string();
         let local_account_address = local_account_address.to_string();
+        let local_account_id = local_account_id.to_string();
         let min_id = min_id.map(str::to_string);
         let statuses = self
             .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
                 let list_id = list_id.clone();
                 let local_account_address = local_account_address.clone();
+                let local_account_id = local_account_id.clone();
                 let min_id = min_id.clone();
                 async move {
                     self.db
                         .get_list_timeline_statuses_in_window(
                             &list_id,
                             &local_account_address,
+                            &local_account_id,
                             fetch_limit,
                             cursor.as_deref(),
                             min_id.as_deref(),
