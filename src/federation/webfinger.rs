@@ -154,14 +154,10 @@ async fn validate_remote_actor_fetch_url(url: &url::Url) -> Result<(), AppError>
 }
 
 async fn fetch_with_validated_redirects(
+    http_client: &reqwest::Client,
     start_url: &url::Url,
     accept_header: &str,
 ) -> Result<reqwest::Response, AppError> {
-    let http_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| AppError::Federation(format!("Failed to build HTTP client: {}", error)))?;
-
     let mut current = start_url.clone();
     for _ in 0..=MAX_FETCH_REDIRECTS {
         validate_remote_actor_fetch_url(&current).await?;
@@ -345,11 +341,12 @@ pub async fn resolve_webfinger(
     let mut last_error = None;
 
     for webfinger_url in webfinger_urls {
-        let response = match http_client
-            .get(webfinger_url.clone())
-            .header("Accept", "application/jrd+json, application/json")
-            .send()
-            .await
+        let response = match fetch_with_validated_redirects(
+            http_client,
+            &webfinger_url,
+            "application/jrd+json, application/json",
+        )
+        .await
         {
             Ok(response) => response,
             Err(error) => {
@@ -479,7 +476,7 @@ pub fn generate_webfinger_response(
 /// Actor JSON document
 pub async fn fetch_actor(
     actor_uri: &str,
-    _http_client: &reqwest::Client,
+    http_client: &reqwest::Client,
 ) -> Result<serde_json::Value, AppError> {
     let parsed = url::Url::parse(actor_uri)
         .map_err(|_| AppError::Validation("actor URI must be a valid URL".to_string()))?;
@@ -491,6 +488,7 @@ pub async fn fetch_actor(
     validate_remote_actor_fetch_url(&parsed).await?;
 
     let response = fetch_with_validated_redirects(
+        http_client,
         &parsed,
         "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
     )
