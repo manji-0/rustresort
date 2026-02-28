@@ -2644,6 +2644,35 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Check if follow request exists, treating default-port variants as equivalent.
+    pub async fn has_follow_request_with_default_port(
+        &self,
+        requester_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let candidates = equivalent_account_address_candidates(requester_address, default_port);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) as count FROM follow_requests WHERE LOWER(requester_address) IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in candidates {
+                separated.push_bind(candidate.to_ascii_lowercase());
+            }
+        }
+        query_builder.push(")");
+
+        let count: i64 = query_builder
+            .build_query_scalar()
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count > 0)
+    }
+
     /// Get follow request details
     pub async fn get_follow_request(
         &self,
