@@ -58,7 +58,7 @@ fn derive_remote_account_address(status_uri: &url::Url) -> String {
 
     let username = status_uri
         .path_segments()
-        .map(|segments| {
+        .and_then(|segments| {
             let path_segments: Vec<&str> = segments.filter(|segment| !segment.is_empty()).collect();
             path_segments
                 .windows(2)
@@ -77,7 +77,6 @@ fn derive_remote_account_address(status_uri: &url::Url) -> String {
                     })
                 })
         })
-        .flatten()
         .unwrap_or("unknown")
         .to_ascii_lowercase();
 
@@ -627,21 +626,36 @@ impl StatusService {
         status_uri: &str,
         reason: PersistedReason,
     ) -> Result<Status, AppError> {
+        if let Some(existing) = self.db.get_status_by_uri(status_uri).await? {
+            return Ok(existing);
+        }
+        if let Some(cached) = self.cache.get_by_uri(status_uri).await {
+            let status = Status {
+                id: cached.id.clone(),
+                uri: cached.uri.clone(),
+                content: cached.content.clone(),
+                content_warning: None,
+                visibility: cached.visibility.clone(),
+                language: None,
+                account_address: cached.account_address.clone(),
+                is_local: false,
+                in_reply_to_uri: cached.reply_to_uri.clone(),
+                boost_of_uri: cached.boost_of_uri.clone(),
+                persisted_reason: reason.as_str().to_string(),
+                created_at: cached.created_at,
+                fetched_at: Some(chrono::Utc::now()),
+            };
+            self.db.insert_status(&status).await?;
+            return Ok(status);
+        }
+
         let normalized = normalize_remote_status_uri(status_uri)?;
         let normalized_uri = normalized.to_string();
-        let mut candidate_uris = vec![status_uri.to_string()];
         if normalized_uri != status_uri {
-            candidate_uris.push(normalized_uri.clone());
-        }
-
-        for candidate_uri in &candidate_uris {
-            if let Some(existing) = self.db.get_status_by_uri(candidate_uri).await? {
+            if let Some(existing) = self.db.get_status_by_uri(&normalized_uri).await? {
                 return Ok(existing);
             }
-        }
-
-        for candidate_uri in &candidate_uris {
-            if let Some(cached) = self.cache.get_by_uri(candidate_uri).await {
+            if let Some(cached) = self.cache.get_by_uri(&normalized_uri).await {
                 let status = Status {
                     id: cached.id.clone(),
                     uri: cached.uri.clone(),
@@ -668,7 +682,7 @@ impl StatusService {
             uri: normalized_uri,
             content: String::new(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: "private".to_string(),
             language: None,
             account_address: derive_remote_account_address(&normalized),
             is_local: false,
@@ -850,7 +864,7 @@ mod tests {
     use chrono::Utc;
     use tempfile::TempDir;
 
-    use crate::data::{Account, EntityId};
+    use crate::data::{Account, CachedStatus, EntityId};
 
     async fn create_test_db() -> (Arc<Database>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -1002,6 +1016,52 @@ mod tests {
 
         let persisted = db.get_status_by_uri(remote_uri).await.unwrap();
         assert!(persisted.is_some());
+    }
+
+    #[tokio::test]
+    async fn favourite_uses_cached_non_http_uri_before_validation() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let remote_uri = "tag:remote.example,2026:status-42";
+        service
+            .cache
+            .insert(CachedStatus {
+                id: EntityId::new().0,
+                uri: remote_uri.to_string(),
+                content: "<p>cached non-http status</p>".to_string(),
+                account_address: "alice@remote.example".to_string(),
+                created_at: Utc::now(),
+                visibility: "private".to_string(),
+                attachments: vec![],
+                reply_to_uri: None,
+                boost_of_uri: None,
+            })
+            .await;
+
+        let status = service.favourite(remote_uri).await.unwrap();
+        assert_eq!(status.uri, remote_uri);
+        assert!(!status.is_local);
+        assert_eq!(status.account_address, "alice@remote.example");
+
+        let persisted = db.get_status_by_uri(remote_uri).await.unwrap();
+        assert!(persisted.is_some());
+        assert!(db.is_favourited(&status.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn placeholder_status_is_non_public_when_cache_misses() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let remote_uri = "https://remote.example/users/alice/statuses/43";
+        let status = service.favourite(remote_uri).await.unwrap();
+        assert_eq!(status.visibility, "private");
+
+        let persisted = db.get_status_by_uri(remote_uri).await.unwrap().unwrap();
+        assert_eq!(persisted.visibility, "private");
     }
 
     #[tokio::test]
