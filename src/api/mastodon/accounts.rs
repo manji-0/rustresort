@@ -669,6 +669,7 @@ pub async fn get_relationships(
         .into_iter()
         .filter_map(|address| normalize_account_address(&address).ok())
         .collect();
+    let follow_request_addresses = state.db.get_follow_request_addresses(1000).await?;
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     let ids: Vec<String> = raw_query
@@ -737,7 +738,9 @@ pub async fn get_relationships(
             .db
             .is_account_muted(&target_address, default_port)
             .await?;
-        let requested = state.db.has_follow_request(&target_address).await?;
+        let requested = follow_request_addresses.iter().any(|candidate| {
+            account_addresses_match_with_default_port(candidate, &normalized_target, default_port)
+        });
 
         let relationship = RelationshipResponse {
             id: id.clone(),
