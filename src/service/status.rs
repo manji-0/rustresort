@@ -24,7 +24,7 @@ fn media_file_extension_from_content_type(content_type: &str) -> &'static str {
 }
 
 fn normalize_remote_status_uri(status_uri: &str) -> Result<url::Url, AppError> {
-    let mut parsed = url::Url::parse(status_uri).map_err(|_| {
+    let parsed = url::Url::parse(status_uri).map_err(|_| {
         AppError::Validation("status URI must be a valid absolute http(s) URL".to_string())
     })?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -37,7 +37,6 @@ fn normalize_remote_status_uri(status_uri: &str) -> Result<url::Url, AppError> {
             "status URI must include a host".to_string(),
         ));
     }
-    parsed.set_fragment(None);
     Ok(parsed)
 }
 
@@ -1062,6 +1061,27 @@ mod tests {
 
         let persisted = db.get_status_by_uri(remote_uri).await.unwrap().unwrap();
         assert_eq!(persisted.visibility, "private");
+    }
+
+    #[tokio::test]
+    async fn favourite_preserves_fragment_in_remote_status_uri() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let remote_uri = "https://remote.example/users/alice/statuses/44#activity";
+        let status = service.favourite(remote_uri).await.unwrap();
+        assert_eq!(status.uri, remote_uri);
+
+        let persisted = db.get_status_by_uri(remote_uri).await.unwrap();
+        assert!(persisted.is_some());
+        let without_fragment = "https://remote.example/users/alice/statuses/44";
+        assert!(
+            db.get_status_by_uri(without_fragment)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
