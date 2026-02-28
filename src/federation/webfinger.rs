@@ -7,6 +7,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::error::AppError;
 
+const MAX_FETCH_REDIRECTS: usize = 5;
+
 /// WebFinger result
 #[derive(Debug, Clone)]
 pub struct WebFingerResult {
@@ -45,17 +47,35 @@ fn parse_account_address(address: &str) -> Result<(String, String), AppError> {
 fn validate_account_domain(domain: &str) -> Result<(), AppError> {
     let parsed = url::Url::parse(&format!("https://{}", domain))
         .map_err(|_| AppError::Validation("address must be in user@domain format".to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::Validation("address must be in user@domain format".to_string()))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if parsed.path() != "/"
         || parsed.query().is_some()
         || parsed.fragment().is_some()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
-        || parsed.host_str().is_none()
     {
         return Err(AppError::Validation(
             "address must be in user@domain format".to_string(),
         ));
     }
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(AppError::Validation(
+            "address host is not allowed".to_string(),
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip_address(ip) {
+            return Err(AppError::Validation(
+                "address host is not allowed".to_string(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -131,6 +151,55 @@ async fn validate_remote_actor_fetch_url(url: &url::Url) -> Result<(), AppError>
     }
 
     Ok(())
+}
+
+async fn fetch_with_validated_redirects(
+    start_url: &url::Url,
+    accept_header: &str,
+) -> Result<reqwest::Response, AppError> {
+    let http_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| AppError::Federation(format!("Failed to build HTTP client: {}", error)))?;
+
+    let mut current = start_url.clone();
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        validate_remote_actor_fetch_url(&current).await?;
+
+        let response = http_client
+            .get(current.clone())
+            .header("Accept", accept_header)
+            .send()
+            .await
+            .map_err(|error| AppError::Federation(format!("Actor fetch failed: {}", error)))?;
+
+        if response.status().is_redirection() {
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(AppError::Federation(
+                    "Actor fetch redirect missing Location header".to_string(),
+                ));
+            };
+            let location = location.to_str().map_err(|_| {
+                AppError::Federation(
+                    "Actor fetch redirect Location was not valid UTF-8".to_string(),
+                )
+            })?;
+            current = current.join(location).map_err(|error| {
+                AppError::Federation(format!(
+                    "Actor fetch redirect target is invalid URL {} ({})",
+                    location, error
+                ))
+            })?;
+            continue;
+        }
+
+        return Ok(response);
+    }
+
+    Err(AppError::Federation(format!(
+        "Actor fetch exceeded redirect limit ({})",
+        MAX_FETCH_REDIRECTS
+    )))
 }
 
 fn extract_explicit_port_from_domain(domain: &str) -> Option<u16> {
@@ -410,7 +479,7 @@ pub fn generate_webfinger_response(
 /// Actor JSON document
 pub async fn fetch_actor(
     actor_uri: &str,
-    http_client: &reqwest::Client,
+    _http_client: &reqwest::Client,
 ) -> Result<serde_json::Value, AppError> {
     let parsed = url::Url::parse(actor_uri)
         .map_err(|_| AppError::Validation("actor URI must be a valid URL".to_string()))?;
@@ -421,15 +490,11 @@ pub async fn fetch_actor(
     }
     validate_remote_actor_fetch_url(&parsed).await?;
 
-    let response = http_client
-        .get(actor_uri)
-        .header(
-            "Accept",
-            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
-        )
-        .send()
-        .await
-        .map_err(|error| AppError::Federation(format!("Actor fetch failed: {}", error)))?;
+    let response = fetch_with_validated_redirects(
+        &parsed,
+        "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+    )
+    .await?;
 
     if !response.status().is_success() {
         return Err(AppError::Federation(format!(
@@ -637,6 +702,23 @@ mod tests {
         let query_error =
             parse_account_address("alice@example.com?x=1").expect_err("query must be rejected");
         assert!(matches!(query_error, crate::error::AppError::Validation(_)));
+    }
+
+    #[test]
+    fn parse_account_address_rejects_private_or_localhost_domains() {
+        let localhost_error =
+            parse_account_address("alice@localhost").expect_err("localhost must be rejected");
+        assert!(matches!(
+            localhost_error,
+            crate::error::AppError::Validation(_)
+        ));
+
+        let loopback_error =
+            parse_account_address("alice@127.0.0.1").expect_err("loopback must be rejected");
+        assert!(matches!(
+            loopback_error,
+            crate::error::AppError::Validation(_)
+        ));
     }
 
     #[tokio::test]
