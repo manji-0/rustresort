@@ -10,6 +10,7 @@ use crate::federation::{ActivityDelivery, DeliveryResult};
 use chrono::Utc;
 
 const OUTBOUND_DELIVERY_TIMEOUT_SECS: u64 = 5;
+const MAX_FETCH_REDIRECTS: usize = 5;
 
 struct DiscoveredRemoteActor {
     actor_uri: String,
@@ -116,14 +117,48 @@ async fn send_validated_get(
     url: &url::Url,
     accept_header: &str,
 ) -> Result<reqwest::Response, AppError> {
-    let _ = resolve_allowed_remote_addrs(url).await?;
+    let mut current = url.clone();
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        let _ = resolve_allowed_remote_addrs(&current).await?;
 
-    http_client
-        .get(url.clone())
-        .header("Accept", accept_header)
-        .send()
-        .await
-        .map_err(|error| AppError::Federation(format!("Request failed for {}: {}", url, error)))
+        let response = http_client
+            .get(current.clone())
+            .header("Accept", accept_header)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Federation(format!("Request failed for {}: {}", current, error))
+            })?;
+
+        if response.status().is_redirection() {
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(AppError::Federation(format!(
+                    "Redirect response from {} missing Location header",
+                    current
+                )));
+            };
+            let location = location.to_str().map_err(|_| {
+                AppError::Federation(format!(
+                    "Redirect response from {} had non-UTF8 Location header",
+                    current
+                ))
+            })?;
+            current = current.join(location).map_err(|error| {
+                AppError::Federation(format!(
+                    "Redirect response from {} had invalid target {} ({})",
+                    current, location, error
+                ))
+            })?;
+            continue;
+        }
+
+        return Ok(response);
+    }
+
+    Err(AppError::Federation(format!(
+        "Request exceeded redirect limit ({}) for {}",
+        MAX_FETCH_REDIRECTS, url
+    )))
 }
 
 async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Result<(), AppError> {
@@ -171,7 +206,8 @@ pub async fn resolve_remote_actor_and_inbox(
         }
     }
 
-    let discovered = discover_remote_actor_and_inbox(&state.http_client, address).await?;
+    let discovered =
+        discover_remote_actor_and_inbox(&state.federation_fetch_client, address).await?;
 
     if let Some(profile) = build_cached_profile(
         address,
