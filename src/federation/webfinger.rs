@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use crate::error::AppError;
 
@@ -101,12 +102,9 @@ fn is_blocked_ip_address(ip: IpAddr) -> bool {
     }
 }
 
-fn redirects_disabled(http_client: &reqwest::Client) -> bool {
-    let debug = format!("{:?}", http_client);
-    debug.contains("redirect_policy") && debug.contains("Policy(None)")
-}
-
-async fn validate_remote_actor_fetch_url(url: &url::Url) -> Result<(), AppError> {
+async fn resolve_validated_remote_actor_fetch_target(
+    url: &url::Url,
+) -> Result<(String, Vec<SocketAddr>), AppError> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(AppError::Validation(
             "actor URI must not include user info".to_string(),
@@ -155,7 +153,7 @@ async fn validate_remote_actor_fetch_url(url: &url::Url) -> Result<(), AppError>
         )));
     }
 
-    Ok(())
+    Ok((host, resolved_addrs))
 }
 
 async fn fetch_with_validated_redirects(
@@ -163,20 +161,33 @@ async fn fetch_with_validated_redirects(
     start_url: &url::Url,
     accept_header: &str,
 ) -> Result<reqwest::Response, AppError> {
-    if !redirects_disabled(http_client) {
-        return Err(AppError::Federation(
-            "validated fetch requires an HTTP client with redirects disabled".to_string(),
-        ));
-    }
-
     let mut current = start_url.clone();
     for _ in 0..=MAX_FETCH_REDIRECTS {
-        validate_remote_actor_fetch_url(&current).await?;
+        let (resolved_host, resolved_addrs) =
+            resolve_validated_remote_actor_fetch_target(&current).await?;
+        let validated_client = reqwest::Client::builder()
+            .user_agent("RustResort/0.1.0")
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&resolved_host, &resolved_addrs)
+            .build()
+            .map_err(|error| {
+                AppError::Federation(format!("Failed to build validated fetch client: {}", error))
+            })?;
 
-        let response = http_client
+        let request = http_client
             .get(current.clone())
             .header("Accept", accept_header)
-            .send()
+            .build()
+            .map_err(|error| {
+                AppError::Federation(format!(
+                    "Failed to build validated fetch request for {}: {}",
+                    current, error
+                ))
+            })?;
+
+        let response = validated_client
+            .execute(request)
             .await
             .map_err(|error| AppError::Federation(format!("Actor fetch failed: {}", error)))?;
 
@@ -496,7 +507,6 @@ pub async fn fetch_actor(
             "actor URI must use http or https".to_string(),
         ));
     }
-    validate_remote_actor_fetch_url(&parsed).await?;
 
     let response = fetch_with_validated_redirects(
         http_client,
@@ -617,10 +627,7 @@ pub struct ParsedActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        fetch_actor, generate_webfinger_response, parse_account_address, parse_actor,
-        redirects_disabled,
-    };
+    use super::{fetch_actor, generate_webfinger_response, parse_account_address, parse_actor};
 
     #[test]
     fn generate_webfinger_response_contains_activitypub_self_link() {
@@ -733,24 +740,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn redirects_disabled_checks_client_policy() {
-        let default_client = reqwest::Client::new();
-        assert!(!redirects_disabled(&default_client));
-
-        let no_redirect_client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("client should build");
-        assert!(redirects_disabled(&no_redirect_client));
-    }
-
     #[tokio::test]
     async fn fetch_actor_rejects_private_and_localhost_targets() {
-        let http_client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("client should build");
+        let http_client = reqwest::Client::new();
 
         let loopback_error = fetch_actor("http://127.0.0.1:8080/actor", &http_client)
             .await
