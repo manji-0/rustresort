@@ -313,6 +313,79 @@ async fn migrate_legacy_oauth_tokens(pool: &Pool<Sqlite>) -> Result<(), AppError
     Ok(())
 }
 
+async fn backfill_missing_status_hashtags(pool: &Pool<Sqlite>) -> Result<(), AppError> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+    let result: Result<usize, AppError> = async {
+        let statuses = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT s.id, s.content
+            FROM statuses s
+            WHERE s.content LIKE '%#%'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM status_hashtags sh
+                  WHERE sh.status_id = s.id
+              )
+            "#,
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        let backfilled_count = statuses.len();
+
+        for (status_id, content) in statuses {
+            for hashtag in extract_hashtags_from_content(&content) {
+                let hashtag_insert_id = EntityId::new().0;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO hashtags (id, name, created_at) VALUES (?, ?, datetime('now'))",
+                )
+                .bind(&hashtag_insert_id)
+                .bind(&hashtag)
+                .execute(&mut *conn)
+                .await?;
+
+                let hashtag_id = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM hashtags WHERE name = ? COLLATE NOCASE LIMIT 1",
+                )
+                .bind(&hashtag)
+                .fetch_one(&mut *conn)
+                .await?;
+
+                let status_hashtag_id = EntityId::new().0;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO status_hashtags (id, status_id, hashtag_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+                )
+                .bind(&status_hashtag_id)
+                .bind(&status_id)
+                .bind(&hashtag_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+
+        Ok(backfilled_count)
+    }
+    .await;
+
+    match result {
+        Ok(backfilled_count) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            if backfilled_count > 0 {
+                tracing::info!(
+                    backfilled_count,
+                    "Backfilled missing hashtag index rows for existing statuses"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
+
 impl Database {
     // =========================================================================
     // Connection
@@ -396,6 +469,7 @@ impl Database {
                 AppError::Internal(anyhow::anyhow!("Migration failed: {}", e))
             })?;
         migrate_legacy_oauth_tokens(&pool).await?;
+        backfill_missing_status_hashtags(&pool).await?;
 
         if let Some(sync_db) = &turso_sync_db {
             sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")

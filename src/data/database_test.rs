@@ -1280,6 +1280,49 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
 }
 
 #[tokio::test]
+async fn test_database_connect_backfills_missing_status_hashtag_rows() {
+    let (db, temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: "500".to_string(),
+        uri: "https://example.com/status/backfill-hashtag".to_string(),
+        content: "<p>Legacy #Rust post</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let raw_pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM status_hashtags WHERE status_id = ?")
+        .bind(&status.id)
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+    drop(raw_pool);
+    drop(db);
+
+    let reopened = Database::connect(&temp_dir.path().join("test.db"))
+        .await
+        .expect("reopen should succeed with backfill");
+    let statuses = reopened
+        .get_statuses_by_hashtag_in_window("rust", 10, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|entry| entry.id).collect();
+    assert!(ids.contains(&status.id));
+}
+
+#[tokio::test]
 async fn test_tag_timeline_query_uses_id_aligned_cursors() {
     let (db, _temp_dir) = create_test_db().await;
     let base_time = Utc::now();
