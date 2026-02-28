@@ -17,7 +17,7 @@ use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
-const OAUTH_AUTHORIZE_CONFIRM_COOKIE: &str = "oauth_authorize_confirm";
+const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
 
 /// App registration request
 #[derive(Debug, Deserialize)]
@@ -155,17 +155,24 @@ fn generate_authorize_confirm_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn build_authorize_confirm_cookie(confirm_token: &str, secure: bool) -> Cookie<'static> {
-    Cookie::build((OAUTH_AUTHORIZE_CONFIRM_COOKIE, confirm_token.to_string()))
-        .path("/oauth/authorize")
-        .http_only(true)
-        .secure(secure)
-        .same_site(SameSite::Lax)
-        .build()
+fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
+    format!("{}{}", OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX, confirm_token)
 }
 
-fn clear_authorize_confirm_cookie() -> Cookie<'static> {
-    let mut cookie = Cookie::build((OAUTH_AUTHORIZE_CONFIRM_COOKIE, "".to_string()))
+fn build_authorize_confirm_cookie(confirm_token: &str, secure: bool) -> Cookie<'static> {
+    Cookie::build((
+        authorize_confirm_cookie_name(confirm_token),
+        "1".to_string(),
+    ))
+    .path("/oauth/authorize")
+    .http_only(true)
+    .secure(secure)
+    .same_site(SameSite::Lax)
+    .build()
+}
+
+fn clear_authorize_confirm_cookie(confirm_token: &str) -> Cookie<'static> {
+    let mut cookie = Cookie::build((authorize_confirm_cookie_name(confirm_token), "".to_string()))
         .path("/oauth/authorize")
         .http_only(true)
         .build();
@@ -417,15 +424,15 @@ pub async fn authorize(
     let context = validate_authorize_request(&state, &req).await?;
 
     if let Some(confirm_token) = req.confirm.as_deref() {
-        let expected_confirm_token = jar
-            .get(OAUTH_AUTHORIZE_CONFIRM_COOKIE)
-            .map(|cookie| cookie.value())
-            .ok_or(AppError::Unauthorized)?;
-        if confirm_token.is_empty() || confirm_token != expected_confirm_token {
+        if confirm_token.is_empty() {
+            return Err(AppError::Unauthorized);
+        }
+        let confirm_cookie_name = authorize_confirm_cookie_name(confirm_token);
+        if jar.get(&confirm_cookie_name).is_none() {
             return Err(AppError::Unauthorized);
         }
 
-        let clear_confirm_cookie = clear_authorize_confirm_cookie();
+        let clear_confirm_cookie = clear_authorize_confirm_cookie(confirm_token);
         let jar = jar.remove(clear_confirm_cookie);
 
         if !req.approve.unwrap_or(false) {
@@ -622,4 +629,23 @@ pub struct RevokeTokenRequest {
     pub client_id: String,
     pub client_secret: String,
     pub token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{authorize_confirm_cookie_name, build_authorize_confirm_cookie};
+
+    #[test]
+    fn authorize_confirm_cookie_name_is_token_scoped() {
+        let first = authorize_confirm_cookie_name("token-a");
+        let second = authorize_confirm_cookie_name("token-b");
+        assert_ne!(first, second);
+        assert_eq!(first, "oauth_authorize_confirm_token-a");
+    }
+
+    #[test]
+    fn build_authorize_confirm_cookie_uses_token_scoped_name() {
+        let cookie = build_authorize_confirm_cookie("token-a", false);
+        assert_eq!(cookie.name(), "oauth_authorize_confirm_token-a");
+    }
 }
