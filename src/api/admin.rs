@@ -124,9 +124,7 @@ async fn block_domain(
     Json(req): Json<BlockDomainRequest>,
 ) -> Result<(), AppError> {
     let domain = normalize_domain(&req.domain)?;
-    if !state.db.is_domain_blocked(&domain).await? {
-        state.db.block_domain(&domain).await?;
-    }
+    state.db.block_domain(&domain).await?;
     Ok(())
 }
 

@@ -2218,7 +2218,7 @@ impl Database {
     pub async fn block_domain(&self, domain: &str) -> Result<(), AppError> {
         let id = EntityId::new().0;
         sqlx::query(
-            "INSERT INTO domain_blocks (id, domain, created_at) VALUES (?, ?, datetime('now'))",
+            "INSERT OR IGNORE INTO domain_blocks (id, domain, created_at) VALUES (?, ?, datetime('now'))",
         )
         .bind(&id)
         .bind(domain)

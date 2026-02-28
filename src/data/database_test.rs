@@ -1132,6 +1132,8 @@ async fn test_domain_block_operations() {
 
     // Block domain
     db.block_domain(domain).await.unwrap();
+    // Duplicate requests should be idempotent
+    db.block_domain(domain).await.unwrap();
 
     // Now blocked
     assert!(db.is_domain_blocked(domain).await.unwrap());
