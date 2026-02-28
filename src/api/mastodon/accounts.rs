@@ -185,6 +185,48 @@ fn normalize_account_address(raw: &str) -> Result<String, AppError> {
     ))
 }
 
+fn account_addresses_match_with_default_port(
+    left: &str,
+    right: &str,
+    default_port: Option<u16>,
+) -> bool {
+    let Ok(left_normalized) = normalize_account_address(left) else {
+        return false;
+    };
+    let Ok(right_normalized) = normalize_account_address(right) else {
+        return false;
+    };
+
+    if left_normalized == right_normalized {
+        return true;
+    }
+
+    let Some((left_user, left_domain)) = left_normalized.split_once('@') else {
+        return false;
+    };
+    let Some((right_user, right_domain)) = right_normalized.split_once('@') else {
+        return false;
+    };
+    if !left_user.eq_ignore_ascii_case(right_user) {
+        return false;
+    }
+
+    let Ok((left_host, left_port)) = parse_host_and_port(left_domain) else {
+        return false;
+    };
+    let Ok((right_host, right_port)) = parse_host_and_port(right_domain) else {
+        return false;
+    };
+    if !left_host.eq_ignore_ascii_case(&right_host) {
+        return false;
+    }
+
+    match default_port {
+        Some(port) => left_port.unwrap_or(port) == right_port.unwrap_or(port),
+        None => left_port == right_port,
+    }
+}
+
 async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
     if id.starts_with("http://") || id.starts_with("https://") {
         return Err(AppError::Validation(
@@ -671,8 +713,22 @@ pub async fn get_relationships(
         };
         let normalized_target = normalize_account_address(&target_address)
             .unwrap_or_else(|_| target_address.to_ascii_lowercase());
-        let following = following_set.contains(&normalized_target);
-        let followed_by = follower_set.contains(&normalized_target);
+        let following = following_set.contains(&normalized_target)
+            || following_set.iter().any(|candidate| {
+                account_addresses_match_with_default_port(
+                    candidate,
+                    &normalized_target,
+                    default_port,
+                )
+            });
+        let followed_by = follower_set.contains(&normalized_target)
+            || follower_set.iter().any(|candidate| {
+                account_addresses_match_with_default_port(
+                    candidate,
+                    &normalized_target,
+                    default_port,
+                )
+            });
         let blocking = state
             .db
             .is_account_blocked(&target_address, default_port)
@@ -785,15 +841,19 @@ pub async fn get_account_lists(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let target_address = resolve_target_address(&state, &id).await?;
     let normalized_target = normalize_account_address(&target_address)?;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
     let all_lists = state.db.get_all_lists().await?;
     let mut matched_lists = Vec::new();
 
     for (list_id, title, replies_policy) in all_lists {
         let accounts = state.db.get_list_accounts(&list_id).await?;
         let contains_target = accounts.into_iter().any(|address| {
-            normalize_account_address(&address)
-                .map(|normalized| normalized == normalized_target)
-                .unwrap_or(false)
+            address == id
+                || account_addresses_match_with_default_port(
+                    &address,
+                    &normalized_target,
+                    default_port,
+                )
         });
         if contains_target {
             matched_lists.push(serde_json::json!({
