@@ -125,19 +125,192 @@ async fn test_timeline_pagination() {
 #[tokio::test]
 async fn test_hashtag_timeline() {
     let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let tagged_public = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/tagged-public".to_string(),
+        content: "<p>Learning #rust today</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let tagged_private = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/tagged-private".to_string(),
+        content: "<p>Private #rust note</p>".to_string(),
+        content_warning: None,
+        visibility: "private".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let untagged_public = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/untagged-public".to_string(),
+        content: "<p>No hashtag here</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&tagged_public).await.unwrap();
+    server
+        .state
+        .db
+        .insert_status(&tagged_private)
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_status(&untagged_public)
+        .await
+        .unwrap();
 
     let response = server
         .client
         .get(&server.url("/api/v1/timelines/tag/rust"))
+        .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
 
     // Hashtag timeline should be accessible
-    if response.status().is_success() {
-        let json: Value = response.json().await.unwrap();
-        assert!(json.is_array());
-    }
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json.is_array());
+    let ids: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(ids.contains(&tagged_public.id));
+    assert!(!ids.contains(&tagged_private.id));
+    assert!(!ids.contains(&untagged_public.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_returns_statuses_for_list_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Test list", "list")
+        .await
+        .unwrap();
+    let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
+    let remote_address = "alice@example.com".to_string();
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, &[local_address.clone(), remote_address.clone()])
+        .await
+        .unwrap();
+
+    let local_status = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/list-local".to_string(),
+        content: "<p>Local list status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let remote_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-remote".to_string(),
+        content: "<p>Remote list status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: remote_address.clone(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let unrelated_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-unrelated".to_string(),
+        content: "<p>Unrelated list status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "bob@example.com".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&local_status).await.unwrap();
+    server.state.db.insert_status(&remote_status).await.unwrap();
+    server
+        .state
+        .db
+        .insert_status(&unrelated_status)
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(json.is_array());
+    let ids: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(ids.contains(&local_status.id));
+    assert!(ids.contains(&remote_status.id));
+    assert!(!ids.contains(&unrelated_status.id));
 }
 
 #[tokio::test]

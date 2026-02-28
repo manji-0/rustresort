@@ -152,35 +152,96 @@ pub async fn public_timeline(
 
 /// GET /api/v1/timelines/tag/:hashtag
 /// Get statuses with a specific hashtag
-///
-/// For single-user instance without hashtag indexing,
-/// this returns an empty array.
 pub async fn tag_timeline(
-    State(_state): State<AppState>,
-    axum::extract::Path(_hashtag): axum::extract::Path<String>,
-    Query(_params): Query<PaginationParams>,
+    State(state): State<AppState>,
+    axum::extract::Path(hashtag): axum::extract::Path<String>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // TODO: Implement hashtag indexing and filtering
-    // For now, return empty array as hashtags are not indexed
-    // In a full implementation, we would:
-    // 1. Parse statuses for hashtags during creation
-    // 2. Store hashtag -> status_id mappings in a separate table
-    // 3. Query that table to find statuses with the given hashtag
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    Ok(Json(vec![]))
+    let limit = params.limit.unwrap_or(20).min(40);
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let timeline_items = timeline_service
+        .tag_timeline(
+            &hashtag,
+            limit,
+            params.max_id.as_deref(),
+            params.min_id.as_deref(),
+        )
+        .await?;
+
+    let responses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| {
+            let response = crate::api::status_to_response(
+                &item.status,
+                &account,
+                &state.config,
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            );
+            serde_json::to_value(response).unwrap()
+        })
+        .collect();
+
+    Ok(Json(responses))
 }
 
 /// GET /api/v1/timelines/list/:list_id
 /// Get statuses from a specific list
-///
-/// For single-user instance, lists are not supported,
-/// so this always returns an error.
 pub async fn list_timeline(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     CurrentUser(_session): CurrentUser,
-    axum::extract::Path(_list_id): axum::extract::Path<String>,
-    Query(_params): Query<PaginationParams>,
+    axum::extract::Path(list_id): axum::extract::Path<String>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Lists not implemented for single-user instance
-    Err(AppError::NotFound)
+    state
+        .db
+        .get_list(&list_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_account_address = format!("{}@{}", account.username, state.config.server.domain);
+
+    let limit = params.limit.unwrap_or(20).min(40);
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let timeline_items = timeline_service
+        .list_timeline(
+            &list_id,
+            &local_account_address,
+            limit,
+            params.max_id.as_deref(),
+            params.min_id.as_deref(),
+        )
+        .await?;
+
+    let responses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| {
+            let response = crate::api::status_to_response(
+                &item.status,
+                &account,
+                &state.config,
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            );
+            serde_json::to_value(response).unwrap()
+        })
+        .collect();
+
+    Ok(Json(responses))
 }

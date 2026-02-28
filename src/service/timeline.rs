@@ -97,6 +97,68 @@ impl TimelineService {
         self.build_timeline_items_with_interactions(statuses).await
     }
 
+    /// Get hashtag timeline.
+    pub async fn tag_timeline(
+        &self,
+        hashtag: &str,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<TimelineItem>, AppError> {
+        let hashtag = hashtag.to_string();
+        let min_id = min_id.map(str::to_string);
+        let statuses = self
+            .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
+                let hashtag = hashtag.clone();
+                let min_id = min_id.clone();
+                async move {
+                    self.db
+                        .get_statuses_by_hashtag_in_window(
+                            &hashtag,
+                            fetch_limit,
+                            cursor.as_deref(),
+                            min_id.as_deref(),
+                        )
+                        .await
+                }
+            })
+            .await?;
+        self.build_timeline_items_with_interactions(statuses).await
+    }
+
+    /// Get list timeline.
+    pub async fn list_timeline(
+        &self,
+        list_id: &str,
+        local_account_address: &str,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<TimelineItem>, AppError> {
+        let list_id = list_id.to_string();
+        let local_account_address = local_account_address.to_string();
+        let min_id = min_id.map(str::to_string);
+        let statuses = self
+            .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
+                let list_id = list_id.clone();
+                let local_account_address = local_account_address.clone();
+                let min_id = min_id.clone();
+                async move {
+                    self.db
+                        .get_list_timeline_statuses_in_window(
+                            &list_id,
+                            &local_account_address,
+                            fetch_limit,
+                            cursor.as_deref(),
+                            min_id.as_deref(),
+                        )
+                        .await
+                }
+            })
+            .await?;
+        self.build_timeline_items_with_interactions(statuses).await
+    }
+
     /// Get account timeline
     ///
     /// Returns statuses from a specific account.
