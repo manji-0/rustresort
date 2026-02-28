@@ -352,26 +352,59 @@ async fn migrate_legacy_oauth_tokens(pool: &Pool<Sqlite>) -> Result<(), AppError
 }
 
 async fn backfill_missing_status_hashtags(pool: &Pool<Sqlite>) -> Result<(), AppError> {
-    let mut conn = pool.acquire().await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    const HASHTAG_BACKFILL_BATCH_SIZE: i64 = 250;
 
-    let result: Result<usize, AppError> = async {
-        let statuses = sqlx::query_as::<_, (String, String)>(
-            r#"
-            SELECT s.id, s.content
-            FROM statuses s
-            WHERE s.content LIKE '%#%'
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM status_hashtags sh
-                  WHERE sh.status_id = s.id
-              )
-            "#,
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-        let backfilled_count = statuses.len();
+    let mut backfilled_count = 0usize;
+    let mut last_status_id: Option<String> = None;
 
+    loop {
+        let statuses = if let Some(last_status_id) = last_status_id.as_deref() {
+            sqlx::query_as::<_, (String, String)>(
+                r#"
+                SELECT s.id, s.content
+                FROM statuses s
+                WHERE s.id > ?
+                  AND s.content LIKE '%#%'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_hashtags sh
+                      WHERE sh.status_id = s.id
+                  )
+                ORDER BY s.id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(last_status_id)
+            .bind(HASHTAG_BACKFILL_BATCH_SIZE)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (String, String)>(
+                r#"
+                SELECT s.id, s.content
+                FROM statuses s
+                WHERE s.content LIKE '%#%'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_hashtags sh
+                      WHERE sh.status_id = s.id
+                  )
+                ORDER BY s.id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(HASHTAG_BACKFILL_BATCH_SIZE)
+            .fetch_all(pool)
+            .await?
+        };
+
+        if statuses.is_empty() {
+            break;
+        }
+        backfilled_count += statuses.len();
+        last_status_id = statuses.last().map(|(status_id, _)| status_id.clone());
+
+        let mut tx = pool.begin().await?;
         for (status_id, content) in statuses {
             for hashtag in extract_hashtags_from_content(&content) {
                 let hashtag_insert_id = EntityId::new().0;
@@ -380,14 +413,14 @@ async fn backfill_missing_status_hashtags(pool: &Pool<Sqlite>) -> Result<(), App
                 )
                 .bind(&hashtag_insert_id)
                 .bind(&hashtag)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
 
                 let hashtag_id = sqlx::query_scalar::<_, String>(
                     "SELECT id FROM hashtags WHERE name = ? COLLATE NOCASE LIMIT 1",
                 )
                 .bind(&hashtag)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut *tx)
                 .await?;
 
                 let status_hashtag_id = EntityId::new().0;
@@ -397,31 +430,21 @@ async fn backfill_missing_status_hashtags(pool: &Pool<Sqlite>) -> Result<(), App
                 .bind(&status_hashtag_id)
                 .bind(&status_id)
                 .bind(&hashtag_id)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
             }
         }
-
-        Ok(backfilled_count)
+        tx.commit().await?;
     }
-    .await;
 
-    match result {
-        Ok(backfilled_count) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
-            if backfilled_count > 0 {
-                tracing::info!(
-                    backfilled_count,
-                    "Backfilled missing hashtag index rows for existing statuses"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-            Err(error)
-        }
+    if backfilled_count > 0 {
+        tracing::info!(
+            backfilled_count,
+            "Backfilled missing hashtag index rows for existing statuses"
+        );
     }
+
+    Ok(())
 }
 
 impl Database {

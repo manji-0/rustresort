@@ -202,7 +202,7 @@ pub async fn list_timeline(
     axum::extract::Path(list_id): axum::extract::Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    state
+    let list = state
         .db
         .get_list(&list_id)
         .await?
@@ -222,7 +222,7 @@ pub async fn list_timeline(
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
-    let timeline_items = timeline_service
+    let mut timeline_items = timeline_service
         .list_timeline(
             &list_id,
             &local_account_address,
@@ -233,6 +233,9 @@ pub async fn list_timeline(
             params.min_id.as_deref(),
         )
         .await?;
+    if list.2 == "none" {
+        timeline_items.retain(|item| item.status.in_reply_to_uri.is_none());
+    }
 
     let responses: Vec<_> = timeline_items
         .iter()

@@ -372,6 +372,82 @@ async fn test_list_timeline_matches_local_account_added_by_id() {
 }
 
 #[tokio::test]
+async fn test_list_timeline_respects_none_replies_policy() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Replies none list", "none")
+        .await
+        .unwrap();
+    let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, &[local_address])
+        .await
+        .unwrap();
+
+    let root = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/list-none-root".to_string(),
+        content: "<p>Root status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let reply = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/list-none-reply".to_string(),
+        content: "<p>Reply status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+    server.state.db.insert_status(&reply).await.unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ids: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(ids.contains(&root.id));
+    assert!(!ids.contains(&reply.id));
+}
+
+#[tokio::test]
 async fn test_timeline_with_max_id() {
     let server = TestServer::new().await;
     server.create_test_account().await;
