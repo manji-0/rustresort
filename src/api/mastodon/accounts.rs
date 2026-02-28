@@ -374,43 +374,72 @@ pub async fn account_statuses(
         limit
     };
 
-    let statuses = state
-        .db
-        .get_local_statuses_in_window(fetch_limit, params.max_id.as_deref(), effective_min_id)
-        .await?;
-
     // Convert to API responses with optional filters.
     let mut responses = Vec::with_capacity(limit);
-    for status in statuses {
-        if exclude_reblogs && status.boost_of_uri.is_some() {
-            continue;
-        }
-        if exclude_replies && status.in_reply_to_uri.is_some() {
-            continue;
+    let mut page_max_id = params.max_id.clone();
+    loop {
+        let statuses = state
+            .db
+            .get_local_statuses_in_window(fetch_limit, page_max_id.as_deref(), effective_min_id)
+            .await?;
+
+        if statuses.is_empty() {
+            break;
         }
 
-        let is_pinned = state.db.is_status_pinned(&status.id).await?;
-        if only_pinned && !is_pinned {
-            continue;
-        }
-        if only_media && state.db.get_media_by_status(&status.id).await?.is_empty() {
-            continue;
+        let batch_len = statuses.len();
+        let mut last_status_id: Option<String> = None;
+        for status in statuses {
+            last_status_id = Some(status.id.clone());
+
+            if exclude_reblogs && status.boost_of_uri.is_some() {
+                continue;
+            }
+            if exclude_replies && status.in_reply_to_uri.is_some() {
+                continue;
+            }
+
+            let is_pinned = state.db.is_status_pinned(&status.id).await?;
+            if only_pinned && !is_pinned {
+                continue;
+            }
+            if only_media && state.db.get_media_by_status(&status.id).await?.is_empty() {
+                continue;
+            }
+
+            let response = crate::api::status_to_response(
+                &status,
+                &account,
+                &state.config,
+                None,
+                None,
+                None,
+                None,
+                Some(is_pinned),
+            );
+            responses.push(serde_json::to_value(response).unwrap());
+            if responses.len() >= limit {
+                break;
+            }
         }
 
-        let response = crate::api::status_to_response(
-            &status,
-            &account,
-            &state.config,
-            None,
-            None,
-            None,
-            None,
-            Some(is_pinned),
-        );
-        responses.push(serde_json::to_value(response).unwrap());
         if responses.len() >= limit {
             break;
         }
+
+        // No more rows to page through.
+        if last_status_id.is_none() || batch_len < fetch_limit {
+            break;
+        }
+
+        let Some(next_max_id) = last_status_id else {
+            break;
+        };
+        if page_max_id.as_deref() == Some(next_max_id.as_str()) {
+            break;
+        }
+
+        page_max_id = Some(next_max_id);
     }
 
     Ok(Json(responses))
