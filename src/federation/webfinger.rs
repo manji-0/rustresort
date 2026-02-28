@@ -3,6 +3,7 @@
 //! Used to discover ActivityPub actor URIs from addresses.
 
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 
 use crate::error::AppError;
 
@@ -36,8 +37,100 @@ fn parse_account_address(address: &str) -> Result<(String, String), AppError> {
             "address must be in user@domain format".to_string(),
         ));
     }
+    validate_account_domain(domain)?;
 
     Ok((username.to_string(), domain.to_string()))
+}
+
+fn validate_account_domain(domain: &str) -> Result<(), AppError> {
+    let parsed = url::Url::parse(&format!("https://{}", domain))
+        .map_err(|_| AppError::Validation("address must be in user@domain format".to_string()))?;
+    if parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host_str().is_none()
+    {
+        return Err(AppError::Validation(
+            "address must be in user@domain format".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_blocked_ip_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip_address(IpAddr::V4(mapped_v4));
+            }
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
+}
+
+async fn validate_remote_actor_fetch_url(url: &url::Url) -> Result<(), AppError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::Validation(
+            "actor URI must not include user info".to_string(),
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::Validation("actor URI must include a host".to_string()))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(AppError::Validation(
+            "actor URI host is not allowed".to_string(),
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip_address(ip) {
+            return Err(AppError::Validation(
+                "actor URI host is not allowed".to_string(),
+            ));
+        }
+    }
+
+    let port = url.port_or_known_default().ok_or_else(|| {
+        AppError::Validation("actor URI must include a known default port".to_string())
+    })?;
+    let mut resolved_addrs: Vec<SocketAddr> = Vec::new();
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Failed to resolve actor host {}: {}", host, error))
+        })?;
+    for address in resolved {
+        if is_blocked_ip_address(address.ip()) {
+            return Err(AppError::Validation(
+                "actor URI host is not allowed".to_string(),
+            ));
+        }
+        resolved_addrs.push(address);
+    }
+    if resolved_addrs.is_empty() {
+        return Err(AppError::Federation(format!(
+            "actor host did not resolve to any IP addresses: {}",
+            host
+        )));
+    }
+
+    Ok(())
 }
 
 fn extract_explicit_port_from_domain(domain: &str) -> Option<u16> {
@@ -326,6 +419,7 @@ pub async fn fetch_actor(
             "actor URI must use http or https".to_string(),
         ));
     }
+    validate_remote_actor_fetch_url(&parsed).await?;
 
     let response = http_client
         .get(actor_uri)
@@ -449,7 +543,7 @@ pub struct ParsedActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_webfinger_response, parse_account_address, parse_actor};
+    use super::{fetch_actor, generate_webfinger_response, parse_account_address, parse_actor};
 
     #[test]
     fn generate_webfinger_response_contains_activitypub_self_link() {
@@ -532,5 +626,39 @@ mod tests {
             parse_account_address("acct:alice@trusted.example").expect("valid address");
         assert_eq!(username, "alice");
         assert_eq!(domain, "trusted.example");
+    }
+
+    #[test]
+    fn parse_account_address_rejects_domain_with_path_or_query() {
+        let path_error =
+            parse_account_address("alice@example.com/path").expect_err("path must be rejected");
+        assert!(matches!(path_error, crate::error::AppError::Validation(_)));
+
+        let query_error =
+            parse_account_address("alice@example.com?x=1").expect_err("query must be rejected");
+        assert!(matches!(query_error, crate::error::AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_actor_rejects_private_and_localhost_targets() {
+        let http_client = reqwest::Client::new();
+
+        let loopback_error = fetch_actor("http://127.0.0.1:8080/actor", &http_client)
+            .await
+            .expect_err("loopback targets must be rejected");
+        assert!(matches!(
+            loopback_error,
+            crate::error::AppError::Validation(message)
+                if message.contains("host is not allowed")
+        ));
+
+        let localhost_error = fetch_actor("http://localhost:8080/actor", &http_client)
+            .await
+            .expect_err("localhost targets must be rejected");
+        assert!(matches!(
+            localhost_error,
+            crate::error::AppError::Validation(message)
+                if message.contains("host is not allowed")
+        ));
     }
 }
