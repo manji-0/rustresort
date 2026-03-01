@@ -157,6 +157,74 @@ async fn test_account_statuses_include_pinned_state() {
 }
 
 #[tokio::test]
+async fn test_account_statuses_only_media_pages_until_limit() {
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::{Duration, Utc};
+    use rustresort::data::{MediaAttachment, Status};
+
+    let now = Utc::now();
+    let mut media_status_ids = Vec::new();
+
+    for idx in 0..12 {
+        let status_id = format!("{:03}", 120 - idx);
+        let status = Status {
+            id: status_id.clone(),
+            uri: format!("https://test.example.com/status/{}", status_id),
+            content: format!("<p>Status {}</p>", idx),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: now - Duration::seconds(idx as i64),
+            fetched_at: None,
+        };
+        server.state.db.insert_status(&status).await.unwrap();
+
+        if idx >= 10 {
+            let media_id = format!("media-{}", status_id);
+            let media = MediaAttachment {
+                id: media_id,
+                status_id: Some(status_id.clone()),
+                s3_key: format!("media/{}.webp", status_id),
+                thumbnail_s3_key: None,
+                content_type: "image/webp".to_string(),
+                file_size: 1024,
+                description: None,
+                blurhash: None,
+                width: Some(64),
+                height: Some(64),
+                created_at: now,
+            };
+            server.state.db.insert_media(&media).await.unwrap();
+            media_status_ids.push(status_id);
+        }
+    }
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("only_media", "true"), ("limit", "2")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let items: Value = response.json().await.unwrap();
+    let items = items.as_array().expect("array response expected");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], media_status_ids[0]);
+    assert_eq!(items[1]["id"], media_status_ids[1]);
+}
+
+#[tokio::test]
 async fn test_account_followers() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;
