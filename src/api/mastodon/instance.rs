@@ -1,8 +1,104 @@
 //! Instance endpoints
 
 use axum::{extract::State, response::Json};
+use std::collections::BTreeSet;
 
 use crate::AppState;
+
+const DEFAULT_INSTANCE_RULES: [&str; 3] = [
+    "Be respectful and civil in all interactions.",
+    "No spam, harassment, or illegal content.",
+    "Content warnings are required for sensitive material.",
+];
+
+fn domain_from_account_address(address: &str) -> Option<String> {
+    let (_, domain) = address.trim().split_once('@')?;
+    let domain = domain
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
+}
+
+fn compute_peer_domains(
+    follow_addresses: &[String],
+    follower_addresses: &[String],
+    local_domain: &str,
+) -> Vec<String> {
+    let local_domain = local_domain.trim().to_ascii_lowercase();
+    let mut peers = BTreeSet::new();
+
+    for address in follow_addresses {
+        if let Some(domain) = domain_from_account_address(address) {
+            if domain != local_domain {
+                peers.insert(domain);
+            }
+        }
+    }
+    for address in follower_addresses {
+        if let Some(domain) = domain_from_account_address(address) {
+            if domain != local_domain {
+                peers.insert(domain);
+            }
+        }
+    }
+
+    peers.into_iter().collect()
+}
+
+fn rule_texts_from_setting(raw: &str) -> Option<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let items = parsed.as_array()?;
+    let mut rules = Vec::with_capacity(items.len());
+
+    for item in items {
+        if let Some(text) = item.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+            rules.push(text.to_string());
+            continue;
+        }
+
+        if let Some(text) = item
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            rules.push(text.to_string());
+        }
+    }
+
+    (!rules.is_empty()).then_some(rules)
+}
+
+async fn load_instance_rule_texts(state: &AppState) -> Vec<String> {
+    if let Ok(Some(raw)) = state.db.get_setting("instance.rules").await {
+        if let Some(rules) = rule_texts_from_setting(&raw) {
+            return rules;
+        }
+        tracing::warn!("Invalid JSON in settings key instance.rules; falling back to defaults");
+    }
+
+    DEFAULT_INSTANCE_RULES
+        .iter()
+        .map(|rule| rule.to_string())
+        .collect()
+}
+
+fn rules_to_json(rule_texts: &[String]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rule_texts
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| {
+                serde_json::json!({
+                    "id": (idx + 1).to_string(),
+                    "text": text
+                })
+            })
+            .collect(),
+    )
+}
 
 /// GET /api/v1/instance
 pub async fn instance(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -25,7 +121,22 @@ pub async fn instance(State(state): State<AppState>) -> Json<serde_json::Value> 
         .await
         .map(|s| s.len() as i64)
         .unwrap_or(0);
-    let domain_count = 0; // TODO: Count federated domains
+    let follow_addresses = state
+        .db
+        .get_all_follow_addresses()
+        .await
+        .unwrap_or_default();
+    let follower_addresses = state
+        .db
+        .get_all_follower_addresses()
+        .await
+        .unwrap_or_default();
+    let peer_domains = compute_peer_domains(
+        &follow_addresses,
+        &follower_addresses,
+        &state.config.server.domain,
+    );
+    let domain_count = peer_domains.len() as i64;
 
     let response = InstanceResponse {
         uri: state.config.server.domain.clone(),
@@ -84,9 +195,22 @@ pub async fn instance(State(state): State<AppState>) -> Json<serde_json::Value> 
 ///
 /// List of federated instances this instance knows about.
 pub async fn instance_peers(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    // TODO: Implement federated peers tracking
-    // For single-user instance, return empty array for now
-    Json(serde_json::json!([]))
+    let follow_addresses = _state
+        .db
+        .get_all_follow_addresses()
+        .await
+        .unwrap_or_default();
+    let follower_addresses = _state
+        .db
+        .get_all_follower_addresses()
+        .await
+        .unwrap_or_default();
+    let peer_domains = compute_peer_domains(
+        &follow_addresses,
+        &follower_addresses,
+        &_state.config.server.domain,
+    );
+    Json(serde_json::json!(peer_domains))
 }
 
 /// GET /api/v1/instance/activity - Get instance activity
@@ -115,23 +239,9 @@ pub async fn instance_activity(State(_state): State<AppState>) -> Json<serde_jso
 /// GET /api/v1/instance/rules - Get instance rules
 ///
 /// List of rules for this instance.
-pub async fn instance_rules(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    // TODO: Make rules configurable
-    // For now, return basic rules for single-user instance
-    Json(serde_json::json!([
-        {
-            "id": "1",
-            "text": "Be respectful and civil in all interactions."
-        },
-        {
-            "id": "2",
-            "text": "No spam, harassment, or illegal content."
-        },
-        {
-            "id": "3",
-            "text": "Content warnings are required for sensitive material."
-        }
-    ]))
+pub async fn instance_rules(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let rules = load_instance_rule_texts(&state).await;
+    Json(rules_to_json(&rules))
 }
 
 /// GET /api/v2/instance - Get instance information (v2)
@@ -153,7 +263,22 @@ pub async fn instance_v2(State(state): State<AppState>) -> Json<serde_json::Valu
         .await
         .map(|s| s.len() as i64)
         .unwrap_or(0);
-    let _domain_count = 0; // TODO: Count federated domains
+    let follow_addresses = state
+        .db
+        .get_all_follow_addresses()
+        .await
+        .unwrap_or_default();
+    let follower_addresses = state
+        .db
+        .get_all_follower_addresses()
+        .await
+        .unwrap_or_default();
+    let peer_domains = compute_peer_domains(
+        &follow_addresses,
+        &follower_addresses,
+        &state.config.server.domain,
+    );
+    let rules = load_instance_rule_texts(&state).await;
 
     Json(serde_json::json!({
         "domain": state.config.server.domain,
@@ -217,19 +342,46 @@ pub async fn instance_v2(State(state): State<AppState>) -> Json<serde_json::Valu
             "email": state.config.instance.contact_email,
             "account": contact_account
         },
-        "rules": [
-            {
-                "id": "1",
-                "text": "Be respectful and civil in all interactions."
-            },
-            {
-                "id": "2",
-                "text": "No spam, harassment, or illegal content."
-            },
-            {
-                "id": "3",
-                "text": "Content warnings are required for sensitive material."
-            }
-        ]
+        "rules": rules_to_json(&rules),
+        "stats": {
+            "domain_count": peer_domains.len()
+        }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_peer_domains, rule_texts_from_setting};
+
+    #[test]
+    fn compute_peer_domains_merges_follows_and_followers_without_duplicates() {
+        let follows = vec![
+            "alice@remote.example".to_string(),
+            "bob@social.example".to_string(),
+        ];
+        let followers = vec![
+            "carol@social.example".to_string(),
+            "dave@another.example".to_string(),
+        ];
+
+        let peers = compute_peer_domains(&follows, &followers, "local.example");
+        assert_eq!(
+            peers,
+            vec![
+                "another.example".to_string(),
+                "remote.example".to_string(),
+                "social.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_texts_from_setting_accepts_string_and_object_arrays() {
+        let from_strings = rule_texts_from_setting(r#"["One","Two"]"#).unwrap();
+        assert_eq!(from_strings, vec!["One".to_string(), "Two".to_string()]);
+
+        let from_objects =
+            rule_texts_from_setting(r#"[{"id":"1","text":"Alpha"},{"text":"Beta"}]"#).unwrap();
+        assert_eq!(from_objects, vec!["Alpha".to_string(), "Beta".to_string()]);
+    }
 }
