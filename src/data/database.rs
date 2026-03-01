@@ -820,6 +820,51 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Atomically patch account credentials while guarding expected media keys.
+    ///
+    /// This updates avatar/header keys and optional profile fields in a single
+    /// SQL statement so callers can avoid partial account updates.
+    pub async fn patch_account_credentials_if_matches(
+        &self,
+        account_id: &str,
+        expected_current_avatar_s3_key: Option<&str>,
+        expected_current_header_s3_key: Option<&str>,
+        avatar_s3_key: Option<&str>,
+        header_s3_key: Option<&str>,
+        display_name: Option<Option<&str>>,
+        note: Option<Option<&str>>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE account
+            SET
+                avatar_s3_key = ?,
+                header_s3_key = ?,
+                display_name = CASE WHEN ? THEN ? ELSE display_name END,
+                note = CASE WHEN ? THEN ? ELSE note END,
+                updated_at = ?
+            WHERE id = ?
+              AND avatar_s3_key IS ?
+              AND header_s3_key IS ?
+            "#,
+        )
+        .bind(avatar_s3_key)
+        .bind(header_s3_key)
+        .bind(display_name.is_some())
+        .bind(display_name.flatten())
+        .bind(note.is_some())
+        .bind(note.flatten())
+        .bind(updated_at)
+        .bind(account_id)
+        .bind(expected_current_avatar_s3_key)
+        .bind(expected_current_header_s3_key)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     // =========================================================================
     // Status
     // =========================================================================

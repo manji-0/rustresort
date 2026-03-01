@@ -152,6 +152,175 @@ impl AccountService {
         Ok(account)
     }
 
+    async fn delete_storage_key_best_effort(&self, key: &str, reason: &str) {
+        if let Err(error) = self.storage.delete(key).await {
+            tracing::warn!(key = %key, error = %error, %reason, "failed to delete media key");
+        }
+    }
+
+    /// Atomically update account credentials.
+    ///
+    /// When avatar/header updates are requested, media uploads are performed
+    /// first and account fields are patched in one database statement. Any
+    /// failure after uploads triggers cleanup of newly uploaded keys.
+    pub async fn update_credentials(
+        &self,
+        display_name: Option<String>,
+        note: Option<String>,
+        avatar_image_data: Option<Vec<u8>>,
+        header_image_data: Option<Vec<u8>>,
+    ) -> Result<Account, AppError> {
+        if avatar_image_data.is_none() && header_image_data.is_none() {
+            return self.update_profile(display_name, note).await;
+        }
+
+        if avatar_image_data
+            .as_ref()
+            .map(|image_data| image_data.is_empty())
+            .unwrap_or(false)
+        {
+            return Err(AppError::Validation(
+                "avatar image data is empty".to_string(),
+            ));
+        }
+        if header_image_data
+            .as_ref()
+            .map(|image_data| image_data.is_empty())
+            .unwrap_or(false)
+        {
+            return Err(AppError::Validation(
+                "header image data is empty".to_string(),
+            ));
+        }
+
+        let account = self.get_account().await?;
+        let previous_avatar_key = account.avatar_s3_key.clone();
+        let previous_header_key = account.header_s3_key.clone();
+
+        let display_name_patch = display_name.map(normalize_optional_text);
+        let note_patch = note.map(normalize_optional_text);
+
+        let mut new_avatar_key = None;
+        if let Some(image_data) = avatar_image_data {
+            let image_id = EntityId::new().0;
+            let (avatar_s3_key, _avatar_url) =
+                self.storage.upload_avatar(&image_id, image_data).await?;
+            new_avatar_key = Some(avatar_s3_key);
+        }
+
+        let mut new_header_key = None;
+        if let Some(image_data) = header_image_data {
+            let image_id = EntityId::new().0;
+            match self.storage.upload_header(&image_id, image_data).await {
+                Ok((header_s3_key, _header_url)) => {
+                    new_header_key = Some(header_s3_key);
+                }
+                Err(error) => {
+                    if let Some(avatar_s3_key) = new_avatar_key.as_deref() {
+                        self.delete_storage_key_best_effort(
+                            avatar_s3_key,
+                            "rollback uploaded avatar after header upload error",
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let updated_at = chrono::Utc::now();
+        let updated = match self
+            .db
+            .patch_account_credentials_if_matches(
+                &account.id,
+                previous_avatar_key.as_deref(),
+                previous_header_key.as_deref(),
+                new_avatar_key.as_deref().or(previous_avatar_key.as_deref()),
+                new_header_key.as_deref().or(previous_header_key.as_deref()),
+                display_name_patch.as_ref().map(|value| value.as_deref()),
+                note_patch.as_ref().map(|value| value.as_deref()),
+                updated_at,
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Some(avatar_s3_key) = new_avatar_key.as_deref() {
+                    self.delete_storage_key_best_effort(
+                        avatar_s3_key,
+                        "rollback uploaded avatar after database update error",
+                    )
+                    .await;
+                }
+                if let Some(header_s3_key) = new_header_key.as_deref() {
+                    self.delete_storage_key_best_effort(
+                        header_s3_key,
+                        "rollback uploaded header after database update error",
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
+        if !updated {
+            if let Some(avatar_s3_key) = new_avatar_key.as_deref() {
+                self.delete_storage_key_best_effort(
+                    avatar_s3_key,
+                    "rollback uploaded avatar after concurrent update/not found",
+                )
+                .await;
+            }
+            if let Some(header_s3_key) = new_header_key.as_deref() {
+                self.delete_storage_key_best_effort(
+                    header_s3_key,
+                    "rollback uploaded header after concurrent update/not found",
+                )
+                .await;
+            }
+            let not_found = match self.db.get_account().await? {
+                Some(current) => current.id != account.id,
+                None => true,
+            };
+            if not_found {
+                return Err(AppError::NotFound);
+            }
+            return Err(AppError::Validation(
+                "credentials changed concurrently; retry".to_string(),
+            ));
+        }
+
+        // Re-read persisted row so response reflects committed state even if
+        // another request updated non-patched fields concurrently.
+        let account = self.get_account().await?;
+
+        if let (Some(old_key), Some(new_key)) = (
+            previous_avatar_key.as_deref(),
+            account.avatar_s3_key.as_deref(),
+        ) {
+            if old_key != new_key {
+                self.delete_storage_key_best_effort(
+                    old_key,
+                    "delete previous avatar after credential update",
+                )
+                .await;
+            }
+        }
+        if let (Some(old_key), Some(new_key)) = (
+            previous_header_key.as_deref(),
+            account.header_s3_key.as_deref(),
+        ) {
+            if old_key != new_key {
+                self.delete_storage_key_best_effort(
+                    old_key,
+                    "delete previous header after credential update",
+                )
+                .await;
+            }
+        }
+
+        Ok(account)
+    }
+
     /// Update avatar image
     ///
     /// # Arguments
