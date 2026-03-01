@@ -9,7 +9,7 @@ use aws_sdk_s3::Client as S3Client;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::BackupStorageConfig;
@@ -93,6 +93,44 @@ fn decrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> 
     cipher
         .decrypt(nonce_value, ciphertext)
         .map_err(|_| AppError::Encryption("backup decryption failed".to_string()))
+}
+
+async fn create_sqlite_backup_snapshot(db_path: &Path) -> Result<Vec<u8>, AppError> {
+    use sqlx::Connection;
+
+    let temp_dir = tempfile::tempdir()
+        .map_err(|error| AppError::Storage(format!("Failed to create temp dir: {}", error)))?;
+    let snapshot_path = temp_dir.path().join("backup_snapshot.db");
+    let escaped_snapshot_path = snapshot_path.to_string_lossy().replace('\'', "''");
+    let connection_string = format!("sqlite:{}?mode=rw", db_path.display());
+
+    let mut connection = sqlx::SqliteConnection::connect(&connection_string)
+        .await
+        .map_err(|error| {
+            AppError::Storage(format!(
+                "Failed to open SQLite connection for backup: {}",
+                error
+            ))
+        })?;
+    sqlx::query(&format!("VACUUM INTO '{}'", escaped_snapshot_path))
+        .execute(&mut connection)
+        .await
+        .map_err(|error| {
+            AppError::Storage(format!(
+                "Failed to create SQLite backup snapshot: {}",
+                error
+            ))
+        })?;
+    connection.close().await.map_err(|error| {
+        AppError::Storage(format!(
+            "Failed to close SQLite backup connection: {}",
+            error
+        ))
+    })?;
+
+    tokio::fs::read(&snapshot_path)
+        .await
+        .map_err(|error| AppError::Storage(format!("Failed to read backup snapshot: {}", error)))
 }
 
 /// Backup service for SQLite database
@@ -207,10 +245,8 @@ impl BackupService {
     pub async fn backup_now(&self) -> Result<String, AppError> {
         tracing::info!("Starting database backup...");
 
-        // 1. Read database file
-        let data = tokio::fs::read(&self.db_path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read database: {}", e)))?;
+        // 1. Create safe SQLite snapshot
+        let data = self.create_sqlite_backup().await?;
 
         tracing::debug!(size = data.len(), "Database read successfully");
 
@@ -247,9 +283,7 @@ impl BackupService {
     /// # Returns
     /// Backup data as bytes
     async fn create_sqlite_backup(&self) -> Result<Vec<u8>, AppError> {
-        Err(AppError::NotImplemented(
-            "online sqlite backup API is not implemented yet".to_string(),
-        ))
+        create_sqlite_backup_snapshot(&self.db_path).await
     }
 
     /// Encrypt backup data
@@ -423,11 +457,13 @@ impl BackupService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AES_256_KEY_BYTES, decrypt_backup_payload, encrypt_backup_payload,
-        parse_backup_encryption_key,
+        AES_256_KEY_BYTES, create_sqlite_backup_snapshot, decrypt_backup_payload,
+        encrypt_backup_payload, parse_backup_encryption_key,
     };
     use crate::config::{BackupEncryptionConfig, BackupStorageConfig};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use sqlx::Connection;
+    use tempfile::TempDir;
 
     fn backup_config(
         backup_enabled: bool,
@@ -499,5 +535,28 @@ mod tests {
         let key = vec![9_u8; AES_256_KEY_BYTES];
         let error = decrypt_backup_payload(&key, &[0_u8; 8]).unwrap_err();
         assert!(matches!(error, crate::error::AppError::Encryption(_)));
+    }
+
+    #[tokio::test]
+    async fn create_sqlite_backup_snapshot_creates_valid_copy() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("source.db");
+        let connection_string = format!("sqlite:{}?mode=rwc", db_path.display());
+        let mut connection = sqlx::SqliteConnection::connect(&connection_string)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE example (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO example (value) VALUES ('hello')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        let backup = create_sqlite_backup_snapshot(&db_path).await.unwrap();
+        assert!(backup.len() > 100);
+        assert_eq!(&backup[..16], b"SQLite format 3\0");
     }
 }
