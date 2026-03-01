@@ -209,6 +209,7 @@ mod tests {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,
             },
+            metrics: MetricsConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: "pretty".to_string(),

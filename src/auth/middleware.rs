@@ -275,6 +275,37 @@ pub async fn require_session_auth(
     Ok(next.run(request).await)
 }
 
+/// Middleware for `/metrics` static bearer-token protection.
+///
+/// If `metrics.auth_token` is unset, access remains anonymous for backward compatibility.
+pub async fn require_metrics_auth(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let Some(expected_token) = state
+        .config
+        .metrics
+        .auth_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(next.run(request).await);
+    };
+
+    let provided = request
+        .headers()
+        .get("Authorization")
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "));
+
+    if provided.is_some_and(|token| token == expected_token) {
+        return Ok(next.run(request).await);
+    }
+
+    Err(AppError::Unauthorized)
+}
+
 /// Middleware to require authentication
 ///
 /// Extracts and verifies session from cookie or Authorization header.

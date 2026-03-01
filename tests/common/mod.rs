@@ -18,6 +18,11 @@ pub struct TestServer {
 impl TestServer {
     /// Create a new test server instance
     pub async fn new() -> Self {
+        Self::with_metrics_auth_token(None).await
+    }
+
+    /// Create a new test server instance with optional `/metrics` bearer auth token.
+    pub async fn with_metrics_auth_token(metrics_auth_token: Option<&str>) -> Self {
         // Create temporary directory for test database
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
@@ -75,6 +80,9 @@ impl TestServer {
             cache: config::CacheConfig {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,
+            },
+            metrics: config::MetricsConfig {
+                auth_token: metrics_auth_token.map(|token| token.to_string()),
             },
             logging: config::LoggingConfig {
                 level: "info".to_string(),
