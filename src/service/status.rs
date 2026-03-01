@@ -5,9 +5,16 @@
 
 use std::sync::Arc;
 
-use crate::data::{Database, EntityId, MediaAttachment, PersistedReason, Status, TimelineCache};
+#[cfg(test)]
+use crate::data::Database;
+use crate::data::{
+    EntityId, MediaAttachment, PersistedReason, Status, StatusRepository, StatusVisibility,
+    TimelineCache,
+};
 use crate::error::AppError;
+#[cfg(test)]
 use crate::storage::MediaStorage;
+use crate::storage::MediaStorageRepository;
 
 const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES: usize = 40 * 1024 * 1024;
@@ -84,20 +91,23 @@ fn derive_remote_account_address(status_uri: &url::Url) -> String {
 
 /// Status service
 pub struct StatusService {
-    db: Arc<Database>,
+    db: Arc<dyn StatusRepository>,
     cache: Arc<TimelineCache>,
-    storage: Arc<MediaStorage>,
+    storage: Arc<dyn MediaStorageRepository>,
     base_url: String,
 }
 
 impl StatusService {
     /// Create new status service
-    pub fn new(
-        db: Arc<Database>,
+    pub fn new<R>(
+        db: Arc<R>,
         cache: Arc<TimelineCache>,
-        storage: Arc<MediaStorage>,
+        storage: Arc<dyn MediaStorageRepository>,
         base_url: String,
-    ) -> Self {
+    ) -> Self
+    where
+        R: StatusRepository + 'static,
+    {
         Self {
             db,
             cache,
@@ -138,15 +148,12 @@ impl StatusService {
     ) -> Result<Status, AppError> {
         let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-        let normalized_visibility = visibility.trim().to_ascii_lowercase();
-        if !matches!(
-            normalized_visibility.as_str(),
-            "public" | "unlisted" | "private" | "direct"
-        ) {
-            return Err(AppError::Validation(
-                "visibility must be one of: public, unlisted, private, direct".to_string(),
-            ));
-        }
+        let normalized_visibility =
+            StatusVisibility::parse(visibility.trim()).ok_or_else(|| {
+                AppError::Validation(
+                    "visibility must be one of: public, unlisted, private, direct".to_string(),
+                )
+            })?;
 
         let content = content.trim().to_string();
         if content.is_empty() && media_ids.is_empty() {
@@ -155,7 +162,7 @@ impl StatusService {
             ));
         }
 
-        let status_id = EntityId::new().0;
+        let status_id = EntityId::new_string();
         let uri = format!(
             "{}/users/{}/statuses/{}",
             self.base_url.trim_end_matches('/'),
@@ -173,7 +180,7 @@ impl StatusService {
             is_local: true,
             in_reply_to_uri,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: chrono::Utc::now(),
             fetched_at: None,
         };
@@ -527,7 +534,7 @@ impl StatusService {
     /// The repost status (Announce wrapper)
     pub async fn repost(&self, status_uri: &str) -> Result<Status, AppError> {
         let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
-        let repost_id = EntityId::new().0;
+        let repost_id = EntityId::new_string();
         let repost_uri = format!(
             "{}/users/{}/statuses/{}/activity",
             self.base_url.trim_end_matches('/'),
@@ -597,7 +604,7 @@ impl StatusService {
             )));
         }
 
-        let media_id = EntityId::new().0;
+        let media_id = EntityId::new_string();
         let extension = media_file_extension_from_content_type(&normalized_content_type);
         let s3_key = format!("media/{}.{}", media_id, extension);
         let file_size = data.len() as i64;
@@ -663,13 +670,14 @@ impl StatusService {
                 uri: cached.uri.clone(),
                 content: cached.content.clone(),
                 content_warning: None,
-                visibility: cached.visibility.clone(),
+                visibility: StatusVisibility::parse(&cached.visibility)
+                    .unwrap_or(StatusVisibility::Private),
                 language: None,
                 account_address: cached.account_address.clone(),
                 is_local: false,
                 in_reply_to_uri: cached.reply_to_uri.clone(),
                 boost_of_uri: cached.boost_of_uri.clone(),
-                persisted_reason: reason.as_str().to_string(),
+                persisted_reason: reason,
                 created_at: cached.created_at,
                 fetched_at: Some(chrono::Utc::now()),
             };
@@ -689,13 +697,14 @@ impl StatusService {
                     uri: cached.uri.clone(),
                     content: cached.content.clone(),
                     content_warning: None,
-                    visibility: cached.visibility.clone(),
+                    visibility: StatusVisibility::parse(&cached.visibility)
+                        .unwrap_or(StatusVisibility::Private),
                     language: None,
                     account_address: cached.account_address.clone(),
                     is_local: false,
                     in_reply_to_uri: cached.reply_to_uri.clone(),
                     boost_of_uri: cached.boost_of_uri.clone(),
-                    persisted_reason: reason.as_str().to_string(),
+                    persisted_reason: reason,
                     created_at: cached.created_at,
                     fetched_at: Some(chrono::Utc::now()),
                 };
@@ -712,13 +721,13 @@ impl StatusService {
             uri: normalized_uri,
             content: String::new(),
             content_warning: None,
-            visibility: "private".to_string(),
+            visibility: StatusVisibility::Private,
             language: None,
             account_address: derive_remote_account_address(&normalized),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: reason.as_str().to_string(),
+            persisted_reason: reason,
             created_at: now,
             fetched_at: Some(now),
         };
@@ -903,7 +912,7 @@ mod tests {
         (Arc::new(db), temp_dir)
     }
 
-    async fn create_test_storage() -> Arc<MediaStorage> {
+    async fn create_test_storage() -> Arc<dyn MediaStorageRepository> {
         let media = crate::config::MediaStorageConfig {
             bucket: "test-media-bucket".to_string(),
             public_url: "https://media.test.example.com".to_string(),
@@ -919,7 +928,7 @@ mod tests {
 
     async fn seed_account(db: &Database, username: &str) {
         let account = Account {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             username: username.to_string(),
             display_name: Some(username.to_string()),
             note: None,
@@ -958,7 +967,7 @@ mod tests {
             .unwrap();
 
         assert!(status.uri.ends_with(&format!("/statuses/{}", status.id)));
-        assert_eq!(status.visibility, "public");
+        assert_eq!(status.visibility, crate::data::StatusVisibility::Public);
         assert_eq!(status.content, "<p>hello</p>");
 
         let persisted = db.get_status(&status.id).await.unwrap().unwrap();
@@ -1007,17 +1016,17 @@ mod tests {
         let service = create_service(db.clone()).await;
 
         let status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: "https://remote.example/users/alice/statuses/legacy".to_string(),
             content: "<p>legacy remote row</p>".to_string(),
             content_warning: None,
-            visibility: "private".to_string(),
+            visibility: crate::data::StatusVisibility::Private,
             language: Some("en".to_string()),
             account_address: "alice@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -1041,17 +1050,17 @@ mod tests {
         let service = create_service(db.clone()).await;
 
         let remote_status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: "https://remote.example/users/alice/statuses/uri-input".to_string(),
             content: "<p>remote</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "alice@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -1078,17 +1087,17 @@ mod tests {
         assert!(!db.is_reposted(&remote_status.id).await.unwrap());
 
         let local_status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: "https://test.example.com/users/testuser/statuses/local-uri-input".to_string(),
             content: "<p>local</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: PersistedReason::Own.as_str().to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -1107,17 +1116,17 @@ mod tests {
         let service = create_service(db.clone()).await;
 
         let status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: "https://remote.example/users/alice/statuses/1".to_string(),
             content: "<p>remote</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "alice@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -1159,7 +1168,7 @@ mod tests {
         service
             .cache
             .insert(CachedStatus {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 uri: remote_uri.to_string(),
                 content: "<p>cached non-http status</p>".to_string(),
                 account_address: "alice@remote.example".to_string(),
@@ -1190,10 +1199,10 @@ mod tests {
         let remote_uri = "https://remote.example/users/alice/statuses/43";
         let status = service.favourite(remote_uri).await.unwrap();
         assert_eq!(status.id, remote_uri);
-        assert_eq!(status.visibility, "private");
+        assert_eq!(status.visibility, crate::data::StatusVisibility::Private);
 
         let persisted = db.get_status_by_uri(remote_uri).await.unwrap().unwrap();
-        assert_eq!(persisted.visibility, "private");
+        assert_eq!(persisted.visibility, crate::data::StatusVisibility::Private);
     }
 
     #[tokio::test]

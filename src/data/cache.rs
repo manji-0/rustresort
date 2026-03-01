@@ -1,12 +1,12 @@
-//! In-memory caches backed by Turso in-memory databases.
+//! In-memory caches backed by process-local hash maps.
 //!
 //! These caches are volatile and cleared on restart.
 
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use turso::{Builder, Connection, Value};
+use tokio::sync::RwLock;
 
 use crate::error::AppError;
 
@@ -43,18 +43,6 @@ pub struct CachedAttachment {
     pub content_type: String,
     pub description: Option<String>,
     pub blurhash: Option<String>,
-}
-
-fn map_turso_error(context: &str, error: turso::Error) -> AppError {
-    AppError::Internal(anyhow::anyhow!("{context}: {error}"))
-}
-
-fn deserialize_attachments(json: &str) -> Vec<CachedAttachment> {
-    serde_json::from_str::<Vec<CachedAttachment>>(json).unwrap_or_default()
-}
-
-fn to_datetime(created_at_ms: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now)
 }
 
 fn ttl_seconds_to_millis(ttl_seconds: u64) -> i64 {
@@ -347,13 +335,23 @@ fn build_cached_profile_from_actor(
 // Timeline Cache
 // =============================================================================
 
+#[derive(Debug, Clone)]
+struct CachedTimelineEntry {
+    status: CachedStatus,
+    inserted_at_ms: i64,
+}
+
+#[derive(Default)]
+struct TimelineCacheState {
+    entries_by_id: HashMap<String, CachedTimelineEntry>,
+    id_by_uri: HashMap<String, String>,
+}
+
 /// Timeline cache (volatile, max 2000 items)
 ///
 /// Stores recent statuses from followees.
 pub struct TimelineCache {
-    /// Hold database for lifetime management.
-    _db: turso::Database,
-    conn: Connection,
+    state: RwLock<TimelineCacheState>,
     /// Maximum lifetime for cached timeline entries (7 days).
     ttl_ms: i64,
     /// Maximum items to keep
@@ -366,218 +364,120 @@ impl TimelineCache {
     /// # Arguments
     /// * `max_items` - Maximum number of statuses to cache
     pub async fn new(max_items: usize) -> Result<Self, AppError> {
-        let max_items = max_items.max(1);
-
-        let db = Builder::new_local(":memory:")
-            .build()
-            .await
-            .map_err(|e| map_turso_error("failed to create timeline cache database", e))?;
-        let conn = db
-            .connect()
-            .map_err(|e| map_turso_error("failed to connect timeline cache database", e))?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS timeline_statuses (
-                id TEXT PRIMARY KEY,
-                uri TEXT NOT NULL UNIQUE,
-                content TEXT NOT NULL,
-                account_address TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                visibility TEXT NOT NULL,
-                attachments_json TEXT NOT NULL,
-                reply_to_uri TEXT,
-                boost_of_uri TEXT,
-                inserted_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_timeline_statuses_created_at
-                ON timeline_statuses(created_at_ms DESC);
-            CREATE INDEX IF NOT EXISTS idx_timeline_statuses_account
-                ON timeline_statuses(account_address, created_at_ms DESC);
-            CREATE INDEX IF NOT EXISTS idx_timeline_statuses_visibility
-                ON timeline_statuses(visibility, created_at_ms DESC);
-            CREATE INDEX IF NOT EXISTS idx_timeline_statuses_uri
-                ON timeline_statuses(uri);
-            "#,
-        )
-        .await
-        .map_err(|e| map_turso_error("failed to initialize timeline cache schema", e))?;
-
         Ok(Self {
-            _db: db,
-            conn,
+            state: RwLock::new(TimelineCacheState::default()),
             ttl_ms: TIMELINE_TTL_MS,
-            max_items,
+            max_items: max_items.max(1),
         })
     }
 
-    async fn prune_expired(&self) -> Result<(), turso::Error> {
-        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
-        self.conn
-            .execute(
-                "DELETE FROM timeline_statuses WHERE inserted_at_ms < ?1",
-                [cutoff],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn update_size_metric(&self) -> Result<(), turso::Error> {
-        let mut rows = self
-            .conn
-            .query("SELECT COUNT(*) FROM timeline_statuses", ())
-            .await?;
-        let count = if let Some(row) = rows.next().await? {
-            row.get::<i64>(0)?
-        } else {
-            0
+    fn remove_entry_locked(state: &mut TimelineCacheState, id: &str) -> bool {
+        let Some(removed) = state.entries_by_id.remove(id) else {
+            return false;
         };
 
-        use crate::metrics::CACHE_SIZE;
-        CACHE_SIZE.with_label_values(&["timeline"]).set(count);
-        Ok(())
+        if matches!(state.id_by_uri.get(&removed.status.uri), Some(mapped_id) if mapped_id == id) {
+            state.id_by_uri.remove(&removed.status.uri);
+        }
+
+        true
     }
 
-    fn parse_status_row(row: &turso::Row) -> Result<CachedStatus, turso::Error> {
-        let attachments_json: String = row.get(6)?;
-        Ok(CachedStatus {
-            id: row.get(0)?,
-            uri: row.get(1)?,
-            content: row.get(2)?,
-            account_address: row.get(3)?,
-            created_at: to_datetime(row.get(4)?),
-            visibility: row.get(5)?,
-            attachments: deserialize_attachments(&attachments_json),
-            reply_to_uri: row.get(7)?,
-            boost_of_uri: row.get(8)?,
-        })
+    fn update_size_metric(&self, count: usize) {
+        use crate::metrics::CACHE_SIZE;
+        CACHE_SIZE
+            .with_label_values(&["timeline"])
+            .set(count.min(i64::MAX as usize) as i64);
+    }
+
+    fn prune_expired_locked(&self, state: &mut TimelineCacheState, now_ms: i64) {
+        let cutoff = now_ms.saturating_sub(self.ttl_ms);
+        let expired_ids: Vec<String> = state
+            .entries_by_id
+            .iter()
+            .filter(|(_, entry)| entry.inserted_at_ms < cutoff)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired_ids {
+            Self::remove_entry_locked(state, &id);
+        }
+    }
+
+    fn enforce_capacity_locked(&self, state: &mut TimelineCacheState) {
+        if state.entries_by_id.len() <= self.max_items {
+            return;
+        }
+
+        let mut ranked: Vec<(String, i64)> = state
+            .entries_by_id
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.status.created_at.timestamp_millis()))
+            .collect();
+        ranked.sort_by(|(id_a, created_at_a), (id_b, created_at_b)| {
+            created_at_b.cmp(created_at_a).then_with(|| id_b.cmp(id_a))
+        });
+
+        for (id, _) in ranked.into_iter().skip(self.max_items) {
+            Self::remove_entry_locked(state, &id);
+        }
     }
 
     /// Insert status into cache
     ///
     /// Automatically evicts oldest items when capacity is reached.
     pub async fn insert(&self, status: CachedStatus) {
-        let attachments_json = match serde_json::to_string(&status.attachments) {
-            Ok(json) => json,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to serialize timeline cache attachments");
-                return;
-            }
-        };
-
-        let created_at_ms = status.created_at.timestamp_millis();
         let inserted_at_ms = Utc::now().timestamp_millis();
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.state.write().await;
 
-        let upsert_result = self
-            .conn
-            .execute(
-                r#"
-                INSERT INTO timeline_statuses (
-                    id, uri, content, account_address, created_at_ms, visibility,
-                    attachments_json, reply_to_uri, boost_of_uri, inserted_at_ms
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT(id) DO UPDATE SET
-                    uri = excluded.uri,
-                    content = excluded.content,
-                    account_address = excluded.account_address,
-                    created_at_ms = excluded.created_at_ms,
-                    visibility = excluded.visibility,
-                    attachments_json = excluded.attachments_json,
-                    reply_to_uri = excluded.reply_to_uri,
-                    boost_of_uri = excluded.boost_of_uri,
-                    inserted_at_ms = excluded.inserted_at_ms
-                "#,
-                (
-                    status.id,
-                    status.uri,
-                    status.content,
-                    status.account_address,
-                    created_at_ms,
-                    status.visibility,
-                    attachments_json,
-                    status.reply_to_uri,
-                    status.boost_of_uri,
-                    inserted_at_ms,
-                ),
-            )
-            .await;
+        self.prune_expired_locked(&mut state, now_ms);
 
-        if let Err(error) = upsert_result {
-            tracing::warn!(%error, "Failed to upsert timeline cache entry");
-            return;
-        }
-
-        if let Err(error) = self.prune_expired().await {
-            tracing::warn!(%error, "Failed to prune expired timeline cache entries");
-        }
-
-        if let Err(error) = self
-            .conn
-            .execute(
-                r#"
-                DELETE FROM timeline_statuses
-                WHERE id IN (
-                    SELECT id
-                    FROM timeline_statuses
-                    ORDER BY created_at_ms DESC, id DESC
-                    LIMIT -1 OFFSET ?1
-                )
-                "#,
-                [self.max_items as i64],
-            )
-            .await
+        if let Some(existing_id) = state.id_by_uri.get(&status.uri).cloned()
+            && existing_id != status.id
         {
-            tracing::warn!(%error, "Failed to enforce timeline cache size limit");
+            Self::remove_entry_locked(&mut state, &existing_id);
         }
 
-        if let Err(error) = self.update_size_metric().await {
-            tracing::warn!(%error, "Failed to update timeline cache metrics");
+        if let Some(existing_uri) = state
+            .entries_by_id
+            .get(&status.id)
+            .map(|entry| entry.status.uri.clone())
+            && existing_uri != status.uri
+            && matches!(
+                state.id_by_uri.get(&existing_uri),
+                Some(mapped_id) if mapped_id == &status.id
+            )
+        {
+            state.id_by_uri.remove(&existing_uri);
         }
+
+        let status_id = status.id.clone();
+        let status_uri = status.uri.clone();
+        state.entries_by_id.insert(
+            status_id.clone(),
+            CachedTimelineEntry {
+                status,
+                inserted_at_ms,
+            },
+        );
+        state.id_by_uri.insert(status_uri, status_id);
+
+        self.enforce_capacity_locked(&mut state);
+        let size = state.entries_by_id.len();
+        drop(state);
+
+        self.update_size_metric(size);
     }
 
     /// Get status by ID
     pub async fn get(&self, id: &str) -> Option<Arc<CachedStatus>> {
-        if let Err(error) = self.prune_expired().await {
-            tracing::warn!(%error, "Failed to prune expired timeline cache entries");
-        }
-
-        let result = self
-            .conn
-            .query(
-                r#"
-                SELECT id, uri, content, account_address, created_at_ms, visibility,
-                       attachments_json, reply_to_uri, boost_of_uri
-                FROM timeline_statuses
-                WHERE id = ?1
-                LIMIT 1
-                "#,
-                [id],
-            )
-            .await;
-
-        let mut rows = match result {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch timeline cache entry by id");
-                return None;
-            }
-        };
-
-        let value = match rows.next().await {
-            Ok(Some(row)) => match Self::parse_status_row(&row) {
-                Ok(status) => Some(Arc::new(status)),
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to decode timeline cache entry");
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to iterate timeline cache rows");
-                None
-            }
-        };
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.state.write().await;
+        self.prune_expired_locked(&mut state, now_ms);
+        let value = state
+            .entries_by_id
+            .get(id)
+            .map(|entry| Arc::new(entry.status.clone()));
 
         use crate::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
         if value.is_some() {
@@ -591,78 +491,43 @@ impl TimelineCache {
 
     /// Get status by URI
     pub async fn get_by_uri(&self, uri: &str) -> Option<Arc<CachedStatus>> {
-        if let Err(error) = self.prune_expired().await {
-            tracing::warn!(%error, "Failed to prune expired timeline cache entries");
-        }
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.state.write().await;
+        self.prune_expired_locked(&mut state, now_ms);
 
-        let result = self
-            .conn
-            .query(
-                r#"
-                SELECT id, uri, content, account_address, created_at_ms, visibility,
-                       attachments_json, reply_to_uri, boost_of_uri
-                FROM timeline_statuses
-                WHERE uri = ?1
-                LIMIT 1
-                "#,
-                [uri],
-            )
-            .await;
-
-        let mut rows = match result {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch timeline cache entry by uri");
-                return None;
-            }
+        let id = state.id_by_uri.get(uri).cloned()?;
+        let Some(entry) = state.entries_by_id.get(&id) else {
+            state.id_by_uri.remove(uri);
+            return None;
         };
-
-        match rows.next().await {
-            Ok(Some(row)) => match Self::parse_status_row(&row) {
-                Ok(status) => Some(Arc::new(status)),
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to decode timeline cache entry");
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to iterate timeline cache rows");
-                None
-            }
-        }
+        Some(Arc::new(entry.status.clone()))
     }
 
     /// Remove status from cache
     pub async fn remove(&self, id: &str) {
-        if let Err(error) = self
-            .conn
-            .execute("DELETE FROM timeline_statuses WHERE id = ?1", [id])
-            .await
-        {
-            tracing::warn!(%error, "Failed to remove timeline cache entry by id");
+        let mut state = self.state.write().await;
+        if !Self::remove_entry_locked(&mut state, id) {
             return;
         }
+        let size = state.entries_by_id.len();
+        drop(state);
 
-        if let Err(error) = self.update_size_metric().await {
-            tracing::warn!(%error, "Failed to update timeline cache metrics");
-        }
+        self.update_size_metric(size);
     }
 
     /// Remove status from cache by ActivityPub URI.
     pub async fn remove_by_uri(&self, uri: &str) {
-        if let Err(error) = self
-            .conn
-            .execute("DELETE FROM timeline_statuses WHERE uri = ?1", [uri])
-            .await
-        {
-            tracing::warn!(%error, "Failed to remove timeline cache entry by uri");
+        let mut state = self.state.write().await;
+        let Some(id) = state.id_by_uri.get(uri).cloned() else {
+            return;
+        };
+        if !Self::remove_entry_locked(&mut state, &id) {
             return;
         }
+        let size = state.entries_by_id.len();
+        drop(state);
 
-        if let Err(error) = self.update_size_metric().await {
-            tracing::warn!(%error, "Failed to update timeline cache metrics");
-        }
+        self.update_size_metric(size);
     }
 
     /// Get home timeline
@@ -679,64 +544,34 @@ impl TimelineCache {
         limit: usize,
         max_id: Option<&str>,
     ) -> Vec<Arc<CachedStatus>> {
-        if followee_addresses.is_empty() {
+        if followee_addresses.is_empty() || limit == 0 {
             return Vec::new();
         }
 
-        if let Err(error) = self.prune_expired().await {
-            tracing::warn!(%error, "Failed to prune expired timeline cache entries");
-        }
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.state.write().await;
+        self.prune_expired_locked(&mut state, now_ms);
 
-        let mut sql = String::from(
-            r#"
-            SELECT id, uri, content, account_address, created_at_ms, visibility,
-                   attachments_json, reply_to_uri, boost_of_uri
-            FROM timeline_statuses
-            WHERE account_address IN (
-            "#,
-        );
-        let placeholders = vec!["?"; followee_addresses.len()].join(", ");
-        sql.push_str(&placeholders);
-        sql.push(')');
-
-        let mut params: Vec<Value> = followee_addresses
-            .iter()
+        let mut statuses: Vec<CachedStatus> = state
+            .entries_by_id
+            .values()
+            .map(|entry| &entry.status)
+            .filter(|status| followee_addresses.contains(&status.account_address))
+            .filter(|status| {
+                max_id
+                    .map(|cursor| status.id.as_str() < cursor)
+                    .unwrap_or(true)
+            })
             .cloned()
-            .map(Value::from)
             .collect();
+        statuses.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        statuses.truncate(limit);
 
-        if let Some(max_id) = max_id {
-            sql.push_str(" AND id < ?");
-            params.push(Value::from(max_id.to_string()));
-        }
-
-        sql.push_str(" ORDER BY created_at_ms DESC LIMIT ?");
-        params.push(Value::from(limit as i64));
-
-        let mut rows = match self.conn.query(&sql, params).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch timeline cache home timeline");
-                return Vec::new();
-            }
-        };
-
-        let mut statuses = Vec::new();
-        loop {
-            match rows.next().await {
-                Ok(Some(row)) => match Self::parse_status_row(&row) {
-                    Ok(status) => statuses.push(Arc::new(status)),
-                    Err(error) => tracing::warn!(%error, "Failed to decode timeline cache entry"),
-                },
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to iterate home timeline rows");
-                    break;
-                }
-            }
-        }
-
-        statuses
+        statuses.into_iter().map(Arc::new).collect()
     }
 
     /// Get public timeline
@@ -747,60 +582,34 @@ impl TimelineCache {
         limit: usize,
         max_id: Option<&str>,
     ) -> Vec<Arc<CachedStatus>> {
-        if let Err(error) = self.prune_expired().await {
-            tracing::warn!(%error, "Failed to prune expired timeline cache entries");
+        if limit == 0 {
+            return Vec::new();
         }
 
-        let (sql, params): (&str, Vec<Value>) = if let Some(max_id) = max_id {
-            (
-                r#"
-                SELECT id, uri, content, account_address, created_at_ms, visibility,
-                       attachments_json, reply_to_uri, boost_of_uri
-                FROM timeline_statuses
-                WHERE visibility = 'public' AND id < ?1
-                ORDER BY created_at_ms DESC
-                LIMIT ?2
-                "#,
-                vec![Value::from(max_id.to_string()), Value::from(limit as i64)],
-            )
-        } else {
-            (
-                r#"
-                SELECT id, uri, content, account_address, created_at_ms, visibility,
-                       attachments_json, reply_to_uri, boost_of_uri
-                FROM timeline_statuses
-                WHERE visibility = 'public'
-                ORDER BY created_at_ms DESC
-                LIMIT ?1
-                "#,
-                vec![Value::from(limit as i64)],
-            )
-        };
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.state.write().await;
+        self.prune_expired_locked(&mut state, now_ms);
 
-        let mut rows = match self.conn.query(sql, params).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch timeline cache public timeline");
-                return Vec::new();
-            }
-        };
+        let mut statuses: Vec<CachedStatus> = state
+            .entries_by_id
+            .values()
+            .map(|entry| &entry.status)
+            .filter(|status| status.visibility == "public")
+            .filter(|status| {
+                max_id
+                    .map(|cursor| status.id.as_str() < cursor)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        statuses.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        statuses.truncate(limit);
 
-        let mut statuses = Vec::new();
-        loop {
-            match rows.next().await {
-                Ok(Some(row)) => match Self::parse_status_row(&row) {
-                    Ok(status) => statuses.push(Arc::new(status)),
-                    Err(error) => tracing::warn!(%error, "Failed to decode timeline cache entry"),
-                },
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to iterate public timeline rows");
-                    break;
-                }
-            }
-        }
-
-        statuses
+        statuses.into_iter().map(Arc::new).collect()
     }
 }
 
@@ -833,6 +642,12 @@ pub struct CachedProfile {
     pub fetched_at: DateTime<Utc>,
 }
 
+#[derive(Default)]
+struct ProfileCacheState {
+    profiles_by_address: HashMap<String, CachedProfile>,
+    addresses_by_uri: HashMap<String, HashSet<String>>,
+}
+
 // =============================================================================
 // Profile Cache
 // =============================================================================
@@ -842,9 +657,7 @@ pub struct CachedProfile {
 /// Populated on startup by fetching from follow addresses in DB.
 /// Updated when Update activities are received.
 pub struct ProfileCache {
-    /// Hold database for lifetime management.
-    _db: turso::Database,
-    conn: Connection,
+    state: RwLock<ProfileCacheState>,
     ttl_ms: i64,
     last_prune_at_ms: AtomicI64,
 }
@@ -852,124 +665,95 @@ pub struct ProfileCache {
 impl ProfileCache {
     /// Create new profile cache
     pub async fn new(ttl_seconds: u64) -> Result<Self, AppError> {
-        let db = Builder::new_local(":memory:")
-            .build()
-            .await
-            .map_err(|e| map_turso_error("failed to create profile cache database", e))?;
-        let conn = db
-            .connect()
-            .map_err(|e| map_turso_error("failed to connect profile cache database", e))?;
-
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS profiles (
-                address TEXT PRIMARY KEY,
-                uri TEXT NOT NULL,
-                display_name TEXT,
-                note TEXT,
-                avatar_url TEXT,
-                header_url TEXT,
-                public_key_pem TEXT NOT NULL,
-                inbox_uri TEXT NOT NULL,
-                outbox_uri TEXT,
-                followers_count INTEGER,
-                following_count INTEGER,
-                fetched_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_profiles_uri ON profiles(uri);
-            CREATE INDEX IF NOT EXISTS idx_profiles_fetched_at ON profiles(fetched_at_ms);
-            "#,
-        )
-        .await
-        .map_err(|e| map_turso_error("failed to initialize profile cache schema", e))?;
-
         Ok(Self {
-            _db: db,
-            conn,
+            state: RwLock::new(ProfileCacheState::default()),
             ttl_ms: ttl_seconds_to_millis(ttl_seconds),
             last_prune_at_ms: AtomicI64::new(0),
         })
     }
 
-    async fn prune_expired(&self) -> Result<(), turso::Error> {
-        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
-        self.conn
-            .execute("DELETE FROM profiles WHERE fetched_at_ms < ?1", [cutoff])
-            .await?;
-        Ok(())
-    }
-
-    async fn prune_expired_if_needed(&self) -> Result<(), turso::Error> {
-        let now = Utc::now().timestamp_millis();
-        let last_prune = self.last_prune_at_ms.load(Ordering::Relaxed);
-        if last_prune > 0 && now.saturating_sub(last_prune) < PROFILE_PRUNE_INTERVAL_MS {
-            return Ok(());
-        }
-
-        self.prune_expired().await?;
-        self.last_prune_at_ms.store(now, Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn update_size_metric(&self) -> Result<(), turso::Error> {
-        let mut rows = self.conn.query("SELECT COUNT(*) FROM profiles", ()).await?;
-        let count = if let Some(row) = rows.next().await? {
-            row.get::<i64>(0)?
-        } else {
-            0
+    fn remove_profile_locked(state: &mut ProfileCacheState, address: &str) -> bool {
+        let Some(removed) = state.profiles_by_address.remove(address) else {
+            return false;
         };
-        use crate::metrics::CACHE_SIZE;
-        CACHE_SIZE.with_label_values(&["profile"]).set(count);
-        Ok(())
-    }
 
-    fn parse_profile_row(row: &turso::Row) -> Result<CachedProfile, turso::Error> {
-        let followers_count: Option<i64> = row.get(9)?;
-        let following_count: Option<i64> = row.get(10)?;
-
-        Ok(CachedProfile {
-            address: row.get(0)?,
-            uri: row.get(1)?,
-            display_name: row.get(2)?,
-            note: row.get(3)?,
-            avatar_url: row.get(4)?,
-            header_url: row.get(5)?,
-            public_key_pem: row.get(6)?,
-            inbox_uri: row.get(7)?,
-            outbox_uri: row.get(8)?,
-            followers_count: followers_count.map(|v| v as u64),
-            following_count: following_count.map(|v| v as u64),
-            fetched_at: to_datetime(row.get(11)?),
-        })
-    }
-
-    async fn get_profiles_by_uri(
-        &self,
-        actor_uri: &str,
-    ) -> Result<Vec<CachedProfile>, turso::Error> {
-        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
-        let mut rows = self
-            .conn
-            .query(
-                r#"
-                SELECT
-                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
-                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
-                FROM profiles
-                WHERE uri = ?1
-                  AND fetched_at_ms >= ?2
-                ORDER BY fetched_at_ms DESC
-                "#,
-                (actor_uri, cutoff),
-            )
-            .await?;
-
-        let mut profiles = Vec::new();
-        while let Some(row) = rows.next().await? {
-            profiles.push(Self::parse_profile_row(&row)?);
+        if let Some(addresses) = state.addresses_by_uri.get_mut(&removed.uri) {
+            addresses.remove(address);
+            if addresses.is_empty() {
+                state.addresses_by_uri.remove(&removed.uri);
+            }
         }
 
-        Ok(profiles)
+        true
+    }
+
+    fn insert_profile_locked(state: &mut ProfileCacheState, profile: CachedProfile) {
+        if let Some(previous) = state.profiles_by_address.get(&profile.address)
+            && previous.uri != profile.uri
+            && let Some(addresses) = state.addresses_by_uri.get_mut(&previous.uri)
+        {
+            addresses.remove(&profile.address);
+            if addresses.is_empty() {
+                state.addresses_by_uri.remove(&previous.uri);
+            }
+        }
+
+        let uri = profile.uri.clone();
+        let address = profile.address.clone();
+        state.profiles_by_address.insert(address.clone(), profile);
+        state
+            .addresses_by_uri
+            .entry(uri)
+            .or_default()
+            .insert(address);
+    }
+
+    fn prune_expired_locked(&self, state: &mut ProfileCacheState, now_ms: i64) {
+        let cutoff = now_ms.saturating_sub(self.ttl_ms);
+        let stale_addresses: Vec<String> = state
+            .profiles_by_address
+            .iter()
+            .filter(|(_, profile)| profile.fetched_at.timestamp_millis() < cutoff)
+            .map(|(address, _)| address.clone())
+            .collect();
+        for address in stale_addresses {
+            Self::remove_profile_locked(state, &address);
+        }
+    }
+
+    async fn prune_expired_if_needed(&self) {
+        let now_ms = Utc::now().timestamp_millis();
+        let last_prune = self.last_prune_at_ms.load(Ordering::Relaxed);
+        if last_prune > 0 && now_ms.saturating_sub(last_prune) < PROFILE_PRUNE_INTERVAL_MS {
+            return;
+        }
+
+        let mut state = self.state.write().await;
+        self.prune_expired_locked(&mut state, now_ms);
+        self.last_prune_at_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    fn update_size_metric(&self, count: usize) {
+        use crate::metrics::CACHE_SIZE;
+        CACHE_SIZE
+            .with_label_values(&["profile"])
+            .set(count.min(i64::MAX as usize) as i64);
+    }
+
+    async fn get_profiles_by_uri(&self, actor_uri: &str) -> Vec<CachedProfile> {
+        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
+        let state = self.state.read().await;
+        let Some(addresses) = state.addresses_by_uri.get(actor_uri) else {
+            return Vec::new();
+        };
+        let mut profiles: Vec<CachedProfile> = addresses
+            .iter()
+            .filter_map(|address| state.profiles_by_address.get(address))
+            .filter(|profile| profile.fetched_at.timestamp_millis() >= cutoff)
+            .cloned()
+            .collect();
+        profiles.sort_by(|a, b| b.fetched_at.cmp(&a.fetched_at));
+        profiles
     }
 
     /// Initialize cache from follow addresses
@@ -1035,49 +819,18 @@ impl ProfileCache {
 
     /// Get profile by address
     pub async fn get(&self, address: &str) -> Option<Arc<CachedProfile>> {
-        if let Err(error) = self.prune_expired_if_needed().await {
-            tracing::warn!(%error, "Failed to prune profile cache");
-        }
+        self.prune_expired_if_needed().await;
 
         let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
-        let result = self
-            .conn
-            .query(
-                r#"
-                SELECT
-                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
-                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
-                FROM profiles
-                WHERE address = ?1
-                  AND fetched_at_ms >= ?2
-                LIMIT 1
-                "#,
-                (address, cutoff),
-            )
-            .await;
-
-        let mut rows = match result {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch profile cache entry");
-                return None;
-            }
-        };
-
-        let value = match rows.next().await {
-            Ok(Some(row)) => match Self::parse_profile_row(&row) {
-                Ok(profile) => Some(Arc::new(profile)),
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to decode profile cache entry");
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to iterate profile cache rows");
-                None
-            }
-        };
+        let value = self
+            .state
+            .read()
+            .await
+            .profiles_by_address
+            .get(address)
+            .filter(|profile| profile.fetched_at.timestamp_millis() >= cutoff)
+            .cloned()
+            .map(Arc::new);
 
         use crate::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
         if value.is_some() {
@@ -1088,130 +841,46 @@ impl ProfileCache {
 
         value
     }
-
     /// Get profile by actor URI
     pub async fn get_by_uri(&self, actor_uri: &str) -> Option<Arc<CachedProfile>> {
-        if let Err(error) = self.prune_expired_if_needed().await {
-            tracing::warn!(%error, "Failed to prune profile cache");
-        }
+        self.prune_expired_if_needed().await;
 
         let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
-        let result = self
-            .conn
-            .query(
-                r#"
-                SELECT
-                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
-                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
-                FROM profiles
-                WHERE uri = ?1
-                  AND fetched_at_ms >= ?2
-                ORDER BY fetched_at_ms DESC
-                LIMIT 1
-                "#,
-                (actor_uri, cutoff),
-            )
-            .await;
+        let state = self.state.read().await;
+        let addresses = state.addresses_by_uri.get(actor_uri)?;
+        let profile = addresses
+            .iter()
+            .filter_map(|address| state.profiles_by_address.get(address))
+            .filter(|profile| profile.fetched_at.timestamp_millis() >= cutoff)
+            .max_by(|a, b| a.fetched_at.cmp(&b.fetched_at))
+            .cloned();
 
-        let mut rows = match result {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to fetch profile cache entry by actor URI");
-                return None;
-            }
-        };
-
-        let value = match rows.next().await {
-            Ok(Some(row)) => match Self::parse_profile_row(&row) {
-                Ok(profile) => Some(Arc::new(profile)),
-                Err(error) => {
-                    tracing::warn!(%error, "Failed to decode profile cache entry");
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to iterate profile cache rows");
-                None
-            }
-        };
-
+        let value = profile.map(Arc::new);
         use crate::metrics::{CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL};
         if value.is_some() {
             CACHE_HITS_TOTAL.with_label_values(&["profile"]).inc();
         } else {
             CACHE_MISSES_TOTAL.with_label_values(&["profile"]).inc();
         }
-
         value
     }
 
     /// Insert or update profile
     pub async fn insert(&self, profile: CachedProfile) {
-        let upsert_result = self
-            .conn
-            .execute(
-                r#"
-                INSERT INTO profiles (
-                    address, uri, display_name, note, avatar_url, header_url, public_key_pem,
-                    inbox_uri, outbox_uri, followers_count, following_count, fetched_at_ms
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(address) DO UPDATE SET
-                    uri = excluded.uri,
-                    display_name = excluded.display_name,
-                    note = excluded.note,
-                    avatar_url = excluded.avatar_url,
-                    header_url = excluded.header_url,
-                    public_key_pem = excluded.public_key_pem,
-                    inbox_uri = excluded.inbox_uri,
-                    outbox_uri = excluded.outbox_uri,
-                    followers_count = excluded.followers_count,
-                    following_count = excluded.following_count,
-                    fetched_at_ms = excluded.fetched_at_ms
-                "#,
-                (
-                    profile.address,
-                    profile.uri,
-                    profile.display_name,
-                    profile.note,
-                    profile.avatar_url,
-                    profile.header_url,
-                    profile.public_key_pem,
-                    profile.inbox_uri,
-                    profile.outbox_uri,
-                    profile.followers_count.map(|v| v as i64),
-                    profile.following_count.map(|v| v as i64),
-                    profile.fetched_at.timestamp_millis(),
-                ),
-            )
-            .await;
+        let mut state = self.state.write().await;
+        Self::insert_profile_locked(&mut state, profile);
+        let size = state.profiles_by_address.len();
+        drop(state);
 
-        if let Err(error) = upsert_result {
-            tracing::warn!(%error, "Failed to upsert profile cache entry");
-            return;
-        }
-
-        if let Err(error) = self.prune_expired_if_needed().await {
-            tracing::warn!(%error, "Failed to prune profile cache");
-        }
-
-        if let Err(error) = self.update_size_metric().await {
-            tracing::warn!(%error, "Failed to update profile cache metrics");
-        }
+        self.prune_expired_if_needed().await;
+        self.update_size_metric(size);
     }
 
     /// Update profile from ActivityPub Update activity
     ///
     /// Called when receiving Update activity for a known actor.
     pub async fn update_from_activity(&self, actor_uri: &str, update_data: serde_json::Value) {
-        let existing_profiles = match self.get_profiles_by_uri(actor_uri).await {
-            Ok(existing_profiles) => existing_profiles,
-            Err(error) => {
-                tracing::warn!(%error, actor_uri = %actor_uri, "Failed to query profile cache by actor URI");
-                return;
-            }
-        };
+        let existing_profiles = self.get_profiles_by_uri(actor_uri).await;
 
         if existing_profiles.is_empty() {
             return;
@@ -1226,15 +895,15 @@ impl ProfileCache {
             return;
         };
 
-        if let Some(id) = actor_object.get("id").and_then(|value| value.as_str()) {
-            if id != actor_uri {
-                tracing::warn!(
-                    actor_uri = %actor_uri,
-                    object_id = %id,
-                    "Ignoring Update activity due to mismatched actor object id"
-                );
-                return;
-            }
+        if let Some(id) = actor_object.get("id").and_then(|value| value.as_str())
+            && id != actor_uri
+        {
+            tracing::warn!(
+                actor_uri = %actor_uri,
+                object_id = %id,
+                "Ignoring Update activity due to mismatched actor object id"
+            );
+            return;
         }
 
         let actor_value = serde_json::Value::Object(actor_object.clone());
@@ -1266,10 +935,10 @@ impl ProfileCache {
                 updated.public_key_pem = public_key_pem;
             }
 
-            if let Some(inbox_uri) = actor_object.get("inbox").and_then(|value| value.as_str()) {
-                if url::Url::parse(inbox_uri).is_ok() {
-                    updated.inbox_uri = inbox_uri.to_string();
-                }
+            if let Some(inbox_uri) = actor_object.get("inbox").and_then(|value| value.as_str())
+                && url::Url::parse(inbox_uri).is_ok()
+            {
+                updated.inbox_uri = inbox_uri.to_string();
             }
 
             if actor_object.contains_key("outbox") {
@@ -1401,14 +1070,14 @@ mod tests {
         cache.insert(sample_status("expired", Utc::now())).await;
         let expired_inserted_at =
             Utc::now().timestamp_millis() - Duration::days(8).num_milliseconds();
-        cache
-            .conn
-            .execute(
-                "UPDATE timeline_statuses SET inserted_at_ms = ?1 WHERE id = ?2",
-                (expired_inserted_at, "expired"),
-            )
-            .await
-            .expect("set old inserted_at");
+        {
+            let mut state = cache.state.write().await;
+            let entry = state
+                .entries_by_id
+                .get_mut("expired")
+                .expect("cache entry should exist");
+            entry.inserted_at_ms = expired_inserted_at;
+        }
 
         assert!(
             cache.get("expired").await.is_none(),

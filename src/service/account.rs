@@ -4,9 +4,13 @@
 
 use std::sync::Arc;
 
-use crate::data::{Account, Database, EntityId};
+#[cfg(test)]
+use crate::data::Database;
+use crate::data::{Account, AccountRepository, EntityId};
 use crate::error::AppError;
+#[cfg(test)]
 use crate::storage::MediaStorage;
+use crate::storage::MediaStorageRepository;
 
 #[cfg(test)]
 const ACCOUNT_KEY_BITS: usize = 2048;
@@ -24,13 +28,16 @@ fn normalize_optional_text(value: String) -> Option<String> {
 
 /// Account service
 pub struct AccountService {
-    db: Arc<Database>,
-    storage: Arc<MediaStorage>,
+    db: Arc<dyn AccountRepository>,
+    storage: Arc<dyn MediaStorageRepository>,
 }
 
 impl AccountService {
     /// Create new account service
-    pub fn new(db: Arc<Database>, storage: Arc<MediaStorage>) -> Self {
+    pub fn new<R>(db: Arc<R>, storage: Arc<dyn MediaStorageRepository>) -> Self
+    where
+        R: AccountRepository + 'static,
+    {
         Self { db, storage }
     }
 
@@ -71,23 +78,29 @@ impl AccountService {
         }
 
         let (private_key_pem, public_key_pem) =
-            tokio::task::spawn_blocking(|| -> Result<(String, String), anyhow::Error> {
+            tokio::task::spawn_blocking(|| -> Result<(String, String), String> {
                 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
                 use rsa::{RsaPrivateKey, RsaPublicKey};
 
                 let mut rng = rand::thread_rng();
-                let private_key = RsaPrivateKey::new(&mut rng, ACCOUNT_KEY_BITS)?;
+                let private_key = RsaPrivateKey::new(&mut rng, ACCOUNT_KEY_BITS)
+                    .map_err(|error| error.to_string())?;
                 let public_key = RsaPublicKey::from(&private_key);
-                let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
-                let public_key_pem = public_key.to_public_key_pem(LineEnding::LF)?;
+                let private_key_pem = private_key
+                    .to_pkcs8_pem(LineEnding::LF)
+                    .map_err(|error| error.to_string())?
+                    .to_string();
+                let public_key_pem = public_key
+                    .to_public_key_pem(LineEnding::LF)
+                    .map_err(|error| error.to_string())?;
                 Ok((private_key_pem, public_key_pem))
             })
             .await
-            .map_err(|e| AppError::Internal(e.into()))?
-            .map_err(AppError::Internal)?;
+            .map_err(|e| AppError::task_join("account key generation", e))?
+            .map_err(AppError::internal)?;
 
         let account = Account {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             username: username.to_string(),
             display_name: Some(username.to_string()),
             note: None,
@@ -132,7 +145,7 @@ impl AccountService {
         let updated = self
             .db
             .patch_account_profile(
-                &account.id,
+                account.id.as_str(),
                 display_name_patch.as_ref().map(|value| value.as_deref()),
                 note_patch.as_ref().map(|value| value.as_deref()),
                 updated_at,
@@ -202,7 +215,7 @@ impl AccountService {
 
         let mut new_avatar_key = None;
         if let Some(image_data) = avatar_image_data {
-            let image_id = EntityId::new().0;
+            let image_id = EntityId::new_string();
             let (avatar_s3_key, _avatar_url) =
                 self.storage.upload_avatar(&image_id, image_data).await?;
             new_avatar_key = Some(avatar_s3_key);
@@ -210,7 +223,7 @@ impl AccountService {
 
         let mut new_header_key = None;
         if let Some(image_data) = header_image_data {
-            let image_id = EntityId::new().0;
+            let image_id = EntityId::new_string();
             match self.storage.upload_header(&image_id, image_data).await {
                 Ok((header_s3_key, _header_url)) => {
                     new_header_key = Some(header_s3_key);
@@ -232,7 +245,7 @@ impl AccountService {
         let updated = match self
             .db
             .patch_account_credentials_if_matches(
-                &account.id,
+                account.id.as_str(),
                 previous_avatar_key.as_deref(),
                 previous_header_key.as_deref(),
                 new_avatar_key.as_deref().or(previous_avatar_key.as_deref()),
@@ -296,26 +309,24 @@ impl AccountService {
         if let (Some(old_key), Some(new_key)) = (
             previous_avatar_key.as_deref(),
             account.avatar_s3_key.as_deref(),
-        ) {
-            if old_key != new_key {
-                self.delete_storage_key_best_effort(
-                    old_key,
-                    "delete previous avatar after credential update",
-                )
-                .await;
-            }
+        ) && old_key != new_key
+        {
+            self.delete_storage_key_best_effort(
+                old_key,
+                "delete previous avatar after credential update",
+            )
+            .await;
         }
         if let (Some(old_key), Some(new_key)) = (
             previous_header_key.as_deref(),
             account.header_s3_key.as_deref(),
-        ) {
-            if old_key != new_key {
-                self.delete_storage_key_best_effort(
-                    old_key,
-                    "delete previous header after credential update",
-                )
-                .await;
-            }
+        ) && old_key != new_key
+        {
+            self.delete_storage_key_best_effort(
+                old_key,
+                "delete previous header after credential update",
+            )
+            .await;
         }
 
         Ok(account)
@@ -338,14 +349,14 @@ impl AccountService {
         let mut account = self.get_account().await?;
         let previous_key = account.avatar_s3_key.clone();
 
-        let image_id = EntityId::new().0;
+        let image_id = EntityId::new_string();
         let (avatar_s3_key, avatar_url) = self.storage.upload_avatar(&image_id, image_data).await?;
 
         let updated_at = chrono::Utc::now();
         let updated = match self
             .db
             .update_account_avatar_key_if_matches(
-                &account.id,
+                account.id.as_str(),
                 previous_key.as_deref(),
                 Some(&avatar_s3_key),
                 updated_at,
@@ -387,14 +398,14 @@ impl AccountService {
         account.avatar_s3_key = Some(avatar_s3_key.clone());
         account.updated_at = updated_at;
 
-        if let Some(old_key) = previous_key.as_deref().filter(|old| *old != avatar_s3_key) {
-            if let Err(error) = self.storage.delete(old_key).await {
-                tracing::warn!(
-                    key = %old_key,
-                    error = %error,
-                    "failed to delete previous avatar from storage"
-                );
-            }
+        if let Some(old_key) = previous_key.as_deref().filter(|old| *old != avatar_s3_key)
+            && let Err(error) = self.storage.delete(old_key).await
+        {
+            tracing::warn!(
+                key = %old_key,
+                error = %error,
+                "failed to delete previous avatar from storage"
+            );
         }
 
         Ok(avatar_url)
@@ -417,14 +428,14 @@ impl AccountService {
         let mut account = self.get_account().await?;
         let previous_key = account.header_s3_key.clone();
 
-        let image_id = EntityId::new().0;
+        let image_id = EntityId::new_string();
         let (header_s3_key, header_url) = self.storage.upload_header(&image_id, image_data).await?;
 
         let updated_at = chrono::Utc::now();
         let updated = match self
             .db
             .update_account_header_key_if_matches(
-                &account.id,
+                account.id.as_str(),
                 previous_key.as_deref(),
                 Some(&header_s3_key),
                 updated_at,
@@ -466,14 +477,14 @@ impl AccountService {
         account.header_s3_key = Some(header_s3_key.clone());
         account.updated_at = updated_at;
 
-        if let Some(old_key) = previous_key.as_deref().filter(|old| *old != header_s3_key) {
-            if let Err(error) = self.storage.delete(old_key).await {
-                tracing::warn!(
-                    key = %old_key,
-                    error = %error,
-                    "failed to delete previous header from storage"
-                );
-            }
+        if let Some(old_key) = previous_key.as_deref().filter(|old| *old != header_s3_key)
+            && let Err(error) = self.storage.delete(old_key).await
+        {
+            tracing::warn!(
+                key = %old_key,
+                error = %error,
+                "failed to delete previous header from storage"
+            );
         }
 
         Ok(header_url)
@@ -507,7 +518,7 @@ mod tests {
         (Arc::new(db), temp_dir)
     }
 
-    async fn create_test_storage() -> Arc<MediaStorage> {
+    async fn create_test_storage() -> Arc<dyn MediaStorageRepository> {
         let media = crate::config::MediaStorageConfig {
             bucket: "test-media-bucket".to_string(),
             public_url: "https://media.test.example.com".to_string(),
@@ -557,7 +568,7 @@ mod tests {
         let service = AccountService::new(db.clone(), storage);
 
         let account = Account {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             username: "admin".to_string(),
             display_name: Some("Admin".to_string()),
             note: Some("first".to_string()),

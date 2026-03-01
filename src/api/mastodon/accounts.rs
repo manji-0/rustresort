@@ -5,16 +5,17 @@ use axum::{
     response::Json,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures::stream::{self, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
 
 use super::federation_delivery::{
-    build_delivery, resolve_remote_actor_and_inbox, spawn_best_effort_delivery,
+    resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_delivery,
 };
-use crate::AppState;
+use crate::AccountApiState;
 use crate::api::dto::AccountResponse;
 use crate::auth::CurrentUser;
-use crate::data::CachedProfile;
+use crate::data::{Account, CachedProfile};
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
@@ -23,7 +24,6 @@ use crate::metrics::{
 
 /// Pagination parameters
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct PaginationParams {
     pub max_id: Option<String>,
     pub min_id: Option<String>,
@@ -50,9 +50,12 @@ pub struct UpdateCredentialsRequest {
     pub note: Option<String>,
     pub avatar: Option<String>, // Base64 encoded image
     pub header: Option<String>, // Base64 encoded image
-    pub locked: Option<bool>,
-    pub bot: Option<bool>,
-    pub discoverable: Option<bool>,
+    #[serde(rename = "locked")]
+    pub _locked: Option<bool>,
+    #[serde(rename = "bot")]
+    pub _bot: Option<bool>,
+    #[serde(rename = "discoverable")]
+    pub _discoverable: Option<bool>,
 }
 
 /// Search query parameters
@@ -61,7 +64,8 @@ pub struct SearchParams {
     pub q: String,
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
-    pub following: Option<bool>,
+    #[serde(rename = "following")]
+    pub _following: Option<bool>,
 }
 
 fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
@@ -128,9 +132,7 @@ async fn decode_base64_image_field_blocking(
 ) -> Result<Vec<u8>, AppError> {
     tokio::task::spawn_blocking(move || decode_base64_image_field(field, &encoded))
         .await
-        .map_err(|error| {
-            AppError::Internal(anyhow::anyhow!("Image decode task panicked: {error}"))
-        })?
+        .map_err(|error| AppError::task_join("base64 image decode", error))?
 }
 
 fn is_decodable_webp_image(bytes: &[u8]) -> bool {
@@ -562,10 +564,29 @@ fn saturating_count(value: Option<u64>) -> i32 {
     value.unwrap_or(0).min(i32::MAX as u64) as i32
 }
 
+fn saturating_count_i64(value: i64) -> i32 {
+    value.clamp(0, i64::from(i32::MAX)) as i32
+}
+
+async fn observed_statuses_count_for_address(
+    db: &crate::data::Database,
+    default_port: Option<u16>,
+    address: &str,
+) -> i32 {
+    let Some(normalized) = canonical_remote_account_address(address) else {
+        return 0;
+    };
+    db.count_statuses_by_account_address_with_default_port(&normalized, default_port)
+        .await
+        .map(saturating_count_i64)
+        .unwrap_or(0)
+}
+
 fn build_remote_account_response_with_profile(
     normalized_address: &str,
     profile: &CachedProfile,
     config: &crate::config::AppConfig,
+    statuses_count: i32,
 ) -> Option<AccountResponse> {
     let (username, domain) = normalized_address.split_once('@')?;
     let media_url = &config.storage.media.public_url;
@@ -610,7 +631,7 @@ fn build_remote_account_response_with_profile(
         header_static: header,
         followers_count: saturating_count(profile.followers_count),
         following_count: saturating_count(profile.following_count),
-        statuses_count: 0,
+        statuses_count,
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
@@ -620,6 +641,7 @@ fn build_remote_account_response_with_profile(
 fn build_remote_account_placeholder_response(
     address: &str,
     config: &crate::config::AppConfig,
+    statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
     let (username, id, acct, url) =
@@ -667,7 +689,7 @@ fn build_remote_account_placeholder_response(
         header_static: header,
         followers_count: 0,
         following_count: 0,
-        statuses_count: 0,
+        statuses_count,
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
@@ -675,29 +697,47 @@ fn build_remote_account_placeholder_response(
 }
 
 pub(crate) async fn resolve_remote_account_response(
-    state: &AppState,
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
     raw_address: &str,
 ) -> Option<AccountResponse> {
     let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
 
-    let mut profile = state.profile_cache.get(&normalized_address).await;
+    let mut profile = profile_cache.get(&normalized_address).await;
     if profile.is_none() {
-        profile = state.profile_cache.get_by_uri(raw_address.trim()).await;
+        profile = profile_cache.get_by_uri(raw_address.trim()).await;
     }
     if profile.is_none()
-        && resolve_remote_actor_and_inbox(state, &normalized_address)
-            .await
-            .is_ok()
+        && resolve_remote_actor_and_inbox_with_dependencies(
+            profile_cache,
+            federation_fetch_client,
+            &normalized_address,
+        )
+        .await
+        .is_ok()
     {
-        profile = state.profile_cache.get(&normalized_address).await;
+        profile = profile_cache.get(&normalized_address).await;
     }
 
     let profile = profile?;
-    build_remote_account_response_with_profile(&normalized_address, &profile, state.config.as_ref())
+    let statuses_count = observed_statuses_count_for_address(
+        db,
+        default_port_for_protocol(&config.server.protocol),
+        &normalized_address,
+    )
+    .await;
+    build_remote_account_response_with_profile(
+        &normalized_address,
+        &profile,
+        config,
+        statuses_count,
+    )
 }
 
 async fn resolve_cached_remote_account_response(
-    state: &AppState,
+    state: &AccountApiState,
     raw_address: &str,
 ) -> Option<AccountResponse> {
     let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
@@ -706,7 +746,48 @@ async fn resolve_cached_remote_account_response(
     } else {
         state.profile_cache.get_by_uri(raw_address.trim()).await?
     };
-    build_remote_account_response_with_profile(&normalized_address, &profile, state.config.as_ref())
+    let statuses_count = observed_statuses_count_for_address(
+        state.db.as_ref(),
+        default_port_for_protocol(&state.config.server.protocol),
+        &normalized_address,
+    )
+    .await;
+    build_remote_account_response_with_profile(
+        &normalized_address,
+        &profile,
+        state.config.as_ref(),
+        statuses_count,
+    )
+}
+
+async fn resolve_remote_account_response_for_list(
+    state: &AccountApiState,
+    raw_address: &str,
+    default_port: Option<u16>,
+) -> Option<AccountResponse> {
+    if let Some(response) = resolve_cached_remote_account_response(state, raw_address).await {
+        return Some(response);
+    }
+
+    // Keep list endpoints responsive even when remote lookup is slow/unreachable.
+    if let Ok(Some(response)) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        resolve_remote_account_response(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            raw_address,
+        ),
+    )
+    .await
+    {
+        return Some(response);
+    }
+
+    let statuses_count =
+        observed_statuses_count_for_address(state.db.as_ref(), default_port, raw_address).await;
+    build_remote_account_placeholder_response(raw_address, state.config.as_ref(), statuses_count)
 }
 
 fn contains_equivalent_address(
@@ -765,7 +846,30 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
     }
 }
 
-async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
+fn build_delivery(
+    state: &AccountApiState,
+    account: &Account,
+) -> crate::federation::ActivityDelivery {
+    crate::federation::build_local_delivery(
+        state.http_client.clone(),
+        &state.config.server.base_url(),
+        account,
+    )
+}
+
+async fn resolve_remote_actor_and_inbox(
+    state: &AccountApiState,
+    address: &str,
+) -> Result<(String, String), AppError> {
+    resolve_remote_actor_and_inbox_with_dependencies(
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        address,
+    )
+    .await
+}
+
+async fn resolve_target_address(state: &AccountApiState, id: &str) -> Result<String, AppError> {
     if id.starts_with("http://") || id.starts_with("https://") {
         if let Some(address) = parse_actor_uri_account_address(id) {
             return normalize_account_address(&address);
@@ -779,13 +883,13 @@ async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, Ap
         return normalize_account_address(id);
     }
 
-    if let Some(account) = state.db.get_account().await? {
-        if account.id == id {
-            return normalize_account_address(&format!(
-                "{}@{}",
-                account.username, state.config.server.domain
-            ));
-        }
+    if let Some(account) = state.db.get_account().await?
+        && account.id.as_str() == id
+    {
+        return normalize_account_address(&format!(
+            "{}@{}",
+            account.username, state.config.server.domain
+        ));
     }
 
     Err(AppError::Validation(
@@ -816,9 +920,23 @@ fn build_remote_account_stub(address: &str) -> serde_json::Value {
     })
 }
 
+async fn resolve_remote_account_or_stub(
+    state: AccountApiState,
+    address: String,
+    default_port: Option<u16>,
+) -> serde_json::Value {
+    if let Some(response) =
+        resolve_remote_account_response_for_list(&state, &address, default_port).await
+    {
+        return serde_json::to_value(response)
+            .unwrap_or_else(|_| build_remote_account_stub(&address));
+    }
+    build_remote_account_stub(&address)
+}
+
 /// GET /api/v1/accounts/verify_credentials
 pub async fn verify_credentials(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
@@ -835,9 +953,6 @@ pub async fn verify_credentials(
         .with_label_values(&["SELECT", "accounts"])
         .inc();
     db_timer.observe_duration();
-
-    // Convert to API response
-    let mut response = crate::api::account_to_response(&account, &state.config);
 
     // Get counts
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -858,8 +973,25 @@ pub async fn verify_credentials(
         .inc();
     db_timer.observe_duration();
 
-    response.followers_count = followers_count;
-    response.following_count = following_count;
+    let db_timer = DB_QUERY_DURATION_SECONDS
+        .with_label_values(&["SELECT", "statuses"])
+        .start_timer();
+    let statuses_count = state.db.count_local_statuses().await? as i32;
+    DB_QUERIES_TOTAL
+        .with_label_values(&["SELECT", "statuses"])
+        .inc();
+    db_timer.observe_duration();
+
+    // Convert to API response
+    let response = crate::api::account_to_response_with_stats(
+        &account,
+        &state.config,
+        crate::api::AccountStats {
+            followers_count,
+            following_count,
+            statuses_count,
+        },
+    );
 
     // Update metrics
     FOLLOWERS_TOTAL.set(followers_count as i64);
@@ -875,7 +1007,7 @@ pub async fn verify_credentials(
 
 /// PATCH /api/v1/accounts/update_credentials
 pub async fn update_credentials(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Json(req): Json<UpdateCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -887,9 +1019,9 @@ pub async fn update_credentials(
         note,
         avatar,
         header,
-        locked: _,
-        bot: _,
-        discoverable: _,
+        _locked: _,
+        _bot: _,
+        _discoverable: _,
     } = req;
 
     let avatar_bytes = avatar
@@ -915,57 +1047,69 @@ pub async fn update_credentials(
         .update_credentials(display_name, note, avatar_bytes, header_bytes)
         .await?;
 
-    // Return updated account
-    let mut response = crate::api::account_to_response(&account, &state.config);
-
     // Get counts
     let followers_count = state.db.count_follower_addresses().await? as i32;
     let following_count = state.db.count_follow_addresses().await? as i32;
+    let statuses_count = state.db.count_local_statuses().await? as i32;
 
-    response.followers_count = followers_count;
-    response.following_count = following_count;
+    // Return updated account
+    let response = crate::api::account_to_response_with_stats(
+        &account,
+        &state.config,
+        crate::api::AccountStats {
+            followers_count,
+            following_count,
+            statuses_count,
+        },
+    );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
 
 /// GET /api/v1/accounts/:id
 pub async fn get_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Get the account from database
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     // Check if ID matches
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
-
-    // Convert to API response
-    let mut response = crate::api::account_to_response(&account, &state.config);
-
     // Get counts
     let followers_count = state.db.count_follower_addresses().await? as i32;
     let following_count = state.db.count_follow_addresses().await? as i32;
+    let statuses_count = state.db.count_local_statuses().await? as i32;
 
-    response.followers_count = followers_count;
-    response.following_count = following_count;
+    // Convert to API response
+    let response = crate::api::account_to_response_with_stats(
+        &account,
+        &state.config,
+        crate::api::AccountStats {
+            followers_count,
+            following_count,
+            statuses_count,
+        },
+    );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
 
 /// GET /api/v1/accounts/:id/statuses
 pub async fn account_statuses(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     Path(id): Path<String>,
     Query(params): Query<AccountStatusesParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get local statuses in pagination window.
     let limit = params.limit.unwrap_or(20).min(40);
@@ -1014,10 +1158,11 @@ pub async fn account_statuses(
                 continue;
             }
 
-            let response = crate::api::status_to_response(
+            let response = crate::api::status_to_response_with_account_stats(
                 &status,
                 &account,
                 &state.config,
+                account_stats,
                 None,
                 None,
                 None,
@@ -1054,14 +1199,14 @@ pub async fn account_statuses(
 
 /// GET /api/v1/accounts/:id/followers
 pub async fn get_account_followers(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
 
@@ -1100,16 +1245,10 @@ pub async fn get_account_followers(
 
     let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
     for address in paged_addresses.into_iter().take(limit) {
-        let response = match resolve_cached_remote_account_response(&state, &address).await {
-            Some(response) => response,
-            None => {
-                let Some(response) =
-                    build_remote_account_placeholder_response(&address, state.config.as_ref())
-                else {
-                    continue;
-                };
-                response
-            }
+        let Some(response) =
+            resolve_remote_account_response_for_list(&state, &address, default_port).await
+        else {
+            continue;
         };
         followers.push(serde_json::to_value(response).unwrap());
     }
@@ -1119,14 +1258,14 @@ pub async fn get_account_followers(
 
 /// GET /api/v1/accounts/:id/following
 pub async fn get_account_following(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
 
@@ -1165,16 +1304,10 @@ pub async fn get_account_following(
 
     let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
     for address in paged_addresses.into_iter().take(limit) {
-        let response = match resolve_cached_remote_account_response(&state, &address).await {
-            Some(response) => response,
-            None => {
-                let Some(response) =
-                    build_remote_account_placeholder_response(&address, state.config.as_ref())
-                else {
-                    continue;
-                };
-                response
-            }
+        let Some(response) =
+            resolve_remote_account_response_for_list(&state, &address, default_port).await
+        else {
+            continue;
         };
         following.push(serde_json::to_value(response).unwrap());
     }
@@ -1184,7 +1317,7 @@ pub async fn get_account_following(
 
 /// POST /api/v1/accounts/:id/follow
 pub async fn follow_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1211,7 +1344,7 @@ pub async fn follow_account(
     }
 
     // Persist follow relationship if not already present.
-    let follow_id = EntityId::new().0;
+    let follow_id = EntityId::new_string();
     let follow = Follow {
         id: follow_id.clone(),
         target_address: target_address.clone(),
@@ -1289,7 +1422,7 @@ mod account_normalization_tests {
 
 /// POST /api/v1/accounts/:id/unfollow
 pub async fn unfollow_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1355,7 +1488,7 @@ pub async fn unfollow_account(
 
 /// GET /api/v1/accounts/relationships
 pub async fn get_relationships(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -1477,7 +1610,7 @@ pub async fn get_relationships(
 
 /// GET /api/v1/accounts/search
 pub async fn search_accounts(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -1511,7 +1644,15 @@ pub async fn search_accounts(
             .as_deref()
             .is_some_and(|identity| identity == local_account_identity)
     {
-        let account_response = crate::api::account_to_response(&account, &state.config);
+        let account_response = crate::api::account_to_response_with_stats(
+            &account,
+            &state.config,
+            crate::api::AccountStats {
+                followers_count: state.db.count_follower_addresses().await? as i32,
+                following_count: state.db.count_follow_addresses().await? as i32,
+                statuses_count: state.db.count_local_statuses().await? as i32,
+            },
+        );
         results.push(serde_json::to_value(account_response).unwrap());
         matched_local_account = true;
     }
@@ -1520,21 +1661,27 @@ pub async fn search_accounts(
     if params.resolve.unwrap_or(false) && query.contains('@') {
         let should_skip_resolve = matched_local_account
             && query_identity.as_deref() == Some(local_account_identity.as_str());
-        if !should_skip_resolve {
-            if let Some(remote_account) = resolve_remote_account_response(&state, &query).await {
-                let remote_identity =
-                    canonical_account_identity(&remote_account.acct, &local_domain);
-                let already_present = results.iter().any(|entry| {
-                    entry
-                        .get("acct")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|acct| {
-                            canonical_account_identity(acct, &local_domain) == remote_identity
-                        })
-                });
-                if !already_present {
-                    results.push(serde_json::to_value(remote_account).unwrap());
-                }
+        if !should_skip_resolve
+            && let Some(remote_account) = resolve_remote_account_response(
+                state.config.as_ref(),
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                state.federation_fetch_client.as_ref(),
+                &query,
+            )
+            .await
+        {
+            let remote_identity = canonical_account_identity(&remote_account.acct, &local_domain);
+            let already_present = results.iter().any(|entry| {
+                entry
+                    .get("acct")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|acct| {
+                        canonical_account_identity(acct, &local_domain) == remote_identity
+                    })
+            });
+            if !already_present {
+                results.push(serde_json::to_value(remote_account).unwrap());
             }
         }
     }
@@ -1549,11 +1696,16 @@ pub async fn search_accounts(
 /// Create account request
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountRequest {
-    pub username: String,
-    pub email: String,
-    pub password: String,
-    pub agreement: Option<bool>,
-    pub locale: Option<String>,
+    #[serde(rename = "username")]
+    pub _username: String,
+    #[serde(rename = "email")]
+    pub _email: String,
+    #[serde(rename = "password")]
+    pub _password: String,
+    #[serde(rename = "agreement")]
+    pub _agreement: Option<bool>,
+    #[serde(rename = "locale")]
+    pub _locale: Option<String>,
 }
 
 /// POST /api/v1/accounts
@@ -1562,7 +1714,7 @@ pub struct CreateAccountRequest {
 /// For single-user instance, this endpoint returns an error
 /// as account creation is not supported.
 pub async fn create_account(
-    State(_state): State<AppState>,
+    State(_state): State<AccountApiState>,
     Json(_req): Json<CreateAccountRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Single-user instance doesn't support account creation via API
@@ -1574,7 +1726,7 @@ pub async fn create_account(
 /// GET /api/v1/accounts/:id/lists
 /// Get lists that contain the specified account
 pub async fn get_account_lists(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -1612,13 +1764,13 @@ pub async fn get_account_lists(
 /// Identity proofs (e.g., Keybase) are not supported,
 /// so this always returns an empty array.
 pub async fn get_account_identity_proofs(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Verify account exists
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
 
@@ -1636,7 +1788,7 @@ pub struct MuteAccountRequest {
 /// POST /api/v1/accounts/:id/block
 /// Block an account
 pub async fn block_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1692,7 +1844,7 @@ pub async fn block_account(
 /// POST /api/v1/accounts/:id/unblock
 /// Unblock an account
 pub async fn unblock_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1753,7 +1905,7 @@ pub async fn unblock_account(
 /// POST /api/v1/accounts/:id/mute
 /// Mute an account
 pub async fn mute_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     req: Option<Json<MuteAccountRequest>>,
@@ -1807,7 +1959,7 @@ pub async fn mute_account(
 /// POST /api/v1/accounts/:id/unmute
 /// Unmute an account
 pub async fn unmute_account(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1846,61 +1998,76 @@ pub async fn unmute_account(
 /// GET /api/v1/blocks
 /// Get list of blocked accounts
 pub async fn get_blocks(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get blocked account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     let addresses = state.db.get_blocked_accounts(limit).await?;
-    let accounts = addresses
-        .iter()
-        .map(|address| build_remote_account_stub(address))
-        .collect();
+    let accounts = stream::iter(addresses.into_iter().take(limit))
+        .map(|address| {
+            let state = state.clone();
+            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+        })
+        .buffered(10)
+        .collect::<Vec<_>>()
+        .await;
     Ok(Json(accounts))
 }
 
 /// GET /api/v1/mutes
 /// Get list of muted accounts
 pub async fn get_mutes(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get muted account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     let addresses = state.db.get_muted_accounts(limit).await?;
-    let accounts = addresses
-        .iter()
-        .map(|address| build_remote_account_stub(address))
-        .collect();
+    let accounts = stream::iter(addresses.into_iter().take(limit))
+        .map(|address| {
+            let state = state.clone();
+            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+        })
+        .buffered(10)
+        .collect::<Vec<_>>()
+        .await;
     Ok(Json(accounts))
 }
 
 /// GET /api/v1/follow_requests
 /// Get list of pending follow requests
 pub async fn get_follow_requests(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get follow requests from database
     let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     let addresses = state.db.get_follow_request_addresses(limit).await?;
-    let accounts = addresses
-        .iter()
-        .map(|address| build_remote_account_stub(address))
-        .collect();
+    let accounts = stream::iter(addresses.into_iter().take(limit))
+        .map(|address| {
+            let state = state.clone();
+            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+        })
+        .buffered(10)
+        .collect::<Vec<_>>()
+        .await;
     Ok(Json(accounts))
 }
 
 /// GET /api/v1/follow_requests/:id
 /// Get a specific follow request
 pub async fn get_follow_request(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1911,13 +2078,23 @@ pub async fn get_follow_request(
         return Err(AppError::NotFound);
     }
 
-    Ok(Json(build_remote_account_stub(&requester_address)))
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let account = if let Some(response) =
+        resolve_remote_account_response_for_list(&state, &requester_address, default_port).await
+    {
+        serde_json::to_value(response)
+            .unwrap_or_else(|_| build_remote_account_stub(&requester_address))
+    } else {
+        build_remote_account_stub(&requester_address)
+    };
+
+    Ok(Json(account))
 }
 
 /// POST /api/v1/follow_requests/:id/authorize
 /// Accept a follow request
 pub async fn authorize_follow_request(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1964,7 +2141,7 @@ pub async fn authorize_follow_request(
 /// POST /api/v1/follow_requests/:id/reject
 /// Reject a follow request
 pub async fn reject_follow_request(
-    State(state): State<AppState>,
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {

@@ -3,7 +3,7 @@
 //! Provides real-time updates via Server-Sent Events (SSE)
 
 use axum::{
-    extract::{Query, State},
+    extract::Query,
     response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
 };
@@ -13,7 +13,6 @@ use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::StreamExt as _;
 
-use crate::AppState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -34,7 +33,6 @@ pub async fn streaming_health() -> impl IntoResponse {
 /// GET /api/v1/streaming/user
 /// Stream events for the authenticated user
 pub async fn stream_user(
-    State(_state): State<AppState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream that sends periodic updates
@@ -54,7 +52,6 @@ pub async fn stream_user(
 /// GET /api/v1/streaming/public
 /// Stream public statuses
 pub async fn stream_public(
-    State(_state): State<AppState>,
     Query(_params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for public timeline
@@ -67,9 +64,8 @@ pub async fn stream_public(
 
 /// GET /api/v1/streaming/public/local
 /// Stream local public statuses
-pub async fn stream_public_local(
-    State(_state): State<AppState>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+pub async fn stream_public_local()
+-> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for local public timeline
     let stream = stream::repeat_with(|| Event::default().event("update").data("{}"))
         .map(Ok)
@@ -81,7 +77,6 @@ pub async fn stream_public_local(
 /// GET /api/v1/streaming/hashtag
 /// Stream statuses with a specific hashtag
 pub async fn stream_hashtag(
-    State(_state): State<AppState>,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let _tag = params
@@ -99,7 +94,6 @@ pub async fn stream_hashtag(
 /// GET /api/v1/streaming/list
 /// Stream statuses from a specific list
 pub async fn stream_list(
-    State(_state): State<AppState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
@@ -121,7 +115,6 @@ pub async fn stream_list(
 /// GET /api/v1/streaming/direct
 /// Stream direct messages
 pub async fn stream_direct(
-    State(_state): State<AppState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     // Create a stream for direct messages

@@ -4,7 +4,7 @@
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{FromRef, Query, State},
     response::{Html, IntoResponse, Redirect},
     routing::get,
 };
@@ -15,7 +15,7 @@ use chrono::{Duration, Utc};
 use rand::RngCore;
 use serde::Deserialize;
 
-use crate::AppState;
+use crate::OAuthWebState;
 use crate::auth::session::{Session, create_session_token};
 use crate::error::AppError;
 
@@ -32,7 +32,11 @@ const SESSION_COOKIE: &str = "session";
 /// - GET /auth/github - Redirect to GitHub
 /// - GET /auth/github/callback - OAuth callback
 /// - POST /logout - Logout
-pub fn auth_router() -> Router<AppState> {
+pub fn auth_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    OAuthWebState: FromRef<S>,
+{
     Router::new()
         .route("/login", get(login_page))
         .route("/auth/github", get(github_redirect))
@@ -76,7 +80,7 @@ async fn login_page() -> impl IntoResponse {
 /// 2. Store state in cookie
 /// 3. Redirect to GitHub with client_id, redirect_uri, scope, state
 async fn github_redirect(
-    State(state): State<AppState>,
+    State(state): State<OAuthWebState>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
     let secure_cookies = state.config.should_use_secure_cookies();
@@ -126,7 +130,7 @@ struct GitHubUser {
 /// 5. Create session and set cookie
 /// 6. Redirect to home
 async fn github_callback(
-    State(state): State<AppState>,
+    State(state): State<OAuthWebState>,
     Query(query): Query<GitHubCallbackQuery>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
@@ -179,7 +183,7 @@ async fn github_callback(
 /// POST /logout
 ///
 /// Clears session cookie and redirects to login.
-async fn logout(State(state): State<AppState>, _jar: CookieJar) -> impl IntoResponse {
+async fn logout(State(state): State<OAuthWebState>, _jar: CookieJar) -> impl IntoResponse {
     let secure_cookies = state.config.should_use_secure_cookies();
     let clear_session = clear_cookie(SESSION_COOKIE, secure_cookies);
     let clear_csrf = clear_cookie(OAUTH_CSRF_COOKIE, secure_cookies);
@@ -214,10 +218,10 @@ fn verify_csrf_state(state: &str, jar: &CookieJar) -> Result<(), AppError> {
     Ok(())
 }
 
-fn build_github_authorize_url(state: &AppState, csrf_state: &str) -> Result<String, AppError> {
+fn build_github_authorize_url(state: &OAuthWebState, csrf_state: &str) -> Result<String, AppError> {
     let redirect_uri = format!("{}/auth/github/callback", state.config.server.base_url());
     let mut url = url::Url::parse(GITHUB_AUTHORIZE_ENDPOINT)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid GitHub authorize URL: {e}")))?;
+        .map_err(|e| AppError::internal(format!("invalid GitHub authorize URL: {e}")))?;
 
     url.query_pairs_mut()
         .append_pair("client_id", &state.config.auth.github.client_id)

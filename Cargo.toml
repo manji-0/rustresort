@@ -7,6 +7,10 @@ description = "A lightweight, single-user ActivityPub server"
 license = "AGPL-3.0"
 repository = "https://github.com/yourusername/rustresort"
 
+[features]
+default = []
+turso-sync = ["dep:turso"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -27,7 +31,8 @@ serde_json = "1"
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "migrate", "macros"] }
 # NOTE: `turso` sync support currently requires a pre-release line.
 # Revisit and migrate to the next stable release when compatibility is confirmed.
-turso = { version = "0.5.0-pre.12", default-features = false, features = ["sync"] }
+# This dependency is optional and only enabled by the `turso-sync` feature.
+turso = { version = "0.5.0-pre.12", default-features = false, features = ["sync"], optional = true }
 # Note: rusqlite removed to avoid libsqlite3-sys version conflict with sqlx
 # Backup functionality will be implemented using sqlx or alternative approach
 
@@ -35,9 +40,8 @@ turso = { version = "0.5.0-pre.12", default-features = false, features = ["sync"
 aws-sdk-s3 = { version = "1.0", default-features = false, features = ["rt-tokio"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["connector-hyper-0-14-x"] }
 hyper-rustls = { version = "0.24.2", default-features = false, features = ["webpki-tokio", "http1", "http2", "tls12"] }
-# OpenSSL is only required transitively by `turso` sync (`hyper-tls`/native-tls chain).
+# OpenSSL is used for VAPID key generation and R2/Turso compatibility.
 # We use `vendored` for reproducible builds without relying on system OpenSSL.
-# If Turso sync becomes rustls-native, this dependency should be removed.
 openssl = { version = "0.10", features = ["vendored"] }
 
 # Crypto/Signatures
@@ -57,7 +61,6 @@ ulid = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 thiserror = "1"
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 config = "0.14"
@@ -69,7 +72,6 @@ image = { version = "0.25", default-features = false, features = ["webp"] }
 
 # Metrics
 prometheus = "0.13"
-lazy_static = "1.4"
 
 # ActivityPub / JSON-LD
 # TODO: Add appropriate crates

@@ -1,6 +1,3 @@
-// Suppress dead_code warnings for WIP modules (will be removed as features are completed)
-#![allow(dead_code)]
-
 //! RustResort - A lightweight, single-user ActivityPub server
 //!
 //! # Architecture
@@ -22,7 +19,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                      Data Layer                              │
 //! │  - SQLite (sqlx)                                            │
-//! │  - Turso in-memory cache                                    │
+//! │  - In-process memory cache                                  │
 //! │  - R2 storage                                               │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
@@ -48,6 +45,7 @@ pub mod metrics;
 pub mod service;
 pub mod storage;
 
+use axum::extract::FromRef;
 use std::sync::Arc;
 
 /// Application state shared across all handlers
@@ -69,10 +67,10 @@ pub struct AppState {
     pub profile_cache: Arc<data::ProfileCache>,
 
     /// Media storage (Cloudflare R2)
-    pub storage: Arc<storage::MediaStorage>,
+    pub storage: Arc<dyn storage::MediaStorageRepository>,
 
     /// Backup service (Cloudflare R2)
-    pub backup: Arc<storage::BackupService>,
+    pub backup: Arc<dyn storage::BackupRepository>,
 
     /// HTTP client for federation
     pub http_client: Arc<reqwest::Client>,
@@ -82,6 +80,338 @@ pub struct AppState {
 
     /// Federation inbound rate limiter
     pub federation_rate_limiter: Arc<federation::RateLimiter>,
+}
+
+/// Minimal state required for authentication middleware.
+#[derive(Clone)]
+pub struct AuthState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for GitHub OAuth web login routes.
+#[derive(Clone)]
+pub struct OAuthWebState {
+    pub config: Arc<config::AppConfig>,
+    pub http_client: Arc<reqwest::Client>,
+}
+
+/// Minimal state required for Mastodon timeline endpoints.
+#[derive(Clone)]
+pub struct TimelineApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub profile_cache: Arc<data::ProfileCache>,
+}
+
+/// Minimal state required for Mastodon status endpoints.
+#[derive(Clone)]
+pub struct StatusApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub storage: Arc<dyn storage::MediaStorageRepository>,
+    pub http_client: Arc<reqwest::Client>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
+}
+
+/// Minimal state required for Mastodon search endpoints.
+#[derive(Clone)]
+pub struct SearchApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
+}
+
+/// Minimal state required for Mastodon instance endpoints.
+#[derive(Clone)]
+pub struct InstanceApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon admin API endpoints.
+#[derive(Clone)]
+pub struct AdminApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon account endpoints.
+#[derive(Clone)]
+pub struct AccountApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub storage: Arc<dyn storage::MediaStorageRepository>,
+    pub http_client: Arc<reqwest::Client>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
+}
+
+/// Minimal state required for Mastodon app/OAuth endpoints.
+#[derive(Clone)]
+pub struct AppsApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon media endpoints.
+#[derive(Clone)]
+pub struct MediaApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub storage: Arc<dyn storage::MediaStorageRepository>,
+}
+
+/// Minimal state required for Mastodon list endpoints.
+#[derive(Clone)]
+pub struct ListsApiState {
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon filter endpoints.
+#[derive(Clone)]
+pub struct FiltersApiState {
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon conversation endpoints.
+#[derive(Clone)]
+pub struct ConversationsApiState {
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon poll endpoints.
+#[derive(Clone)]
+pub struct PollsApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for Mastodon scheduled status endpoints.
+#[derive(Clone)]
+pub struct ScheduledStatusesApiState {
+    pub db: Arc<data::Database>,
+}
+
+/// Minimal state required for ActivityPub endpoints.
+#[derive(Clone)]
+pub struct ActivityPubState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub storage: Arc<dyn storage::MediaStorageRepository>,
+    pub http_client: Arc<reqwest::Client>,
+    pub federation_rate_limiter: Arc<federation::RateLimiter>,
+}
+
+/// Minimal state required for admin API endpoints.
+#[derive(Clone)]
+pub struct SystemAdminState {
+    pub db: Arc<data::Database>,
+    pub backup: Arc<dyn storage::BackupRepository>,
+}
+
+/// Minimal state required for well-known endpoints.
+#[derive(Clone)]
+pub struct WellKnownState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+}
+
+impl FromRef<AppState> for Arc<config::AppConfig> {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<data::Database> {
+    fn from_ref(state: &AppState) -> Self {
+        state.db.clone()
+    }
+}
+
+impl FromRef<AppState> for AuthState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for OAuthWebState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            http_client: state.http_client.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for TimelineApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            timeline_cache: state.timeline_cache.clone(),
+            profile_cache: state.profile_cache.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for StatusApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            timeline_cache: state.timeline_cache.clone(),
+            profile_cache: state.profile_cache.clone(),
+            storage: state.storage.clone(),
+            http_client: state.http_client.clone(),
+            federation_fetch_client: state.federation_fetch_client.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for SearchApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            profile_cache: state.profile_cache.clone(),
+            federation_fetch_client: state.federation_fetch_client.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for InstanceApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for AdminApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for AccountApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            profile_cache: state.profile_cache.clone(),
+            storage: state.storage.clone(),
+            http_client: state.http_client.clone(),
+            federation_fetch_client: state.federation_fetch_client.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for AppsApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for MediaApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            timeline_cache: state.timeline_cache.clone(),
+            storage: state.storage.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for ListsApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for FiltersApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for ConversationsApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for PollsApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for ScheduledStatusesApiState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for ActivityPubState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+            timeline_cache: state.timeline_cache.clone(),
+            profile_cache: state.profile_cache.clone(),
+            storage: state.storage.clone(),
+            http_client: state.http_client.clone(),
+            federation_rate_limiter: state.federation_rate_limiter.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for SystemAdminState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            db: state.db.clone(),
+            backup: state.backup.clone(),
+        }
+    }
+}
+
+impl FromRef<AppState> for WellKnownState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            config: state.config.clone(),
+            db: state.db.clone(),
+        }
+    }
 }
 
 impl AppState {
@@ -105,6 +435,15 @@ impl AppState {
         let db_path = Path::new(&config.database.path);
         let turso_sync_options = match config.database.sync.mode {
             config::DatabaseSyncMode::Turso => {
+                #[cfg(not(feature = "turso-sync"))]
+                {
+                    return Err(error::AppError::Config(
+                        "database.sync.mode=turso requires building with the `turso-sync` feature"
+                            .to_string(),
+                    ));
+                }
+
+                #[cfg(feature = "turso-sync")]
                 let remote_url = config
                     .database
                     .sync
@@ -118,10 +457,13 @@ impl AppState {
                         )
                     })?;
 
-                Some(data::TursoSyncOptions {
-                    remote_url,
-                    auth_token: config.database.sync.turso.auth_token.clone(),
-                })
+                #[cfg(feature = "turso-sync")]
+                {
+                    Some(data::TursoSyncOptions {
+                        remote_url,
+                        auth_token: config.database.sync.turso.auth_token.clone(),
+                    })
+                }
             }
             config::DatabaseSyncMode::D1 => {
                 config
@@ -158,13 +500,13 @@ impl AppState {
             .user_agent("RustResort/0.1.0")
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| error::AppError::Internal(e.into()))?;
+            .map_err(error::AppError::internal)?;
         let federation_fetch_client = reqwest::Client::builder()
             .user_agent("RustResort/0.1.0")
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| error::AppError::Internal(e.into()))?;
+            .map_err(error::AppError::internal)?;
 
         // 4. Initialize federation inbound rate limiter
         let federation_rate_limiter = federation::RateLimiter::new(None, None);
@@ -249,11 +591,11 @@ impl AppState {
                 .unwrap_or(&config.instance.contact_email);
             // Note: email is not stored in account table currently
 
-            if let Some(ref note) = config.admin.note {
-                if account.note.as_deref() != Some(note) {
-                    account.note = Some(note.clone());
-                    updated = true;
-                }
+            if let Some(ref note) = config.admin.note
+                && account.note.as_deref() != Some(note)
+            {
+                account.note = Some(note.clone());
+                updated = true;
             }
 
             if updated {
@@ -278,22 +620,21 @@ impl AppState {
         // Generate RSA keypair for ActivityPub
         let mut rng = rand::thread_rng();
         let bits = 4096;
-        let private_key =
-            RsaPrivateKey::new(&mut rng, bits).map_err(|e| error::AppError::Internal(e.into()))?;
+        let private_key = RsaPrivateKey::new(&mut rng, bits).map_err(error::AppError::internal)?;
         let public_key = RsaPublicKey::from(&private_key);
 
         // Encode keys to PEM
         let private_key_pem = private_key
             .to_pkcs8_pem(LineEnding::LF)
-            .map_err(|e| error::AppError::Internal(e.into()))?
+            .map_err(error::AppError::internal)?
             .to_string();
         let public_key_pem = public_key
             .to_public_key_pem(LineEnding::LF)
-            .map_err(|e| error::AppError::Internal(e.into()))?;
+            .map_err(error::AppError::internal)?;
 
         // Create account
         let account = data::Account {
-            id: data::EntityId::new().0,
+            id: data::EntityId::new_string(),
             username: config.admin.username.clone(),
             display_name: Some(config.admin.display_name.clone()),
             note: config.admin.note.clone(),
@@ -328,24 +669,26 @@ pub fn build_router(state: AppState) -> axum::Router {
     };
 
     let cors_layer = build_cors_layer(&state.config.server);
+    let auth_state = AuthState::from_ref(&state);
+    let config_state: Arc<config::AppConfig> = Arc::from_ref(&state);
 
     Router::new()
         .route("/health", axum::routing::get(health_check))
         .merge(auth::auth_router())
         .merge(api::wellknown_router())
-        .nest("/api", api::mastodon_api_router(state.clone()))
-        .nest("/oauth", api::oauth_router(state.clone()))
+        .nest("/api", api::mastodon_api_router(auth_state.clone()))
+        .nest("/oauth", api::oauth_router(config_state.clone()))
         .merge(api::activitypub_router())
         .nest(
             "/admin",
             api::admin_router().route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
+                config_state.clone(),
                 auth::require_session_auth,
             )),
         )
         .merge(
             api::metrics_router().route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
+                config_state,
                 auth::require_metrics_auth,
             )),
         )

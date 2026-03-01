@@ -11,7 +11,7 @@ async fn test_verify_credentials_without_auth() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/verify_credentials"))
+        .get(server.url("/api/v1/accounts/verify_credentials"))
         .send()
         .await
         .unwrap();
@@ -28,7 +28,7 @@ async fn test_verify_credentials_with_auth() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/verify_credentials"))
+        .get(server.url("/api/v1/accounts/verify_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -49,7 +49,7 @@ async fn test_get_account_by_id() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}", account.id)))
         .send()
         .await
         .unwrap();
@@ -74,7 +74,7 @@ async fn test_update_credentials() {
 
     let response = server
         .client
-        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .patch(server.url("/api/v1/accounts/update_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -101,7 +101,7 @@ async fn test_update_credentials_invalid_avatar_does_not_apply_profile_changes()
 
     let response = server
         .client
-        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .patch(server.url("/api/v1/accounts/update_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -129,7 +129,7 @@ async fn test_update_credentials_invalid_header_does_not_apply_avatar_or_profile
 
     let response = server
         .client
-        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .patch(server.url("/api/v1/accounts/update_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -151,7 +151,7 @@ async fn test_account_statuses() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
         .send()
         .await
         .unwrap();
@@ -175,7 +175,7 @@ async fn test_account_statuses_include_pinned_state() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&create_payload)
         .send()
@@ -187,7 +187,7 @@ async fn test_account_statuses_include_pinned_state() {
 
     let pin_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -196,7 +196,7 @@ async fn test_account_statuses_include_pinned_state() {
 
     let statuses_response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -231,13 +231,13 @@ async fn test_account_statuses_only_media_pages_until_limit() {
             uri: format!("https://test.example.com/status/{}", status_id),
             content: format!("<p>Status {}</p>", idx),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: rustresort::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "testuser@test.example.com".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: now - Duration::seconds(idx as i64),
             fetched_at: None,
         };
@@ -267,7 +267,7 @@ async fn test_account_statuses_only_media_pages_until_limit() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .query(&[("only_media", "true"), ("limit", "2")])
         .send()
@@ -289,7 +289,7 @@ async fn test_account_followers() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .send()
         .await
         .unwrap();
@@ -308,7 +308,7 @@ async fn test_account_following() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
         .send()
         .await
         .unwrap();
@@ -329,7 +329,7 @@ async fn test_follow_account_persists_follow_relationship() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/follow", target)))
+        .post(server.url(&format!("/api/v1/accounts/{}/follow", target)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -354,7 +354,7 @@ async fn test_follow_account_normalizes_address_and_avoids_case_duplicate() {
 
     let first = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/follow", mixed_case_target)))
+        .post(server.url(&format!("/api/v1/accounts/{}/follow", mixed_case_target)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -363,7 +363,7 @@ async fn test_follow_account_normalizes_address_and_avoids_case_duplicate() {
 
     let second = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -383,7 +383,7 @@ async fn test_follow_account_avoids_default_port_variant_duplicate() {
 
     let first = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example:443/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example:443/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -392,7 +392,7 @@ async fn test_follow_account_avoids_default_port_variant_duplicate() {
 
     let second = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -415,13 +415,13 @@ async fn test_insert_follow_is_idempotent_for_duplicate_target_address() {
     server.create_test_account().await;
 
     let first = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
         uri: "https://test.example.com/users/testuser/follow/dup-1".to_string(),
         created_at: Utc::now(),
     };
     let second = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
         uri: "https://test.example.com/users/testuser/follow/dup-2".to_string(),
         created_at: Utc::now(),
@@ -445,7 +445,7 @@ async fn test_unfollow_account_removes_follow_relationship() {
     let target = "alice@remote.example";
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: target.to_string(),
         uri: "https://test.example.com/users/testuser/follow/seed".to_string(),
         created_at: Utc::now(),
@@ -454,7 +454,7 @@ async fn test_unfollow_account_removes_follow_relationship() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unfollow", target)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unfollow", target)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -480,7 +480,7 @@ async fn test_unfollow_account_matches_case_insensitively() {
     let token = server.create_test_token().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "Alice@Remote.EXAMPLE".to_string(),
         uri: "https://test.example.com/users/testuser/follow/mixed".to_string(),
         created_at: Utc::now(),
@@ -489,7 +489,7 @@ async fn test_unfollow_account_matches_case_insensitively() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/unfollow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/unfollow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -510,7 +510,7 @@ async fn test_unfollow_account_matches_default_https_port_variants() {
     let token = server.create_test_token().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://test.example.com/users/testuser/follow/default-port".to_string(),
         created_at: Utc::now(),
@@ -519,7 +519,7 @@ async fn test_unfollow_account_matches_default_https_port_variants() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/unfollow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/unfollow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -538,7 +538,7 @@ async fn test_follow_account_rejects_self_follow() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/follow", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/follow", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -557,7 +557,7 @@ async fn test_follow_account_rejects_self_follow_case_insensitive_address() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/TESTUSER@TEST.EXAMPLE.COM/follow"))
+        .post(server.url("/api/v1/accounts/TESTUSER@TEST.EXAMPLE.COM/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -576,7 +576,7 @@ async fn test_follow_account_rejects_self_follow_with_default_https_port() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/testuser@test.example.com:443/follow"))
+        .post(server.url("/api/v1/accounts/testuser@test.example.com:443/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -595,7 +595,7 @@ async fn test_follow_account_preserves_explicit_port_in_target_address() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example:443/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example:443/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -617,7 +617,7 @@ async fn test_follow_account_preserves_explicit_non_default_port_in_target_addre
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example:80/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example:80/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -641,7 +641,7 @@ async fn test_block_account_matches_default_https_port_variants() {
     let token = server.create_test_token().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://test.example.com/users/testuser/follow/block-default-port".to_string(),
         created_at: Utc::now(),
@@ -650,7 +650,7 @@ async fn test_block_account_matches_default_https_port_variants() {
 
     let block_response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/block"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/block"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -670,7 +670,7 @@ async fn test_block_account_matches_default_https_port_variants() {
 
     let unblock_response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example:443/unblock"))
+        .post(server.url("/api/v1/accounts/alice@remote.example:443/unblock"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -770,7 +770,7 @@ async fn test_block_and_unblock_account_deliver_outbound_activities() {
 
     let block_response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .post(server.url(&format!("/api/v1/accounts/{}/block", target_address)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -789,7 +789,7 @@ async fn test_block_and_unblock_account_deliver_outbound_activities() {
 
     let unblock_response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -823,10 +823,10 @@ async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delive
         State(counter): State<Arc<AtomicUsize>>,
         body: String,
     ) -> StatusCode {
-        if let Ok(activity) = serde_json::from_str::<Value>(&body) {
-            if activity.get("type").and_then(|value| value.as_str()) == Some("Block") {
-                counter.fetch_add(1, Ordering::SeqCst);
-            }
+        if let Ok(activity) = serde_json::from_str::<Value>(&body)
+            && activity.get("type").and_then(|value| value.as_str()) == Some("Block")
+        {
+            counter.fetch_add(1, Ordering::SeqCst);
         }
         StatusCode::ACCEPTED
     }
@@ -870,7 +870,7 @@ async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delive
 
     let first_response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .post(server.url(&format!("/api/v1/accounts/{}/block", target_address)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -895,7 +895,7 @@ async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delive
 
     let second_response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .post(server.url(&format!("/api/v1/accounts/{}/block", target_address)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -969,7 +969,7 @@ async fn test_unblock_account_without_existing_block_skips_outbound_undo_deliver
 
     let unblock_response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -992,7 +992,7 @@ async fn test_mute_account_matches_default_https_port_variants() {
 
     let mute_response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example:443/mute"))
+        .post(server.url("/api/v1/accounts/alice@remote.example:443/mute"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1009,7 +1009,7 @@ async fn test_mute_account_matches_default_https_port_variants() {
 
     let unmute_response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/unmute"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/unmute"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

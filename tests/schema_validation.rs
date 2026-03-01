@@ -19,7 +19,7 @@ async fn test_account_schema_verify_credentials() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/verify_credentials"))
+        .get(server.url("/api/v1/accounts/verify_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -55,7 +55,7 @@ async fn test_account_schema_get_account() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}", account.id)))
         .send()
         .await
         .unwrap();
@@ -94,7 +94,7 @@ async fn test_status_schema_create() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -138,7 +138,7 @@ async fn test_status_schema_get() {
 
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -152,7 +152,7 @@ async fn test_status_schema_get() {
         // Get the status
         let response = server
             .client
-            .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+            .get(server.url(&format!("/api/v1/statuses/{}", status_id)))
             .send()
             .await
             .unwrap();
@@ -185,7 +185,7 @@ async fn test_instance_schema() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/instance"))
+        .get(server.url("/api/v1/instance"))
         .send()
         .await
         .unwrap();
@@ -228,7 +228,7 @@ async fn test_timeline_schema() {
 
         server
             .client
-            .post(&server.url("/api/v1/statuses"))
+            .post(server.url("/api/v1/statuses"))
             .header("Authorization", format!("Bearer {}", token))
             .json(&status_data)
             .send()
@@ -239,7 +239,7 @@ async fn test_timeline_schema() {
     // Get home timeline
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home"))
+        .get(server.url("/api/v1/timelines/home"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -298,7 +298,7 @@ async fn test_status_with_media_schema() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()

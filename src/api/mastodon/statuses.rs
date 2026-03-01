@@ -11,12 +11,12 @@ use std::collections::{HashSet, VecDeque};
 
 use super::accounts::PaginationParams;
 use super::federation_delivery::{
-    build_delivery, local_actor_uri, resolve_remote_actor_and_inbox,
-    spawn_best_effort_batch_delivery, spawn_best_effort_delivery,
+    resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_batch_delivery,
+    spawn_best_effort_delivery,
 };
-use crate::AppState;
+use crate::StatusApiState;
 use crate::auth::CurrentUser;
-use crate::data::PersistedReason;
+use crate::data::{Account, PersistedReason, StatusVisibility};
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
@@ -24,7 +24,7 @@ use crate::metrics::{
 };
 use crate::service::{AccountService, StatusService};
 
-const DEFAULT_VISIBILITY: &str = "public";
+const DEFAULT_VISIBILITY: StatusVisibility = StatusVisibility::Public;
 const CREATE_STATUS_IDEMPOTENCY_ENDPOINT: &str = "/api/v1/statuses";
 const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 256;
 const MIN_POLL_OPTIONS: usize = 2;
@@ -56,7 +56,8 @@ pub struct CreateStatusRequest {
     pub quoted_status_id: Option<String>,
     pub poll: Option<CreateStatusPollRequest>,
     pub scheduled_at: Option<String>,
-    pub sensitive: Option<bool>,
+    #[serde(rename = "sensitive")]
+    pub _sensitive: Option<bool>,
     pub spoiler_text: Option<String>,
     pub visibility: Option<String>,
     pub language: Option<String>,
@@ -88,11 +89,16 @@ fn resolve_action_uri<'a>(
     Ok(None)
 }
 
-fn should_federate_to_followers(visibility: &str) -> bool {
-    visibility == "public" || visibility == "unlisted"
+fn should_federate_to_followers(visibility: StatusVisibility) -> bool {
+    matches!(
+        visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted
+    )
 }
 
-fn ensure_public_visibility_for_public_endpoint(visibility: &str) -> Result<(), AppError> {
+fn ensure_public_visibility_for_public_endpoint(
+    visibility: StatusVisibility,
+) -> Result<(), AppError> {
     if should_federate_to_followers(visibility) {
         Ok(())
     } else {
@@ -100,18 +106,19 @@ fn ensure_public_visibility_for_public_endpoint(visibility: &str) -> Result<(), 
     }
 }
 
-fn normalize_visibility_input(raw_visibility: Option<String>) -> Result<String, AppError> {
-    let visibility = raw_visibility
-        .unwrap_or_else(|| DEFAULT_VISIBILITY.to_string())
-        .trim()
-        .to_ascii_lowercase();
+fn normalize_visibility_input(
+    raw_visibility: Option<String>,
+) -> Result<StatusVisibility, AppError> {
+    let visibility = match raw_visibility {
+        Some(value) => StatusVisibility::parse(&value),
+        None => Some(DEFAULT_VISIBILITY),
+    };
 
-    match visibility.as_str() {
-        "public" | "unlisted" | "private" | "direct" => Ok(visibility),
-        _ => Err(AppError::Validation(
+    visibility.ok_or_else(|| {
+        AppError::Validation(
             "visibility must be one of: public, unlisted, private, direct".to_string(),
-        )),
-    }
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -215,7 +222,7 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppErr
     Ok(Some(key.to_string()))
 }
 
-fn build_status_service(state: &AppState) -> StatusService {
+fn build_status_service(state: &StatusApiState) -> StatusService {
     StatusService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -224,16 +231,42 @@ fn build_status_service(state: &AppState) -> StatusService {
     )
 }
 
-fn build_account_service(state: &AppState) -> AccountService {
+fn build_account_service(state: &StatusApiState) -> AccountService {
     AccountService::new(state.db.clone(), state.storage.clone())
 }
 
+fn local_actor_uri(state: &StatusApiState, username: &str) -> String {
+    crate::federation::local_actor_uri(&state.config.server.base_url(), username)
+}
+
+fn build_delivery(
+    state: &StatusApiState,
+    account: &Account,
+) -> crate::federation::ActivityDelivery {
+    crate::federation::build_local_delivery(
+        state.http_client.clone(),
+        &state.config.server.base_url(),
+        account,
+    )
+}
+
 fn status_response_without_interaction_state(
-    state: &AppState,
+    state: &StatusApiState,
     account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
     status: &crate::data::Status,
 ) -> crate::api::StatusResponse {
-    crate::api::status_to_response(status, account, &state.config, None, None, None, None, None)
+    crate::api::status_to_response_with_account_stats(
+        status,
+        account,
+        &state.config,
+        account_stats,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn status_content_to_source_text(content: &str) -> String {
@@ -288,7 +321,7 @@ struct StatusSourceResponse {
 
 /// POST /api/v1/statuses
 pub async fn create_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     headers: HeaderMap,
     Json(req): Json<CreateStatusRequest>,
@@ -374,7 +407,7 @@ pub async fn create_status(
             quoted_status_id,
             poll,
             scheduled_at,
-            sensitive: _,
+            _sensitive: _,
             spoiler_text,
             visibility,
             language,
@@ -411,19 +444,19 @@ pub async fn create_status(
         // Resolve reply target if provided.
         let mut in_reply_to_uri = None;
         let mut reply_target_account_address = None;
-        let mut persisted_reason = "own".to_string();
+        let mut persisted_reason = PersistedReason::Own;
         if let Some(in_reply_to_id) = in_reply_to_id.as_deref() {
             if let Some(reply_target) = status_service.find(in_reply_to_id).await? {
                 in_reply_to_uri = Some(reply_target.uri.clone());
                 if reply_target.is_local {
-                    persisted_reason = "reply_to_own".to_string();
+                    persisted_reason = PersistedReason::ReplyToOwn;
                 } else if !reply_target.account_address.is_empty() {
                     reply_target_account_address = Some(reply_target.account_address);
                 }
             } else if let Some(reply_target) = status_service.find_by_uri(in_reply_to_id).await? {
                 in_reply_to_uri = Some(reply_target.uri.clone());
                 if reply_target.is_local {
-                    persisted_reason = "reply_to_own".to_string();
+                    persisted_reason = PersistedReason::ReplyToOwn;
                 } else if !reply_target.account_address.is_empty() {
                     reply_target_account_address = Some(reply_target.account_address);
                 }
@@ -446,16 +479,12 @@ pub async fn create_status(
                 None
             } else {
                 Some(serde_json::to_string(&media_ids).map_err(|error| {
-                    AppError::Internal(anyhow::anyhow!(
-                        "failed to serialize scheduled media_ids: {error}"
-                    ))
+                    AppError::serialization("scheduled media_ids serialization", error)
                 })?)
             };
             let poll_options_json = match &poll {
                 Some(poll) => Some(serde_json::to_string(&poll.options).map_err(|error| {
-                    AppError::Internal(anyhow::anyhow!(
-                        "failed to serialize scheduled poll options: {error}"
-                    ))
+                    AppError::serialization("scheduled poll options serialization", error)
                 })?),
                 None => None,
             };
@@ -464,7 +493,7 @@ pub async fn create_status(
                 .create_scheduled_status(
                     &scheduled_at,
                     &content,
-                    &visibility,
+                    visibility.as_str(),
                     spoiler_text.as_deref(),
                     in_reply_to_id.as_deref(),
                     media_ids_json.as_deref(),
@@ -479,7 +508,7 @@ pub async fn create_status(
                 .ok_or(AppError::NotFound);
         }
 
-        let status_id = EntityId::new().0;
+        let status_id = EntityId::new_string();
         let uri = format!(
             "{}/users/{}/statuses/{}",
             state.config.server.base_url(),
@@ -492,7 +521,7 @@ pub async fn create_status(
             uri: uri.clone(),
             content: format!("<p>{}</p>", html_escape::encode_text(&content)),
             content_warning: spoiler_text.clone(),
-            visibility: visibility.clone(),
+            visibility,
             language: language.or(Some("en".to_string())),
             account_address: String::new(),
             is_local: true,
@@ -503,7 +532,7 @@ pub async fn create_status(
             fetched_at: None,
         };
 
-        let should_federate_create = should_federate_to_followers(&status.visibility);
+        let should_federate_create = should_federate_to_followers(status.visibility);
         let create_delivery_targets = if should_federate_create {
             match account_service.get_follower_inboxes().await {
                 Ok(follower_inboxes) => follower_inboxes,
@@ -550,8 +579,9 @@ pub async fn create_status(
                 if let Some(reply_target_account_address) =
                     reply_target_account_address_for_delivery
                 {
-                    match resolve_remote_actor_and_inbox(
-                        &state_for_delivery,
+                    match resolve_remote_actor_and_inbox_with_dependencies(
+                        state_for_delivery.profile_cache.as_ref(),
+                        state_for_delivery.federation_fetch_client.as_ref(),
                         &reply_target_account_address,
                     )
                     .await
@@ -626,10 +656,13 @@ pub async fn create_status(
             None
         };
 
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
         let response = crate::api::status_to_response_with_media(
             &status,
             &account,
             &state.config,
+            account_stats,
+            None,
             Some(false),
             Some(false),
             Some(false),
@@ -637,15 +670,12 @@ pub async fn create_status(
             Some(false),
             &media_attachments,
         );
-        let mut response_value = serde_json::to_value(response).map_err(|error| {
-            AppError::Internal(anyhow::anyhow!(
-                "failed to serialize status response: {error}"
-            ))
-        })?;
-        if let Some(obj) = response_value.as_object_mut() {
-            if let Some(poll_value) = poll_value {
-                obj.insert("poll".to_string(), poll_value);
-            }
+        let mut response_value = serde_json::to_value(response)
+            .map_err(|error| AppError::serialization("status response serialization", error))?;
+        if let Some(obj) = response_value.as_object_mut()
+            && let Some(poll_value) = poll_value
+        {
+            obj.insert("poll".to_string(), poll_value);
         }
         Ok(response_value)
     }
@@ -679,7 +709,7 @@ pub async fn create_status(
 
 /// GET /api/v1/statuses/:id
 pub async fn get_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
@@ -698,20 +728,22 @@ pub async fn get_status(
         .with_label_values(&["SELECT", "statuses"])
         .inc();
     db_timer.observe_duration();
-    ensure_public_visibility_for_public_endpoint(&status.visibility)?;
+    ensure_public_visibility_for_public_endpoint(status.visibility)?;
 
     // Get account
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
     db_timer.observe_duration();
 
     // Convert to API response
-    let response = status_response_without_interaction_state(&state, &account, &status);
+    let response =
+        status_response_without_interaction_state(&state, &account, account_stats, &status);
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -723,7 +755,7 @@ pub async fn get_status(
 
 /// DELETE /api/v1/statuses/:id
 pub async fn delete_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -749,6 +781,7 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
@@ -764,16 +797,16 @@ pub async fn delete_status(
         .inc();
     db_timer.observe_duration();
 
-    let should_federate_delete = should_federate_to_followers(&status.visibility);
+    let should_federate_delete = should_federate_to_followers(status.visibility);
     if should_federate_delete {
         match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                 let delivery = build_delivery(&state, &account);
                 let status_uri = status.uri.clone();
-                let status_visibility = status.visibility.clone();
+                let status_visibility = status.visibility;
                 spawn_best_effort_batch_delivery("delete_status", async move {
                     delivery
-                        .send_delete(&status_uri, &status_visibility, follower_inboxes)
+                        .send_delete(&status_uri, status_visibility.as_str(), follower_inboxes)
                         .await
                 });
             }
@@ -796,10 +829,11 @@ pub async fn delete_status(
     POSTS_TOTAL.dec();
 
     // Return the deleted status
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         Some(false),
         Some(false),
         Some(false),
@@ -817,7 +851,7 @@ pub async fn delete_status(
 
 /// GET /api/v1/statuses/:id/context
 pub async fn get_status_context(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::ContextResponse;
@@ -825,10 +859,11 @@ pub async fn get_status_context(
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
-    ensure_public_visibility_for_public_endpoint(&status.visibility)?;
+    ensure_public_visibility_for_public_endpoint(status.visibility)?;
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let mut ancestors = Vec::new();
     let mut seen_ancestors = HashSet::new();
@@ -844,7 +879,7 @@ pub async fn get_status_context(
         let Some(parent_status) = status_service.find_by_uri(&parent_uri).await? else {
             break;
         };
-        if !should_federate_to_followers(&parent_status.visibility) {
+        if !should_federate_to_followers(parent_status.visibility) {
             break;
         }
 
@@ -871,7 +906,7 @@ pub async fn get_status_context(
             if descendants.len() >= MAX_STATUS_CONTEXT_DESCENDANTS {
                 break 'descendant_scan;
             }
-            if !should_federate_to_followers(&reply.visibility) {
+            if !should_federate_to_followers(reply.visibility) {
                 continue;
             }
             if !seen_descendants.insert(reply.uri.clone()) {
@@ -885,14 +920,20 @@ pub async fn get_status_context(
     let mut ancestor_responses = Vec::with_capacity(ancestors.len());
     for ancestor in &ancestors {
         ancestor_responses.push(status_response_without_interaction_state(
-            &state, &account, ancestor,
+            &state,
+            &account,
+            account_stats,
+            ancestor,
         ));
     }
 
     let mut descendant_responses = Vec::with_capacity(descendants.len());
     for descendant in &descendants {
         descendant_responses.push(status_response_without_interaction_state(
-            &state, &account, descendant,
+            &state,
+            &account,
+            account_stats,
+            descendant,
         ));
     }
 
@@ -906,7 +947,7 @@ pub async fn get_status_context(
 
 /// GET /api/v1/statuses/:id/reblogged_by
 pub async fn get_reblogged_by(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -914,7 +955,7 @@ pub async fn get_reblogged_by(
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
-    ensure_public_visibility_for_public_endpoint(&status.visibility)?;
+    ensure_public_visibility_for_public_endpoint(status.visibility)?;
 
     // For single-user instance, only the owner can reblog
     // In a full implementation, we would query the reposts table
@@ -926,7 +967,7 @@ pub async fn get_reblogged_by(
 
 /// GET /api/v1/statuses/:id/favourited_by
 pub async fn get_favourited_by(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -934,7 +975,7 @@ pub async fn get_favourited_by(
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
-    ensure_public_visibility_for_public_endpoint(&status.visibility)?;
+    ensure_public_visibility_for_public_endpoint(status.visibility)?;
 
     // For single-user instance, only the owner can favourite
     // Check if the status is favourited by the owner
@@ -943,8 +984,10 @@ pub async fn get_favourited_by(
     if is_favourited {
         // Return the owner's account
         let account = build_account_service(&state).get_account().await?;
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-        let account_response = crate::api::account_to_response(&account, &state.config);
+        let account_response =
+            crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
         Ok(Json(vec![serde_json::to_value(account_response).unwrap()]))
     } else {
         // Not favourited, return empty array
@@ -954,7 +997,7 @@ pub async fn get_favourited_by(
 
 /// GET /api/v1/statuses/:id/source
 pub async fn get_status_source(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -980,7 +1023,7 @@ pub async fn get_status_source(
 
 /// POST /api/v1/statuses/:id/favourite
 pub async fn favourite_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -989,6 +1032,7 @@ pub async fn favourite_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get status and add favourite.
     let (status, favourite_id) = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -1009,9 +1053,12 @@ pub async fn favourite_status(
         );
         let status_uri = status.uri.clone();
         spawn_best_effort_delivery("favourite_status", async move {
-            let (_, target_inbox_uri) =
-                resolve_remote_actor_and_inbox(&state_for_delivery, &account_address_for_delivery)
-                    .await?;
+            let (_, target_inbox_uri) = resolve_remote_actor_and_inbox_with_dependencies(
+                state_for_delivery.profile_cache.as_ref(),
+                state_for_delivery.federation_fetch_client.as_ref(),
+                &account_address_for_delivery,
+            )
+            .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
                 .send_like_with_id(&like_activity_uri, &status_uri, &target_inbox_uri)
@@ -1020,10 +1067,11 @@ pub async fn favourite_status(
     }
 
     // Return status with favourited=true
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         Some(true),
         Some(false),
         status_service.is_muted(&status_id).await.ok(),
@@ -1036,7 +1084,7 @@ pub async fn favourite_status(
 
 /// POST /api/v1/statuses/:id/unfavourite
 pub async fn unfavourite_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -1045,6 +1093,7 @@ pub async fn unfavourite_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
         status_service
@@ -1067,34 +1116,33 @@ pub async fn unfavourite_status(
     status_service.unfavourite_loaded(&status).await?;
     let status_id = status.id.clone();
 
-    if let Some(like_activity_uri) = like_activity_uri {
-        if !status.is_local && !status.account_address.is_empty() {
-            let state_for_delivery = state.clone();
-            let account_for_delivery = account.clone();
-            let account_address_for_delivery = status.account_address.clone();
-            spawn_best_effort_delivery("unfavourite_status", async move {
-                let (_, target_inbox_uri) = resolve_remote_actor_and_inbox(
-                    &state_for_delivery,
-                    &account_address_for_delivery,
-                )
-                .await?;
-                let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
-                delivery
-                    .send_undo_to_inbox_with_type(
-                        &like_activity_uri,
-                        Some("Like"),
-                        &target_inbox_uri,
-                    )
-                    .await
-            });
-        }
+    if let Some(like_activity_uri) = like_activity_uri
+        && !status.is_local
+        && !status.account_address.is_empty()
+    {
+        let state_for_delivery = state.clone();
+        let account_for_delivery = account.clone();
+        let account_address_for_delivery = status.account_address.clone();
+        spawn_best_effort_delivery("unfavourite_status", async move {
+            let (_, target_inbox_uri) = resolve_remote_actor_and_inbox_with_dependencies(
+                state_for_delivery.profile_cache.as_ref(),
+                state_for_delivery.federation_fetch_client.as_ref(),
+                &account_address_for_delivery,
+            )
+            .await?;
+            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+            delivery
+                .send_undo_to_inbox_with_type(&like_activity_uri, Some("Like"), &target_inbox_uri)
+                .await
+        });
     }
 
     // Return status with favourited=false
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         Some(false),
         Some(false),
         status_service.is_muted(&status_id).await.ok(),
@@ -1107,7 +1155,7 @@ pub async fn unfavourite_status(
 
 /// POST /api/v1/statuses/:id/reblog
 pub async fn reblog_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -1118,6 +1166,7 @@ pub async fn reblog_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let action_uri = resolve_action_uri(&id, &params)?;
     let (status, repost_uri) = if let Some(uri) = action_uri {
@@ -1126,14 +1175,12 @@ pub async fn reblog_status(
             .get_repost_uri(&status.id)
             .await?
             .ok_or_else(|| {
-                AppError::Internal(anyhow::anyhow!(
-                    "repost URI missing after creating repost activity"
-                ))
+                AppError::internal("repost URI missing after creating repost activity".to_string())
             })?;
         (status, repost_uri)
     } else {
         // Create repost record
-        let repost_id = EntityId::new().0;
+        let repost_id = EntityId::new_string();
         let repost_uri = format!(
             "{}/users/{}/statuses/{}/activity",
             state.config.server.base_url(),
@@ -1145,20 +1192,20 @@ pub async fn reblog_status(
     };
     let status_id = status.id.clone();
 
-    let should_federate_reblog = should_federate_to_followers(&status.visibility);
+    let should_federate_reblog = should_federate_to_followers(status.visibility);
     if should_federate_reblog {
         match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                 let delivery = build_delivery(&state, &account);
                 let announce_activity_uri = repost_uri.clone();
                 let announced_status_uri = status.uri.clone();
-                let announced_status_visibility = status.visibility.clone();
+                let announced_status_visibility = status.visibility;
                 spawn_best_effort_batch_delivery("reblog_status", async move {
                     delivery
                         .send_announce_with_id(
                             &announce_activity_uri,
                             &announced_status_uri,
-                            &announced_status_visibility,
+                            announced_status_visibility.as_str(),
                             follower_inboxes,
                         )
                         .await
@@ -1180,10 +1227,11 @@ pub async fn reblog_status(
     }
 
     // Return the original status with reblogged=true
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status_id).await.ok(),
         Some(true),
         status_service.is_muted(&status_id).await.ok(),
@@ -1196,7 +1244,7 @@ pub async fn reblog_status(
 
 /// POST /api/v1/statuses/:id/unreblog
 pub async fn unreblog_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -1205,6 +1253,7 @@ pub async fn unreblog_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let action_uri = resolve_action_uri(&id, &params)?;
     let status = if let Some(uri) = action_uri {
@@ -1223,7 +1272,7 @@ pub async fn unreblog_status(
     let status_id = status.id.clone();
 
     if let Some(repost_uri) = repost_uri {
-        let should_federate_unreblog = should_federate_to_followers(&status.visibility);
+        let should_federate_unreblog = should_federate_to_followers(status.visibility);
         if should_federate_unreblog {
             match build_account_service(&state).get_follower_inboxes().await {
                 Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
@@ -1251,10 +1300,11 @@ pub async fn unreblog_status(
     }
 
     // Return status with reblogged=false
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status_id).await.ok(),
         Some(false),
         status_service.is_muted(&status_id).await.ok(),
@@ -1267,7 +1317,7 @@ pub async fn unreblog_status(
 
 /// POST /api/v1/statuses/:id/bookmark
 pub async fn bookmark_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -1276,6 +1326,7 @@ pub async fn bookmark_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get status and add bookmark.
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -1286,10 +1337,11 @@ pub async fn bookmark_status(
     let status_id = status.id.clone();
 
     // Return status with bookmarked=true
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status_id).await.ok(),
         status_service.is_reposted(&status_id).await.ok(),
         status_service.is_muted(&status_id).await.ok(),
@@ -1302,7 +1354,7 @@ pub async fn bookmark_status(
 
 /// POST /api/v1/statuses/:id/unbookmark
 pub async fn unbookmark_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<StatusActionParams>,
@@ -1311,6 +1363,7 @@ pub async fn unbookmark_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get status and remove bookmark.
     let status = if let Some(uri) = resolve_action_uri(&id, &params)? {
@@ -1325,10 +1378,11 @@ pub async fn unbookmark_status(
     let status_id = status.id.clone();
 
     // Return status with bookmarked=false
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status_id).await.ok(),
         status_service.is_reposted(&status_id).await.ok(),
         status_service.is_muted(&status_id).await.ok(),
@@ -1344,7 +1398,8 @@ pub async fn unbookmark_status(
 pub struct UpdateStatusRequest {
     pub status: Option<String>,
     pub spoiler_text: Option<String>,
-    pub sensitive: Option<bool>,
+    #[serde(rename = "sensitive")]
+    pub _sensitive: Option<bool>,
     pub media_ids: Option<Vec<String>>,
 }
 
@@ -1352,7 +1407,7 @@ pub struct UpdateStatusRequest {
 /// Edit an existing status
 ///
 pub async fn update_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateStatusRequest>,
@@ -1370,26 +1425,27 @@ pub async fn update_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Update fields if provided
     let mut changed = false;
     let mut media_ids_to_replace: Option<Vec<String>> = None;
 
-    if let Some(content) = req.status {
-        if !content.is_empty() {
-            let next_content = format!("<p>{}</p>", html_escape::encode_text(&content));
-            if status.content != next_content {
-                status.content = next_content;
-                changed = true;
-            }
+    if let Some(content) = req.status
+        && !content.is_empty()
+    {
+        let next_content = format!("<p>{}</p>", html_escape::encode_text(&content));
+        if status.content != next_content {
+            status.content = next_content;
+            changed = true;
         }
     }
 
-    if let Some(spoiler_text) = req.spoiler_text {
-        if status.content_warning.as_deref() != Some(spoiler_text.as_str()) {
-            status.content_warning = Some(spoiler_text);
-            changed = true;
-        }
+    if let Some(spoiler_text) = req.spoiler_text
+        && status.content_warning.as_deref() != Some(spoiler_text.as_str())
+    {
+        status.content_warning = Some(spoiler_text);
+        changed = true;
     }
 
     if let Some(media_ids) = req.media_ids {
@@ -1431,10 +1487,11 @@ pub async fn update_status(
     }
 
     // Return updated status
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status.id).await.ok(),
         status_service.is_reposted(&status.id).await.ok(),
         status_service.is_muted(&status.id).await.ok(),
@@ -1449,7 +1506,7 @@ pub async fn update_status(
 /// Get edit history for a status
 ///
 pub async fn get_status_history(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let status_service = build_status_service(&state);
@@ -1462,6 +1519,7 @@ pub async fn get_status_history(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let edits = status_service.get_edit_history(&id, 40).await?;
     let current_revision_created_at = edits
@@ -1473,7 +1531,7 @@ pub async fn get_status_history(
         "spoiler_text": status.content_warning.clone().unwrap_or_default(),
         "sensitive": status.content_warning.is_some(),
         "created_at": current_revision_created_at.to_rfc3339(),
-        "account": crate::api::account_to_response(&account, &state.config),
+        "account": crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
     });
 
     let mut history = vec![current_version];
@@ -1483,7 +1541,7 @@ pub async fn get_status_history(
             "spoiler_text": content_warning.clone().unwrap_or_default(),
             "sensitive": content_warning.is_some(),
             "created_at": created_at.to_rfc3339(),
-            "account": crate::api::account_to_response(&account, &state.config),
+            "account": crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
         }));
     }
 
@@ -1494,7 +1552,7 @@ pub async fn get_status_history(
 /// Pin a status to profile
 ///
 pub async fn pin_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1512,11 +1570,13 @@ pub async fn pin_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status.id).await.ok(),
         status_service.is_reposted(&status.id).await.ok(),
         status_service.is_muted(&status.id).await.ok(),
@@ -1531,7 +1591,7 @@ pub async fn pin_status(
 /// Unpin a status from profile
 ///
 pub async fn unpin_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1542,11 +1602,13 @@ pub async fn unpin_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status.id).await.ok(),
         status_service.is_reposted(&status.id).await.ok(),
         status_service.is_muted(&status.id).await.ok(),
@@ -1561,7 +1623,7 @@ pub async fn unpin_status(
 /// Mute notifications from a conversation
 ///
 pub async fn mute_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1572,11 +1634,13 @@ pub async fn mute_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status.id).await.ok(),
         status_service.is_reposted(&status.id).await.ok(),
         Some(true),
@@ -1591,7 +1655,7 @@ pub async fn mute_status(
 /// Unmute notifications from a conversation
 ///
 pub async fn unmute_status(
-    State(state): State<AppState>,
+    State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1602,11 +1666,13 @@ pub async fn unmute_status(
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response(
+    let response = crate::api::status_to_response_with_account_stats(
         &status,
         &account,
         &state.config,
+        account_stats,
         status_service.is_favourited(&status.id).await.ok(),
         status_service.is_reposted(&status.id).await.ok(),
         Some(false),

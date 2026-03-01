@@ -90,6 +90,7 @@ impl Default for DatabaseSyncConfig {
 pub enum DatabaseSyncMode {
     #[default]
     None,
+    /// Requires building with the `turso-sync` Cargo feature.
     Turso,
     D1,
 }

@@ -2,15 +2,157 @@
 
 use crate::api::dto::*;
 use crate::config::AppConfig;
-use crate::data::{Account, MediaAttachment, Status};
+use crate::data::{Account, Database, MediaAttachment, Status};
+use crate::error::AppError;
+use std::collections::HashMap;
+
+/// Local account counters used in API responses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AccountStats {
+    pub followers_count: i32,
+    pub following_count: i32,
+    pub statuses_count: i32,
+}
+
+/// Remote account counters used for status response placeholders.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoteAccountStats {
+    pub followers_count: i32,
+    pub following_count: i32,
+    pub statuses_count: i32,
+}
+
+fn saturating_i32(value: i64) -> i32 {
+    if value > i64::from(i32::MAX) {
+        i32::MAX
+    } else if value < i64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        value as i32
+    }
+}
+
+fn saturating_u64_i32(value: u64) -> i32 {
+    if value > i32::MAX as u64 {
+        i32::MAX
+    } else {
+        value as i32
+    }
+}
+
+fn default_port_for_protocol(protocol: &str) -> Option<u16> {
+    match protocol {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+/// Load local account counters from the database.
+pub async fn load_local_account_stats(db: &Database) -> Result<AccountStats, AppError> {
+    Ok(AccountStats {
+        followers_count: saturating_i32(db.count_follower_addresses().await?),
+        following_count: saturating_i32(db.count_follow_addresses().await?),
+        statuses_count: saturating_i32(db.count_local_statuses().await?),
+    })
+}
+
+/// Load remote account status counters for a status list.
+///
+/// Returns a map keyed by the raw status account address.
+pub async fn load_remote_statuses_count_map(
+    db: &Database,
+    local_protocol: &str,
+    statuses: &[Status],
+) -> Result<HashMap<String, i32>, AppError> {
+    let mut counts = HashMap::new();
+    let default_port = default_port_for_protocol(local_protocol);
+
+    for status in statuses {
+        if status.is_local {
+            continue;
+        }
+        let account_address = status.account_address.trim();
+        if account_address.is_empty() || counts.contains_key(account_address) {
+            continue;
+        }
+
+        let count = db
+            .count_statuses_by_account_address_with_default_port(account_address, default_port)
+            .await?;
+        counts.insert(account_address.to_string(), saturating_i32(count));
+    }
+
+    Ok(counts)
+}
+
+/// Load remote account counters for a status list.
+///
+/// Returns a map keyed by the raw status account address.
+pub async fn load_remote_account_stats_map(
+    db: &Database,
+    profile_cache: &crate::data::ProfileCache,
+    local_protocol: &str,
+    statuses: &[Status],
+) -> Result<HashMap<String, RemoteAccountStats>, AppError> {
+    let mut account_stats_map = HashMap::new();
+    let default_port = default_port_for_protocol(local_protocol);
+
+    for status in statuses {
+        if status.is_local {
+            continue;
+        }
+        let account_address = status.account_address.trim();
+        if account_address.is_empty() || account_stats_map.contains_key(account_address) {
+            continue;
+        }
+
+        let statuses_count = db
+            .count_statuses_by_account_address_with_default_port(account_address, default_port)
+            .await?;
+        let mut remote_stats = RemoteAccountStats {
+            statuses_count: saturating_i32(statuses_count),
+            ..RemoteAccountStats::default()
+        };
+
+        let mut profile = profile_cache.get(account_address).await;
+        if profile.is_none() {
+            let normalized_address = account_address.to_ascii_lowercase();
+            if normalized_address != account_address {
+                profile = profile_cache.get(&normalized_address).await;
+            }
+        }
+
+        if let Some(profile) = profile {
+            remote_stats.followers_count =
+                profile.followers_count.map(saturating_u64_i32).unwrap_or(0);
+            remote_stats.following_count =
+                profile.following_count.map(saturating_u64_i32).unwrap_or(0);
+        }
+
+        account_stats_map.insert(account_address.to_string(), remote_stats);
+    }
+
+    Ok(account_stats_map)
+}
 
 /// Convert Account to AccountResponse
+#[cfg(test)]
 pub fn account_to_response(account: &Account, config: &AppConfig) -> AccountResponse {
+    account_to_response_with_stats(account, config, AccountStats::default())
+}
+
+/// Convert Account to AccountResponse with explicit counters.
+pub fn account_to_response_with_stats(
+    account: &Account,
+    config: &AppConfig,
+    stats: AccountStats,
+) -> AccountResponse {
     let base_url = config.server.base_url();
     let media_url = &config.storage.media.public_url;
 
     AccountResponse {
-        id: account.id.clone(),
+        id: account.id.to_string(),
         username: account.username.clone(),
         acct: account.username.clone(), // Local account, no @domain
         display_name: account
@@ -44,16 +186,20 @@ pub fn account_to_response(account: &Account, config: &AppConfig) -> AccountResp
             .as_ref()
             .map(|key| format!("{}/{}", media_url, key))
             .unwrap_or_else(|| format!("{}/default-header.png", media_url)),
-        followers_count: 0, // Will be populated from database
-        following_count: 0, // Will be populated from database
-        statuses_count: 0,  // Will be populated from database
+        followers_count: stats.followers_count,
+        following_count: stats.following_count,
+        statuses_count: stats.statuses_count,
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
     }
 }
 
-fn remote_account_to_response(status: &Status, config: &AppConfig) -> AccountResponse {
+fn remote_account_to_response(
+    status: &Status,
+    config: &AppConfig,
+    remote_stats: Option<RemoteAccountStats>,
+) -> AccountResponse {
     let placeholder_created_at = chrono::DateTime::from_timestamp(0, 0)
         .expect("unix epoch timestamp should always be valid");
     let media_url = &config.storage.media.public_url;
@@ -82,9 +228,9 @@ fn remote_account_to_response(status: &Status, config: &AppConfig) -> AccountRes
         avatar_static: format!("{}/default-avatar.png", media_url),
         header: format!("{}/default-header.png", media_url),
         header_static: format!("{}/default-header.png", media_url),
-        followers_count: 0,
-        following_count: 0,
-        statuses_count: 0,
+        followers_count: remote_stats.map(|stats| stats.followers_count).unwrap_or(0),
+        following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
+        statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
@@ -188,12 +334,14 @@ fn boost_stub_status(
     status: &Status,
     account: &Account,
     config: &AppConfig,
+    account_stats: AccountStats,
+    remote_account_stats: Option<RemoteAccountStats>,
 ) -> StatusResponse {
     let placeholder_created_at = chrono::DateTime::from_timestamp(0, 0)
         .expect("unix epoch timestamp should always be valid");
     let media_url = &config.storage.media.public_url;
     let boost_account = if local_status_id_from_uri(boost_of_uri, config).is_some() {
-        account_to_response(account, config)
+        account_to_response_with_stats(account, config, account_stats)
     } else if let Ok(parsed) = url::Url::parse(boost_of_uri) {
         let normalized_host = parsed
             .host_str()
@@ -249,9 +397,15 @@ fn boost_stub_status(
             avatar_static: format!("{}/default-avatar.png", media_url),
             header: format!("{}/default-header.png", media_url),
             header_static: format!("{}/default-header.png", media_url),
-            followers_count: 0,
-            following_count: 0,
-            statuses_count: 0,
+            followers_count: remote_account_stats
+                .map(|stats| stats.followers_count)
+                .unwrap_or(0),
+            following_count: remote_account_stats
+                .map(|stats| stats.following_count)
+                .unwrap_or(0),
+            statuses_count: remote_account_stats
+                .map(|stats| stats.statuses_count)
+                .unwrap_or(0),
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
@@ -273,9 +427,15 @@ fn boost_stub_status(
             avatar_static: format!("{}/default-avatar.png", media_url),
             header: format!("{}/default-header.png", media_url),
             header_static: format!("{}/default-header.png", media_url),
-            followers_count: 0,
-            following_count: 0,
-            statuses_count: 0,
+            followers_count: remote_account_stats
+                .map(|stats| stats.followers_count)
+                .unwrap_or(0),
+            following_count: remote_account_stats
+                .map(|stats| stats.following_count)
+                .unwrap_or(0),
+            statuses_count: remote_account_stats
+                .map(|stats| stats.statuses_count)
+                .unwrap_or(0),
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
@@ -290,7 +450,7 @@ fn boost_stub_status(
         in_reply_to_account_id: None,
         sensitive: false,
         spoiler_text: String::new(),
-        visibility: status.visibility.clone(),
+        visibility: status.visibility.to_string(),
         language: status.language.clone(),
         uri: boost_of_uri.to_string(),
         url: boost_of_uri.to_string(),
@@ -316,6 +476,7 @@ fn boost_stub_status(
 }
 
 /// Convert Status to StatusResponse
+#[cfg(test)]
 pub fn status_to_response(
     status: &Status,
     account: &Account,
@@ -326,10 +487,95 @@ pub fn status_to_response(
     bookmarked: Option<bool>,
     pinned: Option<bool>,
 ) -> StatusResponse {
+    status_to_response_with_account_stats(
+        status,
+        account,
+        config,
+        AccountStats::default(),
+        favourited,
+        reblogged,
+        muted,
+        bookmarked,
+        pinned,
+    )
+}
+
+/// Convert Status to StatusResponse with explicit local account stats.
+pub fn status_to_response_with_account_stats(
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    favourited: Option<bool>,
+    reblogged: Option<bool>,
+    muted: Option<bool>,
+    bookmarked: Option<bool>,
+    pinned: Option<bool>,
+) -> StatusResponse {
+    status_to_response_with_account_stats_and_remote_count(
+        status,
+        account,
+        config,
+        account_stats,
+        None,
+        favourited,
+        reblogged,
+        muted,
+        bookmarked,
+        pinned,
+    )
+}
+
+/// Convert Status to StatusResponse with explicit local account stats and optional remote count.
+pub fn status_to_response_with_account_stats_and_remote_count(
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    remote_statuses_count: Option<i32>,
+    favourited: Option<bool>,
+    reblogged: Option<bool>,
+    muted: Option<bool>,
+    bookmarked: Option<bool>,
+    pinned: Option<bool>,
+) -> StatusResponse {
+    let remote_account_stats = remote_statuses_count.map(|statuses_count| RemoteAccountStats {
+        statuses_count,
+        ..RemoteAccountStats::default()
+    });
+    status_to_response_with_account_stats_and_remote_stats(
+        status,
+        account,
+        config,
+        account_stats,
+        remote_account_stats,
+        favourited,
+        reblogged,
+        muted,
+        bookmarked,
+        pinned,
+    )
+}
+
+/// Convert Status to StatusResponse with explicit local account stats and optional remote account stats.
+pub fn status_to_response_with_account_stats_and_remote_stats(
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    remote_account_stats: Option<RemoteAccountStats>,
+    favourited: Option<bool>,
+    reblogged: Option<bool>,
+    muted: Option<bool>,
+    bookmarked: Option<bool>,
+    pinned: Option<bool>,
+) -> StatusResponse {
     status_to_response_with_media(
         status,
         account,
         config,
+        account_stats,
+        remote_account_stats,
         favourited,
         reblogged,
         muted,
@@ -344,6 +590,8 @@ pub fn status_to_response_with_media(
     status: &Status,
     account: &Account,
     config: &AppConfig,
+    account_stats: AccountStats,
+    remote_account_stats: Option<RemoteAccountStats>,
     favourited: Option<bool>,
     reblogged: Option<bool>,
     muted: Option<bool>,
@@ -353,9 +601,9 @@ pub fn status_to_response_with_media(
 ) -> StatusResponse {
     let base_url = config.server.base_url();
     let account_response = if status.is_local || status.account_address.trim().is_empty() {
-        account_to_response(account, config)
+        account_to_response_with_stats(account, config, account_stats)
     } else {
-        remote_account_to_response(status, config)
+        remote_account_to_response(status, config, remote_account_stats)
     };
 
     StatusResponse {
@@ -368,7 +616,7 @@ pub fn status_to_response_with_media(
         in_reply_to_account_id: None,
         sensitive: status.content_warning.is_some(),
         spoiler_text: status.content_warning.clone().unwrap_or_default(),
-        visibility: status.visibility.clone(),
+        visibility: status.visibility.to_string(),
         language: status.language.clone(),
         uri: status.uri.clone(),
         url: if status.is_local {
@@ -384,10 +632,16 @@ pub fn status_to_response_with_media(
         favourites_count: 0,
         edited_at: None,
         content: status.content.clone(),
-        reblog: status
-            .boost_of_uri
-            .as_deref()
-            .map(|uri| Box::new(boost_stub_status(uri, status, account, config))),
+        reblog: status.boost_of_uri.as_deref().map(|uri| {
+            Box::new(boost_stub_status(
+                uri,
+                status,
+                account,
+                config,
+                account_stats,
+                remote_account_stats,
+            ))
+        }),
         account: account_response,
         media_attachments: media_attachments
             .iter()
@@ -410,7 +664,7 @@ pub fn status_to_response_with_media(
 mod tests {
     use super::*;
     use crate::config::*;
-    use crate::data::{Account, Status};
+    use crate::data::{Account, PersistedReason, Status};
     use chrono::Utc;
 
     fn create_test_config() -> AppConfig {
@@ -479,7 +733,7 @@ mod tests {
     fn test_account_to_response() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: Some("Test bio".to_string()),
@@ -509,7 +763,7 @@ mod tests {
     fn test_status_to_response() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
@@ -526,13 +780,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Hello, world!</p>".to_string(),
             content_warning: Some("CW".to_string()),
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -566,7 +820,7 @@ mod tests {
     fn test_status_to_response_remote_account_uses_stable_placeholder_created_at() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
@@ -583,13 +837,13 @@ mod tests {
             uri: "https://remote.example/@alice/123".to_string(),
             content: "<p>Remote</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "alice@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "favourited".to_string(),
+            persisted_reason: PersistedReason::Favourited,
             created_at: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -614,7 +868,7 @@ mod tests {
     fn test_status_to_response_preserves_in_reply_to_uri_as_id() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -630,13 +884,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Reply</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: None,
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: Some("https://remote.example/users/alice/statuses/123".to_string()),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -653,7 +907,7 @@ mod tests {
     fn test_status_to_response_uses_local_parent_row_id_for_in_reply_to_id() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -669,7 +923,7 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Reply</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: None,
             account_address: String::new(),
             is_local: true,
@@ -677,7 +931,7 @@ mod tests {
                 "https://test.example.com/users/testuser/statuses/local-123".to_string(),
             ),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -690,7 +944,7 @@ mod tests {
     fn test_status_to_response_keeps_local_activity_uri_when_not_canonical_status_path() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
@@ -708,13 +962,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Reply</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: Some(parent_uri.to_string()),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -727,7 +981,7 @@ mod tests {
     fn test_status_to_response_does_not_map_mismatched_scheme_local_uri_to_row_id() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
@@ -745,13 +999,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Reply</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: Some(parent_uri.to_string()),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -764,7 +1018,7 @@ mod tests {
     fn test_status_to_response_populates_reblog_from_boost_uri() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -780,13 +1034,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Boost</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
-            persisted_reason: "reposted".to_string(),
+            persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -810,7 +1064,7 @@ mod tests {
     fn test_status_to_response_uses_local_boost_row_id_for_reblog_id() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -826,7 +1080,7 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Boost</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
@@ -834,7 +1088,7 @@ mod tests {
             boost_of_uri: Some(
                 "https://test.example.com/users/testuser/statuses/local-123".to_string(),
             ),
-            persisted_reason: "reposted".to_string(),
+            persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -849,7 +1103,7 @@ mod tests {
             reblog.uri,
             "https://test.example.com/users/testuser/statuses/local-123"
         );
-        assert_eq!(reblog.account.id, account.id);
+        assert_eq!(reblog.account.id, account.id.to_string());
         assert_eq!(reblog.account.acct, account.username);
     }
 
@@ -857,7 +1111,7 @@ mod tests {
     fn test_status_to_response_reblog_uses_neutral_placeholder_created_at() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -874,13 +1128,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Boost</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
-            persisted_reason: "reposted".to_string(),
+            persisted_reason: PersistedReason::Reposted,
             created_at: wrapper_created_at,
             fetched_at: None,
         };
@@ -900,7 +1154,7 @@ mod tests {
     fn test_status_to_response_reblog_preserves_boost_authority_and_scheme() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -916,13 +1170,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Boost</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("http://remote.example:8080/users/alice/statuses/999".to_string()),
-            persisted_reason: "reposted".to_string(),
+            persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -940,7 +1194,7 @@ mod tests {
     fn test_status_to_response_with_media_populates_media_attachments() {
         let config = create_test_config();
         let account = Account {
-            id: "123".to_string(),
+            id: "123".into(),
             username: "testuser".to_string(),
             display_name: None,
             note: None,
@@ -956,13 +1210,13 @@ mod tests {
             uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
             content: "<p>Media</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -986,6 +1240,8 @@ mod tests {
             &status,
             &account,
             &config,
+            AccountStats::default(),
+            None,
             None,
             None,
             None,

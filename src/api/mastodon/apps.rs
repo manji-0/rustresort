@@ -20,7 +20,7 @@ use sha2::Digest;
 use std::collections::HashSet;
 use url::Url;
 
-use crate::AppState;
+use crate::AppsApiState;
 use crate::auth::{CurrentUser, verify_session_token};
 use crate::error::AppError;
 
@@ -165,26 +165,19 @@ fn generate_authorize_confirm_token() -> String {
 }
 
 fn generate_vapid_key() -> Result<String, AppError> {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).map_err(|error| {
-        AppError::Internal(anyhow::anyhow!("failed to load P-256 group: {error}"))
-    })?;
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
+        .map_err(|error| AppError::internal(format!("failed to load P-256 group: {error}")))?;
     let key = EcKey::generate(&group).map_err(|error| {
-        AppError::Internal(anyhow::anyhow!(
-            "failed to generate VAPID P-256 keypair: {error}"
-        ))
+        AppError::internal(format!("failed to generate VAPID P-256 keypair: {error}"))
     })?;
     let mut context = BigNumContext::new().map_err(|error| {
-        AppError::Internal(anyhow::anyhow!(
-            "failed to allocate VAPID BN context: {error}"
-        ))
+        AppError::internal(format!("failed to allocate VAPID BN context: {error}"))
     })?;
     let public_bytes = key
         .public_key()
         .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut context)
         .map_err(|error| {
-            AppError::Internal(anyhow::anyhow!(
-                "failed to serialize VAPID public key: {error}"
-            ))
+            AppError::internal(format!("failed to serialize VAPID public key: {error}"))
         })?;
 
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_bytes))
@@ -325,7 +318,7 @@ struct AuthorizeContext {
 }
 
 async fn validate_authorize_request(
-    state: &AppState,
+    state: &AppsApiState,
     req: &AuthorizeRequest,
 ) -> Result<AuthorizeContext, AppError> {
     let response_type = req
@@ -383,7 +376,7 @@ async fn validate_authorize_request(
 }
 
 async fn issue_authorization_code(
-    state: &AppState,
+    state: &AppsApiState,
     app_id: &str,
     redirect_uri: &str,
     requested_scopes: &str,
@@ -391,9 +384,9 @@ async fn issue_authorization_code(
 ) -> Result<Redirect, AppError> {
     use crate::data::{EntityId, OAuthAuthorizationCode};
 
-    let code_value = EntityId::new().0;
+    let code_value = EntityId::new_string();
     let authorization_code = OAuthAuthorizationCode {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         app_id: app_id.to_string(),
         code: code_value.clone(),
         redirect_uri: redirect_uri.to_string(),
@@ -422,7 +415,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 /// POST /api/v1/apps
 pub async fn create_app(
-    State(state): State<AppState>,
+    State(state): State<AppsApiState>,
     Json(req): Json<CreateAppRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, OAuthApp};
@@ -439,9 +432,9 @@ pub async fn create_app(
     }
 
     // Generate app credentials
-    let app_id = EntityId::new().0;
-    let client_id = EntityId::new().0;
-    let client_secret = EntityId::new().0;
+    let app_id = EntityId::new_string();
+    let client_id = EntityId::new_string();
+    let client_secret = EntityId::new_string();
     let vapid_key = generate_vapid_key()?;
     let hashed_client_secret = hash_client_secret(&client_secret);
 
@@ -480,7 +473,7 @@ pub async fn create_app(
 
 /// GET /oauth/authorize
 pub async fn authorize(
-    State(state): State<AppState>,
+    State(state): State<AppsApiState>,
     jar: CookieJar,
     Query(req): Query<AuthorizeRequest>,
 ) -> Result<Response, AppError> {
@@ -535,7 +528,7 @@ pub async fn authorize(
 
 /// GET /api/v1/apps/verify_credentials
 pub async fn verify_app_credentials(
-    State(state): State<AppState>,
+    State(state): State<AppsApiState>,
     headers: HeaderMap,
     CurrentUser(session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -587,7 +580,7 @@ pub async fn verify_app_credentials(
 
 /// POST /oauth/token
 pub async fn create_token(
-    State(state): State<AppState>,
+    State(state): State<AppsApiState>,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, OAuthToken};
@@ -672,8 +665,8 @@ pub async fn create_token(
     };
 
     // Generate access token
-    let token_id = EntityId::new().0;
-    let access_token = EntityId::new().0;
+    let token_id = EntityId::new_string();
+    let access_token = EntityId::new_string();
 
     // Create token
     let issued_at = Utc::now();
@@ -705,7 +698,7 @@ pub async fn create_token(
 
 /// POST /oauth/revoke
 pub async fn revoke_token(
-    State(state): State<AppState>,
+    State(state): State<AppsApiState>,
     Json(req): Json<RevokeTokenRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify client credentials

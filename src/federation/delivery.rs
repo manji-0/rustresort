@@ -2,8 +2,6 @@
 //!
 //! Handles delivering activities to remote servers.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -267,7 +265,7 @@ impl ActivityDelivery {
         let follow_id = format!(
             "{}/follow/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
 
         self.send_follow_with_id(&follow_id, target_actor_uri, target_inbox_uri)
@@ -350,7 +348,7 @@ impl ActivityDelivery {
         let accept_id = format!(
             "{}/accept/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
 
         let activity = builder::accept(
@@ -382,7 +380,7 @@ impl ActivityDelivery {
         let reject_id = format!(
             "{}/reject/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
 
         let activity = builder::reject(
@@ -446,7 +444,7 @@ impl ActivityDelivery {
         let create_id = format!(
             "{}/create/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
         let activity = builder::create(&create_id, &self.actor_uri, note, note_to, note_cc);
 
@@ -465,7 +463,7 @@ impl ActivityDelivery {
         let delete_id = format!(
             "{}/delete/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
         let (to_audience, cc_audience) =
             audience_for_visibility(&self.actor_uri, object_visibility);
@@ -487,7 +485,11 @@ impl ActivityDelivery {
         target_inbox_uri: &str,
     ) -> Result<String, AppError> {
         // Build and deliver Like activity
-        let like_id = format!("{}/like/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let like_id = format!(
+            "{}/like/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
         self.send_like_with_id(&like_id, status_uri, target_inbox_uri)
             .await?;
         Ok(like_id)
@@ -532,7 +534,11 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         // Build and deliver Undo activity
-        let undo_id = format!("{}/undo/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let undo_id = format!(
+            "{}/undo/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
         let object = build_undo_object(activity_uri, activity_type, None);
         let activity = builder::undo(&undo_id, &self.actor_uri, object);
 
@@ -568,7 +574,11 @@ impl ActivityDelivery {
         activity_object: Option<&str>,
         inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let undo_id = format!("{}/undo/{}", self.actor_uri, crate::data::EntityId::new().0);
+        let undo_id = format!(
+            "{}/undo/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
         let object = build_undo_object(activity_uri, activity_type, activity_object);
         let activity = builder::undo(&undo_id, &self.actor_uri, object);
 
@@ -589,7 +599,7 @@ impl ActivityDelivery {
         let announce_id = format!(
             "{}/announce/{}",
             self.actor_uri,
-            crate::data::EntityId::new().0
+            crate::data::EntityId::new_string()
         );
         let results = self
             .send_announce_with_id(&announce_id, status_uri, status_visibility, inbox_uris)

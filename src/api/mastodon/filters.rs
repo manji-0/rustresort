@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::FiltersApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -44,7 +44,7 @@ pub struct UpdateFilterRequest {
 /// GET /api/v1/filters
 /// Get all filters
 pub async fn get_filters(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<FilterResponse>>, AppError> {
     let filters = state.db.get_all_filters().await?;
@@ -78,7 +78,7 @@ pub async fn get_filters(
 /// GET /api/v1/filters/:id
 /// Get a specific filter
 pub async fn get_filter(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<FilterResponse>, AppError> {
@@ -105,7 +105,7 @@ pub async fn get_filter(
 /// POST /api/v1/filters
 /// Create a new filter
 pub async fn create_filter(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(_session): CurrentUser,
     Json(req): Json<CreateFilterRequest>,
 ) -> Result<Json<FilterResponse>, AppError> {
@@ -167,7 +167,7 @@ pub async fn create_filter(
 /// PUT /api/v1/filters/:id
 /// Update a filter
 pub async fn update_filter(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateFilterRequest>,
@@ -241,7 +241,7 @@ pub async fn update_filter(
 /// DELETE /api/v1/filters/:id
 /// Delete a filter
 pub async fn delete_filter(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -260,7 +260,7 @@ pub async fn delete_filter(
 /// For now, this returns the same as v1 API
 /// In the future, this should return filters with keywords
 pub async fn get_filters_v2(
-    State(state): State<AppState>,
+    State(state): State<FiltersApiState>,
     CurrentUser(session): CurrentUser,
 ) -> Result<Json<Vec<FilterResponse>>, AppError> {
     // For now, just return v1 filters

@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 use std::collections::HashSet;
 
-use crate::{AppState, auth::CurrentUser, error::AppError};
+use crate::{PollsApiState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
 pub struct VoteParams {
@@ -19,7 +19,7 @@ pub struct VoteParams {
 ///
 /// View a poll attached to a status.
 pub async fn get_poll(
-    State(state): State<AppState>,
+    State(state): State<PollsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -72,7 +72,7 @@ pub async fn get_poll(
 ///
 /// Vote on a poll attached to a status.
 pub async fn vote_in_poll(
-    State(state): State<AppState>,
+    State(state): State<PollsApiState>,
     CurrentUser(session): CurrentUser,
     Path(id): Path<String>,
     Json(params): Json<VoteParams>,
@@ -127,44 +127,4 @@ pub async fn vote_in_poll(
 
     // Return updated poll
     get_poll(State(state), CurrentUser(session), Path(id)).await
-}
-
-// Helper function to create poll response (for future use)
-#[allow(dead_code)]
-fn poll_to_response(
-    poll_id: &str,
-    options: Vec<String>,
-    votes_count: Vec<i64>,
-    voters_count: i64,
-    expires_at: Option<String>,
-    expired: bool,
-    multiple: bool,
-    voted: bool,
-    own_votes: Vec<usize>,
-) -> serde_json::Value {
-    let total_votes: i64 = votes_count.iter().sum();
-
-    let options_response: Vec<serde_json::Value> = options
-        .iter()
-        .zip(votes_count.iter())
-        .map(|(title, votes)| {
-            serde_json::json!({
-                "title": title,
-                "votes_count": votes
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "id": poll_id,
-        "expires_at": expires_at,
-        "expired": expired,
-        "multiple": multiple,
-        "votes_count": total_votes,
-        "voters_count": voters_count,
-        "voted": voted,
-        "own_votes": own_votes,
-        "options": options_response,
-        "emojis": []
-    })
 }

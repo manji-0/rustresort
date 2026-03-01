@@ -5,204 +5,32 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, State},
-    http::{Method, Request, request::Parts},
+    http::{Request, request::Parts},
     middleware::Next,
     response::Response,
 };
 use axum_extra::extract::CookieJar;
 use chrono::{Duration, Utc};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::session::{Session, verify_session_token};
-use crate::AppState;
+use crate::AuthState;
 use crate::error::AppError;
+
+/// OAuth scope requirement attached to a route definition.
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthScopeRequirement(pub &'static [&'static str]);
 
 fn normalize_mastodon_path(path: &str) -> &str {
     path.strip_prefix("/api").unwrap_or(path)
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
-    let pattern_segments: Vec<&str> = pattern.trim_start_matches('/').split('/').collect();
-    let path_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if pattern_segments.len() != path_segments.len() {
-        return false;
-    }
-
-    pattern_segments
-        .iter()
-        .zip(path_segments.iter())
-        .all(|(pattern_segment, path_segment)| {
-            pattern_segment.starts_with(':') || pattern_segment == path_segment
-        })
-}
-
-fn required_oauth_scopes(method: &Method, path: &str) -> Option<&'static [&'static str]> {
-    const READ_ACCOUNTS: &[&str] = &["read:accounts"];
-    const WRITE_ACCOUNTS: &[&str] = &["write:accounts"];
-    const FOLLOW: &[&str] = &["follow"];
-    const READ_STATUSES: &[&str] = &["read:statuses"];
-    const WRITE_STATUSES: &[&str] = &["write:statuses"];
-    const WRITE_FAVOURITES: &[&str] = &["write:favourites"];
-    const READ_NOTIFICATIONS: &[&str] = &["read:notifications"];
-    const WRITE_NOTIFICATIONS: &[&str] = &["write:notifications"];
-    const WRITE_MEDIA: &[&str] = &["write:media"];
-    const READ_LISTS: &[&str] = &["read:lists"];
-    const WRITE_LISTS: &[&str] = &["write:lists"];
-    const READ_FILTERS: &[&str] = &["read:filters"];
-    const WRITE_FILTERS: &[&str] = &["write:filters"];
-    const READ_SEARCH: &[&str] = &["read:search"];
-
-    let path = normalize_mastodon_path(path);
-    if path.starts_with("/v1/admin/") {
-        // Mastodon admin endpoints are reserved for session-authenticated admin access.
-        return Some(&[]);
-    }
-
-    match *method {
-        Method::GET => {
-            if path_matches("/v1/apps/verify_credentials", path)
-                || path_matches("/v1/accounts/verify_credentials", path)
-                || path_matches("/v1/accounts/:id/followers", path)
-                || path_matches("/v1/accounts/:id/following", path)
-                || path_matches("/v1/accounts/relationships", path)
-                || path_matches("/v1/accounts/search", path)
-                || path_matches("/v1/accounts/:id/lists", path)
-                || path_matches("/v1/accounts/:id/identity_proofs", path)
-                || path_matches("/v1/blocks", path)
-                || path_matches("/v1/mutes", path)
-                || path_matches("/v1/follow_requests", path)
-                || path_matches("/v1/follow_requests/:id", path)
-            {
-                Some(READ_ACCOUNTS)
-            } else if path_matches("/v1/accounts/:id/statuses", path)
-                || path_matches("/v1/statuses/:id/source", path)
-                || path_matches("/v1/statuses/:id/history", path)
-                || path_matches("/v1/timelines/home", path)
-                || path_matches("/v1/timelines/tag/:hashtag", path)
-                || path_matches("/v1/timelines/list/:list_id", path)
-                || path_matches("/v1/media/:id", path)
-                || path_matches("/v1/bookmarks", path)
-                || path_matches("/v1/favourites", path)
-                || path_matches("/v1/polls/:id", path)
-                || path_matches("/v1/scheduled_statuses", path)
-                || path_matches("/v1/scheduled_statuses/:id", path)
-                || path_matches("/v1/conversations", path)
-                || path_matches("/v1/streaming/health", path)
-                || path_matches("/v1/streaming/user", path)
-                || path_matches("/v1/streaming/public", path)
-                || path_matches("/v1/streaming/public/local", path)
-                || path_matches("/v1/streaming/hashtag", path)
-                || path_matches("/v1/streaming/list", path)
-            {
-                Some(READ_STATUSES)
-            } else if path_matches("/v1/notifications", path)
-                || path_matches("/v1/notifications/:id", path)
-                || path_matches("/v1/notifications/unread_count", path)
-                || path_matches("/v1/streaming/direct", path)
-            {
-                Some(READ_NOTIFICATIONS)
-            } else if path_matches("/v1/lists", path)
-                || path_matches("/v1/lists/:id", path)
-                || path_matches("/v1/lists/:id/accounts", path)
-            {
-                Some(READ_LISTS)
-            } else if path_matches("/v1/filters", path)
-                || path_matches("/v1/filters/:id", path)
-                || path_matches("/v2/filters", path)
-            {
-                Some(READ_FILTERS)
-            } else if path_matches("/v1/search", path) || path_matches("/v2/search", path) {
-                Some(READ_SEARCH)
-            } else {
-                None
-            }
-        }
-        Method::PATCH => {
-            if path_matches("/v1/accounts/update_credentials", path) {
-                Some(WRITE_ACCOUNTS)
-            } else {
-                None
-            }
-        }
-        Method::POST => {
-            if path_matches("/v1/accounts/:id/follow", path)
-                || path_matches("/v1/accounts/:id/unfollow", path)
-                || path_matches("/v1/follow_requests/:id/authorize", path)
-                || path_matches("/v1/follow_requests/:id/reject", path)
-            {
-                Some(FOLLOW)
-            } else if path_matches("/v1/accounts/:id/block", path)
-                || path_matches("/v1/accounts/:id/unblock", path)
-                || path_matches("/v1/accounts/:id/mute", path)
-                || path_matches("/v1/accounts/:id/unmute", path)
-            {
-                Some(WRITE_ACCOUNTS)
-            } else if path_matches("/v1/statuses", path)
-                || path_matches("/v1/statuses/:id/reblog", path)
-                || path_matches("/v1/statuses/:id/unreblog", path)
-                || path_matches("/v1/statuses/:id/bookmark", path)
-                || path_matches("/v1/statuses/:id/unbookmark", path)
-                || path_matches("/v1/statuses/:id/pin", path)
-                || path_matches("/v1/statuses/:id/unpin", path)
-                || path_matches("/v1/statuses/:id/mute", path)
-                || path_matches("/v1/statuses/:id/unmute", path)
-                || path_matches("/v1/polls/:id/votes", path)
-                || path_matches("/v1/conversations/:id/read", path)
-            {
-                Some(WRITE_STATUSES)
-            } else if path_matches("/v1/statuses/:id/favourite", path)
-                || path_matches("/v1/statuses/:id/unfavourite", path)
-            {
-                Some(WRITE_FAVOURITES)
-            } else if path_matches("/v1/notifications/:id/dismiss", path)
-                || path_matches("/v1/notifications/clear", path)
-            {
-                Some(WRITE_NOTIFICATIONS)
-            } else if path_matches("/v1/media", path) || path_matches("/v2/media", path) {
-                Some(WRITE_MEDIA)
-            } else if path_matches("/v1/lists", path)
-                || path_matches("/v1/lists/:id/accounts", path)
-            {
-                Some(WRITE_LISTS)
-            } else if path_matches("/v1/filters", path) {
-                Some(WRITE_FILTERS)
-            } else {
-                None
-            }
-        }
-        Method::PUT => {
-            if path_matches("/v1/statuses/:id", path)
-                || path_matches("/v1/scheduled_statuses/:id", path)
-            {
-                Some(WRITE_STATUSES)
-            } else if path_matches("/v1/media/:id", path) {
-                Some(WRITE_MEDIA)
-            } else if path_matches("/v1/lists/:id", path) {
-                Some(WRITE_LISTS)
-            } else if path_matches("/v1/filters/:id", path) {
-                Some(WRITE_FILTERS)
-            } else {
-                None
-            }
-        }
-        Method::DELETE => {
-            if path_matches("/v1/statuses/:id", path)
-                || path_matches("/v1/scheduled_statuses/:id", path)
-                || path_matches("/v1/conversations/:id", path)
-            {
-                Some(WRITE_STATUSES)
-            } else if path_matches("/v1/lists/:id", path)
-                || path_matches("/v1/lists/:id/accounts", path)
-            {
-                Some(WRITE_LISTS)
-            } else if path_matches("/v1/filters/:id", path) {
-                Some(WRITE_FILTERS)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+fn required_oauth_scopes(request: &Request<axum::body::Body>) -> Option<&'static [&'static str]> {
+    request
+        .extensions()
+        .get::<OAuthScopeRequirement>()
+        .map(|requirement| requirement.0)
 }
 
 fn scope_grants(scope_set: &HashSet<String>, required: &str) -> bool {
@@ -234,7 +62,7 @@ fn parse_scope_set(scopes: &str) -> HashSet<String> {
         .collect()
 }
 
-fn build_oauth_session(state: &AppState) -> Session {
+fn build_oauth_session(state: &AuthState) -> Session {
     let now = Utc::now();
     Session {
         github_username: state.config.auth.github_username.clone(),
@@ -251,7 +79,7 @@ fn build_oauth_session(state: &AppState) -> Session {
 /// Accepts signed session tokens from Authorization bearer or session cookie.
 /// OAuth bearer tokens are rejected by this middleware.
 pub async fn require_session_auth(
-    State(state): State<AppState>,
+    State(config): State<Arc<crate::config::AppConfig>>,
     jar: CookieJar,
     mut request: Request<axum::body::Body>,
     next: Next,
@@ -263,10 +91,10 @@ pub async fn require_session_auth(
         .and_then(|h| h.strip_prefix("Bearer "));
 
     if let Some(token) = bearer_token {
-        let session = verify_session_token(token, &state.config.auth.session_secret)?;
+        let session = verify_session_token(token, &config.auth.session_secret)?;
         request.extensions_mut().insert(session);
     } else if let Some(cookie_token) = jar.get("session").map(|cookie| cookie.value()) {
-        let session = verify_session_token(cookie_token, &state.config.auth.session_secret)?;
+        let session = verify_session_token(cookie_token, &config.auth.session_secret)?;
         request.extensions_mut().insert(session);
     } else {
         return Err(AppError::Unauthorized);
@@ -279,12 +107,11 @@ pub async fn require_session_auth(
 ///
 /// If `metrics.auth_token` is unset, access remains anonymous for backward compatibility.
 pub async fn require_metrics_auth(
-    State(state): State<AppState>,
+    State(config): State<Arc<crate::config::AppConfig>>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let Some(expected_token) = state
-        .config
+    let Some(expected_token) = config
         .metrics
         .auth_token
         .as_deref()
@@ -318,7 +145,7 @@ pub async fn require_metrics_auth(
 ///     .layer(middleware::from_fn_with_state(state, require_auth));
 /// ```
 pub async fn require_auth(
-    State(state): State<AppState>,
+    State(state): State<AuthState>,
     jar: CookieJar,
     mut request: Request<axum::body::Body>,
     next: Next,
@@ -339,9 +166,7 @@ pub async fn require_auth(
             }
 
             let scope_set = parse_scope_set(&oauth_token.scopes);
-            if let Some(required_scopes) =
-                required_oauth_scopes(request.method(), request.uri().path())
-            {
+            if let Some(required_scopes) = required_oauth_scopes(&request) {
                 // Empty required scope list means session-only endpoint.
                 if required_scopes.is_empty() {
                     return Err(AppError::Forbidden);
@@ -350,7 +175,8 @@ pub async fn require_auth(
                     return Err(AppError::Forbidden);
                 }
             } else {
-                // Fail closed for unmapped OAuth-protected Mastodon API endpoints.
+                // Fail closed for OAuth-protected Mastodon API endpoints that
+                // forgot to declare route-level scope metadata.
                 let normalized_path = normalize_mastodon_path(request.uri().path());
                 if normalized_path.starts_with("/v1/") || normalized_path.starts_with("/v2/") {
                     return Err(AppError::Forbidden);
@@ -405,25 +231,5 @@ where
             .cloned()
             .map(CurrentUser)
             .ok_or(AppError::Unauthorized)
-    }
-}
-
-/// Optional current user extractor
-///
-/// Returns None if not authenticated, instead of error.
-#[derive(Debug, Clone)]
-pub struct MaybeUser(pub Option<Session>);
-
-#[async_trait]
-impl<S> FromRequestParts<S> for MaybeUser
-where
-    S: Send + Sync,
-{
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Get Session from extensions, return None if missing
-        let session = parts.extensions.get::<Session>().cloned();
-        Ok(MaybeUser(session))
     }
 }

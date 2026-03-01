@@ -4,14 +4,14 @@
 
 use std::{collections::HashSet, future::Future, sync::Arc};
 
-use crate::data::{Database, ProfileCache, Status, TimelineCache};
+use crate::data::{ProfileCache, Status, TimelineCache, TimelineRepository};
 use crate::error::AppError;
 
 /// Timeline service
 pub struct TimelineService {
-    db: Arc<Database>,
-    timeline_cache: Arc<TimelineCache>,
-    profile_cache: Arc<ProfileCache>,
+    db: Arc<dyn TimelineRepository>,
+    _timeline_cache: Arc<TimelineCache>,
+    _profile_cache: Arc<ProfileCache>,
 }
 
 const TIMELINE_MUTE_OVERFETCH_MULTIPLIER: usize = 3;
@@ -19,15 +19,18 @@ const TIMELINE_MUTE_OVERFETCH_MAX_LIMIT: usize = 200;
 
 impl TimelineService {
     /// Create new timeline service
-    pub fn new(
-        db: Arc<Database>,
+    pub fn new<R>(
+        db: Arc<R>,
         timeline_cache: Arc<TimelineCache>,
         profile_cache: Arc<ProfileCache>,
-    ) -> Self {
+    ) -> Self
+    where
+        R: TimelineRepository + 'static,
+    {
         Self {
             db,
-            timeline_cache,
-            profile_cache,
+            _timeline_cache: timeline_cache,
+            _profile_cache: profile_cache,
         }
     }
 

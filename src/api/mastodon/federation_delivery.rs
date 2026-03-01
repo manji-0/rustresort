@@ -3,10 +3,9 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::AppState;
-use crate::data::{Account, CachedProfile};
+use crate::data::CachedProfile;
 use crate::error::AppError;
-use crate::federation::{ActivityDelivery, DeliveryResult};
+use crate::federation::DeliveryResult;
 use chrono::Utc;
 
 const OUTBOUND_DELIVERY_TIMEOUT_SECS: u64 = 5;
@@ -78,12 +77,12 @@ async fn resolve_allowed_remote_addrs(
         ));
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip_address(ip) {
-            return Err(AppError::Validation(
-                "Remote URL host is not allowed".to_string(),
-            ));
-        }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_blocked_ip_address(ip)
+    {
+        return Err(AppError::Validation(
+            "Remote URL host is not allowed".to_string(),
+        ));
     }
 
     let port = url.port_or_known_default().ok_or_else(|| {
@@ -180,40 +179,24 @@ async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Resu
     Ok(())
 }
 
-pub fn local_actor_uri(state: &AppState, username: &str) -> String {
-    crate::federation::local_actor_uri(&state.config.server.base_url(), username)
-}
-
-pub fn local_key_id(actor_uri: &str) -> String {
-    crate::federation::local_key_id(actor_uri)
-}
-
-pub fn build_delivery(state: &AppState, account: &Account) -> ActivityDelivery {
-    crate::federation::build_local_delivery(
-        state.http_client.clone(),
-        &state.config.server.base_url(),
-        account,
-    )
-}
-
-pub async fn resolve_remote_actor_and_inbox(
-    state: &AppState,
+pub async fn resolve_remote_actor_and_inbox_with_dependencies(
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
     address: &str,
 ) -> Result<(String, String), AppError> {
     let address = address.trim();
 
-    if let Some(profile) = state.profile_cache.get(address).await {
+    if let Some(profile) = profile_cache.get(address).await {
         return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
     }
 
-    if let Some(actor_uri_address) = parse_actor_uri_address(address) {
-        if let Some(profile) = state.profile_cache.get_by_uri(&actor_uri_address).await {
-            return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
-        }
+    if let Some(actor_uri_address) = parse_actor_uri_address(address)
+        && let Some(profile) = profile_cache.get_by_uri(&actor_uri_address).await
+    {
+        return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
     }
 
-    let discovered =
-        discover_remote_actor_and_inbox(&state.federation_fetch_client, address).await?;
+    let discovered = discover_remote_actor_and_inbox(federation_fetch_client, address).await?;
 
     if let Some(profile) = build_cached_profile(
         address,
@@ -221,12 +204,12 @@ pub async fn resolve_remote_actor_and_inbox(
         &discovered.inbox_uri,
         &discovered.actor_document,
     ) {
-        state.profile_cache.insert(profile.clone()).await;
+        profile_cache.insert(profile.clone()).await;
 
         if profile.address != discovered.actor_uri {
             let mut actor_uri_alias = profile;
             actor_uri_alias.address = discovered.actor_uri.clone();
-            state.profile_cache.insert(actor_uri_alias).await;
+            profile_cache.insert(actor_uri_alias).await;
         }
     } else {
         tracing::warn!(

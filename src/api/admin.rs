@@ -5,13 +5,13 @@
 
 use axum::{
     Router,
-    extract::State,
+    extract::{FromRef, State},
     response::Json,
     routing::{get, post},
 };
 use chrono::Utc;
 
-use crate::AppState;
+use crate::SystemAdminState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -23,7 +23,11 @@ use crate::error::AppError;
 /// - POST /api/admin/domain_blocks - Block domain
 /// - DELETE /api/admin/domain_blocks/:domain - Unblock domain
 /// - GET /api/admin/domain_blocks - List blocked domains
-pub fn admin_router() -> Router<AppState> {
+pub fn admin_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    SystemAdminState: FromRef<S>,
+{
     Router::new()
         // Backup
         .route("/backup", post(trigger_backup))
@@ -45,7 +49,7 @@ pub fn admin_router() -> Router<AppState> {
 ///
 /// Triggers a manual database backup.
 async fn trigger_backup(
-    State(state): State<AppState>,
+    State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<BackupResponse>, AppError> {
     let key = state.backup.backup().await?;
@@ -68,7 +72,7 @@ pub struct BackupResponse {
 ///
 /// Lists all available backups.
 async fn list_backups(
-    State(state): State<AppState>,
+    State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<BackupInfo>>, AppError> {
     let backups = state
@@ -119,7 +123,7 @@ fn normalize_domain(domain: &str) -> Result<String, AppError> {
 
 /// POST /api/admin/domain_blocks
 async fn block_domain(
-    State(state): State<AppState>,
+    State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
     Json(req): Json<BlockDomainRequest>,
 ) -> Result<(), AppError> {
@@ -130,7 +134,7 @@ async fn block_domain(
 
 /// DELETE /api/admin/domain_blocks/:domain
 async fn unblock_domain(
-    State(state): State<AppState>,
+    State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
     axum::extract::Path(domain): axum::extract::Path<String>,
 ) -> Result<(), AppError> {
@@ -141,7 +145,7 @@ async fn unblock_domain(
 
 /// GET /api/admin/domain_blocks
 async fn list_domain_blocks(
-    State(state): State<AppState>,
+    State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<String>>, AppError> {
     let domains = state.db.get_blocked_domains().await?;

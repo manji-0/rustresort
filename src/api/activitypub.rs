@@ -8,15 +8,15 @@
 use axum::body::Bytes;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     response::Json,
     routing::{get, post},
 };
 use http::HeaderMap;
 use std::sync::Arc;
 
-use crate::AppState;
-use crate::data::Account;
+use crate::ActivityPubState;
+use crate::data::{Account, StatusVisibility};
 use crate::error::AppError;
 use crate::metrics::{
     ACTIVITYPUB_ACTIVITIES_RECEIVED, FEDERATION_REQUEST_DURATION_SECONDS,
@@ -35,7 +35,7 @@ fn extract_signature_key_id(headers: &HeaderMap) -> Result<String, AppError> {
 }
 
 fn build_activity_processor(
-    state: &AppState,
+    state: &ActivityPubState,
     account: &Account,
 ) -> crate::federation::ActivityProcessor {
     let local_address = format!("{}@{}", account.username, state.config.server.domain);
@@ -49,7 +49,6 @@ fn build_activity_processor(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
-        state.http_client.clone(),
         local_address,
         state.config.server.protocol.clone(),
     )
@@ -66,7 +65,11 @@ fn build_activity_processor(
 /// - GET /users/:username/statuses/:id - Note object
 /// - GET /users/:username/followers - Followers collection
 /// - GET /users/:username/following - Following collection
-pub fn activitypub_router() -> Router<AppState> {
+pub fn activitypub_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    ActivityPubState: FromRef<S>,
+{
     Router::new()
         .route("/users/:username", get(actor))
         .route("/users/:username/inbox", post(inbox))
@@ -83,7 +86,7 @@ pub fn activitypub_router() -> Router<AppState> {
 ///
 /// Content-Type: application/activity+json
 async fn actor(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
@@ -152,7 +155,7 @@ async fn actor(
 /// 2. Parse activity
 /// 3. Process based on type
 async fn inbox(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path(username): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -249,7 +252,7 @@ async fn inbox(
 /// 2. Parse activity
 /// 3. Route to appropriate user(s)
 async fn shared_inbox(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(), AppError> {
@@ -308,7 +311,7 @@ async fn shared_inbox(
 ///
 /// Only public activities are included.
 async fn outbox(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify username matches local account
@@ -383,7 +386,7 @@ async fn outbox(
 ///
 /// Returns a Note object for a local status URI.
 async fn status_object(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path((username, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let _timer = HTTP_REQUEST_DURATION_SECONDS
@@ -404,13 +407,16 @@ async fn status_object(
                 .await?
                 .ok_or(AppError::NotFound)?;
 
-            if status.visibility != "public" && status.visibility != "unlisted" {
+            if !matches!(
+                status.visibility,
+                StatusVisibility::Public | StatusVisibility::Unlisted
+            ) {
                 return Err(AppError::NotFound);
             }
 
             let public_audience = "https://www.w3.org/ns/activitystreams#Public";
-            let (to_audience, cc_audience) = match status.visibility.as_str() {
-                "unlisted" => (
+            let (to_audience, cc_audience) = match status.visibility {
+                StatusVisibility::Unlisted => (
                     serde_json::json!([followers_url.clone()]),
                     serde_json::json!([public_audience]),
                 ),
@@ -454,7 +460,7 @@ async fn status_object(
 ///
 /// Returns Followers collection.
 async fn followers(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify username
@@ -498,7 +504,7 @@ async fn followers(
 ///
 /// Returns Following collection.
 async fn following(
-    State(state): State<AppState>,
+    State(state): State<ActivityPubState>,
     Path(username): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify username

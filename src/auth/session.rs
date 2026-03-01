@@ -52,8 +52,8 @@ pub fn create_session_token(
     use sha2::Sha256;
 
     // 1. Serialize session to JSON
-    let payload =
-        serde_json::to_string(session).map_err(|e| crate::error::AppError::Internal(e.into()))?;
+    let payload = serde_json::to_string(session)
+        .map_err(|e| crate::error::AppError::serialization("session payload encoding", e))?;
 
     // 2. Base64 encode the payload
     let payload_b64 = general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
@@ -64,7 +64,7 @@ pub fn create_session_token(
         .map_err(|e| crate::error::AppError::Encryption(e.to_string()))?;
     mac.update(payload_b64.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let signature_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&signature);
+    let signature_b64 = general_purpose::URL_SAFE_NO_PAD.encode(signature);
 
     // 4. Return "{payload}.{signature}"
     Ok(format!("{}.{}", payload_b64, signature_b64))
