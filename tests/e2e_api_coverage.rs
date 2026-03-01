@@ -109,7 +109,7 @@ async fn test_verify_app_credentials() {
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 401);
+    assert_eq!(response.status(), 200);
 }
 
 // ============================================================================

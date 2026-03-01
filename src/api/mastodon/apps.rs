@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::HeaderMap,
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
@@ -14,7 +15,7 @@ use std::collections::HashSet;
 use url::Url;
 
 use crate::AppState;
-use crate::auth::CurrentUser;
+use crate::auth::{CurrentUser, verify_session_token};
 use crate::error::AppError;
 
 const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
@@ -361,6 +362,15 @@ async fn issue_authorization_code(
     Ok(Redirect::to(&location))
 }
 
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
 /// POST /api/v1/apps
 pub async fn create_app(
     State(state): State<AppState>,
@@ -473,18 +483,40 @@ pub async fn authorize(
 
 /// GET /api/v1/apps/verify_credentials
 pub async fn verify_app_credentials(
-    State(_state): State<AppState>,
-    CurrentUser(_session): CurrentUser,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get the app from the current session
-    // For now, return a simple response
-    // TODO: Implement proper app verification from session
+    if let Some(access_token) = extract_bearer_token(&headers) {
+        if let Some(token) = state.db.get_oauth_token(access_token).await? {
+            let app = state
+                .db
+                .get_oauth_app_by_id(&token.app_id)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
 
+            let response = serde_json::json!({
+                "id": app.id,
+                "name": app.name,
+                "website": app.website,
+                "redirect_uri": app.redirect_uri,
+                "client_id": app.client_id,
+                "vapid_key": serde_json::Value::Null,
+            });
+
+            return Ok(Json(response));
+        }
+
+        // `require_auth` accepts either OAuth bearer tokens or signed session tokens.
+        // If this Authorization value isn't an OAuth token, ensure it is a valid session token.
+        verify_session_token(access_token, &state.config.auth.session_secret)?;
+    }
+
+    // Session-authenticated fallback for callers authenticated via cookie or session bearer token.
     let response = serde_json::json!({
-        "name": "RustResort",
-        "website": null,
+        "name": session.name.unwrap_or_else(|| "RustResort".to_string()),
+        "website": serde_json::Value::Null,
     });
-
     Ok(Json(response))
 }
 
@@ -637,7 +669,10 @@ pub struct RevokeTokenRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{authorize_confirm_cookie_name, build_authorize_confirm_cookie};
+    use super::{
+        authorize_confirm_cookie_name, build_authorize_confirm_cookie, extract_bearer_token,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn authorize_confirm_cookie_name_is_token_scoped() {
@@ -651,5 +686,22 @@ mod tests {
     fn build_authorize_confirm_cookie_uses_token_scoped_name() {
         let cookie = build_authorize_confirm_cookie("token-a", false);
         assert_eq!(cookie.name(), "oauth_authorize_confirm_token-a");
+    }
+
+    #[test]
+    fn extract_bearer_token_reads_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_static("Bearer token-value"),
+        );
+        assert_eq!(extract_bearer_token(&headers), Some("token-value"));
+    }
+
+    #[test]
+    fn extract_bearer_token_rejects_empty_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", HeaderValue::from_static("Bearer "));
+        assert_eq!(extract_bearer_token(&headers), None);
     }
 }
