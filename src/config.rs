@@ -6,7 +6,7 @@
 //! 3. Environment variables (override)
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 /// Main application configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -305,8 +305,173 @@ impl AppConfig {
             .build()
             .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
 
-        config
+        let app_config: Self = config
             .try_deserialize()
-            .map_err(|e| crate::error::AppError::Config(e.to_string()))
+            .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
+        app_config.validate()?;
+        Ok(app_config)
+    }
+
+    pub fn should_use_secure_cookies(&self) -> bool {
+        self.server.protocol.eq_ignore_ascii_case("https")
+            || !is_local_server_domain(&self.server.domain)
+    }
+
+    fn validate(&self) -> Result<(), crate::error::AppError> {
+        const MIN_SESSION_SECRET_BYTES: usize = 32;
+
+        if self.auth.session_secret.len() < MIN_SESSION_SECRET_BYTES {
+            return Err(crate::error::AppError::Config(format!(
+                "auth.session_secret must be at least {} bytes",
+                MIN_SESSION_SECRET_BYTES
+            )));
+        }
+
+        if self.auth.session_max_age <= 0 {
+            return Err(crate::error::AppError::Config(
+                "auth.session_max_age must be greater than 0".to_string(),
+            ));
+        }
+
+        if !self.should_use_secure_cookies() {
+            let host = normalized_server_host(&self.server.domain);
+            tracing::warn!(
+                host = %host,
+                protocol = %self.server.protocol,
+                "Using insecure session cookies for local development"
+            );
+        } else if !self.server.protocol.eq_ignore_ascii_case("https") {
+            return Err(crate::error::AppError::Config(
+                "server.protocol must be https for non-local server domains".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+fn normalized_server_host(domain: &str) -> String {
+    let trimmed = domain.trim();
+    let parsed_host = url::Url::parse(&format!("http://{trimmed}"))
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_string()));
+    let host = parsed_host.unwrap_or_else(|| trimmed.to_string());
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_local_server_domain(domain: &str) -> bool {
+    let host = normalized_server_host(domain);
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback() || ip.is_unspecified();
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                domain: "localhost".to_string(),
+                protocol: "http".to_string(),
+            },
+            database: DatabaseConfig {
+                path: PathBuf::from("/tmp/rustresort-test.db"),
+                sync: DatabaseSyncConfig::default(),
+            },
+            storage: StorageConfig {
+                media: MediaStorageConfig {
+                    bucket: "media".to_string(),
+                    public_url: "https://media.example.com".to_string(),
+                },
+                backup: BackupStorageConfig {
+                    enabled: false,
+                    bucket: "backup".to_string(),
+                    interval_seconds: 86_400,
+                    retention_count: 7,
+                    encryption: BackupEncryptionConfig::default(),
+                },
+            },
+            cloudflare: CloudflareConfig {
+                account_id: "account".to_string(),
+                r2_access_key_id: "access-key".to_string(),
+                r2_secret_access_key: "secret-key".to_string(),
+            },
+            auth: AuthConfig {
+                github_username: "admin".to_string(),
+                session_secret: "x".repeat(32),
+                session_max_age: 604_800,
+                github: GitHubOAuthConfig {
+                    client_id: "github-client-id".to_string(),
+                    client_secret: "github-client-secret".to_string(),
+                },
+            },
+            instance: InstanceConfig {
+                title: "RustResort".to_string(),
+                description: "Test instance".to_string(),
+                contact_email: "admin@example.com".to_string(),
+            },
+            admin: AdminConfig {
+                username: "admin".to_string(),
+                display_name: "Admin".to_string(),
+                email: None,
+                note: None,
+            },
+            cache: CacheConfig {
+                timeline_max_items: 2000,
+                profile_ttl: 86_400,
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+                format: "pretty".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn validate_accepts_http_on_localhost() {
+        let config = valid_config();
+        assert!(config.validate().is_ok());
+        assert!(!config.should_use_secure_cookies());
+    }
+
+    #[test]
+    fn validate_rejects_short_session_secret() {
+        let mut config = valid_config();
+        config.auth.session_secret = "short-secret".to_string();
+
+        let error = config
+            .validate()
+            .expect_err("session secret shorter than 32 bytes must fail");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Config(message)
+                if message.contains("auth.session_secret")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_http_for_non_local_domain() {
+        let mut config = valid_config();
+        config.server.domain = "social.example.com".to_string();
+        config.server.protocol = "http".to_string();
+
+        let error = config
+            .validate()
+            .expect_err("public domains must require https");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Config(message)
+                if message.contains("server.protocol must be https")
+        ));
     }
 }

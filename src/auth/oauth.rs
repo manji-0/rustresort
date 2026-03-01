@@ -24,7 +24,6 @@ const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token
 const GITHUB_USER_ENDPOINT: &str = "https://api.github.com/user";
 const OAUTH_CSRF_COOKIE: &str = "oauth_state";
 const SESSION_COOKIE: &str = "session";
-const CSRF_MAX_AGE_SECONDS: i64 = 600;
 
 /// Create authentication router
 ///
@@ -80,9 +79,10 @@ async fn github_redirect(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
+    let secure_cookies = state.config.should_use_secure_cookies();
     let csrf_state = generate_csrf_state();
     let auth_url = build_github_authorize_url(&state, &csrf_state)?;
-    let csrf_cookie = build_csrf_cookie(&csrf_state, state.config.server.protocol == "https");
+    let csrf_cookie = build_csrf_cookie(&csrf_state, secure_cookies);
 
     Ok((jar.add(csrf_cookie), Redirect::to(&auth_url)))
 }
@@ -130,6 +130,7 @@ async fn github_callback(
     Query(query): Query<GitHubCallbackQuery>,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
+    let secure_cookies = state.config.should_use_secure_cookies();
     verify_csrf_state(&query.state, &jar)?;
 
     let access_token = exchange_github_code(
@@ -164,12 +165,8 @@ async fn github_callback(
     };
     let session_token = create_session_token(&session, &state.config.auth.session_secret)?;
 
-    let session_cookie = build_session_cookie(
-        &session_token,
-        state.config.server.protocol == "https",
-        state.config.auth.session_max_age,
-    );
-    let clear_csrf_cookie = clear_cookie(OAUTH_CSRF_COOKIE);
+    let session_cookie = build_session_cookie(&session_token, secure_cookies);
+    let clear_csrf_cookie = clear_cookie(OAUTH_CSRF_COOKIE, secure_cookies);
 
     let jar = jar.remove(clear_csrf_cookie).add(session_cookie);
     Ok((jar, Redirect::to("/")))
@@ -182,9 +179,10 @@ async fn github_callback(
 /// POST /logout
 ///
 /// Clears session cookie and redirects to login.
-async fn logout(_jar: CookieJar) -> impl IntoResponse {
-    let clear_session = clear_cookie(SESSION_COOKIE);
-    let clear_csrf = clear_cookie(OAUTH_CSRF_COOKIE);
+async fn logout(State(state): State<AppState>, _jar: CookieJar) -> impl IntoResponse {
+    let secure_cookies = state.config.should_use_secure_cookies();
+    let clear_session = clear_cookie(SESSION_COOKIE, secure_cookies);
+    let clear_csrf = clear_cookie(OAUTH_CSRF_COOKIE, secure_cookies);
     (
         _jar.remove(clear_session).remove(clear_csrf),
         Redirect::to("/login"),
@@ -239,12 +237,7 @@ fn build_csrf_cookie(state: &str, secure: bool) -> Cookie<'static> {
         .build()
 }
 
-fn build_session_cookie(
-    session_token: &str,
-    secure: bool,
-    max_age_seconds: i64,
-) -> Cookie<'static> {
-    let _ = max_age_seconds;
+fn build_session_cookie(session_token: &str, secure: bool) -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE, session_token.to_string()))
         .path("/")
         .http_only(true)
@@ -253,10 +246,11 @@ fn build_session_cookie(
         .build()
 }
 
-fn clear_cookie(name: &'static str) -> Cookie<'static> {
+fn clear_cookie(name: &'static str, secure: bool) -> Cookie<'static> {
     let mut cookie = Cookie::build((name, "".to_string()))
         .path("/")
         .http_only(true)
+        .secure(secure)
         .build();
     cookie.make_removal();
     cookie
@@ -351,5 +345,21 @@ mod tests {
                 .build(),
         );
         assert!(verify_csrf_state("other", &jar).is_err());
+    }
+
+    #[test]
+    fn build_session_cookie_sets_secure_attributes() {
+        let cookie = build_session_cookie("token", true);
+        assert_eq!(cookie.secure(), Some(true));
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+    }
+
+    #[test]
+    fn build_csrf_cookie_sets_expected_attributes() {
+        let cookie = build_csrf_cookie("state", true);
+        assert_eq!(cookie.secure(), Some(true));
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.same_site(), Some(SameSite::Lax));
     }
 }
