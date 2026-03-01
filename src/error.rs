@@ -89,47 +89,89 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         use axum::Json;
 
-        let (status, error_message, error_type) = match &self {
-            AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string(), "not_found"),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string(), "unauthorized"),
+        let (status, error_message, error_type, should_log_detail) = match &self {
+            AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string(), "not_found", false),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                self.to_string(),
+                "unauthorized",
+                false,
+            ),
             AppError::InvalidSignature => (
                 StatusCode::UNAUTHORIZED,
                 self.to_string(),
                 "invalid_signature",
+                false,
             ),
-            AppError::Forbidden => (StatusCode::FORBIDDEN, self.to_string(), "forbidden"),
-            AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "validation"),
+            AppError::Forbidden => (StatusCode::FORBIDDEN, self.to_string(), "forbidden", false),
+            AppError::Validation(msg) => {
+                (StatusCode::BAD_REQUEST, msg.clone(), "validation", false)
+            }
             AppError::Unprocessable(msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 msg.clone(),
                 "unprocessable",
+                false,
             ),
             AppError::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 self.to_string(),
                 "rate_limited",
+                false,
             ),
-            AppError::NotImplemented(msg) => {
-                (StatusCode::NOT_IMPLEMENTED, msg.clone(), "not_implemented")
-            }
-            AppError::Federation(msg) => (StatusCode::BAD_GATEWAY, msg.clone(), "federation"),
-            AppError::HttpClient(_) => (StatusCode::BAD_GATEWAY, self.to_string(), "http_client"),
+            AppError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                msg.clone(),
+                "not_implemented",
+                false,
+            ),
+            AppError::Federation(_) => (
+                StatusCode::BAD_GATEWAY,
+                "Federation error".to_string(),
+                "federation",
+                true,
+            ),
+            AppError::HttpClient(_) => (
+                StatusCode::BAD_GATEWAY,
+                "Upstream HTTP error".to_string(),
+                "http_client",
+                true,
+            ),
             AppError::Database(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Database error".to_string(),
                 "database",
+                true,
             ),
-            AppError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "storage"),
-            AppError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "config"),
-            AppError::Encryption(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, msg.clone(), "encryption")
-            }
+            AppError::Storage(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error".to_string(),
+                "storage",
+                true,
+            ),
+            AppError::Config(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Configuration error".to_string(),
+                "config",
+                true,
+            ),
+            AppError::Encryption(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Encryption error".to_string(),
+                "encryption",
+                true,
+            ),
             AppError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
                 "internal",
+                true,
             ),
         };
+
+        if should_log_detail {
+            tracing::error!(error = %self, %error_type, "Request failed with internal details");
+        }
 
         // Record error metric
         use crate::metrics::ERRORS_TOTAL;
@@ -147,3 +189,32 @@ impl IntoResponse for AppError {
 
 /// Result type alias using AppError
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn storage_errors_are_sanitized() {
+        let response =
+            AppError::Storage("s3 endpoint timeout at secret-host".to_string()).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body_text.contains("Storage error"));
+        assert!(!body_text.contains("secret-host"));
+    }
+
+    #[tokio::test]
+    async fn validation_errors_keep_message() {
+        let response = AppError::Validation("invalid media id".to_string()).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body_text.contains("invalid media id"));
+    }
+}
