@@ -16,6 +16,7 @@ use openssl::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashSet;
 use url::Url;
 
@@ -25,6 +26,7 @@ use crate::error::AppError;
 
 const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS: i64 = 7_200;
+const OAUTH_CLIENT_SECRET_HASH_PREFIX: &str = "sha256:";
 /// App registration request
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
@@ -187,7 +189,23 @@ fn generate_vapid_key() -> Result<String, AppError> {
 
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_bytes))
 }
+fn hash_client_secret(secret: &str) -> String {
+    let digest = sha2::Sha256::digest(secret.as_bytes());
+    format!(
+        "{}{}",
+        OAUTH_CLIENT_SECRET_HASH_PREFIX,
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    )
+}
 
+fn verify_client_secret(stored_secret: &str, provided_secret: &str) -> bool {
+    if stored_secret.starts_with(OAUTH_CLIENT_SECRET_HASH_PREFIX) {
+        stored_secret == hash_client_secret(provided_secret)
+    } else {
+        // Backward compatibility for legacy plaintext rows.
+        stored_secret == provided_secret
+    }
+}
 fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
     format!("{}{}", OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX, confirm_token)
 }
@@ -425,6 +443,7 @@ pub async fn create_app(
     let client_id = EntityId::new().0;
     let client_secret = EntityId::new().0;
     let vapid_key = generate_vapid_key()?;
+    let hashed_client_secret = hash_client_secret(&client_secret);
 
     // Default scopes if not provided
     let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
@@ -436,7 +455,7 @@ pub async fn create_app(
         website: req.website.clone(),
         redirect_uri: req.redirect_uris.clone(),
         client_id: client_id.clone(),
-        client_secret: client_secret.clone(),
+        client_secret: hashed_client_secret,
         vapid_key: Some(vapid_key),
         scopes: scopes.clone(),
         created_at: Utc::now(),
@@ -452,7 +471,7 @@ pub async fn create_app(
         website: app.website,
         redirect_uri: app.redirect_uri,
         client_id: app.client_id,
-        client_secret: app.client_secret,
+        client_secret,
         vapid_key: app.vapid_key,
     };
 
@@ -585,7 +604,7 @@ pub async fn create_token(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    if app.client_secret != req.client_secret {
+    if !verify_client_secret(&app.client_secret, &req.client_secret) {
         return Err(AppError::Unauthorized);
     }
 
@@ -696,7 +715,7 @@ pub async fn revoke_token(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    if app.client_secret != req.client_secret {
+    if !verify_client_secret(&app.client_secret, &req.client_secret) {
         return Err(AppError::Unauthorized);
     }
 
@@ -717,7 +736,7 @@ pub struct RevokeTokenRequest {
 mod tests {
     use super::{
         authorize_confirm_cookie_name, build_authorize_confirm_cookie, extract_bearer_token,
-        generate_vapid_key,
+        generate_vapid_key, hash_client_secret, verify_client_secret,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -757,7 +776,6 @@ mod tests {
         headers.insert("Authorization", HeaderValue::from_static("Bearer "));
         assert_eq!(extract_bearer_token(&headers), None);
     }
-
     #[test]
     fn generate_vapid_key_uses_url_safe_format() {
         let key = generate_vapid_key().expect("vapid key generation should succeed");
@@ -783,5 +801,18 @@ mod tests {
         let key = EcKey::from_public_key(&group, &point).expect("point should build EC key");
         key.check_key()
             .expect("generated public key should be valid");
+    }
+
+    #[test]
+    fn verify_client_secret_accepts_hashed_storage() {
+        let stored = hash_client_secret("plain-secret");
+        assert!(verify_client_secret(&stored, "plain-secret"));
+        assert!(!verify_client_secret(&stored, "wrong-secret"));
+    }
+
+    #[test]
+    fn verify_client_secret_accepts_legacy_plaintext_storage() {
+        assert!(verify_client_secret("legacy-secret", "legacy-secret"));
+        assert!(!verify_client_secret("legacy-secret", "wrong-secret"));
     }
 }
