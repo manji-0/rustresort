@@ -1227,6 +1227,469 @@ async fn test_list_batch_add_and_remove_accounts() {
 }
 
 #[tokio::test]
+async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
+    let (db, _temp_dir) = create_test_db().await;
+    let base_time = Utc::now();
+
+    let old_public = Status {
+        id: "200".to_string(),
+        uri: "https://example.com/status/tag-old".to_string(),
+        content: "<p>Old #Rust post</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+    let new_public = Status {
+        id: "300".to_string(),
+        uri: "https://example.com/status/tag-new".to_string(),
+        content: "<p>New #rust and #RustLang post</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(1),
+        fetched_at: None,
+    };
+    let private_status = Status {
+        id: "400".to_string(),
+        uri: "https://example.com/status/tag-private".to_string(),
+        content: "<p>Private #RUST post</p>".to_string(),
+        content_warning: None,
+        visibility: "private".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(2),
+        fetched_at: None,
+    };
+
+    db.insert_status(&old_public).await.unwrap();
+    db.insert_status(&new_public).await.unwrap();
+    db.insert_status(&private_status).await.unwrap();
+
+    let rust_statuses = db
+        .get_statuses_by_hashtag_in_window("rust", 10, None, None)
+        .await
+        .unwrap();
+    let rust_ids: Vec<String> = rust_statuses.into_iter().map(|status| status.id).collect();
+    assert_eq!(rust_ids, vec![new_public.id.clone(), old_public.id.clone()]);
+    assert!(!rust_ids.contains(&private_status.id));
+
+    let rustlang_statuses = db
+        .get_statuses_by_hashtag_in_window("RUSTLANG", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(rustlang_statuses.len(), 1);
+    assert_eq!(rustlang_statuses[0].id, new_public.id);
+
+    let hashtags = db.search_hashtags("rust", 10).await.unwrap();
+    let rust = hashtags
+        .iter()
+        .find(|(name, _, _)| name.eq_ignore_ascii_case("rust"))
+        .expect("missing rust hashtag");
+    assert_eq!(rust.1, 3);
+}
+
+#[tokio::test]
+async fn test_insert_status_indexes_markup_wrapped_hashtags() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: "350".to_string(),
+        uri: "https://example.com/status/tag-markup".to_string(),
+        content: "<p>#<span>Rust</span> and #<a href=\"https://example.com/tags/rustlang\">RustLang</a></p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let rust = db
+        .get_statuses_by_hashtag_in_window("rust", 10, None, None)
+        .await
+        .unwrap();
+    let rustlang = db
+        .get_statuses_by_hashtag_in_window("rustlang", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(rust.len(), 1);
+    assert_eq!(rustlang.len(), 1);
+    assert_eq!(rust[0].id, status.id);
+    assert_eq!(rustlang[0].id, status.id);
+}
+
+#[tokio::test]
+async fn test_database_connect_backfills_missing_status_hashtag_rows() {
+    let (db, temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: "500".to_string(),
+        uri: "https://example.com/status/backfill-hashtag".to_string(),
+        content: "<p>Legacy #Rust post</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let raw_pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM status_hashtags WHERE status_id = ?")
+        .bind(&status.id)
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+    drop(raw_pool);
+    drop(db);
+
+    let reopened = Database::connect(&temp_dir.path().join("test.db"))
+        .await
+        .expect("reopen should succeed with backfill");
+    let statuses = reopened
+        .get_statuses_by_hashtag_in_window("rust", 10, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|entry| entry.id).collect();
+    assert!(ids.contains(&status.id));
+}
+
+#[tokio::test]
+async fn test_tag_timeline_query_uses_id_aligned_cursors() {
+    let (db, _temp_dir) = create_test_db().await;
+    let base_time = Utc::now();
+
+    let newest_by_id = Status {
+        id: "300".to_string(),
+        uri: "https://example.com/status/tag-300".to_string(),
+        content: "<p>#Rust id300</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+    let middle_by_id = Status {
+        id: "200".to_string(),
+        uri: "https://example.com/status/tag-200".to_string(),
+        content: "<p>#Rust id200</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(10),
+        fetched_at: None,
+    };
+    let oldest_by_id = Status {
+        id: "100".to_string(),
+        uri: "https://example.com/status/tag-100".to_string(),
+        content: "<p>#Rust id100</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(20),
+        fetched_at: None,
+    };
+
+    db.insert_status(&newest_by_id).await.unwrap();
+    db.insert_status(&middle_by_id).await.unwrap();
+    db.insert_status(&oldest_by_id).await.unwrap();
+
+    let first_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, None, None)
+        .await
+        .unwrap();
+    let first_ids: Vec<String> = first_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(first_ids, vec!["300".to_string(), "200".to_string()]);
+
+    let older_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, Some("200"), None)
+        .await
+        .unwrap();
+    let older_ids: Vec<String> = older_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(older_ids, vec!["100".to_string()]);
+
+    let newer_page = db
+        .get_statuses_by_hashtag_in_window("rust", 2, None, Some("200"))
+        .await
+        .unwrap();
+    let newer_ids: Vec<String> = newer_page.into_iter().map(|status| status.id).collect();
+    assert_eq!(newer_ids, vec!["300".to_string()]);
+}
+
+#[tokio::test]
+async fn test_update_status_refreshes_hashtag_index() {
+    let (db, _temp_dir) = create_test_db().await;
+    let mut status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/tag-update".to_string(),
+        content: "<p>Initial #OldTag</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let old_before = db
+        .get_statuses_by_hashtag_in_window("oldtag", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(old_before.len(), 1);
+
+    status.content = "<p>Updated #newtag</p>".to_string();
+    db.update_status(&status).await.unwrap();
+
+    let old_after = db
+        .get_statuses_by_hashtag_in_window("oldtag", 10, None, None)
+        .await
+        .unwrap();
+    assert!(old_after.is_empty());
+
+    let new_after = db
+        .get_statuses_by_hashtag_in_window("newtag", 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(new_after.len(), 1);
+    assert_eq!(new_after[0].id, status.id);
+}
+
+#[tokio::test]
+async fn test_list_timeline_query_matches_local_and_remote_accounts() {
+    let (db, _temp_dir) = create_test_db().await;
+    let list_id = db.create_list("List timeline", "list").await.unwrap();
+    let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "local-account-id".to_string();
+    let remote_address = "alice@example.com".to_string();
+    db.add_accounts_to_list(&list_id, &[local_address.clone(), remote_address.clone()])
+        .await
+        .unwrap();
+
+    let base_time = Utc::now();
+    let local_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/list-local".to_string(),
+        content: "<p>Local status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: base_time + chrono::Duration::seconds(1),
+        fetched_at: None,
+    };
+    let remote_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-remote".to_string(),
+        content: "<p>Remote status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: remote_address.clone(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: base_time + chrono::Duration::seconds(2),
+        fetched_at: None,
+    };
+    let unrelated_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-unrelated".to_string(),
+        content: "<p>Unrelated status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "bob@example.com".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: base_time,
+        fetched_at: None,
+    };
+
+    db.insert_status(&local_status).await.unwrap();
+    db.insert_status(&remote_status).await.unwrap();
+    db.insert_status(&unrelated_status).await.unwrap();
+
+    let statuses = db
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            Some(443),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
+
+    assert!(ids.contains(&local_status.id));
+    assert!(ids.contains(&remote_status.id));
+    assert!(!ids.contains(&unrelated_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_query_matches_local_account_id_entries() {
+    let (db, _temp_dir) = create_test_db().await;
+    let list_id = db.create_list("List timeline by id", "list").await.unwrap();
+    let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "01HLOCALACCOUNTID".to_string();
+    db.add_accounts_to_list(&list_id, std::slice::from_ref(&local_account_id))
+        .await
+        .unwrap();
+
+    let local_status = Status {
+        id: EntityId::new().0,
+        uri: "https://example.com/status/list-local-by-id".to_string(),
+        content: "<p>Local status by id list member</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&local_status).await.unwrap();
+
+    let statuses = db
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            Some(443),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
+    assert!(ids.contains(&local_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_query_matches_default_port_equivalent_remote_addresses() {
+    let (db, _temp_dir) = create_test_db().await;
+    let list_id = db
+        .create_list("List timeline default-port", "list")
+        .await
+        .unwrap();
+    let local_address = "testuser@test.example.com".to_string();
+    let local_account_id = "01HLOCALACCOUNTID".to_string();
+    db.add_accounts_to_list(&list_id, &[String::from("alice@remote.example")])
+        .await
+        .unwrap();
+
+    let matching_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-default-port-match".to_string(),
+        content: "<p>Remote status from default-port equivalent address</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example:443".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let unrelated_status = Status {
+        id: EntityId::new().0,
+        uri: "https://remote.example/status/list-default-port-unrelated".to_string(),
+        content: "<p>Unrelated remote status</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "bob@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "favourited".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&matching_status).await.unwrap();
+    db.insert_status(&unrelated_status).await.unwrap();
+
+    let statuses = db
+        .get_list_timeline_statuses_in_window(
+            &list_id,
+            &local_address,
+            &local_account_id,
+            Some(443),
+            10,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
+    assert!(ids.contains(&matching_status.id));
+    assert!(!ids.contains(&unrelated_status.id));
+}
+
+#[tokio::test]
 async fn test_insert_status_with_media_attaches_all_media_atomically() {
     let (db, _temp_dir) = create_test_db().await;
 

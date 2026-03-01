@@ -35,6 +35,86 @@ fn poll_is_expired(expires_at: &str, persisted_expired: i64) -> bool {
         .unwrap_or(true)
 }
 
+fn is_hashtag_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn is_hashtag_boundary(previous: Option<char>) -> bool {
+    previous
+        .map(|c| !is_hashtag_char(c) && c != '&' && c != '/')
+        .unwrap_or(true)
+}
+
+fn skip_html_tag(content: &str, start: usize) -> Option<usize> {
+    if !content[start..].starts_with('<') {
+        return None;
+    }
+
+    let mut quoted = None;
+    for (offset, ch) in content[start + 1..].char_indices() {
+        match (quoted, ch) {
+            (Some(quote), _) if ch == quote => quoted = None,
+            (Some(_), _) => {}
+            (None, '"') | (None, '\'') => quoted = Some(ch),
+            (None, '>') => return Some(start + 1 + offset + ch.len_utf8()),
+            (None, _) => {}
+        }
+    }
+
+    None
+}
+
+fn extract_hashtags_from_content(content: &str) -> Vec<String> {
+    let mut hashtags = Vec::new();
+    let mut seen = HashSet::new();
+    let mut chars = content.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if ch != '#' {
+            continue;
+        }
+
+        let previous = content[..index].chars().next_back();
+        if !is_hashtag_boundary(previous) {
+            continue;
+        }
+
+        let mut tag = String::new();
+        let mut cursor = index + ch.len_utf8();
+        loop {
+            let Some(next_char) = content[cursor..].chars().next() else {
+                break;
+            };
+            if is_hashtag_char(next_char) {
+                tag.push(next_char.to_ascii_lowercase());
+                cursor += next_char.len_utf8();
+                continue;
+            }
+            if next_char == '<' {
+                if let Some(after_tag) = skip_html_tag(content, cursor) {
+                    cursor = after_tag;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        while let Some((peek_index, _)) = chars.peek().copied() {
+            if peek_index < cursor {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if !tag.is_empty() && seen.insert(tag.clone()) {
+            hashtags.push(tag);
+        }
+    }
+
+    hashtags
+}
+
 /// Database connection pool wrapper.
 ///
 /// # Turso synchronization
@@ -271,6 +351,102 @@ async fn migrate_legacy_oauth_tokens(pool: &Pool<Sqlite>) -> Result<(), AppError
     Ok(())
 }
 
+async fn backfill_missing_status_hashtags(pool: &Pool<Sqlite>) -> Result<(), AppError> {
+    const HASHTAG_BACKFILL_BATCH_SIZE: i64 = 250;
+
+    let mut backfilled_count = 0usize;
+    let mut last_status_id: Option<String> = None;
+
+    loop {
+        let statuses = if let Some(last_status_id) = last_status_id.as_deref() {
+            sqlx::query_as::<_, (String, String)>(
+                r#"
+                SELECT s.id, s.content
+                FROM statuses s
+                WHERE s.id > ?
+                  AND s.content LIKE '%#%'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_hashtags sh
+                      WHERE sh.status_id = s.id
+                  )
+                ORDER BY s.id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(last_status_id)
+            .bind(HASHTAG_BACKFILL_BATCH_SIZE)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (String, String)>(
+                r#"
+                SELECT s.id, s.content
+                FROM statuses s
+                WHERE s.content LIKE '%#%'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_hashtags sh
+                      WHERE sh.status_id = s.id
+                  )
+                ORDER BY s.id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(HASHTAG_BACKFILL_BATCH_SIZE)
+            .fetch_all(pool)
+            .await?
+        };
+
+        if statuses.is_empty() {
+            break;
+        }
+        backfilled_count += statuses.len();
+        last_status_id = statuses.last().map(|(status_id, _)| status_id.clone());
+
+        let mut tx = pool.begin().await?;
+        for (status_id, content) in statuses {
+            for hashtag in extract_hashtags_from_content(&content) {
+                let hashtag_insert_id = EntityId::new().0;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO hashtags (id, name, created_at) VALUES (?, ?, datetime('now'))",
+                )
+                .bind(&hashtag_insert_id)
+                .bind(&hashtag)
+                .execute(&mut *tx)
+                .await?;
+
+                let hashtag_id = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM hashtags WHERE name = ? COLLATE NOCASE LIMIT 1",
+                )
+                .bind(&hashtag)
+                .fetch_one(&mut *tx)
+                .await?;
+
+                let status_hashtag_id = EntityId::new().0;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO status_hashtags (id, status_id, hashtag_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+                )
+                .bind(&status_hashtag_id)
+                .bind(&status_id)
+                .bind(&hashtag_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+    }
+
+    if backfilled_count > 0 {
+        tracing::info!(
+            backfilled_count,
+            "Backfilled missing hashtag index rows for existing statuses"
+        );
+    }
+
+    Ok(())
+}
+
 impl Database {
     // =========================================================================
     // Connection
@@ -354,6 +530,7 @@ impl Database {
                 AppError::Internal(anyhow::anyhow!("Migration failed: {}", e))
             })?;
         migrate_legacy_oauth_tokens(&pool).await?;
+        backfill_missing_status_hashtags(&pool).await?;
 
         if let Some(sync_db) = &turso_sync_db {
             sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
@@ -755,34 +932,97 @@ impl Database {
         Ok(all_statuses)
     }
 
-    /// Insert a new status
-    pub async fn insert_status(&self, status: &Status) -> Result<(), AppError> {
-        sqlx::query(
-            r#"
-            INSERT INTO statuses (
-                id, uri, content, content_warning, visibility, language,
-                account_address, is_local, in_reply_to_uri, boost_of_uri,
-                persisted_reason, created_at, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&status.id)
-        .bind(&status.uri)
-        .bind(&status.content)
-        .bind(&status.content_warning)
-        .bind(&status.visibility)
-        .bind(&status.language)
-        .bind(&status.account_address)
-        .bind(status.is_local)
-        .bind(&status.in_reply_to_uri)
-        .bind(&status.boost_of_uri)
-        .bind(&status.persisted_reason)
-        .bind(&status.created_at)
-        .bind(&status.fetched_at)
-        .execute(&self.pool)
-        .await?;
+    async fn replace_status_hashtags_in_connection(
+        &self,
+        conn: &mut sqlx::pool::PoolConnection<Sqlite>,
+        status_id: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM status_hashtags WHERE status_id = ?")
+            .bind(status_id)
+            .execute(&mut **conn)
+            .await?;
+
+        let hashtags = extract_hashtags_from_content(content);
+        for hashtag in hashtags {
+            let hashtag_insert_id = EntityId::new().0;
+            sqlx::query(
+                "INSERT OR IGNORE INTO hashtags (id, name, created_at) VALUES (?, ?, datetime('now'))",
+            )
+            .bind(&hashtag_insert_id)
+            .bind(&hashtag)
+            .execute(&mut **conn)
+            .await?;
+
+            let hashtag_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM hashtags WHERE name = ? COLLATE NOCASE LIMIT 1",
+            )
+            .bind(&hashtag)
+            .fetch_one(&mut **conn)
+            .await?;
+
+            let status_hashtag_id = EntityId::new().0;
+            sqlx::query(
+                "INSERT OR IGNORE INTO status_hashtags (id, status_id, hashtag_id, created_at) VALUES (?, ?, ?, datetime('now'))",
+            )
+            .bind(&status_hashtag_id)
+            .bind(status_id)
+            .bind(&hashtag_id)
+            .execute(&mut **conn)
+            .await?;
+        }
 
         Ok(())
+    }
+
+    /// Insert a new status
+    pub async fn insert_status(&self, status: &Status) -> Result<(), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            sqlx::query(
+                r#"
+                INSERT INTO statuses (
+                    id, uri, content, content_warning, visibility, language,
+                    account_address, is_local, in_reply_to_uri, boost_of_uri,
+                    persisted_reason, created_at, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&status.id)
+            .bind(&status.uri)
+            .bind(&status.content)
+            .bind(&status.content_warning)
+            .bind(&status.visibility)
+            .bind(&status.language)
+            .bind(&status.account_address)
+            .bind(status.is_local)
+            .bind(&status.in_reply_to_uri)
+            .bind(&status.boost_of_uri)
+            .bind(&status.persisted_reason)
+            .bind(&status.created_at)
+            .bind(&status.fetched_at)
+            .execute(&mut *conn)
+            .await?;
+
+            self.replace_status_hashtags_in_connection(&mut conn, &status.id, &status.content)
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Insert a new status and attach media atomically.
@@ -834,6 +1074,9 @@ impl Database {
             .bind(&status.fetched_at)
             .execute(&mut *conn)
             .await?;
+
+            self.replace_status_hashtags_in_connection(&mut conn, &status.id, &status.content)
+                .await?;
 
             for media_id in media_ids {
                 let updated = sqlx::query(
@@ -903,27 +1146,47 @@ impl Database {
 
     /// Update an existing status
     pub async fn update_status(&self, status: &Status) -> Result<(), AppError> {
-        sqlx::query(
-            r#"
-            UPDATE statuses
-            SET content = ?, content_warning = ?, visibility = ?, language = ?,
-                in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&status.content)
-        .bind(&status.content_warning)
-        .bind(&status.visibility)
-        .bind(&status.language)
-        .bind(&status.in_reply_to_uri)
-        .bind(&status.boost_of_uri)
-        .bind(&status.persisted_reason)
-        .bind(&status.fetched_at)
-        .bind(&status.id)
-        .execute(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
-        Ok(())
+        let result: Result<(), AppError> = async {
+            sqlx::query(
+                r#"
+                UPDATE statuses
+                SET content = ?, content_warning = ?, visibility = ?, language = ?,
+                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(&status.content)
+            .bind(&status.content_warning)
+            .bind(&status.visibility)
+            .bind(&status.language)
+            .bind(&status.in_reply_to_uri)
+            .bind(&status.boost_of_uri)
+            .bind(&status.persisted_reason)
+            .bind(&status.fetched_at)
+            .bind(&status.id)
+            .execute(&mut *conn)
+            .await?;
+
+            self.replace_status_hashtags_in_connection(&mut conn, &status.id, &status.content)
+                .await?;
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Atomically snapshot previous status content then apply updated fields.
@@ -972,6 +1235,9 @@ impl Database {
             if update_result.rows_affected() != 1 {
                 return Err(AppError::NotFound);
             }
+
+            self.replace_status_hashtags_in_connection(&mut conn, &updated.id, &updated.content)
+                .await?;
 
             Ok(())
         }
@@ -1403,6 +1669,193 @@ impl Database {
             .await?
         };
 
+        Ok(statuses)
+    }
+
+    /// Get public statuses that contain the specified hashtag.
+    pub async fn get_statuses_by_hashtag_in_window(
+        &self,
+        hashtag: &str,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let hashtag = hashtag.trim().trim_start_matches('#');
+        if hashtag.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let statuses = match (max_id, min_id) {
+            (Some(max_id), Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.*
+                    FROM statuses s
+                    INNER JOIN status_hashtags sh ON sh.status_id = s.id
+                    INNER JOIN hashtags h ON h.id = sh.hashtag_id
+                    WHERE h.name = ? COLLATE NOCASE
+                      AND s.visibility = 'public'
+                      AND s.id < ?
+                      AND s.id > ?
+                    ORDER BY s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(hashtag)
+                .bind(max_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.*
+                    FROM statuses s
+                    INNER JOIN status_hashtags sh ON sh.status_id = s.id
+                    INNER JOIN hashtags h ON h.id = sh.hashtag_id
+                    WHERE h.name = ? COLLATE NOCASE
+                      AND s.visibility = 'public'
+                      AND s.id < ?
+                    ORDER BY s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(hashtag)
+                .bind(max_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.*
+                    FROM statuses s
+                    INNER JOIN status_hashtags sh ON sh.status_id = s.id
+                    INNER JOIN hashtags h ON h.id = sh.hashtag_id
+                    WHERE h.name = ? COLLATE NOCASE
+                      AND s.visibility = 'public'
+                      AND s.id > ?
+                    ORDER BY s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(hashtag)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.*
+                    FROM statuses s
+                    INNER JOIN status_hashtags sh ON sh.status_id = s.id
+                    INNER JOIN hashtags h ON h.id = sh.hashtag_id
+                    WHERE h.name = ? COLLATE NOCASE
+                      AND s.visibility = 'public'
+                    ORDER BY s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(hashtag)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(statuses)
+    }
+
+    /// Get statuses for a list timeline by matching account addresses.
+    pub async fn get_list_timeline_statuses_in_window(
+        &self,
+        list_id: &str,
+        local_account_address: &str,
+        local_account_id: &str,
+        default_port: Option<u16>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let list_accounts = self.get_list_accounts(list_id).await?;
+        if list_accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut include_local_statuses = false;
+        let mut remote_candidates = Vec::new();
+        let mut seen_remote = HashSet::new();
+
+        for account_address in list_accounts {
+            if account_address.eq_ignore_ascii_case(local_account_address)
+                || account_address == local_account_id
+            {
+                include_local_statuses = true;
+                continue;
+            }
+
+            for candidate in equivalent_account_address_candidates(&account_address, default_port) {
+                let lowered = candidate.to_ascii_lowercase();
+                if seen_remote.insert(lowered.clone()) {
+                    remote_candidates.push(lowered);
+                }
+            }
+        }
+
+        if remote_candidates.is_empty() && !include_local_statuses {
+            return Ok(Vec::new());
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT DISTINCT s.* FROM statuses s WHERE (");
+        let mut has_clause = false;
+
+        if !remote_candidates.is_empty() {
+            has_clause = true;
+            query_builder.push("(s.account_address <> '' AND LOWER(s.account_address) IN (");
+            {
+                let mut separated = query_builder.separated(", ");
+                for candidate in remote_candidates {
+                    separated.push_bind(candidate);
+                }
+            }
+            query_builder.push("))");
+        }
+
+        if include_local_statuses {
+            if has_clause {
+                query_builder.push(" OR ");
+            }
+            query_builder.push("(s.is_local = 1 AND s.account_address = '')");
+        }
+
+        query_builder.push(")");
+
+        if let Some(max_id) = max_id {
+            query_builder.push(" AND s.id < ");
+            query_builder.push_bind(max_id);
+        }
+        if let Some(min_id) = min_id {
+            query_builder.push(" AND s.id > ");
+            query_builder.push_bind(min_id);
+        }
+
+        query_builder.push(" ORDER BY s.id DESC LIMIT ");
+        query_builder.push_bind(limit as i64);
+
+        let statuses = query_builder
+            .build_query_as::<Status>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(statuses)
     }
 
