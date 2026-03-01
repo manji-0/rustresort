@@ -419,6 +419,114 @@ async fn test_get_relationships_decodes_percent_encoded_ids() {
 }
 
 #[tokio::test]
+async fn test_get_relationships_matches_default_port_equivalent_ids() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow, Follower};
+
+    let target_with_port = "alice@remote.example:443";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new().0,
+            target_address: target_with_port.to_string(),
+            uri: "https://remote.example/follow/1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: target_with_port.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follow/2".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", "alice@remote.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["following"], true);
+    assert_eq!(body[0]["followed_by"], true);
+}
+
+#[tokio::test]
+async fn test_get_relationships_matches_default_port_equivalent_follow_requests() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follow_request(
+            "alice@remote.example:443",
+            "https://remote.example/inbox",
+            "https://remote.example/follows/1",
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", "alice@remote.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["requested"], true);
+}
+
+#[tokio::test]
+async fn test_get_relationships_returns_persisted_mute_notifications_flag() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .mute_account("alice@remote.example:443", false, None, Some(443))
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", "alice@remote.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["muting"], true);
+    assert_eq!(body[0]["muting_notifications"], false);
+}
+
+#[tokio::test]
 async fn test_search_accounts() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -450,6 +558,43 @@ async fn test_get_account_lists() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_account_lists_matches_default_port_equivalent_members() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Port Equivalence", "list")
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, &[String::from("alice@remote.example:443")])
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/alice@remote.example/lists"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == list_id)
+    );
 }
 
 #[tokio::test]

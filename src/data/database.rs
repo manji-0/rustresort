@@ -2615,6 +2615,24 @@ impl Database {
             .any(|existing| account_addresses_match(existing, target_address, default_port)))
     }
 
+    /// Get mute notifications preference for an account.
+    pub async fn get_account_mute_notifications(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<bool>, AppError> {
+        let existing_mutes = sqlx::query_as::<_, (String, i64)>(
+            "SELECT target_address, notifications FROM account_mutes",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(existing_mutes
+            .into_iter()
+            .find(|(existing, _)| account_addresses_match(existing, target_address, default_port))
+            .map(|(_, notifications)| notifications != 0))
+    }
+
     /// Get muted account addresses
     pub async fn get_muted_accounts(&self, limit: usize) -> Result<Vec<String>, AppError> {
         let addresses = sqlx::query_scalar::<_, String>(
@@ -2654,6 +2672,35 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await?;
 
+        Ok(count > 0)
+    }
+
+    /// Check if follow request exists, treating default-port variants as equivalent.
+    pub async fn has_follow_request_with_default_port(
+        &self,
+        requester_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let candidates = equivalent_account_address_candidates(requester_address, default_port);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) as count FROM follow_requests WHERE LOWER(requester_address) IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in candidates {
+                separated.push_bind(candidate.to_ascii_lowercase());
+            }
+        }
+        query_builder.push(")");
+
+        let count: i64 = query_builder
+            .build_query_scalar()
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count > 0)
     }
 
