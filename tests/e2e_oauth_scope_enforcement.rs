@@ -1,7 +1,7 @@
 mod common;
 
 use common::TestServer;
-use reqwest::{StatusCode, header::LOCATION};
+use reqwest::{StatusCode, header::LOCATION, header::SET_COOKIE};
 use serde_json::json;
 use url::Url;
 
@@ -23,6 +23,21 @@ async fn create_oauth_app(server: &TestServer) -> serde_json::Value {
     app_response.json().await.unwrap()
 }
 
+fn extract_confirm_token(authorize_response: &reqwest::Response) -> String {
+    authorize_response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let raw = value.to_str().ok()?;
+            let cookie_pair = raw.split(';').next()?;
+            let (name, _) = cookie_pair.split_once('=')?;
+            name.strip_prefix("oauth_authorize_confirm_")
+                .map(ToString::to_string)
+        })
+        .expect("missing oauth authorize confirm cookie")
+}
+
 async fn create_scoped_oauth_token(server: &TestServer, scope: &str) -> String {
     let app = create_oauth_app(server).await;
 
@@ -32,7 +47,7 @@ async fn create_scoped_oauth_token(server: &TestServer, scope: &str) -> String {
         .build()
         .unwrap();
 
-    let authorize_response = no_redirect_client
+    let consent_response = no_redirect_client
         .get(server.url("/oauth/authorize"))
         .bearer_auth(&session_token)
         .query(&[
@@ -40,6 +55,27 @@ async fn create_scoped_oauth_token(server: &TestServer, scope: &str) -> String {
             ("client_id", app["client_id"].as_str().unwrap()),
             ("redirect_uri", "https://client.example/callback"),
             ("scope", scope),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(consent_response.status(), StatusCode::OK);
+    let confirm_token = extract_confirm_token(&consent_response);
+
+    let authorize_response = no_redirect_client
+        .get(server.url("/oauth/authorize"))
+        .bearer_auth(&session_token)
+        .header(
+            "Cookie",
+            format!("oauth_authorize_confirm_{}=1", confirm_token),
+        )
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", app["client_id"].as_str().unwrap()),
+            ("redirect_uri", "https://client.example/callback"),
+            ("scope", scope),
+            ("approve", "true"),
+            ("confirm", confirm_token.as_str()),
         ])
         .send()
         .await
