@@ -63,3 +63,33 @@ async fn test_404_for_unknown_routes() {
 
     assert_eq!(response.status(), 404);
 }
+
+#[tokio::test]
+async fn test_metrics_requires_authentication() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .get(&server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn test_metrics_accepts_session_bearer_token() {
+    let server = TestServer::new().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(&server.url("/metrics"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}

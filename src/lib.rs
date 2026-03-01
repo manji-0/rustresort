@@ -343,12 +343,17 @@ pub fn build_router(state: AppState) -> axum::Router {
                 auth::require_session_auth,
             )),
         )
+        .merge(
+            api::metrics_router().route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_session_auth,
+            )),
+        )
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
         .with_state(state)
-        .merge(api::metrics_router())
 }
 
 fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {

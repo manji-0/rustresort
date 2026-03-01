@@ -38,7 +38,11 @@ async fn metrics_handler() -> Response {
 
 /// Create metrics router
 ///
-/// Exposes the `/metrics` endpoint publicly.
-pub fn metrics_router() -> Router {
+/// Exposes the `/metrics` endpoint.
+/// Authentication is applied by the top-level router composition.
+pub fn metrics_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new().route("/metrics", get(metrics_handler))
 }
