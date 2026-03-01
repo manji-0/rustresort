@@ -157,6 +157,15 @@ fn generate_authorize_confirm_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn generate_vapid_key() -> String {
+    // Return a stable-size URL-safe key suitable for API compatibility.
+    // This follows the uncompressed EC-point shape (0x04 + 64 random bytes).
+    let mut bytes = [0_u8; 65];
+    bytes[0] = 0x04;
+    rand::thread_rng().fill_bytes(&mut bytes[1..]);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
     format!("{}{}", OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX, confirm_token)
 }
@@ -393,6 +402,7 @@ pub async fn create_app(
     let app_id = EntityId::new().0;
     let client_id = EntityId::new().0;
     let client_secret = EntityId::new().0;
+    let vapid_key = generate_vapid_key();
 
     // Default scopes if not provided
     let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
@@ -405,6 +415,7 @@ pub async fn create_app(
         redirect_uri: req.redirect_uris.clone(),
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
+        vapid_key: Some(vapid_key),
         scopes: scopes.clone(),
         created_at: Utc::now(),
     };
@@ -420,7 +431,7 @@ pub async fn create_app(
         redirect_uri: app.redirect_uri,
         client_id: app.client_id,
         client_secret: app.client_secret,
-        vapid_key: None, // TODO: Implement push notifications
+        vapid_key: app.vapid_key,
     };
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -501,7 +512,7 @@ pub async fn verify_app_credentials(
                 "website": app.website,
                 "redirect_uri": app.redirect_uri,
                 "client_id": app.client_id,
-                "vapid_key": serde_json::Value::Null,
+                "vapid_key": app.vapid_key,
             });
 
             return Ok(Json(response));
@@ -513,6 +524,19 @@ pub async fn verify_app_credentials(
     }
 
     // Session-authenticated fallback for callers authenticated via cookie or session bearer token.
+    // On single-user instances, return the most recently registered app when available.
+    if let Some(app) = state.db.get_latest_oauth_app().await? {
+        let response = serde_json::json!({
+            "id": app.id,
+            "name": app.name,
+            "website": app.website,
+            "redirect_uri": app.redirect_uri,
+            "client_id": app.client_id,
+            "vapid_key": app.vapid_key,
+        });
+        return Ok(Json(response));
+    }
+
     let response = serde_json::json!({
         "name": session.name.unwrap_or_else(|| "RustResort".to_string()),
         "website": serde_json::Value::Null,
@@ -671,6 +695,7 @@ pub struct RevokeTokenRequest {
 mod tests {
     use super::{
         authorize_confirm_cookie_name, build_authorize_confirm_cookie, extract_bearer_token,
+        generate_vapid_key,
     };
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -703,5 +728,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", HeaderValue::from_static("Bearer "));
         assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn generate_vapid_key_uses_url_safe_format() {
+        let key = generate_vapid_key();
+        assert!(!key.is_empty());
+        assert!(!key.contains('+'));
+        assert!(!key.contains('/'));
+        assert!(!key.contains('='));
     }
 }
