@@ -2,7 +2,7 @@
 
 use crate::api::dto::*;
 use crate::config::AppConfig;
-use crate::data::{Account, Status};
+use crate::data::{Account, MediaAttachment, Status};
 
 /// Convert Account to AccountResponse
 pub fn account_to_response(account: &Account, config: &AppConfig) -> AccountResponse {
@@ -91,6 +91,123 @@ fn remote_account_to_response(status: &Status, config: &AppConfig) -> AccountRes
     }
 }
 
+fn extract_status_id_from_uri(uri: &str) -> Option<String> {
+    if let Ok(parsed) = url::Url::parse(uri) {
+        return parsed
+            .path_segments()
+            .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+            .map(str::to_string)
+            .filter(|segment| !segment.is_empty());
+    }
+
+    let trimmed = uri.trim_end_matches('/');
+    trimmed
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
+        .filter(|segment| !segment.is_empty())
+}
+
+fn media_type_from_content_type(content_type: &str) -> &'static str {
+    if content_type.starts_with("image/") {
+        "image"
+    } else if content_type.starts_with("video/") {
+        "video"
+    } else if content_type.starts_with("audio/") {
+        "audio"
+    } else {
+        "unknown"
+    }
+}
+
+fn media_url(media_base_url: &str, s3_key: &str) -> String {
+    format!(
+        "{}/{}",
+        media_base_url.trim_end_matches('/'),
+        s3_key.trim_start_matches('/')
+    )
+}
+
+fn media_attachment_to_response(
+    attachment: &MediaAttachment,
+    config: &AppConfig,
+) -> MediaAttachmentResponse {
+    let media_base_url = &config.storage.media.public_url;
+    let url = media_url(media_base_url, &attachment.s3_key);
+    let preview_url = attachment
+        .thumbnail_s3_key
+        .as_deref()
+        .map(|key| media_url(media_base_url, key))
+        .unwrap_or_else(|| url.clone());
+
+    let meta = if attachment.width.is_some()
+        || attachment.height.is_some()
+        || attachment.focus_x.is_some()
+        || attachment.focus_y.is_some()
+    {
+        Some(serde_json::json!({
+            "original": {
+                "width": attachment.width,
+                "height": attachment.height,
+                "size": attachment.width.zip(attachment.height).map(|(w, h)| format!("{w}x{h}")),
+                "aspect": attachment.width.zip(attachment.height).and_then(|(w, h)| (h != 0).then_some(w as f64 / h as f64)),
+                "focus": attachment.focus_x.zip(attachment.focus_y).map(|(x, y)| format!("{x:.3},{y:.3}")),
+            }
+        }))
+    } else {
+        None
+    };
+
+    MediaAttachmentResponse {
+        id: attachment.id.clone(),
+        media_type: media_type_from_content_type(&attachment.content_type).to_string(),
+        url,
+        preview_url,
+        remote_url: None,
+        text_url: None,
+        meta,
+        description: attachment.description.clone(),
+        blurhash: attachment.blurhash.clone(),
+    }
+}
+
+fn boost_stub_status(
+    boost_of_uri: &str,
+    status: &Status,
+    account_response: &AccountResponse,
+) -> StatusResponse {
+    StatusResponse {
+        id: extract_status_id_from_uri(boost_of_uri).unwrap_or_else(|| boost_of_uri.to_string()),
+        created_at: status.created_at,
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        sensitive: false,
+        spoiler_text: String::new(),
+        visibility: status.visibility.clone(),
+        language: status.language.clone(),
+        uri: boost_of_uri.to_string(),
+        url: boost_of_uri.to_string(),
+        replies_count: 0,
+        reblogs_count: 0,
+        favourites_count: 0,
+        edited_at: None,
+        content: String::new(),
+        reblog: None,
+        account: account_response.clone(),
+        media_attachments: vec![],
+        mentions: vec![],
+        tags: vec![],
+        emojis: vec![],
+        card: None,
+        poll: None,
+        favourited: None,
+        reblogged: None,
+        muted: None,
+        bookmarked: None,
+        pinned: None,
+    }
+}
+
 /// Convert Status to StatusResponse
 pub fn status_to_response(
     status: &Status,
@@ -102,6 +219,31 @@ pub fn status_to_response(
     bookmarked: Option<bool>,
     pinned: Option<bool>,
 ) -> StatusResponse {
+    status_to_response_with_media(
+        status,
+        account,
+        config,
+        favourited,
+        reblogged,
+        muted,
+        bookmarked,
+        pinned,
+        &[],
+    )
+}
+
+/// Convert Status to StatusResponse with media attachments
+pub fn status_to_response_with_media(
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    favourited: Option<bool>,
+    reblogged: Option<bool>,
+    muted: Option<bool>,
+    bookmarked: Option<bool>,
+    pinned: Option<bool>,
+    media_attachments: &[MediaAttachment],
+) -> StatusResponse {
     let base_url = config.server.base_url();
     let account_response = if status.is_local || status.account_address.trim().is_empty() {
         account_to_response(account, config)
@@ -112,7 +254,10 @@ pub fn status_to_response(
     StatusResponse {
         id: status.id.clone(),
         created_at: status.created_at,
-        in_reply_to_id: None, // TODO: Extract from in_reply_to_uri
+        in_reply_to_id: status
+            .in_reply_to_uri
+            .as_deref()
+            .and_then(extract_status_id_from_uri),
         in_reply_to_account_id: None,
         sensitive: status.content_warning.is_some(),
         spoiler_text: status.content_warning.clone().unwrap_or_default(),
@@ -132,9 +277,15 @@ pub fn status_to_response(
         favourites_count: 0,
         edited_at: None,
         content: status.content.clone(),
-        reblog: None, // TODO: Handle boosts
+        reblog: status
+            .boost_of_uri
+            .as_deref()
+            .map(|uri| Box::new(boost_stub_status(uri, status, &account_response))),
         account: account_response,
-        media_attachments: vec![], // TODO: Load from database
+        media_attachments: media_attachments
+            .iter()
+            .map(|attachment| media_attachment_to_response(attachment, config))
+            .collect(),
         mentions: vec![],
         tags: vec![],
         emojis: vec![],
@@ -349,5 +500,151 @@ mod tests {
         assert_eq!(response.muted, None);
         assert_eq!(response.bookmarked, None);
         assert_eq!(response.pinned, None);
+    }
+
+    #[test]
+    fn test_status_to_response_extracts_in_reply_to_id_from_uri() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".to_string(),
+            username: "testuser".to_string(),
+            display_name: None,
+            note: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "456".to_string(),
+            uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
+            content: "<p>Reply</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: None,
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: Some("https://remote.example/users/alice/statuses/123".to_string()),
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+
+        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+
+        assert_eq!(response.in_reply_to_id.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn test_status_to_response_populates_reblog_from_boost_uri() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".to_string(),
+            username: "testuser".to_string(),
+            display_name: None,
+            note: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "456".to_string(),
+            uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
+            content: "<p>Boost</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
+            persisted_reason: "reposted".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+
+        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let reblog = response
+            .reblog
+            .expect("boosted status should include reblog payload");
+
+        assert_eq!(reblog.id, "999");
+        assert_eq!(
+            reblog.uri,
+            "https://remote.example/users/alice/statuses/999"
+        );
+    }
+
+    #[test]
+    fn test_status_to_response_with_media_populates_media_attachments() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".to_string(),
+            username: "testuser".to_string(),
+            display_name: None,
+            note: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "456".to_string(),
+            uri: "https://test.example.com/users/testuser/statuses/456".to_string(),
+            content: "<p>Media</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: "own".to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        let media = MediaAttachment {
+            id: "media-1".to_string(),
+            status_id: Some(status.id.clone()),
+            s3_key: "uploads/media-1.webp".to_string(),
+            thumbnail_s3_key: Some("uploads/thumb-media-1.webp".to_string()),
+            content_type: "image/webp".to_string(),
+            file_size: 1024,
+            description: Some("alt".to_string()),
+            blurhash: Some("LKO2?U%2Tw=w]~RBVZRi};RPxuwH".to_string()),
+            width: Some(1200),
+            height: Some(800),
+            focus_x: Some(0.1),
+            focus_y: Some(-0.2),
+            created_at: Utc::now(),
+        };
+
+        let response = status_to_response_with_media(
+            &status,
+            &account,
+            &config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[media],
+        );
+
+        assert_eq!(response.media_attachments.len(), 1);
+        assert_eq!(response.media_attachments[0].id, "media-1");
+        assert_eq!(response.media_attachments[0].media_type, "image");
+        assert_eq!(
+            response.media_attachments[0].url,
+            "https://media.test.example.com/uploads/media-1.webp"
+        );
     }
 }

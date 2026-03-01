@@ -215,18 +215,6 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppErr
     Ok(Some(key.to_string()))
 }
 
-fn media_type_from_content_type(content_type: &str) -> &'static str {
-    if content_type.starts_with("image/") {
-        "image"
-    } else if content_type.starts_with("video/") {
-        "video"
-    } else if content_type.starts_with("audio/") {
-        "audio"
-    } else {
-        "unknown"
-    }
-}
-
 fn build_status_service(state: &AppState) -> StatusService {
     StatusService::new(
         state.db.clone(),
@@ -599,36 +587,10 @@ pub async fn create_status(
             );
         }
 
-        let media_attachments_value = if !media_ids.is_empty() {
-            let media_attachments = status_service.get_media_by_status(&status.id).await?;
-            let values: Vec<serde_json::Value> = media_attachments
-                .into_iter()
-                .map(|attachment| {
-                    let media_url = format!(
-                        "{}/{}",
-                        state.config.storage.media.public_url, attachment.s3_key
-                    );
-                    let preview_url = attachment
-                        .thumbnail_s3_key
-                        .as_ref()
-                        .map(|key| format!("{}/{}", state.config.storage.media.public_url, key))
-                        .unwrap_or_else(|| media_url.clone());
-                    serde_json::json!({
-                        "id": attachment.id,
-                        "type": media_type_from_content_type(&attachment.content_type),
-                        "url": media_url,
-                        "preview_url": preview_url,
-                        "remote_url": serde_json::Value::Null,
-                        "text_url": serde_json::Value::Null,
-                        "meta": serde_json::Value::Null,
-                        "description": attachment.description,
-                        "blurhash": attachment.blurhash,
-                    })
-                })
-                .collect();
-            Some(serde_json::Value::Array(values))
+        let media_attachments = if !media_ids.is_empty() {
+            status_service.get_media_by_status(&status.id).await?
         } else {
-            None
+            Vec::new()
         };
 
         let poll_value = if poll.is_some() {
@@ -664,7 +626,7 @@ pub async fn create_status(
             None
         };
 
-        let response = crate::api::status_to_response(
+        let response = crate::api::status_to_response_with_media(
             &status,
             &account,
             &state.config,
@@ -673,6 +635,7 @@ pub async fn create_status(
             Some(false),
             Some(false),
             Some(false),
+            &media_attachments,
         );
         let mut response_value = serde_json::to_value(response).map_err(|error| {
             AppError::Internal(anyhow::anyhow!(
@@ -680,9 +643,6 @@ pub async fn create_status(
             ))
         })?;
         if let Some(obj) = response_value.as_object_mut() {
-            if let Some(media_attachments_value) = media_attachments_value {
-                obj.insert("media_attachments".to_string(), media_attachments_value);
-            }
             if let Some(poll_value) = poll_value {
                 obj.insert("poll".to_string(), poll_value);
             }
