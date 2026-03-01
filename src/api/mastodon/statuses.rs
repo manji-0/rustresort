@@ -1413,6 +1413,7 @@ pub async fn update_status(
 
     // Update fields if provided
     let mut changed = false;
+    let mut media_ids_to_replace: Option<Vec<String>> = None;
 
     if let Some(content) = req.status {
         if !content.is_empty() {
@@ -1431,12 +1432,41 @@ pub async fn update_status(
         }
     }
 
-    // TODO: Handle media_ids updates
-    // For now, we skip media updates as it requires more complex logic
+    if let Some(media_ids) = req.media_ids {
+        let mut normalized_media_ids = Vec::with_capacity(media_ids.len());
+        let mut seen_media_ids = HashSet::new();
+        for media_id in media_ids {
+            let trimmed = media_id.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::Validation(
+                    "media_ids must not contain empty values".to_string(),
+                ));
+            }
+            if seen_media_ids.insert(trimmed.to_string()) {
+                normalized_media_ids.push(trimmed.to_string());
+            }
+        }
+
+        let current_media_ids = status_service
+            .get_media_by_status(&id)
+            .await?
+            .into_iter()
+            .map(|media| media.id)
+            .collect::<HashSet<_>>();
+        let requested_media_ids = normalized_media_ids.iter().cloned().collect::<HashSet<_>>();
+        if current_media_ids != requested_media_ids {
+            media_ids_to_replace = Some(normalized_media_ids);
+            changed = true;
+        }
+    }
 
     if changed {
         status_service
-            .update_with_edit_snapshot(&previous_status, &status)
+            .update_with_edit_snapshot_and_media(
+                &previous_status,
+                &status,
+                media_ids_to_replace.as_deref(),
+            )
             .await?;
     }
 

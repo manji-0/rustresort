@@ -152,6 +152,10 @@ pub struct MediaAttachment {
     pub blurhash: Option<String>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    /// Focal point X coordinate between -1.0 and 1.0
+    pub focus_x: Option<f64>,
+    /// Focal point Y coordinate between -1.0 and 1.0
+    pub focus_y: Option<f64>,
     pub created_at: DateTime<Utc>,
 }
 

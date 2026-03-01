@@ -250,12 +250,33 @@ impl StatusService {
             .await
     }
 
+    /// Persist status update with atomic edit snapshot and optional media replacement.
+    pub async fn update_with_edit_snapshot_and_media(
+        &self,
+        previous: &Status,
+        updated: &Status,
+        media_ids: Option<&[String]>,
+    ) -> Result<(), AppError> {
+        self.db
+            .update_status_with_edit_snapshot_and_media(previous, updated, media_ids)
+            .await
+    }
+
     /// Get media attachments linked to a status.
     pub async fn get_media_by_status(
         &self,
         status_id: &str,
     ) -> Result<Vec<MediaAttachment>, AppError> {
         self.db.get_media_by_status(status_id).await
+    }
+
+    /// Replace all media attachments associated with a status.
+    pub async fn replace_media_for_status(
+        &self,
+        status_id: &str,
+        media_ids: &[String],
+    ) -> Result<(), AppError> {
+        self.db.replace_status_media(status_id, media_ids).await
     }
 
     /// Get poll metadata for a status if present.
@@ -589,6 +610,8 @@ impl StatusService {
             blurhash: None,
             width: None,
             height: None,
+            focus_x: None,
+            focus_y: None,
             created_at: chrono::Utc::now(),
         };
 

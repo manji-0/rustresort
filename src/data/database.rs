@@ -989,6 +989,111 @@ impl Database {
         }
     }
 
+    /// Atomically replace status media (optional), snapshot previous content,
+    /// and apply updated status fields.
+    pub async fn update_status_with_edit_snapshot_and_media(
+        &self,
+        previous: &Status,
+        updated: &Status,
+        media_ids: Option<&[String]>,
+    ) -> Result<(), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            if let Some(media_ids) = media_ids {
+                if media_ids.is_empty() {
+                    sqlx::query("UPDATE media_attachments SET status_id = NULL WHERE status_id = ?")
+                        .bind(&updated.id)
+                        .execute(&mut *conn)
+                        .await?;
+                } else {
+                    let placeholders = std::iter::repeat_n("?", media_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "UPDATE media_attachments SET status_id = NULL WHERE status_id = ? AND id NOT IN ({})",
+                        placeholders
+                    );
+                    let mut query = sqlx::query(&sql).bind(&updated.id);
+                    for media_id in media_ids {
+                        query = query.bind(media_id);
+                    }
+                    query.execute(&mut *conn).await?;
+                }
+
+                for media_id in media_ids {
+                    let attach_result = sqlx::query(
+                        "UPDATE media_attachments SET status_id = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
+                    )
+                    .bind(&updated.id)
+                    .bind(media_id)
+                    .bind(&updated.id)
+                    .execute(&mut *conn)
+                    .await?;
+
+                    if attach_result.rows_affected() == 0 {
+                        return Err(AppError::Validation(format!(
+                            "media attachment is already attached to another status: {}",
+                            media_id
+                        )));
+                    }
+                }
+            }
+
+            let edit_id = EntityId::new().0;
+            sqlx::query(
+                r#"
+                INSERT INTO status_edits (id, status_id, content, content_warning, created_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                "#,
+            )
+            .bind(edit_id)
+            .bind(&previous.id)
+            .bind(&previous.content)
+            .bind(&previous.content_warning)
+            .execute(&mut *conn)
+            .await?;
+
+            let update_result = sqlx::query(
+                r#"
+                UPDATE statuses
+                SET content = ?, content_warning = ?, visibility = ?, language = ?,
+                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(&updated.content)
+            .bind(&updated.content_warning)
+            .bind(&updated.visibility)
+            .bind(&updated.language)
+            .bind(&updated.in_reply_to_uri)
+            .bind(&updated.boost_of_uri)
+            .bind(&updated.persisted_reason)
+            .bind(&updated.fetched_at)
+            .bind(&updated.id)
+            .execute(&mut *conn)
+            .await?;
+            if update_result.rows_affected() != 1 {
+                return Err(AppError::NotFound);
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Insert a status edit-history snapshot.
     pub async fn insert_status_edit(
         &self,
@@ -1349,8 +1454,8 @@ impl Database {
             r#"
             INSERT INTO media_attachments (
                 id, status_id, s3_key, thumbnail_s3_key, content_type,
-                file_size, description, blurhash, width, height, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                file_size, description, blurhash, width, height, focus_x, focus_y, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&media.id)
@@ -1363,6 +1468,8 @@ impl Database {
         .bind(&media.blurhash)
         .bind(media.width)
         .bind(media.height)
+        .bind(media.focus_x)
+        .bind(media.focus_y)
         .bind(&media.created_at)
         .execute(&self.pool)
         .await?;
@@ -1410,6 +1517,60 @@ impl Database {
         Ok(())
     }
 
+    /// Replace all media attachments for a status.
+    ///
+    /// Existing attachments not listed in `media_ids` are detached. Each listed
+    /// media attachment must be either unattached or already attached to the
+    /// same status.
+    pub async fn replace_status_media(
+        &self,
+        status_id: &str,
+        media_ids: &[String],
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+
+        if media_ids.is_empty() {
+            sqlx::query("UPDATE media_attachments SET status_id = NULL WHERE status_id = ?")
+                .bind(status_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let placeholders = std::iter::repeat_n("?", media_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE media_attachments SET status_id = NULL WHERE status_id = ? AND id NOT IN ({})",
+                placeholders
+            );
+            let mut query = sqlx::query(&sql).bind(status_id);
+            for media_id in media_ids {
+                query = query.bind(media_id);
+            }
+            query.execute(&mut *tx).await?;
+        }
+
+        for media_id in media_ids {
+            let result = sqlx::query(
+                "UPDATE media_attachments SET status_id = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
+            )
+            .bind(status_id)
+            .bind(media_id)
+            .bind(status_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                return Err(AppError::Validation(format!(
+                    "media attachment is already attached to another status: {}",
+                    media_id
+                )));
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get media by ID
     pub async fn get_media(&self, id: &str) -> Result<Option<MediaAttachment>, AppError> {
         let media =
@@ -1426,7 +1587,7 @@ impl Database {
         sqlx::query(
             r#"
             UPDATE media_attachments 
-            SET description = ?, blurhash = ?, width = ?, height = ?
+            SET description = ?, blurhash = ?, width = ?, height = ?, focus_x = ?, focus_y = ?
             WHERE id = ?
             "#,
         )
@@ -1434,6 +1595,8 @@ impl Database {
         .bind(&media.blurhash)
         .bind(media.width)
         .bind(media.height)
+        .bind(media.focus_x)
+        .bind(media.focus_y)
         .bind(&media.id)
         .execute(&self.pool)
         .await?;
