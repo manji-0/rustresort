@@ -619,6 +619,59 @@ async fn test_favourite_status() {
 }
 
 #[tokio::test]
+async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let status = Status {
+        id: EntityId::new().0,
+        uri: "https://test.example.com/status/fav-by-uri-path".to_string(),
+        content: "<p>Favourite by URI path</p>".to_string(),
+        content_warning: None,
+        visibility: "public".to_string(),
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: "own".to_string(),
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let favourite_response = server
+        .client
+        .post(&server.url(&format!("/api/v1/statuses/{}/favourite", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(favourite_response.status().is_success());
+
+    let encoded_uri: String = url::form_urlencoded::byte_serialize(status.uri.as_bytes()).collect();
+    let favourited_by_response = server
+        .client
+        .get(&server.url(&format!("/api/v1/statuses/{}/favourited_by", encoded_uri)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(favourited_by_response.status(), 200);
+    let body: Value = favourited_by_response.json().await.unwrap();
+    let accounts = body
+        .as_array()
+        .expect("favourited_by response should be an array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["username"], "testuser");
+}
+
+#[tokio::test]
 async fn test_boost_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
