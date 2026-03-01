@@ -7,6 +7,64 @@ mod common;
 use common::TestServer;
 use serde_json::json;
 
+async fn cache_remote_profile(server: &TestServer, address: &str) {
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+
+    let (username, domain) = address
+        .split_once('@')
+        .expect("remote address must be user@domain");
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: address.to_string(),
+            uri: format!("https://{}/users/{}", domain, username),
+            display_name: Some("Alice Remote".to_string()),
+            note: Some("Remote profile".to_string()),
+            avatar_url: Some(format!("https://{}/media/alice-avatar.jpg", domain)),
+            header_url: Some(format!("https://{}/media/alice-header.jpg", domain)),
+            public_key_pem: "test-public-key".to_string(),
+            inbox_uri: format!("https://{}/inbox", domain),
+            outbox_uri: Some(format!("https://{}/users/{}/outbox", domain, username)),
+            followers_count: Some(12),
+            following_count: Some(34),
+            fetched_at: Utc::now(),
+        })
+        .await;
+}
+
+async fn cache_remote_profile_alias_by_actor_uri(
+    server: &TestServer,
+    actor_uri: &str,
+    canonical_address: &str,
+) {
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+
+    let (username, domain) = canonical_address
+        .split_once('@')
+        .expect("canonical address must be user@domain");
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: actor_uri.to_string(),
+            uri: actor_uri.to_string(),
+            display_name: Some("Alice Alias".to_string()),
+            note: Some("Alias profile".to_string()),
+            avatar_url: Some(format!("https://{}/media/alice-avatar.jpg", domain)),
+            header_url: Some(format!("https://{}/media/alice-header.jpg", domain)),
+            public_key_pem: "test-public-key".to_string(),
+            inbox_uri: format!("{}/inbox", actor_uri.trim_end_matches('/')),
+            outbox_uri: Some(format!("https://{}/users/{}/outbox", domain, username)),
+            followers_count: Some(56),
+            following_count: Some(78),
+            fetched_at: Utc::now(),
+        })
+        .await;
+}
+
 // ============================================================================
 // Instance Endpoints (5 endpoints)
 // ============================================================================
@@ -249,6 +307,437 @@ async fn test_account_following() {
 }
 
 #[tokio::test]
+async fn test_account_followers_applies_max_id_cursor() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for address in [
+        "alice@remote.example",
+        "bob@remote.example",
+        "carol@remote.example",
+    ] {
+        server
+            .state
+            .db
+            .insert_follower(&Follower {
+                id: EntityId::new().0,
+                follower_address: address.to_string(),
+                inbox_uri: format!("https://remote.example/inbox/{}", address),
+                uri: format!("https://remote.example/follows/{}", address),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let first_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/followers?limit=1",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_page_response.status(), 200);
+    let first_page: serde_json::Value = first_page_response.json().await.unwrap();
+    let first_id = first_page[0]["id"]
+        .as_str()
+        .expect("first followers page should include id")
+        .to_string();
+
+    let second_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/followers?limit=1&max_id={}",
+            account.id, first_id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_page_response.status(), 200);
+    let second_page: serde_json::Value = second_page_response.json().await.unwrap();
+    let second_id = second_page[0]["id"]
+        .as_str()
+        .expect("second followers page should include id");
+    assert_ne!(second_id, first_id);
+}
+
+#[tokio::test]
+async fn test_account_followers_actor_uri_cursor_preserves_case() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for address in [
+        "https://remote.example/Users/Alice",
+        "https://remote.example/Users/Bob",
+    ] {
+        server
+            .state
+            .db
+            .insert_follower(&Follower {
+                id: EntityId::new().0,
+                follower_address: address.to_string(),
+                inbox_uri: format!("https://remote.example/inbox/{}", address),
+                uri: format!("https://remote.example/follows/{}", address),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let first_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/followers?limit=1",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_page_response.status(), 200);
+    let first_page: serde_json::Value = first_page_response.json().await.unwrap();
+    let first_id = first_page[0]["id"]
+        .as_str()
+        .expect("first followers page should include id")
+        .to_string();
+
+    let second_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/followers?limit=1&max_id={}",
+            account.id, first_id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_page_response.status(), 200);
+    let second_page: serde_json::Value = second_page_response.json().await.unwrap();
+    let second_id = second_page[0]["id"]
+        .as_str()
+        .expect("second followers page should include id");
+    assert_ne!(second_id, first_id);
+}
+
+#[tokio::test]
+async fn test_account_following_applies_max_id_cursor() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for address in [
+        "alice@remote.example",
+        "bob@remote.example",
+        "carol@remote.example",
+    ] {
+        server
+            .state
+            .db
+            .insert_follow(&Follow {
+                id: EntityId::new().0,
+                target_address: address.to_string(),
+                uri: format!("https://remote.example/follows/{}", address),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let first_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/following?limit=1",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_page_response.status(), 200);
+    let first_page: serde_json::Value = first_page_response.json().await.unwrap();
+    let first_id = first_page[0]["id"]
+        .as_str()
+        .expect("first following page should include id")
+        .to_string();
+
+    let second_page_response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/{}/following?limit=1&max_id={}",
+            account.id, first_id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second_page_response.status(), 200);
+    let second_page: serde_json::Value = second_page_response.json().await.unwrap();
+    let second_id = second_page[0]["id"]
+        .as_str()
+        .expect("second following page should include id");
+    assert_ne!(second_id, first_id);
+}
+
+#[tokio::test]
+async fn test_account_followers_returns_remote_account_data_from_cache() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: remote_address.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["acct"], remote_address);
+    assert_eq!(followers[0]["display_name"], "Alice Remote");
+    assert_eq!(followers[0]["followers_count"], 12);
+}
+
+#[tokio::test]
+async fn test_account_following_returns_remote_account_data_from_cache() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new().0,
+            target_address: remote_address.to_string(),
+            uri: "https://remote.example/follows/2".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let following = body.as_array().expect("following should be array");
+    assert_eq!(following.len(), 1);
+    assert_eq!(following[0]["acct"], remote_address);
+    assert_eq!(following[0]["display_name"], "Alice Remote");
+    assert_eq!(following[0]["following_count"], 34);
+}
+
+#[tokio::test]
+async fn test_account_followers_actor_uri_uses_cached_profile_by_uri_alias() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri_address = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: actor_uri_address.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/actor-uri-cached".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri_address, "alice@remote.example")
+        .await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["acct"], "alice@remote.example");
+    assert_eq!(followers[0]["username"], "alice");
+    assert_eq!(followers[0]["display_name"], "Alice Alias");
+    assert_eq!(followers[0]["followers_count"], 56);
+}
+
+#[tokio::test]
+async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri_address = "https://remote.example/actors/12345";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: actor_uri_address.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/actor-uri".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["id"], actor_uri_address);
+    assert_eq!(followers[0]["acct"], actor_uri_address);
+    assert_eq!(followers[0]["url"], actor_uri_address);
+}
+
+#[tokio::test]
+async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri_address = "https://remote.example/actors/12345";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new().0,
+            target_address: actor_uri_address.to_string(),
+            uri: "https://remote.example/follows/actor-uri".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let following = body.as_array().expect("following should be array");
+    assert_eq!(following.len(), 1);
+    assert_eq!(following[0]["id"], actor_uri_address);
+    assert_eq!(following[0]["acct"], actor_uri_address);
+    assert_eq!(following[0]["url"], actor_uri_address);
+}
+
+#[tokio::test]
+async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_url() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri_address = "https://remote.example/@alice";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: actor_uri_address.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/actor-uri-at".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["id"], actor_uri_address);
+    assert_eq!(followers[0]["acct"], actor_uri_address);
+    assert_eq!(followers[0]["username"], "alice");
+    assert_eq!(followers[0]["url"], actor_uri_address);
+}
+
+#[tokio::test]
 async fn test_follow_account() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -473,6 +962,56 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
 }
 
 #[tokio::test]
+async fn test_get_relationships_matches_actor_uri_ids() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow, Follower};
+
+    let actor_uri = "https://remote.example/@alice";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new().0,
+            target_address: actor_uri.to_string(),
+            uri: "https://remote.example/follow/uri-1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: actor_uri.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follow/uri-2".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(&server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", actor_uri)])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["id"], actor_uri);
+    assert_eq!(body[0]["following"], true);
+    assert_eq!(body[0]["followed_by"], true);
+}
+
+#[tokio::test]
 async fn test_get_relationships_matches_default_port_equivalent_follow_requests() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -546,6 +1085,161 @@ async fn test_search_accounts() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_returns_remote_account_data() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/search?q={}&resolve=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account["acct"] == remote_address)
+    );
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_actor_uri_query_uses_cached_alias_profile() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/@alice";
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let encoded_query = urlencoding::encode(actor_uri).into_owned();
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/search?q={encoded_query}&resolve=true"
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    let account = accounts
+        .iter()
+        .find(|account| account["acct"] == "alice@remote.example")
+        .expect("resolved account should be returned");
+    assert_eq!(account["username"], "alice");
+    assert_eq!(account["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_deduplicates_local_account_identity() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "testuser@test.example.com";
+    cache_remote_profile(&server, local_full_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/search?q={}&resolve=true",
+            local_full_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    let local_matches = accounts
+        .iter()
+        .filter(|account| {
+            matches!(
+                account["acct"].as_str(),
+                Some("testuser") | Some("testuser@test.example.com")
+            )
+        })
+        .count();
+    assert_eq!(local_matches, 1);
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_local_address_skips_remote_lookup() {
+    use std::time::Duration;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "testuser@test.example.com";
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        server
+            .client
+            .get(&server.url(&format!(
+                "/api/v1/accounts/search?q={}&resolve=true",
+                local_full_address
+            )))
+            .header("Authorization", format!("Bearer {}", token))
+            .send(),
+    )
+    .await
+    .expect("local resolve search should not block on remote federation")
+    .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "testuser");
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_local_address_with_leading_at_skips_remote_lookup() {
+    use std::time::Duration;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "@testuser@test.example.com";
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        server
+            .client
+            .get(&server.url(&format!(
+                "/api/v1/accounts/search?q={}&resolve=true",
+                local_full_address
+            )))
+            .header("Authorization", format!("Bearer {}", token))
+            .send(),
+    )
+    .await
+    .expect("local resolve search should not block on remote federation")
+    .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "testuser");
 }
 
 #[tokio::test]
@@ -1647,6 +2341,198 @@ async fn test_search_v2() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_returns_remote_account_data() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account["acct"] == remote_address)
+    );
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_actor_uri_query_uses_cached_alias_profile() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/@alice";
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let encoded_query = urlencoding::encode(actor_uri).into_owned();
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v2/search?q={encoded_query}&type=accounts&resolve=true"
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    let account = accounts
+        .iter()
+        .find(|account| account["acct"] == "alice@remote.example")
+        .expect("resolved account should be returned");
+    assert_eq!(account["username"], "alice");
+    assert_eq!(account["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_deduplicates_local_account_identity() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "testuser@test.example.com";
+    cache_remote_profile(&server, local_full_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true",
+            local_full_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    let local_matches = accounts
+        .iter()
+        .filter(|account| {
+            matches!(
+                account["acct"].as_str(),
+                Some("testuser") | Some("testuser@test.example.com")
+            )
+        })
+        .count();
+    assert_eq!(local_matches, 1);
+}
+
+#[tokio::test]
+async fn test_search_v2_accounts_respects_limit() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "testuser@test.example.com";
+    cache_remote_profile(&server, local_full_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true&limit=0",
+            local_full_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert!(accounts.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_local_address_skips_remote_lookup() {
+    use std::time::Duration;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "testuser@test.example.com";
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        server
+            .client
+            .get(&server.url(&format!(
+                "/api/v2/search?q={}&type=accounts&resolve=true",
+                local_full_address
+            )))
+            .header("Authorization", format!("Bearer {}", token))
+            .send(),
+    )
+    .await
+    .expect("local resolve search should not block on remote federation")
+    .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "testuser");
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_local_address_with_leading_at_skips_remote_lookup() {
+    use std::time::Duration;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let local_full_address = "@testuser@test.example.com";
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        server
+            .client
+            .get(&server.url(&format!(
+                "/api/v2/search?q={}&type=accounts&resolve=true",
+                local_full_address
+            )))
+            .header("Authorization", format!("Bearer {}", token))
+            .send(),
+    )
+    .await
+    .expect("local resolve search should not block on remote federation")
+    .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "testuser");
 }
 
 // ============================================================================

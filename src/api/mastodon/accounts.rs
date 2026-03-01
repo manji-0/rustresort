@@ -12,7 +12,9 @@ use super::federation_delivery::{
     build_delivery, resolve_remote_actor_and_inbox, spawn_best_effort_delivery,
 };
 use crate::AppState;
+use crate::api::dto::AccountResponse;
 use crate::auth::CurrentUser;
+use crate::data::CachedProfile;
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
@@ -428,6 +430,11 @@ fn normalize_account_address(raw: &str) -> Result<String, AppError> {
     }
 
     let trimmed = raw.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Err(AppError::Validation(
+            "Invalid account ID format".to_string(),
+        ));
+    }
     let without_leading_at = trimmed.strip_prefix('@').unwrap_or(trimmed);
     let (username, domain) = without_leading_at
         .split_once('@')
@@ -444,6 +451,65 @@ fn normalize_account_address(raw: &str) -> Result<String, AppError> {
         username.to_ascii_lowercase(),
         normalize_domain(domain)?
     ))
+}
+
+fn normalize_remote_lookup_account_address(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(parsed) = parse_actor_uri_account_address(trimmed) {
+        return normalize_account_address(&parsed).ok();
+    }
+    normalize_account_address(trimmed).ok()
+}
+
+fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let normalized_host = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let authority_host = format_authority_host(&normalized_host);
+    let domain = match parsed.port() {
+        Some(port) => format!("{authority_host}:{port}"),
+        None => authority_host,
+    };
+    let username = parsed
+        .path_segments()
+        .and_then(|segments| {
+            let collected = segments.collect::<Vec<_>>();
+            collected
+                .windows(2)
+                .find_map(|window| (window[0] == "users").then_some(window[1]))
+                .or_else(|| {
+                    collected
+                        .iter()
+                        .find_map(|segment| segment.strip_prefix('@'))
+                })
+                .or_else(|| {
+                    collected
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|segment| !segment.is_empty())
+                })
+        })
+        .map(str::to_ascii_lowercase)
+        .filter(|value| !value.is_empty())?;
+
+    Some(format!("{}@{}", username, domain))
+}
+
+fn canonical_remote_account_address(raw: &str) -> Option<String> {
+    parse_actor_uri_account_address(raw)
+        .and_then(|parsed| normalize_account_address(&parsed).ok())
+        .or_else(|| normalize_account_address(raw).ok())
 }
 
 fn account_addresses_match_with_default_port(
@@ -488,10 +554,224 @@ fn account_addresses_match_with_default_port(
     }
 }
 
+fn remote_account_placeholder_created_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(0, 0).expect("unix epoch timestamp should always be valid")
+}
+
+fn saturating_count(value: Option<u64>) -> i32 {
+    value.unwrap_or(0).min(i32::MAX as u64) as i32
+}
+
+fn build_remote_account_response_with_profile(
+    normalized_address: &str,
+    profile: &CachedProfile,
+    config: &crate::config::AppConfig,
+) -> Option<AccountResponse> {
+    let (username, domain) = normalized_address.split_once('@')?;
+    let media_url = &config.storage.media.public_url;
+    let default_avatar = format!("{}/default-avatar.png", media_url);
+    let default_header = format!("{}/default-header.png", media_url);
+
+    let url = Some(profile.uri.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("https://{}/@{}", domain, username));
+    let avatar = profile
+        .avatar_url
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_avatar.clone());
+    let header = profile
+        .header_url
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_header.clone());
+    let display_name = profile
+        .display_name
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| username.to_string());
+
+    Some(AccountResponse {
+        id: normalized_address.to_string(),
+        username: username.to_string(),
+        acct: normalized_address.to_string(),
+        display_name,
+        locked: false,
+        bot: false,
+        discoverable: true,
+        group: false,
+        created_at: profile.fetched_at,
+        note: profile.note.clone().unwrap_or_default(),
+        url,
+        avatar: avatar.clone(),
+        avatar_static: avatar,
+        header: header.clone(),
+        header_static: header,
+        followers_count: saturating_count(profile.followers_count),
+        following_count: saturating_count(profile.following_count),
+        statuses_count: 0,
+        last_status_at: None,
+        emojis: vec![],
+        fields: vec![],
+    })
+}
+
+fn build_remote_account_placeholder_response(
+    address: &str,
+    config: &crate::config::AppConfig,
+) -> Option<AccountResponse> {
+    let trimmed = address.trim();
+    let (username, id, acct, url) =
+        if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
+            let (username, _domain) = parsed_address.split_once('@')?;
+            (
+                username.to_string(),
+                trimmed.to_string(),
+                trimmed.to_string(),
+                trimmed.to_string(),
+            )
+        } else if let Some((username, domain)) = trimmed.split_once('@') {
+            (
+                username.to_ascii_lowercase(),
+                trimmed.to_string(),
+                trimmed.to_string(),
+                format!(
+                    "https://{}/@{}",
+                    domain.to_ascii_lowercase(),
+                    username.to_ascii_lowercase()
+                ),
+            )
+        } else {
+            return None;
+        };
+    let media_url = &config.storage.media.public_url;
+    let avatar = format!("{}/default-avatar.png", media_url);
+    let header = format!("{}/default-header.png", media_url);
+
+    Some(AccountResponse {
+        id,
+        username: username.clone(),
+        acct,
+        display_name: username,
+        locked: false,
+        bot: false,
+        discoverable: true,
+        group: false,
+        created_at: remote_account_placeholder_created_at(),
+        note: String::new(),
+        url,
+        avatar: avatar.clone(),
+        avatar_static: avatar,
+        header: header.clone(),
+        header_static: header,
+        followers_count: 0,
+        following_count: 0,
+        statuses_count: 0,
+        last_status_at: None,
+        emojis: vec![],
+        fields: vec![],
+    })
+}
+
+pub(crate) async fn resolve_remote_account_response(
+    state: &AppState,
+    raw_address: &str,
+) -> Option<AccountResponse> {
+    let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
+
+    let mut profile = state.profile_cache.get(&normalized_address).await;
+    if profile.is_none() {
+        profile = state.profile_cache.get_by_uri(raw_address.trim()).await;
+    }
+    if profile.is_none()
+        && resolve_remote_actor_and_inbox(state, &normalized_address)
+            .await
+            .is_ok()
+    {
+        profile = state.profile_cache.get(&normalized_address).await;
+    }
+
+    let profile = profile?;
+    build_remote_account_response_with_profile(&normalized_address, &profile, state.config.as_ref())
+}
+
+async fn resolve_cached_remote_account_response(
+    state: &AppState,
+    raw_address: &str,
+) -> Option<AccountResponse> {
+    let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
+    let profile = if let Some(profile) = state.profile_cache.get(&normalized_address).await {
+        profile
+    } else {
+        state.profile_cache.get_by_uri(raw_address.trim()).await?
+    };
+    build_remote_account_response_with_profile(&normalized_address, &profile, state.config.as_ref())
+}
+
+fn contains_equivalent_address(
+    seen_addresses: &[String],
+    candidate: &str,
+    default_port: Option<u16>,
+) -> bool {
+    seen_addresses
+        .iter()
+        .any(|seen| account_addresses_match_with_default_port(seen, candidate, default_port))
+}
+
+fn normalized_cursor_id(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(normalize_account_address(trimmed).unwrap_or_else(|_| trimmed.to_string()))
+}
+
+fn apply_account_address_pagination(
+    mut addresses: Vec<String>,
+    params: &PaginationParams,
+) -> Vec<String> {
+    addresses.sort();
+    addresses.dedup();
+    addresses.reverse();
+
+    let max_id = normalized_cursor_id(params.max_id.as_deref());
+    let min_id = normalized_cursor_id(params.min_id.as_deref());
+
+    addresses
+        .into_iter()
+        .filter(|address| {
+            max_id
+                .as_ref()
+                .map(|cursor| address < cursor)
+                .unwrap_or(true)
+                && min_id
+                    .as_ref()
+                    .map(|cursor| address > cursor)
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
+    let normalized_acct = acct.trim().trim_start_matches('@').to_ascii_lowercase();
+    if normalized_acct.contains('@') {
+        normalized_acct
+    } else {
+        format!(
+            "{normalized_acct}@{}",
+            local_domain.trim().to_ascii_lowercase()
+        )
+    }
+}
+
 async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
     if id.starts_with("http://") || id.starts_with("https://") {
+        if let Some(address) = parse_actor_uri_account_address(id) {
+            return normalize_account_address(&address);
+        }
         return Err(AppError::Validation(
-            "Account URI is not yet supported".to_string(),
+            "Invalid account ID format".to_string(),
         ));
     }
 
@@ -776,7 +1056,7 @@ pub async fn account_statuses(
 pub async fn get_account_followers(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -785,19 +1065,63 @@ pub async fn get_account_followers(
         return Err(AppError::NotFound);
     }
 
-    // Get follower addresses
-    let _follower_addresses = state.db.get_all_follower_addresses().await?;
+    let follower_addresses = state.db.get_all_follower_addresses().await?;
+    let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let mut unique_addresses: Vec<String> = Vec::new();
+    let mut followers = Vec::new();
 
-    // TODO: Fetch full account info for each follower from cache/federation
-    // For now, return empty array as we don't have remote account info
-    Ok(Json(vec![]))
+    for address in follower_addresses {
+        let normalized_address = normalize_account_address(&address);
+        let candidate = match normalized_address.as_ref() {
+            Ok(normalized) => normalized.to_string(),
+            Err(_) => {
+                let trimmed = address.trim();
+                if trimmed.is_empty()
+                    || !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
+                {
+                    continue;
+                }
+                trimmed.to_string()
+            }
+        };
+
+        let is_duplicate = match normalized_address {
+            Ok(_) => contains_equivalent_address(&unique_addresses, &candidate, default_port),
+            Err(_) => unique_addresses
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(&candidate)),
+        };
+        if is_duplicate {
+            continue;
+        }
+        unique_addresses.push(candidate);
+    }
+
+    let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
+    for address in paged_addresses.into_iter().take(limit) {
+        let response = match resolve_cached_remote_account_response(&state, &address).await {
+            Some(response) => response,
+            None => {
+                let Some(response) =
+                    build_remote_account_placeholder_response(&address, state.config.as_ref())
+                else {
+                    continue;
+                };
+                response
+            }
+        };
+        followers.push(serde_json::to_value(response).unwrap());
+    }
+
+    Ok(Json(followers))
 }
 
 /// GET /api/v1/accounts/:id/following
 pub async fn get_account_following(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -806,12 +1130,56 @@ pub async fn get_account_following(
         return Err(AppError::NotFound);
     }
 
-    // Get following addresses
-    let _following_addresses = state.db.get_all_follow_addresses().await?;
+    let following_addresses = state.db.get_all_follow_addresses().await?;
+    let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let mut unique_addresses: Vec<String> = Vec::new();
+    let mut following = Vec::new();
 
-    // TODO: Fetch full account info for each followed account from cache/federation
-    // For now, return empty array as we don't have remote account info
-    Ok(Json(vec![]))
+    for address in following_addresses {
+        let normalized_address = normalize_account_address(&address);
+        let candidate = match normalized_address.as_ref() {
+            Ok(normalized) => normalized.to_string(),
+            Err(_) => {
+                let trimmed = address.trim();
+                if trimmed.is_empty()
+                    || !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
+                {
+                    continue;
+                }
+                trimmed.to_string()
+            }
+        };
+
+        let is_duplicate = match normalized_address {
+            Ok(_) => contains_equivalent_address(&unique_addresses, &candidate, default_port),
+            Err(_) => unique_addresses
+                .iter()
+                .any(|seen| seen.eq_ignore_ascii_case(&candidate)),
+        };
+        if is_duplicate {
+            continue;
+        }
+        unique_addresses.push(candidate);
+    }
+
+    let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
+    for address in paged_addresses.into_iter().take(limit) {
+        let response = match resolve_cached_remote_account_response(&state, &address).await {
+            Some(response) => response,
+            None => {
+                let Some(response) =
+                    build_remote_account_placeholder_response(&address, state.config.as_ref())
+                else {
+                    continue;
+                };
+                response
+            }
+        };
+        following.push(serde_json::to_value(response).unwrap());
+    }
+
+    Ok(Json(following))
 }
 
 /// POST /api/v1/accounts/:id/follow
@@ -912,6 +1280,11 @@ mod account_normalization_tests {
         let normalized = normalize_account_address("Alice@[2001:DB8::1]:443").unwrap();
         assert_eq!(normalized, "alice@[2001:db8::1]:443");
     }
+
+    #[test]
+    fn normalize_account_address_rejects_url_shaped_values() {
+        assert!(normalize_account_address("https://remote.example/@alice").is_err());
+    }
 }
 
 /// POST /api/v1/accounts/:id/unfollow
@@ -993,14 +1366,14 @@ pub async fn get_relationships(
         .get_all_follow_addresses()
         .await?
         .into_iter()
-        .filter_map(|address| normalize_account_address(&address).ok())
+        .filter_map(|address| canonical_remote_account_address(&address))
         .collect();
     let follower_set: HashSet<String> = state
         .db
         .get_all_follower_addresses()
         .await?
         .into_iter()
-        .filter_map(|address| normalize_account_address(&address).ok())
+        .filter_map(|address| canonical_remote_account_address(&address))
         .collect();
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
@@ -1114,9 +1487,18 @@ pub async fn search_accounts(
 
     let query = params.q.trim().to_lowercase();
     let mut results = vec![];
+    let local_domain = state.config.server.domain.to_ascii_lowercase();
 
     // Get our account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_account_identity = canonical_account_identity(
+        &format!("{}@{}", account.username, state.config.server.domain),
+        &local_domain,
+    );
+    let query_identity = query
+        .contains('@')
+        .then(|| canonical_account_identity(&query, &local_domain));
+    let mut matched_local_account = false;
 
     // Check if query matches our username
     if account.username.to_lowercase().contains(&query)
@@ -1125,20 +1507,36 @@ pub async fn search_accounts(
             .as_ref()
             .map(|d| d.to_lowercase().contains(&query))
             .unwrap_or(false)
+        || query_identity
+            .as_deref()
+            .is_some_and(|identity| identity == local_account_identity)
     {
         let account_response = crate::api::account_to_response(&account, &state.config);
         results.push(serde_json::to_value(account_response).unwrap());
+        matched_local_account = true;
     }
 
-    // If resolve=true and query looks like an account address, try WebFinger
+    // If resolve=true and query looks like an account address, resolve and return profile info.
     if params.resolve.unwrap_or(false) && query.contains('@') {
-        // TODO: Implement WebFinger lookup for remote accounts
-        // This would:
-        // 1. Parse the account address
-        // 2. Perform WebFinger lookup
-        // 3. Fetch the actor profile
-        // 4. Convert to AccountResponse
-        // 5. Add to results
+        let should_skip_resolve = matched_local_account
+            && query_identity.as_deref() == Some(local_account_identity.as_str());
+        if !should_skip_resolve {
+            if let Some(remote_account) = resolve_remote_account_response(&state, &query).await {
+                let remote_identity =
+                    canonical_account_identity(&remote_account.acct, &local_domain);
+                let already_present = results.iter().any(|entry| {
+                    entry
+                        .get("acct")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|acct| {
+                            canonical_account_identity(acct, &local_domain) == remote_identity
+                        })
+                });
+                if !already_present {
+                    results.push(serde_json::to_value(remote_account).unwrap());
+                }
+            }
+        }
     }
 
     // Apply limit

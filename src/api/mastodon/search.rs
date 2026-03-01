@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::accounts::resolve_remote_account_response;
 use crate::{AppState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +33,18 @@ pub struct SearchParams {
     offset: Option<usize>,
 }
 
+fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
+    let normalized_acct = acct.trim().trim_start_matches('@').to_ascii_lowercase();
+    if normalized_acct.contains('@') {
+        normalized_acct
+    } else {
+        format!(
+            "{normalized_acct}@{}",
+            local_domain.trim().to_ascii_lowercase()
+        )
+    }
+}
+
 /// GET /api/v2/search - Search for content
 ///
 /// Search for accounts, hashtags, and statuses.
@@ -41,6 +54,7 @@ pub async fn search_v2(
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let query = params.q.trim();
+    let local_domain = state.config.server.domain.to_ascii_lowercase();
 
     if query.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -53,6 +67,7 @@ pub async fn search_v2(
     let mut accounts = Vec::new();
     let mut statuses: Vec<serde_json::Value> = Vec::new();
     let mut hashtags = Vec::new();
+    let account_limit = params.limit.unwrap_or(40).min(80);
 
     // Determine what to search based on type parameter
     let search_accounts =
@@ -66,19 +81,45 @@ pub async fn search_v2(
     if search_accounts {
         // Check if query looks like an account address (contains @)
         if query.contains('@') {
+            let query_identity = canonical_account_identity(query, &local_domain);
+            let mut local_account_identity = None;
+            let mut matched_local_account = false;
+
             // For single-user instance, check if it's our account
             if let Ok(Some(account)) = state.db.get_account().await {
                 let account_address =
                     format!("{}@{}", account.username, state.config.server.domain);
+                local_account_identity =
+                    Some(canonical_account_identity(&account_address, &local_domain));
                 if account_address
                     .to_lowercase()
                     .contains(&query.to_lowercase())
+                    || local_account_identity.as_deref() == Some(query_identity.as_str())
                 {
                     accounts.push(crate::api::account_to_response(&account, &state.config));
+                    matched_local_account = true;
                 }
             }
 
-            // TODO: WebFinger lookup for remote accounts if resolve=true
+            if params.resolve {
+                let should_skip_resolve = matched_local_account
+                    && local_account_identity.as_deref() == Some(query_identity.as_str());
+                if !should_skip_resolve {
+                    if let Some(remote_account) =
+                        resolve_remote_account_response(&state, query).await
+                    {
+                        let remote_identity =
+                            canonical_account_identity(&remote_account.acct, &local_domain);
+                        let already_present = accounts.iter().any(|account| {
+                            canonical_account_identity(&account.acct, &local_domain)
+                                == remote_identity
+                        });
+                        if !already_present {
+                            accounts.push(remote_account);
+                        }
+                    }
+                }
+            }
         } else {
             // Search by username
             if let Ok(Some(account)) = state.db.get_account().await {
@@ -98,6 +139,7 @@ pub async fn search_v2(
                 }
             }
         }
+        accounts.truncate(account_limit);
     }
 
     // Search statuses
