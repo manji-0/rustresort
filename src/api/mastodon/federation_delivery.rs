@@ -1,4 +1,6 @@
 use std::future::Future;
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::AppState;
@@ -8,11 +10,174 @@ use crate::federation::{ActivityDelivery, DeliveryResult};
 use chrono::Utc;
 
 const OUTBOUND_DELIVERY_TIMEOUT_SECS: u64 = 5;
+const MAX_FETCH_REDIRECTS: usize = 5;
 
 struct DiscoveredRemoteActor {
     actor_uri: String,
     inbox_uri: String,
     actor_document: serde_json::Value,
+}
+
+fn is_shared_ipv4_space(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_blocked_ip_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || is_shared_ipv4_space(v4)
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip_address(IpAddr::V4(mapped_v4));
+            }
+
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+        }
+    }
+}
+
+async fn resolve_allowed_remote_addrs(
+    url: &url::Url,
+) -> Result<(String, u16, Vec<SocketAddr>), AppError> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(AppError::Validation(
+            "Remote URL must use http or https".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::Validation(
+            "Remote URL must not include user info".to_string(),
+        ));
+    }
+
+    let raw_host = url
+        .host_str()
+        .ok_or_else(|| AppError::Validation("Remote URL must include a host".to_string()))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&raw_host)
+        .to_string();
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(AppError::Validation(
+            "Remote URL host is not allowed".to_string(),
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip_address(ip) {
+            return Err(AppError::Validation(
+                "Remote URL host is not allowed".to_string(),
+            ));
+        }
+    }
+
+    let port = url.port_or_known_default().ok_or_else(|| {
+        AppError::Validation("Remote URL must include a known default port".to_string())
+    })?;
+    let mut resolved_addrs = Vec::new();
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Failed to resolve remote host {}: {}", host, error))
+        })?;
+    for address in resolved {
+        if is_blocked_ip_address(address.ip()) {
+            return Err(AppError::Validation(
+                "Remote URL host is not allowed".to_string(),
+            ));
+        }
+        resolved_addrs.push(address);
+    }
+    if resolved_addrs.is_empty() {
+        return Err(AppError::Federation(format!(
+            "Remote host did not resolve to any IP addresses: {}",
+            host
+        )));
+    }
+
+    Ok((host, port, resolved_addrs))
+}
+
+async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
+    let _ = resolve_allowed_remote_addrs(url).await?;
+    Ok(())
+}
+
+async fn send_validated_get(
+    http_client: &reqwest::Client,
+    url: &url::Url,
+    accept_header: &str,
+) -> Result<reqwest::Response, AppError> {
+    let mut current = url.clone();
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        let _ = resolve_allowed_remote_addrs(&current).await?;
+
+        let response = http_client
+            .get(current.clone())
+            .header("Accept", accept_header)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Federation(format!("Request failed for {}: {}", current, error))
+            })?;
+
+        if response.status().is_redirection() {
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(AppError::Federation(format!(
+                    "Redirect response from {} missing Location header",
+                    current
+                )));
+            };
+            let location = location.to_str().map_err(|_| {
+                AppError::Federation(format!(
+                    "Redirect response from {} had non-UTF8 Location header",
+                    current
+                ))
+            })?;
+            current = current.join(location).map_err(|error| {
+                AppError::Federation(format!(
+                    "Redirect response from {} had invalid target {} ({})",
+                    current, location, error
+                ))
+            })?;
+            continue;
+        }
+
+        return Ok(response);
+    }
+
+    Err(AppError::Federation(format!(
+        "Request exceeded redirect limit ({}) for {}",
+        MAX_FETCH_REDIRECTS, url
+    )))
+}
+
+async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Result<(), AppError> {
+    let actor_url = url::Url::parse(actor_uri).map_err(|error| {
+        AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
+    })?;
+    validate_remote_fetch_url(&actor_url).await?;
+
+    let inbox_url = url::Url::parse(inbox_uri).map_err(|error| {
+        AppError::Federation(format!("Invalid inbox URI {} ({})", inbox_uri, error))
+    })?;
+    validate_remote_fetch_url(&inbox_url).await?;
+    Ok(())
 }
 
 pub fn local_actor_uri(state: &AppState, username: &str) -> String {
@@ -47,7 +212,8 @@ pub async fn resolve_remote_actor_and_inbox(
         }
     }
 
-    let discovered = discover_remote_actor_and_inbox(&state.http_client, address).await?;
+    let discovered =
+        discover_remote_actor_and_inbox(&state.federation_fetch_client, address).await?;
 
     if let Some(profile) = build_cached_profile(
         address,
@@ -178,18 +344,7 @@ async fn discover_remote_actor_and_inbox(
         })?
         .to_string();
 
-    url::Url::parse(&canonical_actor_uri).map_err(|error| {
-        AppError::Federation(format!(
-            "Invalid actor URI discovered for {}: {} ({})",
-            address, canonical_actor_uri, error
-        ))
-    })?;
-    url::Url::parse(&inbox_uri).map_err(|error| {
-        AppError::Federation(format!(
-            "Invalid inbox URI discovered for {}: {} ({})",
-            address, inbox_uri, error
-        ))
-    })?;
+    validate_actor_and_inbox_urls(&canonical_actor_uri, &inbox_uri).await?;
 
     Ok(DiscoveredRemoteActor {
         actor_uri: canonical_actor_uri,
@@ -280,11 +435,12 @@ async fn discover_actor_uri(
     let mut last_error = None;
 
     for webfinger_url in webfinger_urls {
-        let response = match http_client
-            .get(webfinger_url.clone())
-            .header("Accept", "application/jrd+json, application/json")
-            .send()
-            .await
+        let response = match send_validated_get(
+            http_client,
+            &webfinger_url,
+            "application/jrd+json, application/json",
+        )
+        .await
         {
             Ok(response) => response,
             Err(error) => {
@@ -421,20 +577,16 @@ async fn fetch_actor_document(
     http_client: &reqwest::Client,
     actor_uri: &str,
 ) -> Result<serde_json::Value, AppError> {
-    let response = http_client
-        .get(actor_uri)
-        .header(
-            "Accept",
-            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
-        )
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Federation(format!(
-                "Actor fetch failed for {}: {}",
-                actor_uri, error
-            ))
-        })?;
+    let actor_url = url::Url::parse(actor_uri).map_err(|error| {
+        AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
+    })?;
+    let response = send_validated_get(
+        http_client,
+        &actor_url,
+        "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+    )
+    .await
+    .map_err(|error| AppError::Federation(format!("Actor fetch failed for {}: {}", actor_uri, error)))?;
 
     if !response.status().is_success() {
         return Err(AppError::Federation(format!(
@@ -456,8 +608,9 @@ async fn fetch_actor_document(
 mod tests {
     use super::{
         build_cached_profile, extract_actor_uri_from_webfinger, parse_actor_uri_address,
-        webfinger_urls_for_domain,
+        validate_remote_fetch_url, webfinger_urls_for_domain,
     };
+    use crate::error::AppError;
 
     #[test]
     fn extract_actor_uri_accepts_activity_json_type() {
@@ -635,5 +788,45 @@ mod tests {
             &actor,
         );
         assert!(profile.is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_loopback_ip() {
+        let url =
+            url::Url::parse("http://127.0.0.1/users/alice").expect("loopback URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("loopback URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_shared_ipv4_space() {
+        let url = url::Url::parse("http://100.100.100.200/users/alice")
+            .expect("shared-space URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("shared-space URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_localhost_domain() {
+        let url =
+            url::Url::parse("https://localhost/users/alice").expect("localhost URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("localhost URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_remote_fetch_url_rejects_ipv4_mapped_ipv6_loopback() {
+        let url = url::Url::parse("http://[::ffff:7f00:1]/users/alice")
+            .expect("ipv4-mapped ipv6 URL should parse");
+        let error = validate_remote_fetch_url(&url)
+            .await
+            .expect_err("ipv4-mapped loopback URL must be rejected");
+        assert!(matches!(error, AppError::Validation(_)));
     }
 }

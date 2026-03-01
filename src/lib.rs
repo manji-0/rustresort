@@ -77,6 +77,9 @@ pub struct AppState {
     /// HTTP client for federation
     pub http_client: Arc<reqwest::Client>,
 
+    /// HTTP client for federation fetches with redirect handling disabled.
+    pub federation_fetch_client: Arc<reqwest::Client>,
+
     /// Federation inbound rate limiter
     pub federation_rate_limiter: Arc<federation::RateLimiter>,
 }
@@ -156,6 +159,12 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| error::AppError::Internal(e.into()))?;
+        let federation_fetch_client = reqwest::Client::builder()
+            .user_agent("RustResort/0.1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| error::AppError::Internal(e.into()))?;
 
         // 4. Initialize federation inbound rate limiter
         let federation_rate_limiter = federation::RateLimiter::new(None, None);
@@ -202,6 +211,7 @@ impl AppState {
             storage: Arc::new(storage),
             backup: Arc::new(backup),
             http_client: Arc::new(http_client),
+            federation_fetch_client: Arc::new(federation_fetch_client),
             federation_rate_limiter: Arc::new(federation_rate_limiter),
         })
     }
