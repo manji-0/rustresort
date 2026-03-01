@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::accounts::resolve_remote_account_response;
 use crate::{AppState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +79,16 @@ pub async fn search_v2(
                 }
             }
 
-            // TODO: WebFinger lookup for remote accounts if resolve=true
+            if params.resolve {
+                if let Some(remote_account) = resolve_remote_account_response(&state, query).await {
+                    let already_present = accounts
+                        .iter()
+                        .any(|account| account.id == remote_account.id);
+                    if !already_present {
+                        accounts.push(remote_account);
+                    }
+                }
+            }
         } else {
             // Search by username
             if let Ok(Some(account)) = state.db.get_account().await {
