@@ -360,6 +360,98 @@ async fn test_patch_account_profile_noop_returns_success() {
 }
 
 #[tokio::test]
+async fn test_patch_account_credentials_if_matches_updates_profile_and_media_keys() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let account = Account {
+        id: EntityId::new().0,
+        username: "credential-user".to_string(),
+        display_name: Some("Before".to_string()),
+        note: Some("before-note".to_string()),
+        avatar_s3_key: Some("media/old-avatar.webp".to_string()),
+        header_s3_key: Some("media/old-header.webp".to_string()),
+        private_key_pem: "private_key".to_string(),
+        public_key_pem: "public_key".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.upsert_account(&account).await.unwrap();
+
+    let updated = db
+        .patch_account_credentials_if_matches(
+            &account.id,
+            Some("media/old-avatar.webp"),
+            Some("media/old-header.webp"),
+            Some("media/new-avatar.webp"),
+            Some("media/new-header.webp"),
+            Some(Some("After")),
+            Some(None),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let stored = db.get_account().await.unwrap().unwrap();
+    assert_eq!(stored.display_name, Some("After".to_string()));
+    assert_eq!(stored.note, None);
+    assert_eq!(
+        stored.avatar_s3_key,
+        Some("media/new-avatar.webp".to_string())
+    );
+    assert_eq!(
+        stored.header_s3_key,
+        Some("media/new-header.webp".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_keys() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let account = Account {
+        id: EntityId::new().0,
+        username: "credential-user".to_string(),
+        display_name: Some("Before".to_string()),
+        note: Some("before-note".to_string()),
+        avatar_s3_key: Some("media/old-avatar.webp".to_string()),
+        header_s3_key: Some("media/old-header.webp".to_string()),
+        private_key_pem: "private_key".to_string(),
+        public_key_pem: "public_key".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.upsert_account(&account).await.unwrap();
+
+    let updated = db
+        .patch_account_credentials_if_matches(
+            &account.id,
+            Some("media/unexpected-avatar.webp"),
+            Some("media/old-header.webp"),
+            Some("media/new-avatar.webp"),
+            Some("media/new-header.webp"),
+            Some(Some("After")),
+            Some(Some("after-note")),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(!updated);
+
+    let stored = db.get_account().await.unwrap().unwrap();
+    assert_eq!(stored.display_name, Some("Before".to_string()));
+    assert_eq!(stored.note, Some("before-note".to_string()));
+    assert_eq!(
+        stored.avatar_s3_key,
+        Some("media/old-avatar.webp".to_string())
+    );
+    assert_eq!(
+        stored.header_s3_key,
+        Some("media/old-header.webp".to_string())
+    );
+}
+
+#[tokio::test]
 async fn test_status_crud() {
     let (db, _temp_dir) = create_test_db().await;
 

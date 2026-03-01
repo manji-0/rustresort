@@ -89,6 +89,62 @@ async fn test_update_credentials() {
 }
 
 #[tokio::test]
+async fn test_update_credentials_invalid_avatar_does_not_apply_profile_changes() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let update_data = serde_json::json!({
+        "display_name": "Changed Name",
+        "avatar": "not-base64"
+    });
+
+    let response = server
+        .client
+        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&update_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+
+    let account = server.state.db.get_account().await.unwrap().unwrap();
+    assert_eq!(account.display_name.as_deref(), Some("Test User"));
+    assert!(account.avatar_s3_key.is_none());
+}
+
+#[tokio::test]
+async fn test_update_credentials_invalid_header_does_not_apply_avatar_or_profile_changes() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let update_data = serde_json::json!({
+        "display_name": "Changed Name",
+        "avatar": "UklGRhoAAABXRUJQVlA4TA4AAAAvAAAAEM1VICIC0f+IBA==",
+        "header": "data:image/webp,not-base64"
+    });
+
+    let response = server
+        .client
+        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&update_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+
+    let account = server.state.db.get_account().await.unwrap().unwrap();
+    assert_eq!(account.display_name.as_deref(), Some("Test User"));
+    assert!(account.avatar_s3_key.is_none());
+    assert!(account.header_s3_key.is_none());
+}
+
+#[tokio::test]
 async fn test_account_statuses() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;

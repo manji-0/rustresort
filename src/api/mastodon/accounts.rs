@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, Query, RawQuery, State},
     response::Json,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -59,6 +60,253 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
     pub following: Option<bool>,
+}
+
+fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
+    let trimmed = encoded.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(format!(
+            "{field} image must not be empty"
+        )));
+    }
+
+    let payload = if trimmed.starts_with("data:") {
+        let (meta, body) = trimmed.split_once(',').ok_or_else(|| {
+            AppError::Validation(format!(
+                "{field} image must be a base64 data URL or raw base64"
+            ))
+        })?;
+        let meta_lower = meta.to_ascii_lowercase();
+        if !meta_lower.contains(";base64") {
+            return Err(AppError::Validation(format!(
+                "{field} data URL must include ;base64"
+            )));
+        }
+        if !meta_lower.starts_with("data:image/webp") {
+            return Err(AppError::Validation(format!(
+                "{field} data URL must use image/webp MIME type"
+            )));
+        }
+        body
+    } else {
+        trimmed
+    };
+
+    let normalized: String = payload
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if normalized.is_empty() {
+        return Err(AppError::Validation(format!(
+            "{field} image must not be empty"
+        )));
+    }
+
+    let decoded = BASE64_STANDARD
+        .decode(normalized)
+        .map_err(|_| AppError::Validation(format!("{field} image is not valid base64")))?;
+
+    if !is_valid_webp_container(&decoded) {
+        return Err(AppError::Validation(format!(
+            "{field} image must contain WebP bytes"
+        )));
+    }
+    if !is_decodable_webp_image(&decoded) {
+        return Err(AppError::Validation(format!(
+            "{field} image must contain decodable WebP bytes"
+        )));
+    }
+
+    Ok(decoded)
+}
+
+async fn decode_base64_image_field_blocking(
+    field: &'static str,
+    encoded: String,
+) -> Result<Vec<u8>, AppError> {
+    tokio::task::spawn_blocking(move || decode_base64_image_field(field, &encoded))
+        .await
+        .map_err(|error| {
+            AppError::Internal(anyhow::anyhow!("Image decode task panicked: {error}"))
+        })?
+}
+
+fn is_decodable_webp_image(bytes: &[u8]) -> bool {
+    use image::ImageDecoder;
+    use image::codecs::webp::WebPDecoder;
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(bytes);
+    let Ok(decoder) = WebPDecoder::new(cursor) else {
+        return false;
+    };
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let total_bytes = decoder.total_bytes();
+    if total_bytes == 0 || total_bytes > (64 * 1024 * 1024) as u64 {
+        return false;
+    }
+
+    let mut output = vec![0_u8; total_bytes as usize];
+    decoder.read_image(&mut output).is_ok()
+}
+
+fn is_valid_vp8_chunk(payload: &[u8]) -> bool {
+    if payload.len() < 10 || payload[3] != 0x9d || payload[4] != 0x01 || payload[5] != 0x2a {
+        return false;
+    }
+
+    // Keyframe bit must be 0 for streams carrying width/height in the VP8 frame header.
+    if payload[0] & 0x01 != 0 {
+        return false;
+    }
+
+    let first_partition_size =
+        ((payload[0] as u32 >> 5) | ((payload[1] as u32) << 3) | ((payload[2] as u32) << 11))
+            & 0x7ffff;
+    if first_partition_size == 0 {
+        return false;
+    }
+    if first_partition_size as usize > payload.len().saturating_sub(3) {
+        return false;
+    }
+
+    let width = u16::from_le_bytes([payload[6], payload[7]]) & 0x3fff;
+    let height = u16::from_le_bytes([payload[8], payload[9]]) & 0x3fff;
+    width > 0 && height > 0
+}
+
+fn is_valid_vp8l_chunk(payload: &[u8]) -> bool {
+    if payload.len() < 5 || payload[0] != 0x2f {
+        return false;
+    }
+
+    let packed = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let version = (packed >> 29) & 0x07;
+    if version != 0 {
+        return false;
+    }
+
+    let width = (packed & 0x3fff) + 1;
+    let height = ((packed >> 14) & 0x3fff) + 1;
+    width > 0 && height > 0
+}
+
+fn anmf_chunk_contains_frame_data(payload: &[u8]) -> bool {
+    if payload.len() < 16 {
+        return false;
+    }
+
+    let mut offset = 16;
+    let mut has_frame_data = false;
+    while offset + 8 <= payload.len() {
+        let chunk_type = &payload[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            payload[offset + 4],
+            payload[offset + 5],
+            payload[offset + 6],
+            payload[offset + 7],
+        ]) as usize;
+        offset += 8;
+
+        if offset + chunk_size > payload.len() {
+            return false;
+        }
+        let chunk_payload = &payload[offset..offset + chunk_size];
+
+        match chunk_type {
+            b"VP8 " => {
+                if !is_valid_vp8_chunk(chunk_payload) {
+                    return false;
+                }
+                has_frame_data = true;
+            }
+            b"VP8L" => {
+                if !is_valid_vp8l_chunk(chunk_payload) {
+                    return false;
+                }
+                has_frame_data = true;
+            }
+            _ => {}
+        }
+
+        let padded_size = chunk_size + (chunk_size % 2);
+        if offset + padded_size > payload.len() {
+            return false;
+        }
+        offset += padded_size;
+    }
+
+    has_frame_data
+}
+
+fn is_valid_webp_container(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+
+    let riff_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let container_len = riff_size + 8;
+    if container_len > bytes.len() {
+        return false;
+    }
+    let bytes = &bytes[..container_len];
+
+    let mut offset = 12;
+    let mut has_frame_data = false;
+    while offset + 8 <= bytes.len() {
+        let chunk_type = &bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        offset += 8;
+
+        if offset + chunk_size > bytes.len() {
+            return false;
+        }
+        let payload = &bytes[offset..offset + chunk_size];
+
+        match chunk_type {
+            b"VP8 " => {
+                if !is_valid_vp8_chunk(payload) {
+                    return false;
+                }
+                has_frame_data = true;
+            }
+            b"VP8L" => {
+                if !is_valid_vp8l_chunk(payload) {
+                    return false;
+                }
+                has_frame_data = true;
+            }
+            b"VP8X" => {
+                if payload.len() != 10 {
+                    return false;
+                }
+            }
+            b"ANMF" => {
+                if !anmf_chunk_contains_frame_data(payload) {
+                    return false;
+                }
+                has_frame_data = true;
+            }
+            _ => {}
+        }
+
+        let padded_size = chunk_size + (chunk_size % 2);
+        if offset + padded_size > bytes.len() {
+            return false;
+        }
+        offset += padded_size;
+    }
+
+    has_frame_data
 }
 
 fn default_port_for_protocol(protocol: &str) -> Option<u16> {
@@ -351,28 +599,41 @@ pub async fn update_credentials(
     CurrentUser(_session): CurrentUser,
     Json(req): Json<UpdateCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use chrono::Utc;
+    let account_service =
+        crate::service::AccountService::new(state.db.clone(), state.storage.clone());
 
-    // Get current account
-    let mut account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let UpdateCredentialsRequest {
+        display_name,
+        note,
+        avatar,
+        header,
+        locked: _,
+        bot: _,
+        discoverable: _,
+    } = req;
 
-    // Update fields if provided
-    if let Some(display_name) = req.display_name {
-        account.display_name = Some(display_name);
-    }
+    let avatar_bytes = avatar
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let avatar_bytes = match avatar_bytes {
+        Some(encoded) => Some(decode_base64_image_field_blocking("avatar", encoded).await?),
+        None => None,
+    };
+    let header_bytes = header
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let header_bytes = match header_bytes {
+        Some(encoded) => Some(decode_base64_image_field_blocking("header", encoded).await?),
+        None => None,
+    };
 
-    if let Some(note) = req.note {
-        account.note = Some(note);
-    }
-
-    // TODO: Handle avatar and header uploads
-    // For now, we skip image processing as it requires multipart/form-data handling
-    // and S3 upload integration
-
-    account.updated_at = Utc::now();
-
-    // Save to database
-    state.db.upsert_account(&account).await?;
+    let account = account_service
+        .update_credentials(display_name, note, avatar_bytes, header_bytes)
+        .await?;
 
     // Return updated account
     let mut response = crate::api::account_to_response(&account, &state.config);
@@ -637,7 +898,7 @@ pub async fn follow_account(
 }
 
 #[cfg(test)]
-mod tests {
+mod account_normalization_tests {
     use super::normalize_account_address;
 
     #[test]
@@ -1351,4 +1612,92 @@ pub async fn reject_follow_request(
     };
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+#[cfg(test)]
+mod image_decode_tests {
+    use super::decode_base64_image_field;
+
+    const VALID_WEBP_BASE64: &str = "UklGRhoAAABXRUJQVlA4TA4AAAAvAAAAEM1VICIC0f+IBA==";
+
+    #[test]
+    fn decode_base64_image_field_accepts_raw_base64() {
+        let encoded = VALID_WEBP_BASE64;
+        let decoded = decode_base64_image_field("avatar", encoded).expect("decode should succeed");
+        assert_eq!(&decoded[0..4], b"RIFF");
+        assert_eq!(&decoded[8..12], b"WEBP");
+        assert!(decoded.len() >= 20);
+    }
+
+    #[test]
+    fn decode_base64_image_field_accepts_data_url() {
+        let encoded = format!("data:image/webp;base64,{}", VALID_WEBP_BASE64);
+        let decoded = decode_base64_image_field("header", &encoded).expect("decode should succeed");
+        assert_eq!(&decoded[0..4], b"RIFF");
+        assert_eq!(&decoded[8..12], b"WEBP");
+        assert!(decoded.len() >= 20);
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_non_base64_data_url() {
+        let encoded = "data:image/webp,abc";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("base64"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_non_webp_data_url_mime() {
+        let encoded = "data:image/png;base64,aGVsbG8=";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("image/webp"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_raw_non_webp_bytes() {
+        let encoded = "aGVsbG8=";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_truncated_webp_header_only() {
+        let encoded = "UklGRgAAAABXRUJQ";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_invalid_vp8x_chunk_payload() {
+        let encoded = "UklGRgwAAABXRUJQVlA4WAAAAAA=";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_vp8x_header_without_frame_data() {
+        let encoded = "UklGRhYAAABXRUJQVlA4WAoAAAAAAAAAAAAAAAAA";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_invalid_vp8_frame_header() {
+        let encoded = "UklGRhYAAABXRUJQVlA4IAoAAAAAAACdASoAAAAA";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_invalid_vp8l_header_fields() {
+        let encoded = "UklGRhIAAABXRUJQVlA4TAUAAAAvAAAA4AA=";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_non_decodable_vp8_payload() {
+        let encoded = "UklGRhgAAABXRUJQVlA4IAwAAAAAAQCdASoEAA0AGsY=";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("WebP"));
+    }
 }
