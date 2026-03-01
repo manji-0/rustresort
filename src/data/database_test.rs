@@ -30,6 +30,7 @@ fn test_oauth_app() -> OAuthApp {
         redirect_uri: "https://example.com/callback".to_string(),
         client_id: EntityId::new().0,
         client_secret: EntityId::new().0,
+        vapid_key: Some(EntityId::new().0),
         scopes: "read write".to_string(),
         created_at: Utc::now(),
     }

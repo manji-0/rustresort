@@ -9,6 +9,11 @@ use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use base64::Engine;
 use chrono::Utc;
+use openssl::{
+    bn::BigNumContext,
+    ec::{EcGroup, EcKey, PointConversionForm},
+    nid::Nid,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -155,6 +160,32 @@ fn generate_authorize_confirm_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_vapid_key() -> Result<String, AppError> {
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).map_err(|error| {
+        AppError::Internal(anyhow::anyhow!("failed to load P-256 group: {error}"))
+    })?;
+    let key = EcKey::generate(&group).map_err(|error| {
+        AppError::Internal(anyhow::anyhow!(
+            "failed to generate VAPID P-256 keypair: {error}"
+        ))
+    })?;
+    let mut context = BigNumContext::new().map_err(|error| {
+        AppError::Internal(anyhow::anyhow!(
+            "failed to allocate VAPID BN context: {error}"
+        ))
+    })?;
+    let public_bytes = key
+        .public_key()
+        .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut context)
+        .map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize VAPID public key: {error}"
+            ))
+        })?;
+
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_bytes))
 }
 
 fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
@@ -393,6 +424,7 @@ pub async fn create_app(
     let app_id = EntityId::new().0;
     let client_id = EntityId::new().0;
     let client_secret = EntityId::new().0;
+    let vapid_key = generate_vapid_key()?;
 
     // Default scopes if not provided
     let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
@@ -405,6 +437,7 @@ pub async fn create_app(
         redirect_uri: req.redirect_uris.clone(),
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
+        vapid_key: Some(vapid_key),
         scopes: scopes.clone(),
         created_at: Utc::now(),
     };
@@ -420,7 +453,7 @@ pub async fn create_app(
         redirect_uri: app.redirect_uri,
         client_id: app.client_id,
         client_secret: app.client_secret,
-        vapid_key: None, // TODO: Implement push notifications
+        vapid_key: app.vapid_key,
     };
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -501,7 +534,7 @@ pub async fn verify_app_credentials(
                 "website": app.website,
                 "redirect_uri": app.redirect_uri,
                 "client_id": app.client_id,
-                "vapid_key": serde_json::Value::Null,
+                "vapid_key": app.vapid_key,
             });
 
             return Ok(Json(response));
@@ -513,6 +546,19 @@ pub async fn verify_app_credentials(
     }
 
     // Session-authenticated fallback for callers authenticated via cookie or session bearer token.
+    // On single-user instances, return the most recently registered app when available.
+    if let Some(app) = state.db.get_latest_oauth_app().await? {
+        let response = serde_json::json!({
+            "id": app.id,
+            "name": app.name,
+            "website": app.website,
+            "redirect_uri": app.redirect_uri,
+            "client_id": app.client_id,
+            "vapid_key": app.vapid_key,
+        });
+        return Ok(Json(response));
+    }
+
     let response = serde_json::json!({
         "name": session.name.unwrap_or_else(|| "RustResort".to_string()),
         "website": serde_json::Value::Null,
@@ -671,8 +717,15 @@ pub struct RevokeTokenRequest {
 mod tests {
     use super::{
         authorize_confirm_cookie_name, build_authorize_confirm_cookie, extract_bearer_token,
+        generate_vapid_key,
     };
     use axum::http::{HeaderMap, HeaderValue};
+    use base64::Engine;
+    use openssl::{
+        bn::BigNumContext,
+        ec::{EcGroup, EcKey, EcPoint},
+        nid::Nid,
+    };
 
     #[test]
     fn authorize_confirm_cookie_name_is_token_scoped() {
@@ -703,5 +756,32 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", HeaderValue::from_static("Bearer "));
         assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn generate_vapid_key_uses_url_safe_format() {
+        let key = generate_vapid_key().expect("vapid key generation should succeed");
+        assert!(!key.is_empty());
+        assert!(!key.contains('+'));
+        assert!(!key.contains('/'));
+        assert!(!key.contains('='));
+    }
+
+    #[test]
+    fn generate_vapid_key_returns_valid_uncompressed_p256_public_key() {
+        let encoded = generate_vapid_key().expect("vapid key generation should succeed");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("generated key should decode from base64url");
+        assert_eq!(decoded.len(), 65);
+        assert_eq!(decoded[0], 0x04);
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let mut context = BigNumContext::new().unwrap();
+        let point = EcPoint::from_bytes(&group, &decoded, &mut context)
+            .expect("public key bytes must be valid curve point");
+        let key = EcKey::from_public_key(&group, &point).expect("point should build EC key");
+        key.check_key()
+            .expect("generated public key should be valid");
     }
 }
