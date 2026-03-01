@@ -198,12 +198,18 @@ impl StatusService {
 
     /// Get status by ID
     pub async fn get(&self, id: &str) -> Result<Status, AppError> {
-        self.db.get_status(id).await?.ok_or(AppError::NotFound)
+        self.find(id).await?.ok_or(AppError::NotFound)
     }
 
     /// Try to get status by ID.
     pub async fn find(&self, id: &str) -> Result<Option<Status>, AppError> {
-        self.db.get_status(id).await
+        if let Some(status) = self.db.get_status(id).await? {
+            return Ok(Some(status));
+        }
+        if id.starts_with("http://") || id.starts_with("https://") {
+            return self.db.get_status_by_uri(id).await;
+        }
+        Ok(None)
     }
 
     /// Get status by URI
@@ -700,7 +706,9 @@ impl StatusService {
 
         let now = chrono::Utc::now();
         let placeholder = Status {
-            id: EntityId::new().0,
+            // Keep placeholder IDs aligned with the canonical status URI so API
+            // fields that surface in_reply_to_id can resolve through /statuses/:id.
+            id: normalized_uri.clone(),
             uri: normalized_uri,
             content: String::new(),
             content_warning: None,
@@ -730,7 +738,7 @@ impl StatusService {
         status_id: &str,
     ) -> Result<(Status, String), AppError> {
         let status = self.get(status_id).await?;
-        let favourite_id = self.db.insert_favourite(status_id).await?;
+        let favourite_id = self.db.insert_favourite(&status.id).await?;
         Ok((status, favourite_id))
     }
 
@@ -744,7 +752,7 @@ impl StatusService {
     /// Bookmark by local status ID
     pub async fn bookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
-        self.db.insert_bookmark(status_id).await?;
+        self.db.insert_bookmark(&status.id).await?;
         Ok(status)
     }
 
@@ -762,7 +770,7 @@ impl StatusService {
         repost_uri: &str,
     ) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
-        self.db.insert_repost(status_id, repost_uri).await?;
+        self.db.insert_repost(&status.id, repost_uri).await?;
         Ok(status)
     }
 
@@ -794,7 +802,7 @@ impl StatusService {
     /// Undo repost for a status by its persisted database ID
     pub async fn unrepost_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
-        self.db.delete_repost(status_id).await?;
+        self.db.delete_repost(&status.id).await?;
         Ok(status)
     }
 
@@ -815,7 +823,7 @@ impl StatusService {
                 "Can only pin own statuses".to_string(),
             ));
         }
-        self.db.insert_status_pin(status_id).await?;
+        self.db.insert_status_pin(&status.id).await?;
         Ok(status)
     }
 
@@ -827,7 +835,7 @@ impl StatusService {
                 "Can only pin own statuses".to_string(),
             ));
         }
-        self.db.delete_status_pin(status_id).await?;
+        self.db.delete_status_pin(&status.id).await?;
         Ok(status)
     }
 
@@ -993,6 +1001,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_and_find_fallback_to_uri_lookup_for_legacy_remote_rows() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let status = Status {
+            id: EntityId::new().0,
+            uri: "https://remote.example/users/alice/statuses/legacy".to_string(),
+            content: "<p>legacy remote row</p>".to_string(),
+            content_warning: None,
+            visibility: "private".to_string(),
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let fetched = service.get(&status.uri).await.unwrap();
+        assert_eq!(fetched.id, status.id);
+        assert_eq!(fetched.uri, status.uri);
+
+        let found = service.find(&status.uri).await.unwrap();
+        assert_eq!(
+            found.as_ref().map(|value| value.id.as_str()),
+            Some(status.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn by_id_mutations_use_loaded_status_id_when_input_is_uri() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let service = create_service(db.clone()).await;
+
+        let remote_status = Status {
+            id: EntityId::new().0,
+            uri: "https://remote.example/users/alice/statuses/uri-input".to_string(),
+            content: "<p>remote</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Favourited.as_str().to_string(),
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&remote_status).await.unwrap();
+
+        service
+            .favourite_by_id_with_id(&remote_status.uri)
+            .await
+            .unwrap();
+        assert!(db.is_favourited(&remote_status.id).await.unwrap());
+
+        service.bookmark_by_id(&remote_status.uri).await.unwrap();
+        assert!(db.is_bookmarked(&remote_status.id).await.unwrap());
+
+        service
+            .repost_by_id(
+                &remote_status.uri,
+                "https://test.example.com/activities/repost/1",
+            )
+            .await
+            .unwrap();
+        assert!(db.is_reposted(&remote_status.id).await.unwrap());
+        service.unrepost_by_id(&remote_status.uri).await.unwrap();
+        assert!(!db.is_reposted(&remote_status.id).await.unwrap());
+
+        let local_status = Status {
+            id: EntityId::new().0,
+            uri: "https://test.example.com/users/testuser/statuses/local-uri-input".to_string(),
+            content: "<p>local</p>".to_string(),
+            content_warning: None,
+            visibility: "public".to_string(),
+            language: Some("en".to_string()),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Own.as_str().to_string(),
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        db.insert_status(&local_status).await.unwrap();
+
+        service.pin_by_id(&local_status.uri).await.unwrap();
+        assert!(db.is_status_pinned(&local_status.id).await.unwrap());
+        service.unpin_by_id(&local_status.uri).await.unwrap();
+        assert!(!db.is_status_pinned(&local_status.id).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn repost_and_unrepost_roundtrip_by_uri() {
         let (db, _temp_dir) = create_test_db().await;
         seed_account(db.as_ref(), "testuser").await;
@@ -1031,6 +1139,7 @@ mod tests {
 
         let remote_uri = "https://remote.example/users/alice/statuses/42";
         let status = service.favourite(remote_uri).await.unwrap();
+        assert_eq!(status.id, remote_uri);
         assert_eq!(status.uri, remote_uri);
         assert!(!status.is_local);
         assert_eq!(status.account_address, "alice@remote.example");
@@ -1080,6 +1189,7 @@ mod tests {
 
         let remote_uri = "https://remote.example/users/alice/statuses/43";
         let status = service.favourite(remote_uri).await.unwrap();
+        assert_eq!(status.id, remote_uri);
         assert_eq!(status.visibility, "private");
 
         let persisted = db.get_status_by_uri(remote_uri).await.unwrap().unwrap();
