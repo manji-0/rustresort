@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use url::Url;
 
 use crate::AppState;
-use crate::auth::CurrentUser;
+use crate::auth::{CurrentUser, verify_session_token};
 use crate::error::AppError;
 
 const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
@@ -485,29 +485,38 @@ pub async fn authorize(
 pub async fn verify_app_credentials(
     State(state): State<AppState>,
     headers: HeaderMap,
-    CurrentUser(_session): CurrentUser,
+    CurrentUser(session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let access_token = extract_bearer_token(&headers).ok_or(AppError::Unauthorized)?;
-    let token = state
-        .db
-        .get_oauth_token(access_token)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    let app = state
-        .db
-        .get_oauth_app_by_id(&token.app_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+    if let Some(access_token) = extract_bearer_token(&headers) {
+        if let Some(token) = state.db.get_oauth_token(access_token).await? {
+            let app = state
+                .db
+                .get_oauth_app_by_id(&token.app_id)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
 
+            let response = serde_json::json!({
+                "id": app.id,
+                "name": app.name,
+                "website": app.website,
+                "redirect_uri": app.redirect_uri,
+                "client_id": app.client_id,
+                "vapid_key": serde_json::Value::Null,
+            });
+
+            return Ok(Json(response));
+        }
+
+        // `require_auth` accepts either OAuth bearer tokens or signed session tokens.
+        // If this Authorization value isn't an OAuth token, ensure it is a valid session token.
+        verify_session_token(access_token, &state.config.auth.session_secret)?;
+    }
+
+    // Session-authenticated fallback for callers authenticated via cookie or session bearer token.
     let response = serde_json::json!({
-        "id": app.id,
-        "name": app.name,
-        "website": app.website,
-        "redirect_uri": app.redirect_uri,
-        "client_id": app.client_id,
-        "vapid_key": serde_json::Value::Null,
+        "name": session.name.unwrap_or_else(|| "RustResort".to_string()),
+        "website": serde_json::Value::Null,
     });
-
     Ok(Json(response))
 }
 
