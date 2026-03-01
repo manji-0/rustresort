@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, Query, RawQuery, State},
     response::Json,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -59,6 +60,45 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
     pub following: Option<bool>,
+}
+
+fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
+    let trimmed = encoded.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Validation(format!(
+            "{field} image must not be empty"
+        )));
+    }
+
+    let payload = if trimmed.starts_with("data:") {
+        let (meta, body) = trimmed.split_once(',').ok_or_else(|| {
+            AppError::Validation(format!(
+                "{field} image must be a base64 data URL or raw base64"
+            ))
+        })?;
+        if !meta.to_ascii_lowercase().contains(";base64") {
+            return Err(AppError::Validation(format!(
+                "{field} data URL must include ;base64"
+            )));
+        }
+        body
+    } else {
+        trimmed
+    };
+
+    let normalized: String = payload
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if normalized.is_empty() {
+        return Err(AppError::Validation(format!(
+            "{field} image must not be empty"
+        )));
+    }
+
+    BASE64_STANDARD
+        .decode(normalized)
+        .map_err(|_| AppError::Validation(format!("{field} image is not valid base64")))
 }
 
 fn default_port_for_protocol(protocol: &str) -> Option<u16> {
@@ -351,28 +391,40 @@ pub async fn update_credentials(
     CurrentUser(_session): CurrentUser,
     Json(req): Json<UpdateCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use chrono::Utc;
+    let account_service =
+        crate::service::AccountService::new(state.db.clone(), state.storage.clone());
 
-    // Get current account
-    let mut account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let UpdateCredentialsRequest {
+        display_name,
+        note,
+        avatar,
+        header,
+        locked: _,
+        bot: _,
+        discoverable: _,
+    } = req;
 
-    // Update fields if provided
-    if let Some(display_name) = req.display_name {
-        account.display_name = Some(display_name);
+    account_service.update_profile(display_name, note).await?;
+
+    if let Some(avatar_encoded) = avatar
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let avatar_bytes = decode_base64_image_field("avatar", avatar_encoded)?;
+        account_service.update_avatar(avatar_bytes).await?;
     }
 
-    if let Some(note) = req.note {
-        account.note = Some(note);
+    if let Some(header_encoded) = header
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let header_bytes = decode_base64_image_field("header", header_encoded)?;
+        account_service.update_header(header_bytes).await?;
     }
 
-    // TODO: Handle avatar and header uploads
-    // For now, we skip image processing as it requires multipart/form-data handling
-    // and S3 upload integration
-
-    account.updated_at = Utc::now();
-
-    // Save to database
-    state.db.upsert_account(&account).await?;
+    let account = account_service.get_account().await?;
 
     // Return updated account
     let mut response = crate::api::account_to_response(&account, &state.config);
@@ -637,7 +689,7 @@ pub async fn follow_account(
 }
 
 #[cfg(test)]
-mod tests {
+mod account_normalization_tests {
     use super::normalize_account_address;
 
     #[test]
@@ -1351,4 +1403,30 @@ pub async fn reject_follow_request(
     };
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
+}
+
+#[cfg(test)]
+mod image_decode_tests {
+    use super::decode_base64_image_field;
+
+    #[test]
+    fn decode_base64_image_field_accepts_raw_base64() {
+        let encoded = "aGVsbG8=";
+        let decoded = decode_base64_image_field("avatar", encoded).expect("decode should succeed");
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn decode_base64_image_field_accepts_data_url() {
+        let encoded = "data:image/webp;base64,aGVsbG8=";
+        let decoded = decode_base64_image_field("header", encoded).expect("decode should succeed");
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn decode_base64_image_field_rejects_non_base64_data_url() {
+        let encoded = "data:image/webp,abc";
+        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
+        assert!(format!("{error}").contains("base64"));
+    }
 }
