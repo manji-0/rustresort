@@ -11,7 +11,9 @@ use super::federation_delivery::{
     build_delivery, resolve_remote_actor_and_inbox, spawn_best_effort_delivery,
 };
 use crate::AppState;
+use crate::api::dto::AccountResponse;
 use crate::auth::CurrentUser;
+use crate::data::CachedProfile;
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
@@ -238,6 +240,93 @@ fn account_addresses_match_with_default_port(
         Some(port) => left_port.unwrap_or(port) == right_port.unwrap_or(port),
         None => left_port == right_port,
     }
+}
+
+fn remote_account_placeholder_created_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(0, 0).expect("unix epoch timestamp should always be valid")
+}
+
+fn saturating_count(value: Option<u64>) -> i32 {
+    value.unwrap_or(0).min(i32::MAX as u64) as i32
+}
+
+fn build_remote_account_response(
+    normalized_address: &str,
+    profile: Option<&CachedProfile>,
+    config: &crate::config::AppConfig,
+) -> Option<AccountResponse> {
+    let (username, domain) = normalized_address.split_once('@')?;
+    let media_url = &config.storage.media.public_url;
+    let default_avatar = format!("{}/default-avatar.png", media_url);
+    let default_header = format!("{}/default-header.png", media_url);
+
+    let url = profile
+        .map(|value| value.uri.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("https://{}/@{}", domain, username));
+    let avatar = profile
+        .and_then(|value| value.avatar_url.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_avatar.clone());
+    let header = profile
+        .and_then(|value| value.header_url.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_header.clone());
+    let display_name = profile
+        .and_then(|value| value.display_name.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| username.to_string());
+
+    Some(AccountResponse {
+        id: normalized_address.to_string(),
+        username: username.to_string(),
+        acct: normalized_address.to_string(),
+        display_name,
+        locked: false,
+        bot: false,
+        discoverable: true,
+        group: false,
+        created_at: profile
+            .map(|value| value.fetched_at)
+            .unwrap_or_else(remote_account_placeholder_created_at),
+        note: profile
+            .and_then(|value| value.note.clone())
+            .unwrap_or_default(),
+        url,
+        avatar: avatar.clone(),
+        avatar_static: avatar,
+        header: header.clone(),
+        header_static: header,
+        followers_count: saturating_count(profile.and_then(|value| value.followers_count)),
+        following_count: saturating_count(profile.and_then(|value| value.following_count)),
+        statuses_count: 0,
+        last_status_at: None,
+        emojis: vec![],
+        fields: vec![],
+    })
+}
+
+pub(crate) async fn resolve_remote_account_response(
+    state: &AppState,
+    raw_address: &str,
+) -> Option<AccountResponse> {
+    let normalized_address = normalize_account_address(raw_address).ok()?;
+
+    let mut profile = state.profile_cache.get(&normalized_address).await;
+    if profile.is_none()
+        && resolve_remote_actor_and_inbox(state, &normalized_address)
+            .await
+            .is_ok()
+    {
+        profile = state.profile_cache.get(&normalized_address).await;
+    }
+
+    build_remote_account_response(
+        &normalized_address,
+        profile.as_deref(),
+        state.config.as_ref(),
+    )
 }
 
 async fn resolve_target_address(state: &AppState, id: &str) -> Result<String, AppError> {
@@ -515,7 +604,7 @@ pub async fn account_statuses(
 pub async fn get_account_followers(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -524,19 +613,34 @@ pub async fn get_account_followers(
         return Err(AppError::NotFound);
     }
 
-    // Get follower addresses
-    let _follower_addresses = state.db.get_all_follower_addresses().await?;
+    let follower_addresses = state.db.get_all_follower_addresses().await?;
+    let limit = params.limit.unwrap_or(40).min(80);
+    let mut seen = HashSet::new();
+    let mut followers = Vec::new();
 
-    // TODO: Fetch full account info for each follower from cache/federation
-    // For now, return empty array as we don't have remote account info
-    Ok(Json(vec![]))
+    for address in follower_addresses {
+        let Ok(normalized_address) = normalize_account_address(&address) else {
+            continue;
+        };
+        if !seen.insert(normalized_address.clone()) {
+            continue;
+        }
+        if let Some(response) = resolve_remote_account_response(&state, &normalized_address).await {
+            followers.push(serde_json::to_value(response).unwrap());
+        }
+        if followers.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(Json(followers))
 }
 
 /// GET /api/v1/accounts/:id/following
 pub async fn get_account_following(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -545,12 +649,27 @@ pub async fn get_account_following(
         return Err(AppError::NotFound);
     }
 
-    // Get following addresses
-    let _following_addresses = state.db.get_all_follow_addresses().await?;
+    let following_addresses = state.db.get_all_follow_addresses().await?;
+    let limit = params.limit.unwrap_or(40).min(80);
+    let mut seen = HashSet::new();
+    let mut following = Vec::new();
 
-    // TODO: Fetch full account info for each followed account from cache/federation
-    // For now, return empty array as we don't have remote account info
-    Ok(Json(vec![]))
+    for address in following_addresses {
+        let Ok(normalized_address) = normalize_account_address(&address) else {
+            continue;
+        };
+        if !seen.insert(normalized_address.clone()) {
+            continue;
+        }
+        if let Some(response) = resolve_remote_account_response(&state, &normalized_address).await {
+            following.push(serde_json::to_value(response).unwrap());
+        }
+        if following.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(Json(following))
 }
 
 /// POST /api/v1/accounts/:id/follow
@@ -869,15 +988,20 @@ pub async fn search_accounts(
         results.push(serde_json::to_value(account_response).unwrap());
     }
 
-    // If resolve=true and query looks like an account address, try WebFinger
+    // If resolve=true and query looks like an account address, resolve and return profile info.
     if params.resolve.unwrap_or(false) && query.contains('@') {
-        // TODO: Implement WebFinger lookup for remote accounts
-        // This would:
-        // 1. Parse the account address
-        // 2. Perform WebFinger lookup
-        // 3. Fetch the actor profile
-        // 4. Convert to AccountResponse
-        // 5. Add to results
+        if let Some(remote_account) = resolve_remote_account_response(&state, &query).await {
+            let remote_id = remote_account.id.clone();
+            let already_present = results.iter().any(|entry| {
+                entry
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value == remote_id)
+            });
+            if !already_present {
+                results.push(serde_json::to_value(remote_account).unwrap());
+            }
+        }
     }
 
     // Apply limit

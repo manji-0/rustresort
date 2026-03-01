@@ -7,6 +7,33 @@ mod common;
 use common::TestServer;
 use serde_json::json;
 
+async fn cache_remote_profile(server: &TestServer, address: &str) {
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+
+    let (username, domain) = address
+        .split_once('@')
+        .expect("remote address must be user@domain");
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: address.to_string(),
+            uri: format!("https://{}/users/{}", domain, username),
+            display_name: Some("Alice Remote".to_string()),
+            note: Some("Remote profile".to_string()),
+            avatar_url: Some(format!("https://{}/media/alice-avatar.jpg", domain)),
+            header_url: Some(format!("https://{}/media/alice-header.jpg", domain)),
+            public_key_pem: "test-public-key".to_string(),
+            inbox_uri: format!("https://{}/inbox", domain),
+            outbox_uri: Some(format!("https://{}/users/{}/outbox", domain, username)),
+            followers_count: Some(12),
+            following_count: Some(34),
+            fetched_at: Utc::now(),
+        })
+        .await;
+}
+
 // ============================================================================
 // Instance Endpoints (5 endpoints)
 // ============================================================================
@@ -241,6 +268,87 @@ async fn test_account_following() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_account_followers_returns_remote_account_data_from_cache() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new().0,
+            follower_address: remote_address.to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["acct"], remote_address);
+    assert_eq!(followers[0]["display_name"], "Alice Remote");
+    assert_eq!(followers[0]["followers_count"], 12);
+}
+
+#[tokio::test]
+async fn test_account_following_returns_remote_account_data_from_cache() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new().0,
+            target_address: remote_address.to_string(),
+            uri: "https://remote.example/follows/2".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let following = body.as_array().expect("following should be array");
+    assert_eq!(following.len(), 1);
+    assert_eq!(following[0]["acct"], remote_address);
+    assert_eq!(following[0]["display_name"], "Alice Remote");
+    assert_eq!(following[0]["following_count"], 34);
 }
 
 #[tokio::test]
@@ -541,6 +649,35 @@ async fn test_search_accounts() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_accounts_resolve_returns_remote_account_data() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v1/accounts/search?q={}&resolve=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account["acct"] == remote_address)
+    );
 }
 
 #[tokio::test]
@@ -1642,6 +1779,37 @@ async fn test_search_v2() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_v2_resolve_returns_remote_account_data() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(&server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account["acct"] == remote_address)
+    );
 }
 
 // ============================================================================
