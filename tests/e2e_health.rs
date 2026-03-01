@@ -63,3 +63,49 @@ async fn test_404_for_unknown_routes() {
 
     assert_eq!(response.status(), 404);
 }
+
+#[tokio::test]
+async fn test_metrics_is_public_without_auth_token() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .get(&server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_metrics_requires_configured_bearer_token() {
+    let server = TestServer::with_metrics_auth_token(Some("metrics-secret")).await;
+
+    let unauthorized = server
+        .client
+        .get(&server.url("/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), 401);
+
+    let wrong_token = server
+        .client
+        .get(&server.url("/metrics"))
+        .header("Authorization", "Bearer not-the-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_token.status(), 401);
+
+    let response = server
+        .client
+        .get(&server.url("/metrics"))
+        .header("Authorization", "Bearer metrics-secret")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}

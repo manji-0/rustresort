@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub instance: InstanceConfig,
     pub admin: AdminConfig,
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
 }
 
@@ -251,6 +253,15 @@ pub struct CacheConfig {
     pub profile_ttl: u64,
 }
 
+/// Metrics endpoint authentication configuration
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MetricsConfig {
+    /// Optional static bearer token required by `/metrics`.
+    ///
+    /// When omitted, the endpoint remains publicly readable for backward compatibility.
+    pub auth_token: Option<String>,
+}
+
 /// Logging configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoggingConfig {
@@ -330,6 +341,17 @@ impl AppConfig {
         if self.auth.session_max_age <= 0 {
             return Err(crate::error::AppError::Config(
                 "auth.session_max_age must be greater than 0".to_string(),
+            ));
+        }
+
+        if self
+            .metrics
+            .auth_token
+            .as_ref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(crate::error::AppError::Config(
+                "metrics.auth_token must not be empty when provided".to_string(),
             ));
         }
 
@@ -430,6 +452,7 @@ mod tests {
                 timeline_max_items: 2000,
                 profile_ttl: 86_400,
             },
+            metrics: MetricsConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: "pretty".to_string(),
@@ -472,6 +495,21 @@ mod tests {
             error,
             crate::error::AppError::Config(message)
                 if message.contains("server.protocol must be https")
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_blank_metrics_auth_token() {
+        let mut config = valid_config();
+        config.metrics.auth_token = Some("   ".to_string());
+
+        let error = config
+            .validate()
+            .expect_err("blank metrics auth token must fail");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Config(message)
+                if message.contains("metrics.auth_token")
         ));
     }
 }
