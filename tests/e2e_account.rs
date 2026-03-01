@@ -200,6 +200,8 @@ async fn test_account_statuses_only_media_pages_until_limit() {
                 blurhash: None,
                 width: Some(64),
                 height: Some(64),
+                focus_x: None,
+                focus_y: None,
                 created_at: now,
             };
             server.state.db.insert_media(&media).await.unwrap();

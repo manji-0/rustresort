@@ -2906,8 +2906,8 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO oauth_apps (
-                id, name, website, redirect_uri, client_id, client_secret, scopes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, name, website, redirect_uri, client_id, client_secret, vapid_key, scopes, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&app.id)
@@ -2916,6 +2916,7 @@ impl Database {
         .bind(&app.redirect_uri)
         .bind(&app.client_id)
         .bind(&app.client_secret)
+        .bind(&app.vapid_key)
         .bind(&app.scopes)
         .bind(&app.created_at)
         .execute(&self.pool)
@@ -2943,6 +2944,17 @@ impl Database {
             .bind(app_id)
             .fetch_optional(&self.pool)
             .await?;
+
+        Ok(app)
+    }
+
+    /// Get latest OAuth app by creation time.
+    pub async fn get_latest_oauth_app(&self) -> Result<Option<OAuthApp>, AppError> {
+        let app = sqlx::query_as::<_, OAuthApp>(
+            "SELECT * FROM oauth_apps ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(app)
     }

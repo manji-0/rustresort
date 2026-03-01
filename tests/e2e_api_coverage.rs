@@ -110,6 +110,11 @@ async fn test_verify_app_credentials() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        body.get("client_id").is_none(),
+        "session fallback must not leak unrelated app credentials"
+    );
 }
 
 // ============================================================================
