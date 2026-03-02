@@ -476,27 +476,47 @@ fn boost_stub_status(
 }
 
 /// Convert Status to StatusResponse
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusInteractions {
+    pub favourited: Option<bool>,
+    pub reblogged: Option<bool>,
+    pub muted: Option<bool>,
+    pub bookmarked: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
+impl StatusInteractions {
+    pub const fn new(
+        favourited: Option<bool>,
+        reblogged: Option<bool>,
+        muted: Option<bool>,
+        bookmarked: Option<bool>,
+        pinned: Option<bool>,
+    ) -> Self {
+        Self {
+            favourited,
+            reblogged,
+            muted,
+            bookmarked,
+            pinned,
+        }
+    }
+}
+
+/// Convert Status to StatusResponse
 #[cfg(test)]
 pub fn status_to_response(
     status: &Status,
     account: &Account,
     config: &AppConfig,
-    favourited: Option<bool>,
-    reblogged: Option<bool>,
-    muted: Option<bool>,
-    bookmarked: Option<bool>,
-    pinned: Option<bool>,
+    interactions: StatusInteractions,
 ) -> StatusResponse {
     status_to_response_with_account_stats(
         status,
         account,
         config,
         AccountStats::default(),
-        favourited,
-        reblogged,
-        muted,
-        bookmarked,
-        pinned,
+        interactions,
     )
 }
 
@@ -506,11 +526,7 @@ pub fn status_to_response_with_account_stats(
     account: &Account,
     config: &AppConfig,
     account_stats: AccountStats,
-    favourited: Option<bool>,
-    reblogged: Option<bool>,
-    muted: Option<bool>,
-    bookmarked: Option<bool>,
-    pinned: Option<bool>,
+    interactions: StatusInteractions,
 ) -> StatusResponse {
     status_to_response_with_account_stats_and_remote_count(
         status,
@@ -518,11 +534,7 @@ pub fn status_to_response_with_account_stats(
         config,
         account_stats,
         None,
-        favourited,
-        reblogged,
-        muted,
-        bookmarked,
-        pinned,
+        interactions,
     )
 }
 
@@ -533,11 +545,7 @@ pub fn status_to_response_with_account_stats_and_remote_count(
     config: &AppConfig,
     account_stats: AccountStats,
     remote_statuses_count: Option<i32>,
-    favourited: Option<bool>,
-    reblogged: Option<bool>,
-    muted: Option<bool>,
-    bookmarked: Option<bool>,
-    pinned: Option<bool>,
+    interactions: StatusInteractions,
 ) -> StatusResponse {
     let remote_account_stats = remote_statuses_count.map(|statuses_count| RemoteAccountStats {
         statuses_count,
@@ -549,11 +557,7 @@ pub fn status_to_response_with_account_stats_and_remote_count(
         config,
         account_stats,
         remote_account_stats,
-        favourited,
-        reblogged,
-        muted,
-        bookmarked,
-        pinned,
+        interactions,
     )
 }
 
@@ -564,11 +568,7 @@ pub fn status_to_response_with_account_stats_and_remote_stats(
     config: &AppConfig,
     account_stats: AccountStats,
     remote_account_stats: Option<RemoteAccountStats>,
-    favourited: Option<bool>,
-    reblogged: Option<bool>,
-    muted: Option<bool>,
-    bookmarked: Option<bool>,
-    pinned: Option<bool>,
+    interactions: StatusInteractions,
 ) -> StatusResponse {
     status_to_response_with_media(
         status,
@@ -576,11 +576,7 @@ pub fn status_to_response_with_account_stats_and_remote_stats(
         config,
         account_stats,
         remote_account_stats,
-        favourited,
-        reblogged,
-        muted,
-        bookmarked,
-        pinned,
+        interactions,
         &[],
     )
 }
@@ -592,11 +588,7 @@ pub fn status_to_response_with_media(
     config: &AppConfig,
     account_stats: AccountStats,
     remote_account_stats: Option<RemoteAccountStats>,
-    favourited: Option<bool>,
-    reblogged: Option<bool>,
-    muted: Option<bool>,
-    bookmarked: Option<bool>,
-    pinned: Option<bool>,
+    interactions: StatusInteractions,
     media_attachments: &[MediaAttachment],
 ) -> StatusResponse {
     let base_url = config.server.base_url();
@@ -652,11 +644,11 @@ pub fn status_to_response_with_media(
         emojis: vec![],
         card: None,
         poll: None,
-        favourited,
-        reblogged,
-        muted,
-        bookmarked,
-        pinned,
+        favourited: interactions.favourited,
+        reblogged: interactions.reblogged,
+        muted: interactions.muted,
+        bookmarked: interactions.bookmarked,
+        pinned: interactions.pinned,
     }
 }
 
@@ -795,11 +787,13 @@ mod tests {
             &status,
             &account,
             &config,
-            Some(true),
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(false),
+            StatusInteractions::new(
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
         );
 
         assert_eq!(response.id, "456");
@@ -850,7 +844,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
 
         assert_eq!(response.account.acct, "alice@remote.example");
         assert_eq!(
@@ -895,7 +890,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
 
         assert_eq!(
             response.in_reply_to_id.as_deref(),
@@ -936,7 +932,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         assert_eq!(response.in_reply_to_id.as_deref(), Some("local-123"));
     }
 
@@ -973,7 +970,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         assert_eq!(response.in_reply_to_id.as_deref(), Some(parent_uri));
     }
 
@@ -1010,7 +1008,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         assert_eq!(response.in_reply_to_id.as_deref(), Some(parent_uri));
     }
 
@@ -1045,7 +1044,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         let reblog = response
             .reblog
             .expect("boosted status should include reblog payload");
@@ -1093,7 +1093,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         let reblog = response
             .reblog
             .expect("boosted status should include reblog payload");
@@ -1139,7 +1140,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         let reblog = response
             .reblog
             .expect("boosted status should include reblog payload");
@@ -1181,7 +1183,8 @@ mod tests {
             fetched_at: None,
         };
 
-        let response = status_to_response(&status, &account, &config, None, None, None, None, None);
+        let response =
+            status_to_response(&status, &account, &config, StatusInteractions::default());
         let reblog = response
             .reblog
             .expect("boosted status should include reblog payload");
@@ -1242,11 +1245,7 @@ mod tests {
             &config,
             AccountStats::default(),
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            StatusInteractions::default(),
             &[media],
         );
 

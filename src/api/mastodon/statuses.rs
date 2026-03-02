@@ -16,7 +16,7 @@ use super::federation_delivery::{
 };
 use crate::StatusApiState;
 use crate::auth::CurrentUser;
-use crate::data::{Account, PersistedReason, StatusVisibility};
+use crate::data::{Account, PersistedReason, ScheduledStatusInsert, StatusVisibility};
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS,
@@ -228,6 +228,7 @@ fn build_status_service(state: &StatusApiState) -> StatusService {
         state.timeline_cache.clone(),
         state.storage.clone(),
         state.config.server.base_url().to_string(),
+        state.config.admin.username.clone(),
     )
 }
 
@@ -261,11 +262,7 @@ fn status_response_without_interaction_state(
         account,
         &state.config,
         account_stats,
-        None,
-        None,
-        None,
-        None,
-        None,
+        crate::api::StatusInteractions::default(),
     )
 }
 
@@ -490,17 +487,17 @@ pub async fn create_status(
             };
 
             let scheduled_id = status_service
-                .create_scheduled_status(
-                    &scheduled_at,
-                    &content,
-                    visibility.as_str(),
-                    spoiler_text.as_deref(),
-                    in_reply_to_id.as_deref(),
-                    media_ids_json.as_deref(),
-                    poll_options_json.as_deref(),
-                    poll.as_ref().map(|poll| poll.expires_in),
-                    poll.as_ref().is_some_and(|poll| poll.multiple),
-                )
+                .create_scheduled_status(&ScheduledStatusInsert {
+                    scheduled_at,
+                    status_text: content.clone(),
+                    visibility: visibility.to_string(),
+                    content_warning: spoiler_text.clone(),
+                    in_reply_to_id: in_reply_to_id.clone(),
+                    media_ids: media_ids_json,
+                    poll_options: poll_options_json,
+                    poll_expires_in: poll.as_ref().map(|poll| poll.expires_in),
+                    poll_multiple: poll.as_ref().is_some_and(|poll| poll.multiple),
+                })
                 .await?;
             return status_service
                 .get_scheduled_status(&scheduled_id)
@@ -663,11 +660,13 @@ pub async fn create_status(
             &state.config,
             account_stats,
             None,
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(false),
+            crate::api::StatusInteractions::new(
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
             &media_attachments,
         );
         let mut response_value = serde_json::to_value(response)
@@ -834,11 +833,13 @@ pub async fn delete_status(
         &account,
         &state.config,
         account_stats,
-        Some(false),
-        Some(false),
-        Some(false),
-        Some(false),
-        Some(false),
+        crate::api::StatusInteractions::new(
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ),
     );
 
     // Record successful request
@@ -1072,11 +1073,13 @@ pub async fn favourite_status(
         &account,
         &state.config,
         account_stats,
-        Some(true),
-        Some(false),
-        status_service.is_muted(&status_id).await.ok(),
-        status_service.is_bookmarked(&status_id).await.ok(),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            Some(true),
+            Some(false),
+            status_service.is_muted(&status_id).await.ok(),
+            status_service.is_bookmarked(&status_id).await.ok(),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1143,11 +1146,13 @@ pub async fn unfavourite_status(
         &account,
         &state.config,
         account_stats,
-        Some(false),
-        Some(false),
-        status_service.is_muted(&status_id).await.ok(),
-        status_service.is_bookmarked(&status_id).await.ok(),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            Some(false),
+            Some(false),
+            status_service.is_muted(&status_id).await.ok(),
+            status_service.is_bookmarked(&status_id).await.ok(),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1232,11 +1237,13 @@ pub async fn reblog_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status_id).await.ok(),
-        Some(true),
-        status_service.is_muted(&status_id).await.ok(),
-        status_service.is_bookmarked(&status_id).await.ok(),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status_id).await.ok(),
+            Some(true),
+            status_service.is_muted(&status_id).await.ok(),
+            status_service.is_bookmarked(&status_id).await.ok(),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1305,11 +1312,13 @@ pub async fn unreblog_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status_id).await.ok(),
-        Some(false),
-        status_service.is_muted(&status_id).await.ok(),
-        status_service.is_bookmarked(&status_id).await.ok(),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status_id).await.ok(),
+            Some(false),
+            status_service.is_muted(&status_id).await.ok(),
+            status_service.is_bookmarked(&status_id).await.ok(),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1342,11 +1351,13 @@ pub async fn bookmark_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status_id).await.ok(),
-        status_service.is_reposted(&status_id).await.ok(),
-        status_service.is_muted(&status_id).await.ok(),
-        Some(true),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status_id).await.ok(),
+            status_service.is_reposted(&status_id).await.ok(),
+            status_service.is_muted(&status_id).await.ok(),
+            Some(true),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1383,11 +1394,13 @@ pub async fn unbookmark_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status_id).await.ok(),
-        status_service.is_reposted(&status_id).await.ok(),
-        status_service.is_muted(&status_id).await.ok(),
-        Some(false),
-        status_service.is_pinned(&status_id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status_id).await.ok(),
+            status_service.is_reposted(&status_id).await.ok(),
+            status_service.is_muted(&status_id).await.ok(),
+            Some(false),
+            status_service.is_pinned(&status_id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1492,11 +1505,13 @@ pub async fn update_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status.id).await.ok(),
-        status_service.is_reposted(&status.id).await.ok(),
-        status_service.is_muted(&status.id).await.ok(),
-        status_service.is_bookmarked(&status.id).await.ok(),
-        status_service.is_pinned(&status.id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status.id).await.ok(),
+            status_service.is_reposted(&status.id).await.ok(),
+            status_service.is_muted(&status.id).await.ok(),
+            status_service.is_bookmarked(&status.id).await.ok(),
+            status_service.is_pinned(&status.id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1577,11 +1592,13 @@ pub async fn pin_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status.id).await.ok(),
-        status_service.is_reposted(&status.id).await.ok(),
-        status_service.is_muted(&status.id).await.ok(),
-        status_service.is_bookmarked(&status.id).await.ok(),
-        Some(true),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status.id).await.ok(),
+            status_service.is_reposted(&status.id).await.ok(),
+            status_service.is_muted(&status.id).await.ok(),
+            status_service.is_bookmarked(&status.id).await.ok(),
+            Some(true),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1609,11 +1626,13 @@ pub async fn unpin_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status.id).await.ok(),
-        status_service.is_reposted(&status.id).await.ok(),
-        status_service.is_muted(&status.id).await.ok(),
-        status_service.is_bookmarked(&status.id).await.ok(),
-        Some(false),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status.id).await.ok(),
+            status_service.is_reposted(&status.id).await.ok(),
+            status_service.is_muted(&status.id).await.ok(),
+            status_service.is_bookmarked(&status.id).await.ok(),
+            Some(false),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1641,11 +1660,13 @@ pub async fn mute_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status.id).await.ok(),
-        status_service.is_reposted(&status.id).await.ok(),
-        Some(true),
-        status_service.is_bookmarked(&status.id).await.ok(),
-        status_service.is_pinned(&status.id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status.id).await.ok(),
+            status_service.is_reposted(&status.id).await.ok(),
+            Some(true),
+            status_service.is_bookmarked(&status.id).await.ok(),
+            status_service.is_pinned(&status.id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))
@@ -1673,11 +1694,13 @@ pub async fn unmute_status(
         &account,
         &state.config,
         account_stats,
-        status_service.is_favourited(&status.id).await.ok(),
-        status_service.is_reposted(&status.id).await.ok(),
-        Some(false),
-        status_service.is_bookmarked(&status.id).await.ok(),
-        status_service.is_pinned(&status.id).await.ok(),
+        crate::api::StatusInteractions::new(
+            status_service.is_favourited(&status.id).await.ok(),
+            status_service.is_reposted(&status.id).await.ok(),
+            Some(false),
+            status_service.is_bookmarked(&status.id).await.ok(),
+            status_service.is_pinned(&status.id).await.ok(),
+        ),
     );
 
     Ok(Json(serde_json::to_value(response).unwrap()))

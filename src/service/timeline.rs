@@ -4,7 +4,7 @@
 
 use std::{collections::HashSet, future::Future, sync::Arc};
 
-use crate::data::{ProfileCache, Status, TimelineCache, TimelineRepository};
+use crate::data::{ListTimelineQuery, ProfileCache, Status, TimelineCache, TimelineRepository};
 use crate::error::AppError;
 
 /// Timeline service
@@ -132,35 +132,30 @@ impl TimelineService {
     /// Get list timeline.
     pub async fn list_timeline(
         &self,
-        list_id: &str,
-        local_account_address: &str,
-        local_account_id: &str,
-        default_port: Option<u16>,
-        limit: usize,
-        max_id: Option<&str>,
-        min_id: Option<&str>,
+        query: &ListTimelineQuery,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        let list_id = list_id.to_string();
-        let local_account_address = local_account_address.to_string();
-        let local_account_id = local_account_id.to_string();
-        let min_id = min_id.map(str::to_string);
+        let list_id = query.list_id.clone();
+        let local_account_address = query.local_account_address.clone();
+        let local_account_id = query.local_account_id.clone();
+        let default_port = query.default_port;
+        let min_id = query.min_id.clone();
         let statuses = self
-            .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
+            .collect_visible_statuses(query.limit, query.max_id.clone(), |fetch_limit, cursor| {
                 let list_id = list_id.clone();
                 let local_account_address = local_account_address.clone();
                 let local_account_id = local_account_id.clone();
                 let min_id = min_id.clone();
                 async move {
                     self.db
-                        .get_list_timeline_statuses_in_window(
-                            &list_id,
-                            &local_account_address,
-                            &local_account_id,
+                        .get_list_timeline_statuses_in_window(&ListTimelineQuery {
+                            list_id,
+                            local_account_address,
+                            local_account_id,
                             default_port,
-                            fetch_limit,
-                            cursor.as_deref(),
-                            min_id.as_deref(),
-                        )
+                            limit: fetch_limit,
+                            max_id: cursor,
+                            min_id,
+                        })
                         .await
                 }
             })

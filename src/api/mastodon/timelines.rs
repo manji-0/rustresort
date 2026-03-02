@@ -9,6 +9,7 @@ use serde::Deserialize;
 use super::accounts::PaginationParams;
 use crate::TimelineApiState;
 use crate::auth::CurrentUser;
+use crate::data::ListTimelineQuery;
 use crate::error::AppError;
 use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
@@ -85,11 +86,13 @@ pub async fn home_timeline(
                 &state.config,
                 account_stats,
                 remote_stats,
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
+                crate::api::StatusInteractions::new(
+                    Some(item.favourited),
+                    Some(item.reblogged),
+                    None,
+                    Some(item.bookmarked),
+                    None,
+                ),
             );
             serde_json::to_value(response).unwrap()
         })
@@ -166,11 +169,13 @@ pub async fn public_timeline(
                 &state.config,
                 account_stats,
                 remote_stats,
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
+                crate::api::StatusInteractions::new(
+                    Some(item.favourited),
+                    Some(item.reblogged),
+                    None,
+                    Some(item.bookmarked),
+                    None,
+                ),
             );
             serde_json::to_value(response).unwrap()
         })
@@ -232,11 +237,13 @@ pub async fn tag_timeline(
                 &state.config,
                 account_stats,
                 remote_stats,
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
+                crate::api::StatusInteractions::new(
+                    Some(item.favourited),
+                    Some(item.reblogged),
+                    None,
+                    Some(item.bookmarked),
+                    None,
+                ),
             );
             serde_json::to_value(response).unwrap()
         })
@@ -280,17 +287,16 @@ pub async fn list_timeline(
         let min_id = params.min_id.clone();
 
         while collected.len() < limit {
-            let page = timeline_service
-                .list_timeline(
-                    &list_id,
-                    &local_account_address,
-                    &local_account_id,
-                    default_port,
-                    limit,
-                    cursor.as_deref(),
-                    min_id.as_deref(),
-                )
-                .await?;
+            let query = ListTimelineQuery {
+                list_id: list_id.clone(),
+                local_account_address: local_account_address.clone(),
+                local_account_id: local_account_id.clone(),
+                default_port,
+                limit,
+                max_id: cursor.clone(),
+                min_id: min_id.clone(),
+            };
+            let page = timeline_service.list_timeline(&query).await?;
             if page.is_empty() {
                 break;
             }
@@ -313,17 +319,16 @@ pub async fn list_timeline(
 
         collected
     } else {
-        timeline_service
-            .list_timeline(
-                &list_id,
-                &local_account_address,
-                &local_account_id,
-                default_port,
-                limit,
-                params.max_id.as_deref(),
-                params.min_id.as_deref(),
-            )
-            .await?
+        let query = ListTimelineQuery {
+            list_id: list_id.clone(),
+            local_account_address: local_account_address.clone(),
+            local_account_id: local_account_id.clone(),
+            default_port,
+            limit,
+            max_id: params.max_id.clone(),
+            min_id: params.min_id.clone(),
+        };
+        timeline_service.list_timeline(&query).await?
     };
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
@@ -349,11 +354,13 @@ pub async fn list_timeline(
                 &state.config,
                 account_stats,
                 remote_stats,
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
+                crate::api::StatusInteractions::new(
+                    Some(item.favourited),
+                    Some(item.reblogged),
+                    None,
+                    Some(item.bookmarked),
+                    None,
+                ),
             );
             serde_json::to_value(response).unwrap()
         })

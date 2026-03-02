@@ -194,11 +194,13 @@ pub async fn search_v2(
                                 &state.config,
                                 account_stats,
                                 remote_stats,
-                                Some(false), // favourited
-                                Some(false), // reblogged
-                                Some(false), // muted
-                                Some(false), // bookmarked
-                                Some(false), // pinned
+                                crate::api::StatusInteractions::new(
+                                    Some(false),
+                                    Some(false),
+                                    Some(false),
+                                    Some(false),
+                                    Some(false),
+                                ),
                             );
                         statuses.push(serde_json::to_value(status_response).unwrap_or_default());
                     }

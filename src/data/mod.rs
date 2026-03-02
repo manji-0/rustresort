@@ -14,7 +14,10 @@ mod sync;
 pub use cache::{CachedAttachment, CachedProfile, CachedStatus, ProfileCache, TimelineCache};
 pub use database::{Database, TursoSyncOptions};
 pub use models::*;
-pub use repository::{AccountRepository, StatusRepository, TimelineRepository};
+pub use repository::{
+    AccountCredentialsPatch, AccountRepository, ListTimelineQuery, ScheduledStatusInsert,
+    StatusRepository, TimelineRepository,
+};
 pub use sync::{sync_to_d1, validate_d1_sync_environment};
 
 #[cfg(test)]

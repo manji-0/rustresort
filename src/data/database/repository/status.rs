@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::data::ListTimelineQuery;
 
 impl Database {
     // =========================================================================
@@ -951,19 +952,13 @@ impl Database {
     /// Get statuses for a list timeline by matching account addresses.
     pub async fn get_list_timeline_statuses_in_window(
         &self,
-        list_id: &str,
-        local_account_address: &str,
-        local_account_id: &str,
-        default_port: Option<u16>,
-        limit: usize,
-        max_id: Option<&str>,
-        min_id: Option<&str>,
+        query: &ListTimelineQuery,
     ) -> Result<Vec<Status>, AppError> {
-        if limit == 0 {
+        if query.limit == 0 {
             return Ok(Vec::new());
         }
 
-        let list_accounts = self.get_list_accounts(list_id).await?;
+        let list_accounts = self.get_list_accounts(query.list_id.as_str()).await?;
         if list_accounts.is_empty() {
             return Ok(Vec::new());
         }
@@ -973,14 +968,16 @@ impl Database {
         let mut seen_remote = HashSet::new();
 
         for account_address in list_accounts {
-            if account_address.eq_ignore_ascii_case(local_account_address)
-                || account_address == local_account_id
+            if account_address.eq_ignore_ascii_case(query.local_account_address.as_str())
+                || account_address == query.local_account_id
             {
                 include_local_statuses = true;
                 continue;
             }
 
-            for candidate in equivalent_account_address_candidates(&account_address, default_port) {
+            for candidate in
+                equivalent_account_address_candidates(&account_address, query.default_port)
+            {
                 let lowered = candidate.to_ascii_lowercase();
                 if seen_remote.insert(lowered.clone()) {
                     remote_candidates.push(lowered);
@@ -1017,17 +1014,17 @@ impl Database {
 
         query_builder.push(")");
 
-        if let Some(max_id) = max_id {
+        if let Some(max_id) = query.max_id.as_deref() {
             query_builder.push(" AND s.id < ");
             query_builder.push_bind(max_id);
         }
-        if let Some(min_id) = min_id {
+        if let Some(min_id) = query.min_id.as_deref() {
             query_builder.push(" AND s.id > ");
             query_builder.push_bind(min_id);
         }
 
         query_builder.push(" ORDER BY s.id DESC LIMIT ");
-        query_builder.push_bind(limit as i64);
+        query_builder.push_bind(query.limit as i64);
 
         let statuses = query_builder
             .build_query_as::<Status>()

@@ -224,195 +224,90 @@ pub struct WellKnownState {
     pub db: Arc<data::Database>,
 }
 
-impl FromRef<AppState> for Arc<config::AppConfig> {
-    fn from_ref(state: &AppState) -> Self {
-        state.config.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<data::Database> {
-    fn from_ref(state: &AppState) -> Self {
-        state.db.clone()
-    }
-}
-
-impl FromRef<AppState> for AuthState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
+macro_rules! impl_from_ref_field {
+    ($target:ty, $field:ident) => {
+        impl FromRef<AppState> for $target {
+            fn from_ref(state: &AppState) -> Self {
+                state.$field.clone()
+            }
         }
-    }
+    };
 }
 
-impl FromRef<AppState> for OAuthWebState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            http_client: state.http_client.clone(),
+macro_rules! impl_from_ref_state {
+    ($target:ty { $($field:ident),+ $(,)? }) => {
+        impl FromRef<AppState> for $target {
+            fn from_ref(state: &AppState) -> Self {
+                Self {
+                    $($field: state.$field.clone(),)+
+                }
+            }
         }
-    }
+    };
 }
 
-impl FromRef<AppState> for TimelineApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            timeline_cache: state.timeline_cache.clone(),
-            profile_cache: state.profile_cache.clone(),
-        }
-    }
-}
+impl_from_ref_field!(Arc<config::AppConfig>, config);
+impl_from_ref_field!(Arc<data::Database>, db);
 
-impl FromRef<AppState> for StatusApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            timeline_cache: state.timeline_cache.clone(),
-            profile_cache: state.profile_cache.clone(),
-            storage: state.storage.clone(),
-            http_client: state.http_client.clone(),
-            federation_fetch_client: state.federation_fetch_client.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for SearchApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            profile_cache: state.profile_cache.clone(),
-            federation_fetch_client: state.federation_fetch_client.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for InstanceApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for AdminApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for AccountApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            profile_cache: state.profile_cache.clone(),
-            storage: state.storage.clone(),
-            http_client: state.http_client.clone(),
-            federation_fetch_client: state.federation_fetch_client.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for AppsApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for MediaApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            timeline_cache: state.timeline_cache.clone(),
-            storage: state.storage.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for ListsApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for FiltersApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for ConversationsApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for PollsApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for ScheduledStatusesApiState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for ActivityPubState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-            timeline_cache: state.timeline_cache.clone(),
-            profile_cache: state.profile_cache.clone(),
-            storage: state.storage.clone(),
-            http_client: state.http_client.clone(),
-            federation_rate_limiter: state.federation_rate_limiter.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for SystemAdminState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-            backup: state.backup.clone(),
-        }
-    }
-}
-
-impl FromRef<AppState> for WellKnownState {
-    fn from_ref(state: &AppState) -> Self {
-        Self {
-            config: state.config.clone(),
-            db: state.db.clone(),
-        }
-    }
-}
+impl_from_ref_state!(AuthState { config, db });
+impl_from_ref_state!(OAuthWebState {
+    config,
+    http_client
+});
+impl_from_ref_state!(TimelineApiState {
+    config,
+    db,
+    timeline_cache,
+    profile_cache,
+});
+impl_from_ref_state!(StatusApiState {
+    config,
+    db,
+    timeline_cache,
+    profile_cache,
+    storage,
+    http_client,
+    federation_fetch_client,
+});
+impl_from_ref_state!(SearchApiState {
+    config,
+    db,
+    profile_cache,
+    federation_fetch_client,
+});
+impl_from_ref_state!(InstanceApiState { config, db });
+impl_from_ref_state!(AdminApiState { config, db });
+impl_from_ref_state!(AccountApiState {
+    config,
+    db,
+    profile_cache,
+    storage,
+    http_client,
+    federation_fetch_client,
+});
+impl_from_ref_state!(AppsApiState { config, db });
+impl_from_ref_state!(MediaApiState {
+    config,
+    db,
+    timeline_cache,
+    storage,
+});
+impl_from_ref_state!(ListsApiState { db });
+impl_from_ref_state!(FiltersApiState { db });
+impl_from_ref_state!(ConversationsApiState { db });
+impl_from_ref_state!(PollsApiState { config, db });
+impl_from_ref_state!(ScheduledStatusesApiState { db });
+impl_from_ref_state!(ActivityPubState {
+    config,
+    db,
+    timeline_cache,
+    profile_cache,
+    storage,
+    http_client,
+    federation_rate_limiter,
+});
+impl_from_ref_state!(SystemAdminState { db, backup });
+impl_from_ref_state!(WellKnownState { config, db });
 
 impl AppState {
     /// Initialize application state
