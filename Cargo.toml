@@ -7,6 +7,10 @@ description = "A lightweight, single-user ActivityPub server"
 license = "AGPL-3.0"
 repository = "https://github.com/yourusername/rustresort"
 
+[workspace]
+members = [".", "crates/rustresort-models", "crates/rustresort-storage"]
+default-members = [".", "crates/rustresort-models", "crates/rustresort-storage"]
+
 [features]
 default = []
 turso-sync = ["dep:turso"]
@@ -36,10 +40,6 @@ turso = { version = "0.5.0-pre.12", default-features = false, features = ["sync"
 # Note: rusqlite removed to avoid libsqlite3-sys version conflict with sqlx
 # Backup functionality will be implemented using sqlx or alternative approach
 
-# Cloudflare R2 (S3-compatible)
-aws-sdk-s3 = { version = "1.0", default-features = false, features = ["rt-tokio"] }
-aws-smithy-runtime = { version = "1", default-features = false, features = ["connector-hyper-0-14-x"] }
-hyper-rustls = { version = "0.24.2", default-features = false, features = ["webpki-tokio", "http1", "http2", "tls12"] }
 # OpenSSL is used for VAPID key generation and R2/Turso compatibility.
 # We use `vendored` for reproducible builds without relying on system OpenSSL.
 openssl = { version = "0.10", features = ["vendored"] }
@@ -69,6 +69,8 @@ urlencoding = "2"
 html-escape = "0.2"
 ammonia = "4"
 image = { version = "0.25", default-features = false, features = ["webp"] }
+rustresort-models = { path = "crates/rustresort-models" }
+rustresort-storage = { path = "crates/rustresort-storage" }
 
 # Metrics
 prometheus = "0.13"
