@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use crate::data::Database;
-use crate::data::{Account, AccountRepository, EntityId};
+use crate::data::{Account, AccountCredentialsPatch, AccountRepository, EntityId};
 use crate::error::AppError;
 #[cfg(test)]
 use crate::storage::MediaStorage;
@@ -244,16 +244,20 @@ impl AccountService {
         let updated_at = chrono::Utc::now();
         let updated = match self
             .db
-            .patch_account_credentials_if_matches(
-                account.id.as_str(),
-                previous_avatar_key.as_deref(),
-                previous_header_key.as_deref(),
-                new_avatar_key.as_deref().or(previous_avatar_key.as_deref()),
-                new_header_key.as_deref().or(previous_header_key.as_deref()),
-                display_name_patch.as_ref().map(|value| value.as_deref()),
-                note_patch.as_ref().map(|value| value.as_deref()),
+            .patch_account_credentials_if_matches(&AccountCredentialsPatch {
+                account_id: account.id.clone(),
+                expected_current_avatar_s3_key: previous_avatar_key.clone(),
+                expected_current_header_s3_key: previous_header_key.clone(),
+                avatar_s3_key: new_avatar_key
+                    .clone()
+                    .or_else(|| previous_avatar_key.clone()),
+                header_s3_key: new_header_key
+                    .clone()
+                    .or_else(|| previous_header_key.clone()),
+                display_name: display_name_patch.clone(),
+                note: note_patch.clone(),
                 updated_at,
-            )
+            })
             .await
         {
             Ok(updated) => updated,

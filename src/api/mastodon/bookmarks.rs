@@ -54,11 +54,13 @@ pub async fn get_bookmarks(
             &state.config,
             account_stats,
             remote_stats,
-            Some(item.favourited),
-            Some(item.reblogged),
-            None,
-            Some(item.bookmarked),
-            None,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
         );
         responses.push(serde_json::to_value(response).unwrap());
     }
@@ -109,11 +111,13 @@ pub async fn get_favourites(
             &state.config,
             account_stats,
             remote_stats,
-            Some(item.favourited),
-            Some(item.reblogged),
-            None,
-            Some(item.bookmarked),
-            None,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
         );
         responses.push(serde_json::to_value(response).unwrap());
     }

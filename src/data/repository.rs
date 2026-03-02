@@ -11,6 +11,42 @@ use crate::error::AppError;
 
 use super::{Account, Database, MediaAttachment, Status};
 
+#[derive(Debug, Clone)]
+pub struct AccountCredentialsPatch {
+    pub account_id: String,
+    pub expected_current_avatar_s3_key: Option<String>,
+    pub expected_current_header_s3_key: Option<String>,
+    pub avatar_s3_key: Option<String>,
+    pub header_s3_key: Option<String>,
+    pub display_name: Option<Option<String>>,
+    pub note: Option<Option<String>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledStatusInsert {
+    pub scheduled_at: String,
+    pub status_text: String,
+    pub visibility: String,
+    pub content_warning: Option<String>,
+    pub in_reply_to_id: Option<String>,
+    pub media_ids: Option<String>,
+    pub poll_options: Option<String>,
+    pub poll_expires_in: Option<i64>,
+    pub poll_multiple: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListTimelineQuery {
+    pub list_id: String,
+    pub local_account_address: String,
+    pub local_account_id: String,
+    pub default_port: Option<u16>,
+    pub limit: usize,
+    pub max_id: Option<String>,
+    pub min_id: Option<String>,
+}
+
 /// Data access for account domain operations.
 #[async_trait]
 pub trait AccountRepository: Send + Sync {
@@ -26,14 +62,7 @@ pub trait AccountRepository: Send + Sync {
     ) -> Result<bool, AppError>;
     async fn patch_account_credentials_if_matches(
         &self,
-        account_id: &str,
-        expected_current_avatar_s3_key: Option<&str>,
-        expected_current_header_s3_key: Option<&str>,
-        avatar_s3_key: Option<&str>,
-        header_s3_key: Option<&str>,
-        display_name: Option<Option<&str>>,
-        note: Option<Option<&str>>,
-        updated_at: DateTime<Utc>,
+        patch: &AccountCredentialsPatch,
     ) -> Result<bool, AppError>;
     async fn update_account_avatar_key_if_matches(
         &self,
@@ -54,7 +83,6 @@ pub trait AccountRepository: Send + Sync {
 /// Data access used by `StatusService`.
 #[async_trait]
 pub trait StatusRepository: Send + Sync {
-    async fn get_account(&self) -> Result<Option<Account>, AppError>;
     async fn insert_status_with_media_and_poll(
         &self,
         status: &Status,
@@ -129,15 +157,7 @@ pub trait StatusRepository: Send + Sync {
     ) -> Result<(), AppError>;
     async fn create_scheduled_status(
         &self,
-        scheduled_at: &str,
-        status_text: &str,
-        visibility: &str,
-        content_warning: Option<&str>,
-        in_reply_to_id: Option<&str>,
-        media_ids: Option<&str>,
-        poll_options: Option<&str>,
-        poll_expires_in: Option<i64>,
-        poll_multiple: bool,
+        request: &ScheduledStatusInsert,
     ) -> Result<String, AppError>;
     async fn get_scheduled_status(&self, id: &str) -> Result<Option<serde_json::Value>, AppError>;
     async fn delete_status(&self, id: &str) -> Result<(), AppError>;
@@ -184,13 +204,7 @@ pub trait TimelineRepository: Send + Sync {
     ) -> Result<Vec<Status>, AppError>;
     async fn get_list_timeline_statuses_in_window(
         &self,
-        list_id: &str,
-        local_account_address: &str,
-        local_account_id: &str,
-        default_port: Option<u16>,
-        limit: usize,
-        max_id: Option<&str>,
-        min_id: Option<&str>,
+        query: &ListTimelineQuery,
     ) -> Result<Vec<Status>, AppError>;
     async fn get_favourited_statuses(
         &self,
@@ -240,27 +254,9 @@ impl AccountRepository for Database {
 
     async fn patch_account_credentials_if_matches(
         &self,
-        account_id: &str,
-        expected_current_avatar_s3_key: Option<&str>,
-        expected_current_header_s3_key: Option<&str>,
-        avatar_s3_key: Option<&str>,
-        header_s3_key: Option<&str>,
-        display_name: Option<Option<&str>>,
-        note: Option<Option<&str>>,
-        updated_at: DateTime<Utc>,
+        patch: &AccountCredentialsPatch,
     ) -> Result<bool, AppError> {
-        Database::patch_account_credentials_if_matches(
-            self,
-            account_id,
-            expected_current_avatar_s3_key,
-            expected_current_header_s3_key,
-            avatar_s3_key,
-            header_s3_key,
-            display_name,
-            note,
-            updated_at,
-        )
-        .await
+        Database::patch_account_credentials_if_matches(self, patch).await
     }
 
     async fn update_account_avatar_key_if_matches(
@@ -300,10 +296,6 @@ impl AccountRepository for Database {
 
 #[async_trait]
 impl StatusRepository for Database {
-    async fn get_account(&self) -> Result<Option<Account>, AppError> {
-        Database::get_account(self).await
-    }
-
     async fn insert_status_with_media_and_poll(
         &self,
         status: &Status,
@@ -441,29 +433,9 @@ impl StatusRepository for Database {
 
     async fn create_scheduled_status(
         &self,
-        scheduled_at: &str,
-        status_text: &str,
-        visibility: &str,
-        content_warning: Option<&str>,
-        in_reply_to_id: Option<&str>,
-        media_ids: Option<&str>,
-        poll_options: Option<&str>,
-        poll_expires_in: Option<i64>,
-        poll_multiple: bool,
+        request: &ScheduledStatusInsert,
     ) -> Result<String, AppError> {
-        Database::create_scheduled_status(
-            self,
-            scheduled_at,
-            status_text,
-            visibility,
-            content_warning,
-            in_reply_to_id,
-            media_ids,
-            poll_options,
-            poll_expires_in,
-            poll_multiple,
-        )
-        .await
+        Database::create_scheduled_status(self, request).await
     }
 
     async fn get_scheduled_status(&self, id: &str) -> Result<Option<serde_json::Value>, AppError> {
@@ -578,25 +550,9 @@ impl TimelineRepository for Database {
 
     async fn get_list_timeline_statuses_in_window(
         &self,
-        list_id: &str,
-        local_account_address: &str,
-        local_account_id: &str,
-        default_port: Option<u16>,
-        limit: usize,
-        max_id: Option<&str>,
-        min_id: Option<&str>,
+        query: &ListTimelineQuery,
     ) -> Result<Vec<Status>, AppError> {
-        Database::get_list_timeline_statuses_in_window(
-            self,
-            list_id,
-            local_account_address,
-            local_account_id,
-            default_port,
-            limit,
-            max_id,
-            min_id,
-        )
-        .await
+        Database::get_list_timeline_statuses_in_window(self, query).await
     }
 
     async fn get_favourited_statuses(

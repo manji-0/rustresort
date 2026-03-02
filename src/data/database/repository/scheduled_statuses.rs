@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::data::ScheduledStatusInsert;
 
 impl Database {
     // =========================================================================
@@ -8,15 +9,7 @@ impl Database {
     /// Create scheduled status
     pub async fn create_scheduled_status(
         &self,
-        scheduled_at: &str,
-        status_text: &str,
-        visibility: &str,
-        content_warning: Option<&str>,
-        in_reply_to_id: Option<&str>,
-        media_ids: Option<&str>,
-        poll_options: Option<&str>,
-        poll_expires_in: Option<i64>,
-        poll_multiple: bool,
+        request: &ScheduledStatusInsert,
     ) -> Result<String, AppError> {
         let id = EntityId::new_string();
         sqlx::query(
@@ -29,15 +22,15 @@ impl Database {
             "#,
         )
         .bind(&id)
-        .bind(scheduled_at)
-        .bind(status_text)
-        .bind(visibility)
-        .bind(content_warning)
-        .bind(in_reply_to_id)
-        .bind(media_ids)
-        .bind(poll_options)
-        .bind(poll_expires_in)
-        .bind(poll_multiple as i64)
+        .bind(request.scheduled_at.as_str())
+        .bind(request.status_text.as_str())
+        .bind(request.visibility.as_str())
+        .bind(request.content_warning.as_deref())
+        .bind(request.in_reply_to_id.as_deref())
+        .bind(request.media_ids.as_deref())
+        .bind(request.poll_options.as_deref())
+        .bind(request.poll_expires_in)
+        .bind(request.poll_multiple as i64)
         .execute(&self.pool)
         .await?;
 

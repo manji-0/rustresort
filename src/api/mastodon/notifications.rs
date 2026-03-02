@@ -90,11 +90,7 @@ pub async fn get_notifications(
                     &state.config,
                     account_stats,
                     remote_stats,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::api::StatusInteractions::default(),
                 ),
             )
         } else {
@@ -188,11 +184,7 @@ pub async fn get_notification(
                 &state.config,
                 account_stats,
                 remote_stats,
-                None,
-                None,
-                None,
-                None,
-                None,
+                crate::api::StatusInteractions::default(),
             ),
         )
     } else {

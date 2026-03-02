@@ -1163,11 +1163,7 @@ pub async fn account_statuses(
                 &account,
                 &state.config,
                 account_stats,
-                None,
-                None,
-                None,
-                None,
-                Some(is_pinned),
+                crate::api::StatusInteractions::new(None, None, None, None, Some(is_pinned)),
             );
             responses.push(serde_json::to_value(response).unwrap());
             if responses.len() >= limit {

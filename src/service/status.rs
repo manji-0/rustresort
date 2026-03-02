@@ -8,8 +8,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::data::Database;
 use crate::data::{
-    EntityId, MediaAttachment, PersistedReason, Status, StatusRepository, StatusVisibility,
-    TimelineCache,
+    EntityId, MediaAttachment, PersistedReason, ScheduledStatusInsert, Status, StatusRepository,
+    StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
 #[cfg(test)]
@@ -95,6 +95,7 @@ pub struct StatusService {
     cache: Arc<TimelineCache>,
     storage: Arc<dyn MediaStorageRepository>,
     base_url: String,
+    local_username: String,
 }
 
 impl StatusService {
@@ -104,6 +105,7 @@ impl StatusService {
         cache: Arc<TimelineCache>,
         storage: Arc<dyn MediaStorageRepository>,
         base_url: String,
+        local_username: String,
     ) -> Self
     where
         R: StatusRepository + 'static,
@@ -113,6 +115,7 @@ impl StatusService {
             cache,
             storage,
             base_url,
+            local_username,
         }
     }
 
@@ -146,8 +149,6 @@ impl StatusService {
         in_reply_to_uri: Option<String>,
         media_ids: Vec<String>,
     ) -> Result<Status, AppError> {
-        let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
-
         let normalized_visibility =
             StatusVisibility::parse(visibility.trim()).ok_or_else(|| {
                 AppError::Validation(
@@ -166,7 +167,7 @@ impl StatusService {
         let uri = format!(
             "{}/users/{}/statuses/{}",
             self.base_url.trim_end_matches('/'),
-            account.username,
+            self.local_username,
             status_id
         );
         let status = Status {
@@ -411,29 +412,9 @@ impl StatusService {
     /// Create scheduled status payload.
     pub async fn create_scheduled_status(
         &self,
-        scheduled_at: &str,
-        status_text: &str,
-        visibility: &str,
-        content_warning: Option<&str>,
-        in_reply_to_id: Option<&str>,
-        media_ids: Option<&str>,
-        poll_options: Option<&str>,
-        poll_expires_in: Option<i64>,
-        poll_multiple: bool,
+        request: &ScheduledStatusInsert,
     ) -> Result<String, AppError> {
-        self.db
-            .create_scheduled_status(
-                scheduled_at,
-                status_text,
-                visibility,
-                content_warning,
-                in_reply_to_id,
-                media_ids,
-                poll_options,
-                poll_expires_in,
-                poll_multiple,
-            )
-            .await
+        self.db.create_scheduled_status(request).await
     }
 
     /// Get scheduled status response payload by ID.
@@ -533,12 +514,11 @@ impl StatusService {
     /// # Returns
     /// The repost status (Announce wrapper)
     pub async fn repost(&self, status_uri: &str) -> Result<Status, AppError> {
-        let account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
         let repost_id = EntityId::new_string();
         let repost_uri = format!(
             "{}/users/{}/statuses/{}/activity",
             self.base_url.trim_end_matches('/'),
-            account.username,
+            self.local_username,
             repost_id
         );
         self.repost_by_uri(status_uri, &repost_uri).await
@@ -945,7 +925,13 @@ mod tests {
     async fn create_service(db: Arc<Database>) -> StatusService {
         let cache = Arc::new(TimelineCache::new(64).await.unwrap());
         let storage = create_test_storage().await;
-        StatusService::new(db, cache, storage, "https://test.example.com".to_string())
+        StatusService::new(
+            db,
+            cache,
+            storage,
+            "https://test.example.com".to_string(),
+            "testuser".to_string(),
+        )
     }
 
     #[tokio::test]

@@ -379,16 +379,16 @@ async fn test_patch_account_credentials_if_matches_updates_profile_and_media_key
     db.upsert_account(&account).await.unwrap();
 
     let updated = db
-        .patch_account_credentials_if_matches(
-            account.id.as_str(),
-            Some("media/old-avatar.webp"),
-            Some("media/old-header.webp"),
-            Some("media/new-avatar.webp"),
-            Some("media/new-header.webp"),
-            Some(Some("After")),
-            Some(None),
-            Utc::now(),
-        )
+        .patch_account_credentials_if_matches(&AccountCredentialsPatch {
+            account_id: account.id.clone(),
+            expected_current_avatar_s3_key: Some("media/old-avatar.webp".to_string()),
+            expected_current_header_s3_key: Some("media/old-header.webp".to_string()),
+            avatar_s3_key: Some("media/new-avatar.webp".to_string()),
+            header_s3_key: Some("media/new-header.webp".to_string()),
+            display_name: Some(Some("After".to_string())),
+            note: Some(None),
+            updated_at: Utc::now(),
+        })
         .await
         .unwrap();
     assert!(updated);
@@ -425,16 +425,16 @@ async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_k
     db.upsert_account(&account).await.unwrap();
 
     let updated = db
-        .patch_account_credentials_if_matches(
-            account.id.as_str(),
-            Some("media/unexpected-avatar.webp"),
-            Some("media/old-header.webp"),
-            Some("media/new-avatar.webp"),
-            Some("media/new-header.webp"),
-            Some(Some("After")),
-            Some(Some("after-note")),
-            Utc::now(),
-        )
+        .patch_account_credentials_if_matches(&AccountCredentialsPatch {
+            account_id: account.id.clone(),
+            expected_current_avatar_s3_key: Some("media/unexpected-avatar.webp".to_string()),
+            expected_current_header_s3_key: Some("media/old-header.webp".to_string()),
+            avatar_s3_key: Some("media/new-avatar.webp".to_string()),
+            header_s3_key: Some("media/new-header.webp".to_string()),
+            display_name: Some(Some("After".to_string())),
+            note: Some(Some("after-note".to_string())),
+            updated_at: Utc::now(),
+        })
         .await
         .unwrap();
     assert!(!updated);
@@ -1740,15 +1740,15 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
     db.insert_status(&unrelated_status).await.unwrap();
 
     let statuses = db
-        .get_list_timeline_statuses_in_window(
-            &list_id,
-            &local_address,
-            &local_account_id,
-            Some(443),
-            10,
-            None,
-            None,
-        )
+        .get_list_timeline_statuses_in_window(&ListTimelineQuery {
+            list_id: list_id.clone(),
+            local_account_address: local_address.clone(),
+            local_account_id: local_account_id.clone(),
+            default_port: Some(443),
+            limit: 10,
+            max_id: None,
+            min_id: None,
+        })
         .await
         .unwrap();
     let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
@@ -1786,15 +1786,15 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
     db.insert_status(&local_status).await.unwrap();
 
     let statuses = db
-        .get_list_timeline_statuses_in_window(
-            &list_id,
-            &local_address,
-            &local_account_id,
-            Some(443),
-            10,
-            None,
-            None,
-        )
+        .get_list_timeline_statuses_in_window(&ListTimelineQuery {
+            list_id: list_id.clone(),
+            local_account_address: local_address.clone(),
+            local_account_id: local_account_id.clone(),
+            default_port: Some(443),
+            limit: 10,
+            max_id: None,
+            min_id: None,
+        })
         .await
         .unwrap();
     let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();
@@ -1848,15 +1848,15 @@ async fn test_list_timeline_query_matches_default_port_equivalent_remote_address
     db.insert_status(&unrelated_status).await.unwrap();
 
     let statuses = db
-        .get_list_timeline_statuses_in_window(
-            &list_id,
-            &local_address,
-            &local_account_id,
-            Some(443),
-            10,
-            None,
-            None,
-        )
+        .get_list_timeline_statuses_in_window(&ListTimelineQuery {
+            list_id: list_id.clone(),
+            local_account_address: local_address.clone(),
+            local_account_id: local_account_id.clone(),
+            default_port: Some(443),
+            limit: 10,
+            max_id: None,
+            min_id: None,
+        })
         .await
         .unwrap();
     let ids: Vec<String> = statuses.into_iter().map(|status| status.id).collect();

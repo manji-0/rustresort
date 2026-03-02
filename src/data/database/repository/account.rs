@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::data::AccountCredentialsPatch;
 
 impl Database {
     // =========================================================================
@@ -235,14 +236,7 @@ impl Database {
     /// SQL statement so callers can avoid partial account updates.
     pub async fn patch_account_credentials_if_matches(
         &self,
-        account_id: &str,
-        expected_current_avatar_s3_key: Option<&str>,
-        expected_current_header_s3_key: Option<&str>,
-        avatar_s3_key: Option<&str>,
-        header_s3_key: Option<&str>,
-        display_name: Option<Option<&str>>,
-        note: Option<Option<&str>>,
-        updated_at: DateTime<Utc>,
+        patch: &AccountCredentialsPatch,
     ) -> Result<bool, AppError> {
         let result = sqlx::query(
             r#"
@@ -258,16 +252,21 @@ impl Database {
               AND header_s3_key IS ?
             "#,
         )
-        .bind(avatar_s3_key)
-        .bind(header_s3_key)
-        .bind(display_name.is_some())
-        .bind(display_name.flatten())
-        .bind(note.is_some())
-        .bind(note.flatten())
-        .bind(updated_at)
-        .bind(account_id)
-        .bind(expected_current_avatar_s3_key)
-        .bind(expected_current_header_s3_key)
+        .bind(patch.avatar_s3_key.as_deref())
+        .bind(patch.header_s3_key.as_deref())
+        .bind(patch.display_name.is_some())
+        .bind(
+            patch
+                .display_name
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        )
+        .bind(patch.note.is_some())
+        .bind(patch.note.as_ref().and_then(|value| value.as_deref()))
+        .bind(patch.updated_at)
+        .bind(patch.account_id.as_str())
+        .bind(patch.expected_current_avatar_s3_key.as_deref())
+        .bind(patch.expected_current_header_s3_key.as_deref())
         .execute(&self.pool)
         .await?;
 

@@ -192,6 +192,7 @@ pub async fn upload_media(
         state.timeline_cache.clone(),
         state.storage.clone(),
         state.config.server.base_url().to_string(),
+        state.config.admin.username.clone(),
     );
     let media = status_service
         .upload_media(file_data, content_type, description)
