@@ -6,25 +6,28 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{AppState, auth::CurrentUser, error::AppError};
+use crate::{ConversationsApiState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
 pub struct ConversationsParams {
     /// Maximum number of results to return (default 20)
     limit: Option<usize>,
     /// Return results older than this ID
-    max_id: Option<String>,
+    #[serde(rename = "max_id")]
+    _max_id: Option<String>,
     /// Return results newer than this ID
-    since_id: Option<String>,
+    #[serde(rename = "since_id")]
+    _since_id: Option<String>,
     /// Return results immediately newer than this ID
-    min_id: Option<String>,
+    #[serde(rename = "min_id")]
+    _min_id: Option<String>,
 }
 
 /// GET /api/v1/conversations - Get conversations
 ///
 /// View all conversations (direct message threads).
 pub async fn get_conversations(
-    State(state): State<AppState>,
+    State(state): State<ConversationsApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<ConversationsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -91,7 +94,7 @@ pub async fn get_conversations(
 ///
 /// Remove a conversation from the list.
 pub async fn delete_conversation(
-    State(state): State<AppState>,
+    State(state): State<ConversationsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -108,7 +111,7 @@ pub async fn delete_conversation(
 ///
 /// Mark a conversation as read.
 pub async fn mark_conversation_read(
-    State(state): State<AppState>,
+    State(state): State<ConversationsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -124,20 +127,4 @@ pub async fn mark_conversation_read(
         "id": id,
         "unread": false,
     })))
-}
-
-// Helper function to create conversation response (for future use)
-#[allow(dead_code)]
-fn conversation_to_response(
-    id: &str,
-    unread: bool,
-    accounts: Vec<serde_json::Value>,
-    last_status: Option<serde_json::Value>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "unread": unread,
-        "accounts": accounts,
-        "last_status": last_status
-    })
 }

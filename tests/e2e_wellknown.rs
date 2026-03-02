@@ -11,7 +11,7 @@ async fn test_webfinger_endpoint_exists() {
 
     let response = server
         .client
-        .get(&server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
+        .get(server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
         .send()
         .await
         .unwrap();
@@ -27,7 +27,7 @@ async fn test_nodeinfo_discovery() {
 
     let response = server
         .client
-        .get(&server.url("/.well-known/nodeinfo"))
+        .get(server.url("/.well-known/nodeinfo"))
         .send()
         .await
         .unwrap();
@@ -42,7 +42,7 @@ async fn test_host_meta_endpoint() {
 
     let response = server
         .client
-        .get(&server.url("/.well-known/host-meta"))
+        .get(server.url("/.well-known/host-meta"))
         .send()
         .await
         .unwrap();
@@ -58,7 +58,7 @@ async fn test_webfinger_with_account() {
 
     let response = server
         .client
-        .get(&server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
+        .get(server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
         .send()
         .await
         .unwrap();

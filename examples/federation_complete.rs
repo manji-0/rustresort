@@ -20,8 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Note: This example demonstrates the API usage.");
     println!("In production, initialize Database with a real connection pool.\n");
 
-    let timeline_cache = Arc::new(TimelineCache::new(1000));
-    let profile_cache = Arc::new(ProfileCache::new(3600).await?);
+    let _timeline_cache = Arc::new(TimelineCache::new(1000));
+    let _profile_cache = Arc::new(ProfileCache::new(3600).await?);
 
     // 2. Set up public key cache
     let key_cache = Arc::new(PublicKeyCache::new(
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production, load from secure storage
     let private_key_pem = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----".to_string();
 
-    let delivery = Arc::new(ActivityDelivery::new(
+    let _delivery = Arc::new(ActivityDelivery::new(
         http_client.clone(),
         actor_uri.clone(),
         key_id,

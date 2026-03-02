@@ -62,13 +62,29 @@ pub enum AppError {
     #[error("Encryption error: {0}")]
     Encryption(String),
 
+    /// JSON serialization/deserialization error (500)
+    #[error("Serialization error during {operation}: {source}")]
+    Serialization {
+        operation: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Async task join error (500)
+    #[error("Task join error during {operation}: {source}")]
+    TaskJoin {
+        operation: &'static str,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+
     /// Rate limit exceeded (429)
     #[error("Rate limit exceeded")]
     RateLimited,
 
     /// Internal server error (500)
     #[error("Internal error: {0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(String),
 
     /// Not implemented (501)
     #[error("Not implemented: {0}")]
@@ -161,6 +177,18 @@ impl IntoResponse for AppError {
                 "encryption",
                 true,
             ),
+            AppError::Serialization { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Serialization error".to_string(),
+                "serialization",
+                true,
+            ),
+            AppError::TaskJoin { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Task execution error".to_string(),
+                "task_join",
+                true,
+            ),
             AppError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
@@ -184,6 +212,23 @@ impl IntoResponse for AppError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+impl AppError {
+    /// Construct internal error from any displayable error context.
+    pub fn internal(error: impl std::fmt::Display) -> Self {
+        Self::Internal(error.to_string())
+    }
+
+    /// Construct JSON serialization/deserialization error with operation context.
+    pub fn serialization(operation: &'static str, source: serde_json::Error) -> Self {
+        Self::Serialization { operation, source }
+    }
+
+    /// Construct task join error with operation context.
+    pub fn task_join(operation: &'static str, source: tokio::task::JoinError) -> Self {
+        Self::TaskJoin { operation, source }
     }
 }
 
@@ -216,5 +261,32 @@ mod tests {
             .expect("body bytes");
         let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(body_text.contains("invalid media id"));
+    }
+
+    #[tokio::test]
+    async fn serialization_errors_are_sanitized() {
+        let source = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("invalid JSON should produce serde error");
+        let response = AppError::serialization("test parse", source).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body_text.contains("Serialization error"));
+        assert!(!body_text.contains("test parse"));
+    }
+
+    #[tokio::test]
+    async fn task_join_errors_are_sanitized() {
+        let join_error = tokio::task::spawn(async { panic!("sensitive panic detail") })
+            .await
+            .expect_err("task should panic");
+        let response = AppError::task_join("task test", join_error).into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body_text.contains("Task execution error"));
+        assert!(!body_text.contains("sensitive panic detail"));
     }
 }

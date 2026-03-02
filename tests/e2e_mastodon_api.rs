@@ -19,7 +19,7 @@ async fn test_create_status_with_content_warning() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -45,7 +45,7 @@ async fn test_create_status_without_auth_empty() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .json(&status_data)
         .send()
         .await
@@ -66,7 +66,7 @@ async fn test_create_status_without_auth_missing() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .json(&status_data)
         .send()
         .await
@@ -82,7 +82,7 @@ async fn test_get_nonexistent_status() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/statuses/nonexistent"))
+        .get(server.url("/api/v1/statuses/nonexistent"))
         .send()
         .await
         .unwrap();
@@ -96,7 +96,7 @@ async fn test_get_nonexistent_account() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/nonexistent"))
+        .get(server.url("/api/v1/accounts/nonexistent"))
         .send()
         .await
         .unwrap();
@@ -119,7 +119,7 @@ async fn test_timeline_pagination_limit() {
 
         server
             .client
-            .post(&server.url("/api/v1/statuses"))
+            .post(server.url("/api/v1/statuses"))
             .header("Authorization", format!("Bearer {}", token))
             .json(&status_data)
             .send()
@@ -130,7 +130,7 @@ async fn test_timeline_pagination_limit() {
     // Request with limit
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home?limit=3"))
+        .get(server.url("/api/v1/timelines/home?limit=3"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -152,7 +152,7 @@ async fn test_timeline_max_limit() {
     // Request with very large limit (should be capped at 40)
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home?limit=1000"))
+        .get(server.url("/api/v1/timelines/home?limit=1000"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -174,7 +174,7 @@ async fn test_verify_credentials_returns_counts() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/verify_credentials"))
+        .get(server.url("/api/v1/accounts/verify_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -195,7 +195,7 @@ async fn test_account_statuses_empty() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
         .send()
         .await
         .unwrap();
@@ -214,7 +214,7 @@ async fn test_public_timeline_without_auth() {
     // Public timeline should be accessible without authentication
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -236,7 +236,7 @@ async fn test_status_html_escaping() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()

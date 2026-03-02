@@ -3585,7 +3585,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "ammonia",
- "anyhow",
  "aws-sdk-s3",
  "aws-smithy-runtime",
  "axum",
@@ -3600,7 +3599,6 @@ dependencies = [
  "hyper-rustls 0.24.2",
  "image",
  "jsonschema",
- "lazy_static",
  "mockall",
  "openssl",
  "prometheus",

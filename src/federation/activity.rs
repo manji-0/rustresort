@@ -2,13 +2,13 @@
 //!
 //! Handles incoming ActivityPub activities.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use crate::data::{CachedAttachment, CachedStatus, Database, ProfileCache, TimelineCache};
+use crate::data::{
+    CachedAttachment, CachedStatus, Database, NotificationType, ProfileCache, TimelineCache,
+};
 use crate::error::AppError;
 
 /// Return true when a Follow target references the local actor.
@@ -280,7 +280,7 @@ pub enum ActivityType {
 
 impl ActivityType {
     /// Parse activity type from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "Create" => Some(Self::Create),
             "Update" => Some(Self::Update),
@@ -315,7 +315,6 @@ pub struct ActivityProcessor {
     db: Arc<Database>,
     timeline_cache: Arc<TimelineCache>,
     profile_cache: Arc<ProfileCache>,
-    http_client: Arc<reqwest::Client>,
     /// Local account address for comparison
     local_address: String,
     /// Local instance protocol
@@ -330,7 +329,6 @@ impl ActivityProcessor {
         db: Arc<Database>,
         timeline_cache: Arc<TimelineCache>,
         profile_cache: Arc<ProfileCache>,
-        http_client: Arc<reqwest::Client>,
         local_address: String,
         local_protocol: String,
     ) -> Self {
@@ -338,7 +336,6 @@ impl ActivityProcessor {
             db,
             timeline_cache,
             profile_cache,
-            http_client,
             local_address,
             local_protocol,
             delivery: None,
@@ -377,7 +374,7 @@ impl ActivityProcessor {
             .and_then(|t| t.as_str())
             .ok_or_else(|| AppError::Validation("Missing activity type".to_string()))?;
 
-        let activity_type = ActivityType::from_str(activity_type_str).ok_or_else(|| {
+        let activity_type = ActivityType::parse(activity_type_str).ok_or_else(|| {
             AppError::Validation(format!("Unknown activity type: {}", activity_type_str))
         })?;
 
@@ -435,7 +432,7 @@ impl ActivityProcessor {
         let activity_type = activity
             .get("type")
             .and_then(|t| t.as_str())
-            .and_then(ActivityType::from_str);
+            .and_then(ActivityType::parse);
 
         match activity_type {
             Some(ActivityType::Follow) => {
@@ -477,11 +474,11 @@ impl ActivityProcessor {
                         return PersistenceDecision::Persist;
                     }
                     // Check if it's a reply to our post
-                    if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str()) {
-                        if self.is_local_status(in_reply_to) {
-                            // Reply to our post -> Persist (notification)
-                            return PersistenceDecision::Persist;
-                        }
+                    if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str())
+                        && self.is_local_status(in_reply_to)
+                    {
+                        // Reply to our post -> Persist (notification)
+                        return PersistenceDecision::Persist;
                     }
                     // Create from followee -> CacheOnly
                     if actor_is_followee {
@@ -553,8 +550,8 @@ impl ActivityProcessor {
 
             // Create mention notification
             let notification = crate::data::Notification {
-                id: crate::data::EntityId::new().0,
-                notification_type: "mention".to_string(),
+                id: crate::data::EntityId::new_string(),
+                notification_type: NotificationType::Mention,
                 origin_account_address: actor_address.clone(),
                 status_uri,
                 read: false,
@@ -565,64 +562,62 @@ impl ActivityProcessor {
         }
 
         // 4. Check if reply to our post -> create notification
-        if should_persist_notification {
-            if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str()) {
-                if self.is_local_status(in_reply_to) {
-                    // Get the status URI
-                    let status_uri = object
-                        .get("id")
-                        .and_then(|id| id.as_str())
-                        .map(|s| s.to_string());
+        if should_persist_notification
+            && let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str())
+            && self.is_local_status(in_reply_to)
+        {
+            // Get the status URI
+            let status_uri = object
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string());
 
-                    // Create reply notification (if not already created as mention)
-                    if !self.mentions_local_user(object) {
-                        let notification = crate::data::Notification {
-                            id: crate::data::EntityId::new().0,
-                            notification_type: "mention".to_string(), // Replies are also mentions
-                            origin_account_address: actor_address.clone(),
-                            status_uri,
-                            read: false,
-                            created_at: chrono::Utc::now(),
-                        };
+            // Create reply notification (if not already created as mention)
+            if !self.mentions_local_user(object) {
+                let notification = crate::data::Notification {
+                    id: crate::data::EntityId::new_string(),
+                    notification_type: NotificationType::Mention, // Replies are also mentions
+                    origin_account_address: actor_address.clone(),
+                    status_uri,
+                    read: false,
+                    created_at: chrono::Utc::now(),
+                };
 
-                        self.db.insert_notification(&notification).await?;
-                    }
-                }
+                self.db.insert_notification(&notification).await?;
             }
         }
 
         // 5. Cache followee posts without persisting to DB.
-        if should_cache_status {
-            if let Some(status_uri) = object.get("id").and_then(|id| id.as_str()) {
-                let created_at = object
-                    .get("published")
-                    .and_then(|published| published.as_str())
-                    .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
-                    .map(|timestamp| timestamp.with_timezone(&Utc))
-                    .unwrap_or_else(Utc::now);
-                let sanitized_content = sanitize_remote_html(
-                    object
-                        .get("content")
-                        .and_then(|content| content.as_str())
-                        .unwrap_or_default(),
-                );
+        if should_cache_status && let Some(status_uri) = object.get("id").and_then(|id| id.as_str())
+        {
+            let created_at = object
+                .get("published")
+                .and_then(|published| published.as_str())
+                .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            let sanitized_content = sanitize_remote_html(
+                object
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .unwrap_or_default(),
+            );
 
-                let cached = CachedStatus {
-                    id: status_uri.to_string(),
-                    uri: status_uri.to_string(),
-                    content: sanitized_content,
-                    account_address: actor_address,
-                    created_at,
-                    visibility: self.extract_visibility(object),
-                    attachments: self.extract_cached_attachments(object),
-                    reply_to_uri: object
-                        .get("inReplyTo")
-                        .and_then(|reply| reply.as_str())
-                        .map(str::to_string),
-                    boost_of_uri: None,
-                };
-                self.timeline_cache.insert(cached).await;
-            }
+            let cached = CachedStatus {
+                id: status_uri.to_string(),
+                uri: status_uri.to_string(),
+                content: sanitized_content,
+                account_address: actor_address,
+                created_at,
+                visibility: self.extract_visibility(object),
+                attachments: self.extract_cached_attachments(object),
+                reply_to_uri: object
+                    .get("inReplyTo")
+                    .and_then(|reply| reply.as_str())
+                    .map(str::to_string),
+                boost_of_uri: None,
+            };
+            self.timeline_cache.insert(cached).await;
         }
 
         Ok(())
@@ -734,7 +729,7 @@ impl ActivityProcessor {
 
         // 3. Add to followers table
         let follower = crate::data::Follower {
-            id: crate::data::EntityId::new().0,
+            id: crate::data::EntityId::new_string(),
             follower_address: actor_address.clone(),
             inbox_uri: inbox_uri.clone(),
             uri: follow_activity_uri.clone(),
@@ -745,8 +740,8 @@ impl ActivityProcessor {
 
         // 4. Create notification
         let notification = crate::data::Notification {
-            id: crate::data::EntityId::new().0,
-            notification_type: "follow".to_string(),
+            id: crate::data::EntityId::new_string(),
+            notification_type: NotificationType::Follow,
             origin_account_address: actor_address,
             status_uri: None,
             read: false,
@@ -917,8 +912,8 @@ impl ActivityProcessor {
 
         // 2. Create notification
         let notification = crate::data::Notification {
-            id: crate::data::EntityId::new().0,
-            notification_type: "favourite".to_string(),
+            id: crate::data::EntityId::new_string(),
+            notification_type: NotificationType::Favourite,
             origin_account_address: actor_address,
             status_uri: Some(object.to_string()),
             read: false,
@@ -956,8 +951,8 @@ impl ActivityProcessor {
 
                 // Create mention notification for quote boost
                 let notification = crate::data::Notification {
-                    id: crate::data::EntityId::new().0,
-                    notification_type: "mention".to_string(),
+                    id: crate::data::EntityId::new_string(),
+                    notification_type: NotificationType::Mention,
                     origin_account_address: actor_address,
                     status_uri,
                     read: false,
@@ -973,8 +968,8 @@ impl ActivityProcessor {
             if self.is_local_status(object_uri) {
                 // Create reblog notification for boost of our status
                 let notification = crate::data::Notification {
-                    id: crate::data::EntityId::new().0,
-                    notification_type: "reblog".to_string(),
+                    id: crate::data::EntityId::new_string(),
+                    notification_type: NotificationType::Reblog,
                     origin_account_address: actor_address,
                     status_uri: Some(object_uri.to_string()),
                     read: false,
@@ -1068,19 +1063,19 @@ impl ActivityProcessor {
     /// Extract actor address from actor URI
     /// Example: https://example.com/users/alice -> alice@example.com
     fn extract_actor_address(&self, actor_uri: &str) -> String {
-        if let Ok(parsed) = url::Url::parse(actor_uri) {
-            if let Some(host) = parsed.host_str() {
-                let normalized_host = host.to_ascii_lowercase();
-                let authority_host = format_authority_host(&normalized_host);
-                let normalized_port = parsed.port();
-                let domain = match normalized_port {
-                    Some(port) => format!("{}:{}", authority_host, port),
-                    None => authority_host,
-                };
+        if let Ok(parsed) = url::Url::parse(actor_uri)
+            && let Some(host) = parsed.host_str()
+        {
+            let normalized_host = host.to_ascii_lowercase();
+            let authority_host = format_authority_host(&normalized_host);
+            let normalized_port = parsed.port();
+            let domain = match normalized_port {
+                Some(port) => format!("{}:{}", authority_host, port),
+                None => authority_host,
+            };
 
-                if let Some(username) = extract_username_from_actor_path(parsed.path()) {
-                    return format!("{}@{}", username.to_ascii_lowercase(), domain);
-                }
+            if let Some(username) = extract_username_from_actor_path(parsed.path()) {
+                return format!("{}@{}", username.to_ascii_lowercase(), domain);
             }
         }
         // Fallback: use the full URI as address
@@ -1105,30 +1100,29 @@ impl ActivityProcessor {
         };
 
         // Check 'to' field
-        if let Some(to) = object.get("to") {
-            if check_array(to) {
-                return true;
-            }
+        if let Some(to) = object.get("to")
+            && check_array(to)
+        {
+            return true;
         }
 
         // Check 'cc' field
-        if let Some(cc) = object.get("cc") {
-            if check_array(cc) {
-                return true;
-            }
+        if let Some(cc) = object.get("cc")
+            && check_array(cc)
+        {
+            return true;
         }
 
         // Check 'tag' field for Mention type
-        if let Some(tag) = object.get("tag") {
-            if let Some(tags) = tag.as_array() {
-                for t in tags {
-                    if t.get("type").and_then(|ty| ty.as_str()) == Some("Mention") {
-                        if let Some(href) = t.get("href").and_then(|h| h.as_str()) {
-                            if href.contains(&self.local_address) {
-                                return true;
-                            }
-                        }
-                    }
+        if let Some(tag) = object.get("tag")
+            && let Some(tags) = tag.as_array()
+        {
+            for t in tags {
+                if t.get("type").and_then(|ty| ty.as_str()) == Some("Mention")
+                    && let Some(href) = t.get("href").and_then(|h| h.as_str())
+                    && href.contains(&self.local_address)
+                {
+                    return true;
                 }
             }
         }
@@ -1159,10 +1153,10 @@ impl ActivityProcessor {
         // Check if URI contains local domain/address
         status_uri.contains(&self.local_address)
             || status_uri.contains("/users/")
-                && status_uri.split("://").nth(1).map_or(false, |s| {
+                && status_uri.split("://").nth(1).is_some_and(|s| {
                     s.split('/')
                         .next()
-                        .map_or(false, |domain| self.local_address.ends_with(domain))
+                        .is_some_and(|domain| self.local_address.ends_with(domain))
                 })
     }
 }
@@ -1171,8 +1165,8 @@ impl ActivityProcessor {
 mod tests {
     use super::{extract_follow_target, is_local_follow_target};
     use crate::data::{
-        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, ProfileCache,
-        TimelineCache,
+        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, PersistedReason,
+        ProfileCache, TimelineCache,
     };
     use crate::error::AppError;
     use chrono::Utc;
@@ -1197,13 +1191,11 @@ mod tests {
         let db = Arc::new(Database::connect(&db_path).await.unwrap());
         let timeline_cache = Arc::new(TimelineCache::new(16).await.unwrap());
         let profile_cache = Arc::new(ProfileCache::new(86400).await.unwrap());
-        let http_client = Arc::new(reqwest::Client::new());
 
         let processor = super::ActivityProcessor::new(
             db.clone(),
             timeline_cache.clone(),
             profile_cache.clone(),
-            http_client,
             local_address.to_string(),
             local_protocol.to_string(),
         );
@@ -1580,7 +1572,7 @@ mod tests {
         let actor_uri = "https://remote.example/users/bob";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/1".to_string(),
@@ -1608,7 +1600,7 @@ mod tests {
         let actor_uri = "https://remote.example:443/users/bob";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/no-id-port-variant".to_string(),
@@ -1636,7 +1628,7 @@ mod tests {
         let actor_uri = "https://remote.example/users/bob";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "Bob@Remote.Example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/mixed-case".to_string(),
@@ -1666,7 +1658,7 @@ mod tests {
         let follow_uri = "https://remote.example/follows/uri-form";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: follow_uri.to_string(),
@@ -1691,7 +1683,7 @@ mod tests {
         let actor_uri = "https://remote.example/users/bob";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/current".to_string(),
@@ -1720,7 +1712,7 @@ mod tests {
         let actor_uri = "https://remote.example/users/bob";
 
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/2".to_string(),
@@ -1751,7 +1743,7 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/1";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "Bob@Remote.Example".to_string(),
             uri: "https://example.com/users/alice/follow/1".to_string(),
             created_at: Utc::now(),
@@ -1784,7 +1776,7 @@ mod tests {
         let status_uri = "https://remote.example:443/users/bob/statuses/port-normalized";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/port-normalized".to_string(),
             created_at: Utc::now(),
@@ -1818,7 +1810,7 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/port-follow-row";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example:443".to_string(),
             uri: "https://example.com/users/alice/follow/port-follow-row".to_string(),
             created_at: Utc::now(),
@@ -1851,7 +1843,7 @@ mod tests {
         let status_uri = "https://remote.example/@bob/statuses/2";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/2".to_string(),
             created_at: Utc::now(),
@@ -1884,7 +1876,7 @@ mod tests {
         let status_uri = "https://remote.example/accounts/bob/statuses/3";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/3".to_string(),
             created_at: Utc::now(),
@@ -1917,7 +1909,7 @@ mod tests {
         let status_uri = "https://[2001:db8::1]/users/bob/statuses/ipv6";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@[2001:db8::1]".to_string(),
             uri: "https://example.com/users/alice/follow/ipv6".to_string(),
             created_at: Utc::now(),
@@ -1950,7 +1942,7 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/sanitized";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/sanitized".to_string(),
             created_at: Utc::now(),
@@ -1989,7 +1981,7 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/3";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/3".to_string(),
             created_at: Utc::now(),
@@ -2060,7 +2052,7 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/4";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/4".to_string(),
             created_at: Utc::now(),
@@ -2068,17 +2060,17 @@ mod tests {
         db.insert_follow(&follow).await.unwrap();
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Persisted remote status</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "bob@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "bookmarked".to_string(),
+            persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -2102,7 +2094,7 @@ mod tests {
         let status_uri = "https://another.example/users/alice/statuses/5";
 
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
             uri: "https://example.com/users/alice/follow/5".to_string(),
             created_at: Utc::now(),
@@ -2110,17 +2102,17 @@ mod tests {
         db.insert_follow(&follow).await.unwrap();
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Owned by another actor</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "alice@another.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "bookmarked".to_string(),
+            persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -2144,17 +2136,17 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/6";
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Persisted remote status after unfollow</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "bob@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "favourited".to_string(),
+            persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -2178,17 +2170,17 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/tombstone";
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Persisted remote status</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "bob@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "bookmarked".to_string(),
+            persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -2216,17 +2208,17 @@ mod tests {
         let status_uri = "https://[2001:db8::1]/users/bob/statuses/owned";
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Owned by IPv6 actor</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "bob@[2001:db8::1]".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "bookmarked".to_string(),
+            persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };
@@ -2282,17 +2274,17 @@ mod tests {
         let status_uri = "https://remote.example/users/bob/statuses/8";
 
         let status = crate::data::Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: status_uri.to_string(),
             content: "<p>Owned by bob without explicit port</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "bob@remote.example".to_string(),
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "bookmarked".to_string(),
+            persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
         };

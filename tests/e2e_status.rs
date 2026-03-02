@@ -16,7 +16,7 @@ async fn test_create_status_without_auth() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .json(&status_data)
         .send()
         .await
@@ -39,7 +39,7 @@ async fn test_create_status_with_auth() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -67,7 +67,7 @@ async fn test_create_status_rejects_invalid_visibility() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -87,17 +87,17 @@ async fn test_get_status() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/123".to_string(),
         content: "<p>Test status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -106,7 +106,7 @@ async fn test_get_status() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
         .send()
         .await
         .unwrap();
@@ -130,7 +130,7 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -143,7 +143,7 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
 
     let status_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", status_id)))
         .send()
         .await
         .unwrap();
@@ -151,7 +151,7 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
 
     let context_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/context", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/context", status_id)))
         .send()
         .await
         .unwrap();
@@ -159,7 +159,7 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
 
     let reblogged_by_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/reblogged_by", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/reblogged_by", status_id)))
         .send()
         .await
         .unwrap();
@@ -167,7 +167,7 @@ async fn test_private_status_is_hidden_from_public_status_endpoints() {
 
     let favourited_by_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/favourited_by", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/favourited_by", status_id)))
         .send()
         .await
         .unwrap();
@@ -191,7 +191,7 @@ async fn test_create_status_rejects_poll_and_media_together() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -217,7 +217,7 @@ async fn test_create_status_with_poll_includes_poll_in_response() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -247,7 +247,7 @@ async fn test_vote_in_poll_rejects_duplicate_choices() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -259,7 +259,7 @@ async fn test_vote_in_poll_rejects_duplicate_choices() {
 
     let vote_response = server
         .client
-        .post(&server.url(&format!("/api/v1/polls/{}/votes", poll_id)))
+        .post(server.url(&format!("/api/v1/polls/{}/votes", poll_id)))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({ "choices": [0, 0] }))
         .send()
@@ -278,7 +278,7 @@ async fn test_create_status_with_media_ids_includes_media_attachments_in_respons
     use rustresort::data::{EntityId, MediaAttachment};
 
     let media = MediaAttachment {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         status_id: None,
         s3_key: "media/test-image.webp".to_string(),
         thumbnail_s3_key: None,
@@ -301,7 +301,7 @@ async fn test_create_status_with_media_ids_includes_media_attachments_in_respons
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -329,7 +329,7 @@ async fn test_create_status_with_scheduled_at_returns_scheduled_status() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -366,7 +366,7 @@ async fn test_create_status_with_scheduled_poll_returns_poll_options_array() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -392,7 +392,7 @@ async fn test_create_status_is_idempotent_with_idempotency_key() {
 
     let first_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", "same-key")
         .json(&status_data)
@@ -405,7 +405,7 @@ async fn test_create_status_is_idempotent_with_idempotency_key() {
 
     let second_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", "same-key")
         .json(&status_data)
@@ -492,7 +492,7 @@ async fn test_create_status_idempotency_recovers_after_pending_is_cleared() {
     });
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", key)
         .json(&payload)
@@ -513,7 +513,7 @@ async fn test_create_status_rejects_quoted_status_id_parameter() {
 
     let quote_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
             "status": "Quote",
@@ -536,17 +536,17 @@ async fn test_delete_status() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/456".to_string(),
         content: "<p>To be deleted</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -555,7 +555,7 @@ async fn test_delete_status() {
 
     let response = server
         .client
-        .delete(&server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .delete(server.url(&format!("/api/v1/statuses/{}", status.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -566,7 +566,7 @@ async fn test_delete_status() {
         // Verify status is deleted
         let get_response = server
             .client
-            .get(&server.url(&format!("/api/v1/statuses/{}", status.id)))
+            .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
             .send()
             .await
             .unwrap();
@@ -586,17 +586,17 @@ async fn test_favourite_status() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/fav".to_string(),
         content: "<p>Favourite me!</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -605,7 +605,7 @@ async fn test_favourite_status() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/favourite", status.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/favourite", status.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -628,17 +628,17 @@ async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/fav-by-uri-path".to_string(),
         content: "<p>Favourite by URI path</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -647,7 +647,7 @@ async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
 
     let favourite_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/favourite", status.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/favourite", status.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -657,7 +657,7 @@ async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
     let encoded_uri: String = url::form_urlencoded::byte_serialize(status.uri.as_bytes()).collect();
     let favourited_by_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/favourited_by", encoded_uri)))
+        .get(server.url(&format!("/api/v1/statuses/{}/favourited_by", encoded_uri)))
         .send()
         .await
         .unwrap();
@@ -682,17 +682,17 @@ async fn test_boost_status() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/boost".to_string(),
         content: "<p>Boost me!</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -701,7 +701,7 @@ async fn test_boost_status() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/reblog", status.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/reblog", status.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -724,17 +724,17 @@ async fn test_status_context() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/context".to_string(),
         content: "<p>Context test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -743,7 +743,7 @@ async fn test_status_context() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/context", status.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/context", status.id)))
         .send()
         .await
         .unwrap();
@@ -765,47 +765,47 @@ async fn test_status_context_includes_ancestors_and_descendants() {
     server.create_test_account().await;
 
     let root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/root".to_string(),
         content: "<p>Root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let middle = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/middle".to_string(),
         content: "<p>Middle</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let leaf = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/leaf".to_string(),
         content: "<p>Leaf</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: Some(middle.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -815,7 +815,7 @@ async fn test_status_context_includes_ancestors_and_descendants() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/context", middle.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/context", middle.id)))
         .send()
         .await
         .unwrap();
@@ -841,17 +841,17 @@ async fn test_status_context_limits_descendants() {
 
     let base_time = Utc::now();
     let root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/context-limit-root".to_string(),
         content: "<p>Root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
     };
@@ -860,17 +860,17 @@ async fn test_status_context_limits_descendants() {
     let mut expected_ids = Vec::new();
     for index in 0..50 {
         let descendant = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: format!("https://test.example.com/status/context-limit-descendant-{index}"),
             content: format!("<p>Descendant {index}</p>"),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: rustresort::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: String::new(),
             is_local: true,
             in_reply_to_uri: Some(root.uri.clone()),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: base_time + Duration::seconds((index + 1) as i64),
             fetched_at: None,
         };
@@ -882,7 +882,7 @@ async fn test_status_context_limits_descendants() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/context", root.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/context", root.id)))
         .send()
         .await
         .unwrap();
@@ -910,7 +910,7 @@ async fn test_status_source_returns_plain_text() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&create_payload)
         .send()
@@ -922,7 +922,7 @@ async fn test_status_source_returns_plain_text() {
 
     let source_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/source", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/source", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -946,7 +946,7 @@ async fn test_status_history_contains_previous_version_after_edit() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&create_payload)
         .send()
@@ -962,7 +962,7 @@ async fn test_status_history_contains_previous_version_after_edit() {
     });
     let update_response = server
         .client
-        .put(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .put(server.url(&format!("/api/v1/statuses/{}", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_payload)
         .send()
@@ -972,7 +972,7 @@ async fn test_status_history_contains_previous_version_after_edit() {
 
     let history_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/history", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/history", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1003,17 +1003,17 @@ async fn test_status_history_rejects_remote_status() {
     let token = server.create_test_token().await;
 
     let remote_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/users/alice/statuses/remote-history".to_string(),
         content: "<p>Remote status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "alice@remote.example".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "timeline".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Timeline,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1021,7 +1021,7 @@ async fn test_status_history_rejects_remote_status() {
 
     let history_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/history", remote_status.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/history", remote_status.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1041,7 +1041,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
     });
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&create_payload)
         .send()
@@ -1053,7 +1053,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let pin_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1064,7 +1064,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let mute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/mute", status_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/mute", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1075,7 +1075,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let read_after_set = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", status_id)))
         .send()
         .await
         .unwrap();
@@ -1089,7 +1089,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let unpin_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/unpin", status_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/unpin", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1100,7 +1100,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let unmute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/unmute", status_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/unmute", status_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1111,7 +1111,7 @@ async fn test_pin_and_mute_state_persists_across_reads() {
 
     let read_after_clear = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", status_id)))
         .send()
         .await
         .unwrap();
@@ -1134,32 +1134,32 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
     let token = server.create_test_token().await;
 
     let root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/thread-muted-root".to_string(),
         content: "<p>Root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let reply = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/thread-muted-reply".to_string(),
         content: "<p>Reply</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1168,7 +1168,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
 
     let mute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1177,7 +1177,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
 
     let root_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", &root.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", &root.id)))
         .send()
         .await
         .unwrap();
@@ -1187,7 +1187,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
 
     let reply_response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", &reply.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", &reply.id)))
         .send()
         .await
         .unwrap();
@@ -1198,7 +1198,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
 
     let unmute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/unmute", &root.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/unmute", &root.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1207,7 +1207,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
 
     let root_after_unmute = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}", &root.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}", &root.id)))
         .send()
         .await
         .unwrap();
@@ -1227,17 +1227,17 @@ async fn test_create_reply_status_persists_reply_metadata() {
     let token = server.create_test_token().await;
 
     let parent = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/original".to_string(),
         content: "<p>Original post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: String::new(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1251,7 +1251,7 @@ async fn test_create_reply_status_persists_reply_metadata() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
         .send()
@@ -1273,7 +1273,10 @@ async fn test_create_reply_status_persists_reply_metadata() {
         .unwrap()
         .expect("reply should be persisted");
     assert_eq!(reply.in_reply_to_uri, Some(parent.uri));
-    assert_eq!(reply.persisted_reason, "reply_to_own");
+    assert_eq!(
+        reply.persisted_reason,
+        rustresort::data::PersistedReason::ReplyToOwn
+    );
 }
 
 #[tokio::test]
@@ -1310,7 +1313,7 @@ async fn test_create_reply_status_accepts_cache_only_remote_target() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
         .send()
@@ -1332,7 +1335,10 @@ async fn test_create_reply_status_accepts_cache_only_remote_target() {
         .unwrap()
         .expect("reply should be persisted");
     assert_eq!(reply.in_reply_to_uri, Some(remote_uri.to_string()));
-    assert_eq!(reply.persisted_reason, "own");
+    assert_eq!(
+        reply.persisted_reason,
+        rustresort::data::PersistedReason::Own
+    );
 }
 
 #[tokio::test]
@@ -1417,7 +1423,7 @@ async fn test_create_reply_status_delivers_to_remote_reply_target_inbox_without_
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
         .send()
@@ -1470,7 +1476,7 @@ async fn test_favourite_remote_status_by_uri_persists_from_cache() {
     let encoded_uri: String = url::form_urlencoded::byte_serialize(remote_uri.as_bytes()).collect();
     let response = server
         .client
-        .post(&server.url(&format!(
+        .post(server.url(&format!(
             "/api/v1/statuses/placeholder/favourite?uri={}",
             encoded_uri
         )))
@@ -1493,7 +1499,10 @@ async fn test_favourite_remote_status_by_uri_persists_from_cache() {
         .unwrap()
         .expect("remote status should be persisted");
     assert!(!persisted.is_local);
-    assert_eq!(persisted.persisted_reason, "favourited");
+    assert_eq!(
+        persisted.persisted_reason,
+        rustresort::data::PersistedReason::Favourited
+    );
 }
 
 #[tokio::test]
@@ -1504,7 +1513,7 @@ async fn test_favourite_status_rejects_empty_uri_query_parameter() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses/placeholder/favourite?uri="))
+        .post(server.url("/api/v1/statuses/placeholder/favourite?uri="))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1542,7 +1551,7 @@ async fn test_favourite_remote_status_by_path_id_uri_fallback_persists_from_cach
     let encoded_id: String = url::form_urlencoded::byte_serialize(remote_uri.as_bytes()).collect();
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/favourite", encoded_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/favourite", encoded_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1592,7 +1601,7 @@ async fn test_bookmark_remote_status_by_uri_persists_from_cache() {
     let encoded_uri: String = url::form_urlencoded::byte_serialize(remote_uri.as_bytes()).collect();
     let response = server
         .client
-        .post(&server.url(&format!(
+        .post(server.url(&format!(
             "/api/v1/statuses/placeholder/bookmark?uri={}",
             encoded_uri
         )))
@@ -1615,7 +1624,10 @@ async fn test_bookmark_remote_status_by_uri_persists_from_cache() {
         .unwrap()
         .expect("remote status should be persisted");
     assert!(!persisted.is_local);
-    assert_eq!(persisted.persisted_reason, "bookmarked");
+    assert_eq!(
+        persisted.persisted_reason,
+        rustresort::data::PersistedReason::Bookmarked
+    );
 }
 
 #[tokio::test]
@@ -1647,7 +1659,7 @@ async fn test_bookmark_remote_status_by_path_id_uri_fallback_persists_from_cache
     let encoded_id: String = url::form_urlencoded::byte_serialize(remote_uri.as_bytes()).collect();
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/bookmark", encoded_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/bookmark", encoded_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1697,7 +1709,7 @@ async fn test_reblog_remote_status_by_uri_persists_from_cache() {
     let encoded_uri: String = url::form_urlencoded::byte_serialize(remote_uri.as_bytes()).collect();
     let response = server
         .client
-        .post(&server.url(&format!(
+        .post(server.url(&format!(
             "/api/v1/statuses/placeholder/reblog?uri={}",
             encoded_uri
         )))
@@ -1720,7 +1732,10 @@ async fn test_reblog_remote_status_by_uri_persists_from_cache() {
         .unwrap()
         .expect("remote status should be persisted");
     assert!(!persisted.is_local);
-    assert_eq!(persisted.persisted_reason, "reposted");
+    assert_eq!(
+        persisted.persisted_reason,
+        rustresort::data::PersistedReason::Reposted
+    );
     assert!(server.state.db.is_reposted(&persisted.id).await.unwrap());
 }
 
@@ -1733,7 +1748,7 @@ async fn test_notifications_fallback_to_cached_status() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
     let remote_uri = "https://remote.example/users/alice/statuses/notif-cache";
-    let notification_id = EntityId::new().0;
+    let notification_id = EntityId::new_string();
 
     server
         .state
@@ -1753,7 +1768,7 @@ async fn test_notifications_fallback_to_cached_status() {
 
     let notification = Notification {
         id: notification_id.clone(),
-        notification_type: "mention".to_string(),
+        notification_type: rustresort::data::NotificationType::Mention,
         origin_account_address: "alice@remote.example".to_string(),
         status_uri: Some(remote_uri.to_string()),
         read: false,
@@ -1768,7 +1783,7 @@ async fn test_notifications_fallback_to_cached_status() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications"))
+        .get(server.url("/api/v1/notifications"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::ListsApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
@@ -42,15 +42,18 @@ pub struct AddAccountsRequest {
 /// Pagination parameters
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
-    pub max_id: Option<String>,
-    pub min_id: Option<String>,
-    pub limit: Option<usize>,
+    #[serde(rename = "max_id")]
+    pub _max_id: Option<String>,
+    #[serde(rename = "min_id")]
+    pub _min_id: Option<String>,
+    #[serde(rename = "limit")]
+    pub _limit: Option<usize>,
 }
 
 /// GET /api/v1/lists
 /// Get all lists owned by the user
 pub async fn get_lists(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<ListResponse>>, AppError> {
     let lists = state.db.get_all_lists().await?;
@@ -70,7 +73,7 @@ pub async fn get_lists(
 /// GET /api/v1/lists/:id
 /// Get a specific list
 pub async fn get_list(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ListResponse>, AppError> {
@@ -86,7 +89,7 @@ pub async fn get_list(
 /// POST /api/v1/lists
 /// Create a new list
 pub async fn create_list(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Json(req): Json<CreateListRequest>,
 ) -> Result<Json<ListResponse>, AppError> {
@@ -117,7 +120,7 @@ pub async fn create_list(
 /// PUT /api/v1/lists/:id
 /// Update a list
 pub async fn update_list(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateListRequest>,
@@ -153,7 +156,7 @@ pub async fn update_list(
 /// DELETE /api/v1/lists/:id
 /// Delete a list
 pub async fn delete_list(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -169,7 +172,7 @@ pub async fn delete_list(
 /// GET /api/v1/lists/:id/accounts
 /// Get accounts in a list
 pub async fn get_list_accounts(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(_params): Query<PaginationParams>,
@@ -208,7 +211,7 @@ pub async fn get_list_accounts(
 /// POST /api/v1/lists/:id/accounts
 /// Add accounts to a list
 pub async fn add_list_accounts(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<AddAccountsRequest>,
@@ -225,7 +228,7 @@ pub async fn add_list_accounts(
 /// DELETE /api/v1/lists/:id/accounts
 /// Remove accounts from a list
 pub async fn delete_list_accounts(
-    State(state): State<AppState>,
+    State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<AddAccountsRequest>,

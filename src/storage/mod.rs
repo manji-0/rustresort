@@ -6,9 +6,11 @@
 
 mod backup;
 mod media;
+mod repository;
 
-pub use backup::BackupService;
+pub use backup::{BackupInfo, BackupService};
 pub use media::MediaStorage;
+pub use repository::{BackupRepository, MediaStorageRepository};
 
 pub(crate) fn build_r2_http_client() -> aws_sdk_s3::config::SharedHttpClient {
     use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;

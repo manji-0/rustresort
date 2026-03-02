@@ -24,13 +24,13 @@ fn test_db_connection_string(temp_dir: &TempDir) -> String {
 
 fn test_oauth_app() -> OAuthApp {
     OAuthApp {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         name: "Test App".to_string(),
         website: None,
         redirect_uri: "https://example.com/callback".to_string(),
-        client_id: EntityId::new().0,
-        client_secret: EntityId::new().0,
-        vapid_key: Some(EntityId::new().0),
+        client_id: EntityId::new_string(),
+        client_secret: EntityId::new_string(),
+        vapid_key: Some(EntityId::new_string()),
         scopes: "read write".to_string(),
         created_at: Utc::now(),
     }
@@ -38,7 +38,7 @@ fn test_oauth_app() -> OAuthApp {
 
 fn test_oauth_token(app_id: &str, access_token: &str) -> OAuthToken {
     OAuthToken {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         app_id: app_id.to_string(),
         access_token: access_token.to_string(),
         grant_type: "authorization_code".to_string(),
@@ -126,8 +126,8 @@ async fn test_oauth_token_migration_hashes_existing_plaintext_rows_on_reconnect(
     .bind(&legacy_token.access_token)
     .bind(&legacy_token.grant_type)
     .bind(&legacy_token.scopes)
-    .bind(&legacy_token.created_at)
-    .bind(&legacy_token.expires_at)
+    .bind(legacy_token.created_at)
+    .bind(legacy_token.expires_at)
     .bind(legacy_token.revoked)
     .execute(&pool)
     .await
@@ -185,8 +185,8 @@ async fn test_oauth_token_migration_rehashes_fake_sha256_prefixed_plaintext() {
     .bind(&legacy_token.access_token)
     .bind(&legacy_token.grant_type)
     .bind(&legacy_token.scopes)
-    .bind(&legacy_token.created_at)
-    .bind(&legacy_token.expires_at)
+    .bind(legacy_token.created_at)
+    .bind(legacy_token.expires_at)
     .bind(legacy_token.revoked)
     .execute(&pool)
     .await
@@ -268,7 +268,7 @@ async fn test_account_upsert_and_get() {
     let (db, _temp_dir) = create_test_db().await;
 
     let account = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "testuser".to_string(),
         display_name: Some("Test User".to_string()),
         note: Some("Test bio".to_string()),
@@ -296,7 +296,7 @@ async fn test_insert_account_if_empty_enforces_singleton() {
     let (db, _temp_dir) = create_test_db().await;
 
     let first = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "first".to_string(),
         display_name: Some("First".to_string()),
         note: None,
@@ -309,7 +309,7 @@ async fn test_insert_account_if_empty_enforces_singleton() {
     };
 
     let second = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "second".to_string(),
         display_name: Some("Second".to_string()),
         note: None,
@@ -336,7 +336,7 @@ async fn test_patch_account_profile_noop_returns_success() {
     let (db, _temp_dir) = create_test_db().await;
 
     let account = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "patch-user".to_string(),
         display_name: Some("Patch User".to_string()),
         note: Some("original note".to_string()),
@@ -350,7 +350,7 @@ async fn test_patch_account_profile_noop_returns_success() {
     db.upsert_account(&account).await.unwrap();
 
     let updated = db
-        .patch_account_profile(&account.id, None, None, Utc::now())
+        .patch_account_profile(account.id.as_str(), None, None, Utc::now())
         .await
         .unwrap();
     assert!(updated);
@@ -365,7 +365,7 @@ async fn test_patch_account_credentials_if_matches_updates_profile_and_media_key
     let (db, _temp_dir) = create_test_db().await;
 
     let account = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "credential-user".to_string(),
         display_name: Some("Before".to_string()),
         note: Some("before-note".to_string()),
@@ -380,7 +380,7 @@ async fn test_patch_account_credentials_if_matches_updates_profile_and_media_key
 
     let updated = db
         .patch_account_credentials_if_matches(
-            &account.id,
+            account.id.as_str(),
             Some("media/old-avatar.webp"),
             Some("media/old-header.webp"),
             Some("media/new-avatar.webp"),
@@ -411,7 +411,7 @@ async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_k
     let (db, _temp_dir) = create_test_db().await;
 
     let account = Account {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         username: "credential-user".to_string(),
         display_name: Some("Before".to_string()),
         note: Some("before-note".to_string()),
@@ -426,7 +426,7 @@ async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_k
 
     let updated = db
         .patch_account_credentials_if_matches(
-            &account.id,
+            account.id.as_str(),
             Some("media/unexpected-avatar.webp"),
             Some("media/old-header.webp"),
             Some("media/new-avatar.webp"),
@@ -457,17 +457,17 @@ async fn test_status_crud() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/123".to_string(),
         content: "<p>Hello, world!</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -499,7 +499,7 @@ async fn test_follow_operations() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "user@example.com".to_string(),
         uri: "https://example.com/follows/123".to_string(),
         created_at: Utc::now(),
@@ -520,17 +520,96 @@ async fn test_follow_operations() {
 }
 
 #[tokio::test]
+async fn test_count_statuses_by_account_address_counts_remote_statuses_case_insensitively() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let local_status = Status {
+        id: EntityId::new_string(),
+        uri: "https://local.test/statuses/1".to_string(),
+        content: "<p>local</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&local_status).await.unwrap();
+
+    let remote_status_1 = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/1".to_string(),
+        content: "<p>remote-1</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: PersistedReason::Reposted,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    db.insert_status(&remote_status_1).await.unwrap();
+
+    let remote_status_2 = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/2".to_string(),
+        content: "<p>remote-2</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "ALICE@REMOTE.EXAMPLE".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: PersistedReason::Favourited,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    db.insert_status(&remote_status_2).await.unwrap();
+
+    let other_remote_status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/bob/statuses/1".to_string(),
+        content: "<p>remote-3</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "bob@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: PersistedReason::Bookmarked,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    db.insert_status(&other_remote_status).await.unwrap();
+
+    let count = db
+        .count_statuses_by_account_address("alice@remote.example")
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn test_insert_follow_if_absent_deduplicates_default_port_variants() {
     let (db, _temp_dir) = create_test_db().await;
 
     let first = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://example.com/follows/default-port-first".to_string(),
         created_at: Utc::now(),
     };
     let second = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
         uri: "https://example.com/follows/default-port-second".to_string(),
         created_at: Utc::now(),
@@ -558,7 +637,7 @@ async fn test_insert_follow_if_absent_is_atomic_for_equivalent_targets() {
     let barrier1 = barrier.clone();
     let task1 = tokio::spawn(async move {
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "alice@remote.example:443".to_string(),
             uri: "https://example.com/follows/atomic-1".to_string(),
             created_at: Utc::now(),
@@ -573,7 +652,7 @@ async fn test_insert_follow_if_absent_is_atomic_for_equivalent_targets() {
     let barrier2 = barrier.clone();
     let task2 = tokio::spawn(async move {
         let follow = Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: "alice@remote.example".to_string(),
             uri: "https://example.com/follows/atomic-2".to_string(),
             created_at: Utc::now(),
@@ -597,7 +676,7 @@ async fn test_follower_operations() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follower = Follower {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         follower_address: "follower@example.com".to_string(),
         inbox_uri: "https://example.com/inbox".to_string(),
         uri: "https://example.com/follows/456".to_string(),
@@ -630,7 +709,7 @@ async fn test_delete_follower_matches_missing_default_https_port() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follower = Follower {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         follower_address: "bob@remote.example:443".to_string(),
         inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
         uri: "https://remote.example/follows/default-port".to_string(),
@@ -650,7 +729,7 @@ async fn test_delete_follower_by_address_and_uri_matches_default_https_port_vari
     let (db, _temp_dir) = create_test_db().await;
 
     let follower = Follower {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         follower_address: "bob@remote.example".to_string(),
         inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
         uri: "https://remote.example/follows/default-port-uri".to_string(),
@@ -677,7 +756,7 @@ async fn test_delete_follow_matches_missing_default_https_port() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://example.com/follows/default-port".to_string(),
         created_at: Utc::now(),
@@ -696,7 +775,7 @@ async fn test_delete_follow_matches_explicit_default_https_port() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
         uri: "https://example.com/follows/no-port".to_string(),
         created_at: Utc::now(),
@@ -715,7 +794,7 @@ async fn test_delete_follow_does_not_match_non_default_port() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:80".to_string(),
         uri: "https://example.com/follows/non-default-port".to_string(),
         created_at: Utc::now(),
@@ -734,7 +813,7 @@ async fn test_get_follow_uri_matches_case_insensitively() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "Alice@Remote.EXAMPLE".to_string(),
         uri: "https://example.com/follows/case-insensitive".to_string(),
         created_at: Utc::now(),
@@ -756,7 +835,7 @@ async fn test_get_follow_uri_matches_default_https_port_variants() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://example.com/follows/default-port-uri".to_string(),
         created_at: Utc::now(),
@@ -778,7 +857,7 @@ async fn test_get_follow_uri_does_not_match_non_default_port_variant() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
         uri: "https://example.com/follows/no-port-uri".to_string(),
         created_at: Utc::now(),
@@ -797,7 +876,7 @@ async fn test_block_account_removes_follow_for_default_port_variant() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
         uri: "https://example.com/follows/block-match".to_string(),
         created_at: Utc::now(),
@@ -866,8 +945,8 @@ async fn test_notification_operations() {
     let (db, _temp_dir) = create_test_db().await;
 
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "mention".to_string(),
+        id: EntityId::new_string(),
+        notification_type: NotificationType::Mention,
         origin_account_address: "user@example.com".to_string(),
         status_uri: Some("https://example.com/status/123".to_string()),
         read: false,
@@ -880,7 +959,10 @@ async fn test_notification_operations() {
     // Get unread notifications
     let notifications = db.get_notifications(10, None, true).await.unwrap();
     assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0].notification_type, "mention");
+    assert_eq!(
+        notifications[0].notification_type,
+        crate::data::NotificationType::Mention
+    );
 
     // Mark as read
     db.mark_notification_read(&notification.id).await.unwrap();
@@ -894,17 +976,17 @@ async fn test_favourite_operations() {
 
     // Create a status first (required for foreign key)
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/fav".to_string(),
         content: "<p>Test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -936,17 +1018,17 @@ async fn test_bookmark_operations() {
 
     // Create a status first (required for foreign key)
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/bookmark".to_string(),
         content: "<p>Test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -974,17 +1056,17 @@ async fn test_repost_operations() {
 
     // Create a status first (required for foreign key)
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/repost".to_string(),
         content: "<p>Test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1017,13 +1099,13 @@ async fn test_status_pin_and_mute_operations() {
         uri: "https://example.com/status/pin-mute-root".to_string(),
         content: "<p>Pin and mute root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1032,13 +1114,13 @@ async fn test_status_pin_and_mute_operations() {
         uri: "https://example.com/status/pin-mute-reply".to_string(),
         content: "<p>Pin and mute reply</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1073,13 +1155,13 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         uri: "https://example.com/status/parent".to_string(),
         content: "<p>Parent</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1088,13 +1170,13 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         uri: "https://example.com/status/child-a".to_string(),
         content: "<p>Child A</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(parent.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1103,13 +1185,13 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         uri: "https://example.com/status/child-b".to_string(),
         content: "<p>Child B</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(parent.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1155,13 +1237,13 @@ async fn test_bookmarked_statuses_order_and_cursor_by_bookmark_time() {
             uri: format!("https://example.com/status/{}", id),
             content: "<p>Test</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -1201,13 +1283,13 @@ async fn test_favourited_statuses_order_and_cursor_by_favourite_time() {
             uri: format!("https://example.com/status/{}", id),
             content: "<p>Test</p>".to_string(),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: crate::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -1329,13 +1411,13 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         uri: "https://example.com/status/tag-old".to_string(),
         content: "<p>Old #Rust post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
     };
@@ -1344,13 +1426,13 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         uri: "https://example.com/status/tag-new".to_string(),
         content: "<p>New #rust and #RustLang post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(1),
         fetched_at: None,
     };
@@ -1359,13 +1441,13 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         uri: "https://example.com/status/tag-private".to_string(),
         content: "<p>Private #RUST post</p>".to_string(),
         content_warning: None,
-        visibility: "private".to_string(),
+        visibility: crate::data::StatusVisibility::Private,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(2),
         fetched_at: None,
     };
@@ -1406,13 +1488,13 @@ async fn test_insert_status_indexes_markup_wrapped_hashtags() {
         uri: "https://example.com/status/tag-markup".to_string(),
         content: "<p>#<span>Rust</span> and #<a href=\"https://example.com/tags/rustlang\">RustLang</a></p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1441,13 +1523,13 @@ async fn test_database_connect_backfills_missing_status_hashtag_rows() {
         uri: "https://example.com/status/backfill-hashtag".to_string(),
         content: "<p>Legacy #Rust post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1485,13 +1567,13 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         uri: "https://example.com/status/tag-300".to_string(),
         content: "<p>#Rust id300</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
     };
@@ -1500,13 +1582,13 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         uri: "https://example.com/status/tag-200".to_string(),
         content: "<p>#Rust id200</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(10),
         fetched_at: None,
     };
@@ -1515,13 +1597,13 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         uri: "https://example.com/status/tag-100".to_string(),
         content: "<p>#Rust id100</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(20),
         fetched_at: None,
     };
@@ -1556,17 +1638,17 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
 async fn test_update_status_refreshes_hashtag_index() {
     let (db, _temp_dir) = create_test_db().await;
     let mut status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/tag-update".to_string(),
         content: "<p>Initial #OldTag</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1608,47 +1690,47 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
 
     let base_time = Utc::now();
     let local_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/list-local".to_string(),
         content: "<p>Local status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(1),
         fetched_at: None,
     };
     let remote_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-remote".to_string(),
         content: "<p>Remote status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: remote_address.clone(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: PersistedReason::Favourited,
         created_at: base_time + chrono::Duration::seconds(2),
         fetched_at: None,
     };
     let unrelated_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-unrelated".to_string(),
         content: "<p>Unrelated status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "bob@example.com".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: PersistedReason::Favourited,
         created_at: base_time,
         fetched_at: None,
     };
@@ -1687,17 +1769,17 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
         .unwrap();
 
     let local_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/list-local-by-id".to_string(),
         content: "<p>Local status by id list member</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1733,32 +1815,32 @@ async fn test_list_timeline_query_matches_default_port_equivalent_remote_address
         .unwrap();
 
     let matching_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-default-port-match".to_string(),
         content: "<p>Remote status from default-port equivalent address</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "alice@remote.example:443".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let unrelated_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-default-port-unrelated".to_string(),
         content: "<p>Unrelated remote status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "bob@remote.example".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1787,22 +1869,22 @@ async fn test_insert_status_with_media_attaches_all_media_atomically() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/with-media".to_string(),
         content: "<p>Status with media</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
 
-    let media_ids = vec![EntityId::new().0, EntityId::new().0];
+    let media_ids = vec![EntityId::new_string(), EntityId::new_string()];
     for media_id in &media_ids {
         db.insert_media(&MediaAttachment {
             id: media_id.clone(),
@@ -1841,23 +1923,23 @@ async fn test_insert_status_with_media_rolls_back_when_media_missing() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/missing-media".to_string(),
         content: "<p>Status with missing media</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
 
     let result = db
-        .insert_status_with_media(&status, &[EntityId::new().0])
+        .insert_status_with_media(&status, &[EntityId::new_string()])
         .await;
     assert!(result.is_err());
     assert!(db.get_status(&status.id).await.unwrap().is_none());
@@ -1868,23 +1950,23 @@ async fn test_insert_status_with_media_rolls_back_when_media_already_attached() 
     let (db, _temp_dir) = create_test_db().await;
 
     let existing_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/existing".to_string(),
         content: "<p>Existing status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     db.insert_status(&existing_status).await.unwrap();
 
-    let media_id = EntityId::new().0;
+    let media_id = EntityId::new_string();
     db.insert_media(&MediaAttachment {
         id: media_id.clone(),
         status_id: Some(existing_status.id.clone()),
@@ -1904,17 +1986,17 @@ async fn test_insert_status_with_media_rolls_back_when_media_already_attached() 
     .unwrap();
 
     let new_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/new".to_string(),
         content: "<p>New status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1934,17 +2016,17 @@ async fn test_insert_status_with_media_and_poll_persists_poll_atomically() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/with-poll".to_string(),
         content: "<p>Status with poll</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1970,17 +2052,17 @@ async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() 
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/with-poll-missing-media".to_string(),
         content: "<p>Status with poll and missing media</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -1989,7 +2071,7 @@ async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() 
     let result = db
         .insert_status_with_media_and_poll(
             &status,
-            &[EntityId::new().0],
+            &[EntityId::new_string()],
             Some((&poll_options, 600, false)),
         )
         .await;
@@ -2008,17 +2090,17 @@ async fn test_vote_in_poll_rejects_duplicate_option_and_rolls_back_counts() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-duplicate-vote".to_string(),
         content: "<p>Poll</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2053,32 +2135,32 @@ async fn test_vote_in_poll_rejects_option_from_other_poll() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status_1 = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-1".to_string(),
         content: "<p>Poll 1</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let status_2 = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-2".to_string(),
         content: "<p>Poll 2</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2114,17 +2196,17 @@ async fn test_vote_in_poll_rejects_second_ballot_for_multiple_poll() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-multiple-second-vote".to_string(),
         content: "<p>Poll</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2168,17 +2250,17 @@ async fn test_get_poll_marks_immediately_expired_poll_as_expired() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-immediate-expire".to_string(),
         content: "<p>Poll</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2201,17 +2283,17 @@ async fn test_vote_in_poll_rejects_when_expires_at_has_passed() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/poll-expired-vote".to_string(),
         content: "<p>Poll</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2255,39 +2337,39 @@ async fn test_attach_media_to_status_rejects_reassign_to_another_status() {
     let (db, _temp_dir) = create_test_db().await;
 
     let first_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/first".to_string(),
         content: "<p>First status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let second_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/second".to_string(),
         content: "<p>Second status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     db.insert_status(&first_status).await.unwrap();
     db.insert_status(&second_status).await.unwrap();
 
-    let media_id = EntityId::new().0;
+    let media_id = EntityId::new_string();
     db.insert_media(&MediaAttachment {
         id: media_id.clone(),
         status_id: Some(first_status.id.clone()),
@@ -2320,25 +2402,25 @@ async fn test_replace_status_media_detaches_and_attaches_expected_media() {
     let (db, _temp_dir) = create_test_db().await;
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://example.com/status/media-replace".to_string(),
         content: "<p>status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     db.insert_status(&status).await.unwrap();
 
-    let keep_id = EntityId::new().0;
-    let detach_id = EntityId::new().0;
-    let attach_id = EntityId::new().0;
+    let keep_id = EntityId::new_string();
+    let detach_id = EntityId::new_string();
+    let attach_id = EntityId::new_string();
     for (media_id, status_id) in [
         (&keep_id, Some(status.id.clone())),
         (&detach_id, Some(status.id.clone())),
@@ -2385,7 +2467,7 @@ async fn test_replace_status_media_detaches_and_attaches_expected_media() {
 async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_status() {
     let (db, _temp_dir) = create_test_db().await;
 
-    let media_id = EntityId::new().0;
+    let media_id = EntityId::new_string();
     db.insert_media(&MediaAttachment {
         id: media_id.clone(),
         status_id: None,
@@ -2409,13 +2491,13 @@ async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_s
         uri: "https://example.com/status/missing".to_string(),
         content: "<p>before</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: crate::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -2481,7 +2563,7 @@ async fn test_accept_follow_request_rolls_back_on_follower_insert_failure() {
     let (db, _temp_dir) = create_test_db().await;
 
     db.insert_follower(&Follower {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         follower_address: "alice@remote.example".to_string(),
         inbox_uri: "https://existing.example/inbox".to_string(),
         uri: "https://existing.example/follows/1".to_string(),

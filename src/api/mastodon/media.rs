@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::MediaApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 use crate::metrics::{
@@ -101,7 +101,7 @@ fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
 
 /// POST /api/v1/media
 pub async fn upload_media(
-    State(state): State<AppState>,
+    State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -248,7 +248,7 @@ pub async fn upload_media(
 
 /// POST /api/v2/media (async upload)
 pub async fn upload_media_v2(
-    State(state): State<AppState>,
+    State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
     multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -260,7 +260,7 @@ pub async fn upload_media_v2(
 
 /// GET /api/v1/media/:id
 pub async fn get_media(
-    State(state): State<AppState>,
+    State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -310,7 +310,7 @@ pub async fn get_media(
 
 /// PUT /api/v1/media/:id
 pub async fn update_media(
-    State(state): State<AppState>,
+    State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateMediaRequest>,

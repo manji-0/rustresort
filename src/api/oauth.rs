@@ -1,22 +1,30 @@
 //! OAuth endpoints
 
 use axum::{
-    Router, middleware,
+    Router,
+    extract::FromRef,
+    middleware,
     routing::{get, post},
 };
+use std::sync::Arc;
 
 use super::mastodon::apps::{authorize, create_token, revoke_token};
-use crate::AppState;
+use crate::AppsApiState;
 use crate::auth::require_session_auth;
+use crate::config::AppConfig;
 
 /// Create OAuth router
 ///
 /// These routes do NOT require authentication (they provide authentication).
-pub fn oauth_router(state: AppState) -> Router<AppState> {
+pub fn oauth_router<S>(config: Arc<AppConfig>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppsApiState: FromRef<S>,
+{
     let authorize_routes = Router::new()
         .route("/authorize", get(authorize))
         .route_layer(middleware::from_fn_with_state(
-            state.clone(),
+            config.clone(),
             require_session_auth,
         ));
 

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! HTTP Signatures for ActivityPub
 //!
 //! Implements signing and verification per:
@@ -183,12 +182,12 @@ async fn validate_remote_actor_url(actor_url: &url::Url) -> Result<(), AppError>
         ));
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip_address(ip) {
-            return Err(AppError::Validation(
-                "Actor URL host is not allowed".to_string(),
-            ));
-        }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_blocked_ip_address(ip)
+    {
+        return Err(AppError::Validation(
+            "Actor URL host is not allowed".to_string(),
+        ));
     }
 
     let port = actor_url.port_or_known_default().ok_or_else(|| {

@@ -99,7 +99,7 @@ impl TestServer {
             let db = Database::connect(&db_path).await.unwrap();
             let now = Utc::now();
             let seeded_account = Account {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 username: "testuser".to_string(),
                 display_name: Some("Test User".to_string()),
                 note: Some("Test account".to_string()),
@@ -182,7 +182,7 @@ impl TestServer {
             account
         } else {
             Account {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 username: "testuser".to_string(),
                 display_name: Some("Test User".to_string()),
                 note: Some("Test bio".to_string()),

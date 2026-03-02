@@ -6,13 +6,13 @@
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{FromRef, Query, State},
     response::Json,
     routing::get,
 };
 use serde::Deserialize;
 
-use crate::AppState;
+use crate::WellKnownState;
 use crate::error::AppError;
 
 /// Create well-known router
@@ -22,7 +22,11 @@ use crate::error::AppError;
 /// - GET /.well-known/nodeinfo
 /// - GET /.well-known/host-meta
 /// - GET /nodeinfo/2.0
-pub fn wellknown_router() -> Router<AppState> {
+pub fn wellknown_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    WellKnownState: FromRef<S>,
+{
     Router::new()
         .route("/.well-known/webfinger", get(webfinger))
         .route("/.well-known/nodeinfo", get(nodeinfo_links))
@@ -42,7 +46,7 @@ struct WebFingerQuery {
 ///
 /// Query: ?resource=acct:user@domain
 async fn webfinger(
-    State(state): State<AppState>,
+    State(state): State<WellKnownState>,
     Query(query): Query<WebFingerQuery>,
 ) -> Result<Json<crate::federation::WebFingerResponse>, AppError> {
     // Parse resource (acct:username@domain)
@@ -89,7 +93,7 @@ async fn webfinger(
 /// GET /.well-known/nodeinfo
 ///
 /// Returns links to nodeinfo documents.
-async fn nodeinfo_links(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn nodeinfo_links(State(state): State<WellKnownState>) -> Json<serde_json::Value> {
     let base_url = state.config.server.base_url();
     Json(serde_json::json!({
         "links": [
@@ -104,7 +108,7 @@ async fn nodeinfo_links(State(state): State<AppState>) -> Json<serde_json::Value
 /// GET /nodeinfo/2.0
 ///
 /// Returns NodeInfo 2.0 document.
-async fn nodeinfo(State(_state): State<AppState>) -> Json<serde_json::Value> {
+async fn nodeinfo(State(_state): State<WellKnownState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": "2.0",
         "software": {
@@ -130,7 +134,7 @@ async fn nodeinfo(State(_state): State<AppState>) -> Json<serde_json::Value> {
 /// GET /.well-known/host-meta
 ///
 /// Returns host-meta XML for WebFinger discovery.
-async fn host_meta(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+async fn host_meta(State(state): State<WellKnownState>) -> impl axum::response::IntoResponse {
     let base_url = state.config.server.base_url();
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

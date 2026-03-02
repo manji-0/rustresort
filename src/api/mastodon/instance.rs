@@ -3,7 +3,7 @@
 use axum::{extract::State, response::Json};
 use std::collections::BTreeSet;
 
-use crate::AppState;
+use crate::InstanceApiState;
 
 const DEFAULT_INSTANCE_RULES: [&str; 3] = [
     "Be respectful and civil in all interactions.",
@@ -13,23 +13,23 @@ const DEFAULT_INSTANCE_RULES: [&str; 3] = [
 
 fn domain_from_account_address(address: &str) -> Option<String> {
     let trimmed = address.trim();
-    if let Ok(parsed) = url::Url::parse(trimmed) {
-        if let Some(host) = parsed.host_str().map(|value| {
+    if let Ok(parsed) = url::Url::parse(trimmed)
+        && let Some(host) = parsed.host_str().map(|value| {
             value
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .trim_end_matches('.')
                 .to_ascii_lowercase()
-        }) {
-            if host.is_empty() {
-                return None;
-            }
-            let authority = match parsed.port() {
-                Some(port) => format!("{}:{port}", format_authority_host(&host)),
-                None => format_authority_host(&host),
-            };
-            return normalize_domain_authority(&authority, None);
+        })
+    {
+        if host.is_empty() {
+            return None;
         }
+        let authority = match parsed.port() {
+            Some(port) => format!("{}:{port}", format_authority_host(&host)),
+            None => format_authority_host(&host),
+        };
+        return normalize_domain_authority(&authority, None);
     }
 
     let acct_like = trimmed.strip_prefix("acct:").unwrap_or(trimmed);
@@ -93,19 +93,17 @@ fn compute_peer_domains(
     for address in follow_addresses {
         if let Some(domain) = domain_from_account_address(address)
             .and_then(|domain| normalize_domain_authority(&domain, default_port))
+            && domain != local_domain
         {
-            if domain != local_domain {
-                peers.insert(domain);
-            }
+            peers.insert(domain);
         }
     }
     for address in follower_addresses {
         if let Some(domain) = domain_from_account_address(address)
             .and_then(|domain| normalize_domain_authority(&domain, default_port))
+            && domain != local_domain
         {
-            if domain != local_domain {
-                peers.insert(domain);
-            }
+            peers.insert(domain);
         }
     }
 
@@ -136,7 +134,7 @@ fn rule_texts_from_setting(raw: &str) -> Option<Vec<String>> {
     (!rules.is_empty()).then_some(rules)
 }
 
-async fn load_instance_rule_texts(state: &AppState) -> Vec<String> {
+async fn load_instance_rule_texts(state: &InstanceApiState) -> Vec<String> {
     if let Ok(Some(raw)) = state.db.get_setting("instance.rules").await {
         if let Some(rules) = rule_texts_from_setting(&raw) {
             return rules;
@@ -166,14 +164,21 @@ fn rules_to_json(rule_texts: &[String]) -> serde_json::Value {
 }
 
 /// GET /api/v1/instance
-pub async fn instance(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     use crate::api::dto::*;
 
     let _base_url = state.config.server.base_url();
 
     // Get account for contact
     let contact_account = if let Ok(Some(account)) = state.db.get_account().await {
-        Some(crate::api::account_to_response(&account, &state.config))
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+            .await
+            .unwrap_or_default();
+        Some(crate::api::account_to_response_with_stats(
+            &account,
+            &state.config,
+            account_stats,
+        ))
     } else {
         None
     };
@@ -260,7 +265,7 @@ pub async fn instance(State(state): State<AppState>) -> Json<serde_json::Value> 
 /// GET /api/v1/instance/peers - Get instance peers
 ///
 /// List of federated instances this instance knows about.
-pub async fn instance_peers(State(_state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn instance_peers(State(_state): State<InstanceApiState>) -> Json<serde_json::Value> {
     let follow_addresses = _state
         .db
         .get_all_follow_addresses()
@@ -283,7 +288,7 @@ pub async fn instance_peers(State(_state): State<AppState>) -> Json<serde_json::
 /// GET /api/v1/instance/activity - Get instance activity
 ///
 /// Instance activity over the last 3 months, binned weekly.
-pub async fn instance_activity(State(_state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn instance_activity(State(_state): State<InstanceApiState>) -> Json<serde_json::Value> {
     // Return activity statistics for the last 12 weeks
     // For single-user instance, return minimal activity data
 
@@ -306,7 +311,7 @@ pub async fn instance_activity(State(_state): State<AppState>) -> Json<serde_jso
 /// GET /api/v1/instance/rules - Get instance rules
 ///
 /// List of rules for this instance.
-pub async fn instance_rules(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn instance_rules(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     let rules = load_instance_rule_texts(&state).await;
     Json(rules_to_json(&rules))
 }
@@ -314,10 +319,17 @@ pub async fn instance_rules(State(state): State<AppState>) -> Json<serde_json::V
 /// GET /api/v2/instance - Get instance information (v2)
 ///
 /// Extended instance information with additional fields.
-pub async fn instance_v2(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     // Get account for contact
     let contact_account = if let Ok(Some(account)) = state.db.get_account().await {
-        Some(crate::api::account_to_response(&account, &state.config))
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+            .await
+            .unwrap_or_default();
+        Some(crate::api::account_to_response_with_stats(
+            &account,
+            &state.config,
+            account_stats,
+        ))
     } else {
         None
     };

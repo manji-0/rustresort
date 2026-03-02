@@ -11,7 +11,7 @@ async fn test_home_timeline_without_auth() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home"))
+        .get(server.url("/api/v1/timelines/home"))
         .send()
         .await
         .unwrap();
@@ -28,7 +28,7 @@ async fn test_home_timeline_with_auth() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home"))
+        .get(server.url("/api/v1/timelines/home"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -47,7 +47,7 @@ async fn test_public_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -65,7 +65,7 @@ async fn test_local_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public?local=true"))
+        .get(server.url("/api/v1/timelines/public?local=true"))
         .send()
         .await
         .unwrap();
@@ -88,17 +88,17 @@ async fn test_timeline_pagination() {
 
     for i in 0..5 {
         let status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: format!("https://test.example.com/status/{}", i),
             content: format!("<p>Status {}</p>", i),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: rustresort::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "testuser@test.example.com".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -107,7 +107,7 @@ async fn test_timeline_pagination() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public?limit=3"))
+        .get(server.url("/api/v1/timelines/public?limit=3"))
         .send()
         .await
         .unwrap();
@@ -116,7 +116,7 @@ async fn test_timeline_pagination() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         assert!(json.is_array());
-        if json.as_array().unwrap().len() > 0 {
+        if !json.as_array().unwrap().is_empty() {
             assert!(json.as_array().unwrap().len() <= 3);
         }
     }
@@ -132,47 +132,47 @@ async fn test_hashtag_timeline() {
     use rustresort::data::{EntityId, Status};
 
     let tagged_public = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/tagged-public".to_string(),
         content: "<p>Learning #rust today</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let tagged_private = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/tagged-private".to_string(),
         content: "<p>Private #rust note</p>".to_string(),
         content_warning: None,
-        visibility: "private".to_string(),
+        visibility: rustresort::data::StatusVisibility::Private,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let untagged_public = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/untagged-public".to_string(),
         content: "<p>No hashtag here</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -192,7 +192,7 @@ async fn test_hashtag_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/tag/rust"))
+        .get(server.url("/api/v1/timelines/tag/rust"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -238,47 +238,47 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
         .unwrap();
 
     let local_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/list-local".to_string(),
         content: "<p>Local list status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let remote_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-remote".to_string(),
         content: "<p>Remote list status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: remote_address.clone(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let unrelated_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example/status/list-unrelated".to_string(),
         content: "<p>Unrelated list status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "bob@example.com".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "favourited".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -293,7 +293,7 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -328,25 +328,26 @@ async fn test_list_timeline_matches_local_account_added_by_id() {
         .create_list("Test list by id", "list")
         .await
         .unwrap();
+    let account_id = account.id.to_string();
     server
         .state
         .db
-        .add_accounts_to_list(&list_id, std::slice::from_ref(&account.id))
+        .add_accounts_to_list(&list_id, std::slice::from_ref(&account_id))
         .await
         .unwrap();
 
     let local_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/list-local-id".to_string(),
         content: "<p>Local list status by id</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -354,7 +355,7 @@ async fn test_list_timeline_matches_local_account_added_by_id() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -395,32 +396,32 @@ async fn test_list_timeline_respects_none_replies_policy() {
         .unwrap();
 
     let root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/list-none-root".to_string(),
         content: "<p>Root status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let reply = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/list-none-reply".to_string(),
         content: "<p>Reply status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -429,7 +430,7 @@ async fn test_list_timeline_respects_none_replies_policy() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -475,13 +476,13 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         uri: "https://test.example.com/status/list-none-page-root".to_string(),
         content: "<p>Root status</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -490,13 +491,13 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         uri: "https://test.example.com/status/list-none-page-reply-old".to_string(),
         content: "<p>Reply old</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -505,13 +506,13 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         uri: "https://test.example.com/status/list-none-page-reply-new".to_string(),
         content: "<p>Reply new</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "".to_string(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -521,7 +522,7 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/timelines/list/{}?limit=1", list_id)))
+        .get(server.url(&format!("/api/v1/timelines/list/{}?limit=1", list_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -546,7 +547,7 @@ async fn test_timeline_with_max_id() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home?max_id=123456"))
+        .get(server.url("/api/v1/timelines/home?max_id=123456"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -567,7 +568,7 @@ async fn test_timeline_with_since_id() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home?since_id=123456"))
+        .get(server.url("/api/v1/timelines/home?since_id=123456"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -590,47 +591,47 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
     let token = server.create_test_token().await;
 
     let root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/thread-root".to_string(),
         content: "<p>Thread root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let reply = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/thread-reply".to_string(),
         content: "<p>Thread reply</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
     let other = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/other-thread".to_string(),
         content: "<p>Other thread</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -640,7 +641,7 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
 
     let mute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/mute", &reply.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -649,7 +650,7 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
 
     let timeline_response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -680,47 +681,47 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
 
     let base_time = Utc::now();
     let visible_a = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/visible-a".to_string(),
         content: "<p>Visible A</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
     };
     let visible_b = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/visible-b".to_string(),
         content: "<p>Visible B</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time + Duration::seconds(1),
         fetched_at: None,
     };
     let muted_root = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/status/muted-root".to_string(),
         content: "<p>Muted root</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time + Duration::seconds(2),
         fetched_at: None,
     };
@@ -731,17 +732,17 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
     let mut mute_target_id = String::new();
     for index in 0..21 {
         let reply = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: format!("https://test.example.com/status/muted-reply-{index}"),
             content: format!("<p>Muted reply {index}</p>"),
             content_warning: None,
-            visibility: "public".to_string(),
+            visibility: rustresort::data::StatusVisibility::Public,
             language: Some("en".to_string()),
             account_address: "testuser@test.example.com".to_string(),
             is_local: true,
             in_reply_to_uri: Some(muted_root.uri.clone()),
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: base_time + Duration::seconds((index + 3) as i64),
             fetched_at: None,
         };
@@ -751,7 +752,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
 
     let mute_response = server
         .client
-        .post(&server.url(&format!("/api/v1/statuses/{}/mute", mute_target_id)))
+        .post(server.url(&format!("/api/v1/statuses/{}/mute", mute_target_id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -760,7 +761,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
 
     let timeline_response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();

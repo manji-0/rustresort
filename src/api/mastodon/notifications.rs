@@ -6,16 +6,16 @@ use axum::{
 };
 
 use super::accounts::PaginationParams;
-use crate::AppState;
+use crate::TimelineApiState;
 use crate::auth::CurrentUser;
-use crate::data::Status;
+use crate::data::{PersistedReason, Status, StatusVisibility};
 use crate::error::AppError;
 
-async fn get_notification_status(state: &AppState, status_uri: &str) -> Option<Status> {
-    if let Ok(status) = state.db.get_status_by_uri(status_uri).await {
-        if status.is_some() {
-            return status;
-        }
+async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> Option<Status> {
+    if let Ok(status) = state.db.get_status_by_uri(status_uri).await
+        && status.is_some()
+    {
+        return status;
     }
 
     let cached = state.timeline_cache.get_by_uri(status_uri).await?;
@@ -24,13 +24,14 @@ async fn get_notification_status(state: &AppState, status_uri: &str) -> Option<S
         uri: cached.uri.clone(),
         content: cached.content.clone(),
         content_warning: None,
-        visibility: cached.visibility.clone(),
+        visibility: StatusVisibility::parse(&cached.visibility)
+            .unwrap_or(StatusVisibility::Private),
         language: None,
         account_address: cached.account_address.clone(),
         is_local: false,
         in_reply_to_uri: cached.reply_to_uri.clone(),
         boost_of_uri: cached.boost_of_uri.clone(),
-        persisted_reason: "cache_only".to_string(),
+        persisted_reason: PersistedReason::CacheOnly,
         created_at: cached.created_at,
         fetched_at: Some(chrono::Utc::now()),
     })
@@ -38,7 +39,7 @@ async fn get_notification_status(state: &AppState, status_uri: &str) -> Option<S
 
 /// GET /api/v1/notifications
 pub async fn get_notifications(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -46,6 +47,7 @@ pub async fn get_notifications(
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get notifications
     let limit = params.limit.unwrap_or(20).min(40);
@@ -69,25 +71,45 @@ pub async fn get_notifications(
         };
 
         let status_response = if let Some(status) = status {
-            Some(crate::api::status_to_response(
-                &status,
-                &account,
-                &state.config,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ))
+            let status_batch = vec![status.clone()];
+            let remote_account_stats = crate::api::load_remote_account_stats_map(
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                &state.config.server.protocol,
+                &status_batch,
+            )
+            .await
+            .unwrap_or_default();
+            let remote_stats = remote_account_stats
+                .get(status.account_address.trim())
+                .copied();
+            Some(
+                crate::api::status_to_response_with_account_stats_and_remote_stats(
+                    &status,
+                    &account,
+                    &state.config,
+                    account_stats,
+                    remote_stats,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
         } else {
             None
         };
 
         let response = NotificationResponse {
             id: notification.id.clone(),
-            notification_type: notification.notification_type.clone(),
+            notification_type: notification.notification_type.to_string(),
             created_at: notification.created_at,
-            account: crate::api::account_to_response(&account, &state.config),
+            account: crate::api::account_to_response_with_stats(
+                &account,
+                &state.config,
+                account_stats,
+            ),
             status: status_response,
         };
 
@@ -99,7 +121,7 @@ pub async fn get_notifications(
 
 /// POST /api/v1/notifications/:id/dismiss
 pub async fn dismiss_notification(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -111,7 +133,7 @@ pub async fn dismiss_notification(
 
 /// POST /api/v1/notifications/clear
 pub async fn clear_notifications(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Mark all notifications as read
@@ -123,7 +145,7 @@ pub async fn clear_notifications(
 /// GET /api/v1/notifications/:id
 /// Get a single notification by ID
 pub async fn get_notification(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -131,6 +153,7 @@ pub async fn get_notification(
 
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let notification = state
         .db
@@ -146,25 +169,41 @@ pub async fn get_notification(
     };
 
     let status_response = if let Some(status) = status {
-        Some(crate::api::status_to_response(
-            &status,
-            &account,
-            &state.config,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ))
+        let status_batch = vec![status.clone()];
+        let remote_account_stats = crate::api::load_remote_account_stats_map(
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            &state.config.server.protocol,
+            &status_batch,
+        )
+        .await
+        .unwrap_or_default();
+        let remote_stats = remote_account_stats
+            .get(status.account_address.trim())
+            .copied();
+        Some(
+            crate::api::status_to_response_with_account_stats_and_remote_stats(
+                &status,
+                &account,
+                &state.config,
+                account_stats,
+                remote_stats,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
     } else {
         None
     };
 
     let response = NotificationResponse {
         id: notification.id.clone(),
-        notification_type: notification.notification_type.clone(),
+        notification_type: notification.notification_type.to_string(),
         created_at: notification.created_at,
-        account: crate::api::account_to_response(&account, &state.config),
+        account: crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
         status: status_response,
     };
 
@@ -174,7 +213,7 @@ pub async fn get_notification(
 /// GET /api/v1/notifications/unread_count
 /// Get the count of unread notifications
 pub async fn get_unread_count(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Get unread notifications

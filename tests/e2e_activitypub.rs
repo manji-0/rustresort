@@ -12,7 +12,7 @@ async fn test_actor_endpoint() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser"))
+        .get(server.url("/users/testuser"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -43,7 +43,7 @@ async fn test_inbox_endpoint_rejects_unsigned_activity() {
 
     let response = server
         .client
-        .post(&server.url("/users/testuser/inbox"))
+        .post(server.url("/users/testuser/inbox"))
         .header("Content-Type", "application/activity+json")
         .json(&activity)
         .send()
@@ -70,7 +70,7 @@ async fn test_inbox_rejects_signature_key_id_actor_mismatch() {
 
     let response = server
         .client
-        .post(&server.url("/users/testuser/inbox"))
+        .post(server.url("/users/testuser/inbox"))
         .header("Content-Type", "application/activity+json")
         .header(
             "Signature",
@@ -94,7 +94,7 @@ async fn test_outbox_endpoint() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/outbox"))
+        .get(server.url("/users/testuser/outbox"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -117,21 +117,29 @@ async fn test_outbox_excludes_private_and_direct_statuses() {
     server.create_test_account().await;
 
     for visibility in ["public", "unlisted", "private", "direct"] {
+        let parsed_visibility = match visibility {
+            "public" => rustresort::data::StatusVisibility::Public,
+            "unlisted" => rustresort::data::StatusVisibility::Unlisted,
+            "private" => rustresort::data::StatusVisibility::Private,
+            "direct" => rustresort::data::StatusVisibility::Direct,
+            _ => unreachable!("test visibility fixture should be valid"),
+        };
+
         let status = Status {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             uri: format!(
                 "https://test.example.com/users/testuser/statuses/outbox-{}",
                 visibility
             ),
             content: format!("<p>{}</p>", visibility),
             content_warning: None,
-            visibility: visibility.to_string(),
+            visibility: parsed_visibility,
             language: Some("en".to_string()),
             account_address: "testuser@test.example.com".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -140,7 +148,7 @@ async fn test_outbox_excludes_private_and_direct_statuses() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/outbox"))
+        .get(server.url("/users/testuser/outbox"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -183,7 +191,7 @@ async fn test_followers_collection() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/followers"))
+        .get(server.url("/users/testuser/followers"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -204,7 +212,7 @@ async fn test_following_collection() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/following"))
+        .get(server.url("/users/testuser/following"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -228,17 +236,17 @@ async fn test_status_as_activity() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/123".to_string(),
         content: "<p>ActivityPub test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -247,7 +255,7 @@ async fn test_status_as_activity() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/statuses/123"))
+        .get(server.url("/users/testuser/statuses/123"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -273,17 +281,17 @@ async fn test_unlisted_status_activity_audience() {
     use rustresort::data::{EntityId, Status};
 
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/124".to_string(),
         content: "<p>Unlisted ActivityPub test</p>".to_string(),
         content_warning: None,
-        visibility: "unlisted".to_string(),
+        visibility: rustresort::data::StatusVisibility::Unlisted,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -292,7 +300,7 @@ async fn test_unlisted_status_activity_audience() {
 
     let response = server
         .client
-        .get(&server.url("/users/testuser/statuses/124"))
+        .get(server.url("/users/testuser/statuses/124"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -327,7 +335,7 @@ async fn test_shared_inbox_rejects_unsigned_activity() {
 
     let response = server
         .client
-        .post(&server.url("/inbox"))
+        .post(server.url("/inbox"))
         .header("Content-Type", "application/activity+json")
         .json(&activity)
         .send()
@@ -356,7 +364,7 @@ async fn test_shared_inbox_rejects_signature_key_id_actor_mismatch() {
 
     let response = server
         .client
-        .post(&server.url("/inbox"))
+        .post(server.url("/inbox"))
         .header("Content-Type", "application/activity+json")
         .header(
             "Signature",
@@ -381,7 +389,7 @@ async fn test_actor_content_negotiation() {
     // Request with HTML Accept header
     let _html_response = server
         .client
-        .get(&server.url("/users/testuser"))
+        .get(server.url("/users/testuser"))
         .header("Accept", "text/html")
         .send()
         .await
@@ -390,7 +398,7 @@ async fn test_actor_content_negotiation() {
     // Request with ActivityPub Accept header
     let ap_response = server
         .client
-        .get(&server.url("/users/testuser"))
+        .get(server.url("/users/testuser"))
         .header("Accept", "application/activity+json")
         .send()
         .await

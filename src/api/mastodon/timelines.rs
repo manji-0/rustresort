@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::accounts::PaginationParams;
-use crate::AppState;
+use crate::TimelineApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 use crate::metrics::{
@@ -24,7 +24,7 @@ pub struct PublicTimelineParams {
 
 /// GET /api/v1/timelines/home
 pub async fn home_timeline(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
@@ -38,6 +38,7 @@ pub async fn home_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
@@ -55,6 +56,17 @@ pub async fn home_timeline(
     let timeline_items = timeline_service
         .home_timeline(limit, params.max_id.as_deref(), params.min_id.as_deref())
         .await?;
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "statuses"])
         .inc();
@@ -64,10 +76,15 @@ pub async fn home_timeline(
     let responses: Vec<_> = timeline_items
         .iter()
         .map(|item| {
-            let response = crate::api::status_to_response(
+            let remote_stats = remote_account_stats
+                .get(item.status.account_address.trim())
+                .copied();
+            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
                 &item.status,
                 &account,
                 &state.config,
+                account_stats,
+                remote_stats,
                 Some(item.favourited),
                 Some(item.reblogged),
                 None,
@@ -88,7 +105,7 @@ pub async fn home_timeline(
 
 /// GET /api/v1/timelines/public
 pub async fn public_timeline(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     Query(params): Query<PublicTimelineParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Start timing the request
@@ -101,6 +118,7 @@ pub async fn public_timeline(
         .with_label_values(&["SELECT", "accounts"])
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
@@ -119,6 +137,17 @@ pub async fn public_timeline(
     let timeline_items = timeline_service
         .public_timeline(local_only, limit, params.pagination.max_id.as_deref())
         .await?;
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await?;
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "statuses"])
         .inc();
@@ -128,10 +157,15 @@ pub async fn public_timeline(
     let responses: Vec<_> = timeline_items
         .iter()
         .map(|item| {
-            let response = crate::api::status_to_response(
+            let remote_stats = remote_account_stats
+                .get(item.status.account_address.trim())
+                .copied();
+            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
                 &item.status,
                 &account,
                 &state.config,
+                account_stats,
+                remote_stats,
                 Some(item.favourited),
                 Some(item.reblogged),
                 None,
@@ -153,11 +187,12 @@ pub async fn public_timeline(
 /// GET /api/v1/timelines/tag/:hashtag
 /// Get statuses with a specific hashtag
 pub async fn tag_timeline(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     axum::extract::Path(hashtag): axum::extract::Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let limit = params.limit.unwrap_or(20).min(40);
     let timeline_service = TimelineService::new(
@@ -173,14 +208,30 @@ pub async fn tag_timeline(
             params.min_id.as_deref(),
         )
         .await?;
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await?;
 
     let responses: Vec<_> = timeline_items
         .iter()
         .map(|item| {
-            let response = crate::api::status_to_response(
+            let remote_stats = remote_account_stats
+                .get(item.status.account_address.trim())
+                .copied();
+            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
                 &item.status,
                 &account,
                 &state.config,
+                account_stats,
+                remote_stats,
                 Some(item.favourited),
                 Some(item.reblogged),
                 None,
@@ -197,7 +248,7 @@ pub async fn tag_timeline(
 /// GET /api/v1/timelines/list/:list_id
 /// Get statuses from a specific list
 pub async fn list_timeline(
-    State(state): State<AppState>,
+    State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     axum::extract::Path(list_id): axum::extract::Path<String>,
     Query(params): Query<PaginationParams>,
@@ -208,8 +259,9 @@ pub async fn list_timeline(
         .await?
         .ok_or(AppError::NotFound)?;
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     let local_account_address = format!("{}@{}", account.username, state.config.server.domain);
-    let local_account_id = account.id.clone();
+    let local_account_id = account.id.to_string();
     let default_port = match state.config.server.protocol.as_str() {
         "https" => Some(443),
         "http" => Some(80),
@@ -273,14 +325,30 @@ pub async fn list_timeline(
             )
             .await?
     };
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await?;
 
     let responses: Vec<_> = timeline_items
         .iter()
         .map(|item| {
-            let response = crate::api::status_to_response(
+            let remote_stats = remote_account_stats
+                .get(item.status.account_address.trim())
+                .copied();
+            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
                 &item.status,
                 &account,
                 &state.config,
+                account_stats,
+                remote_stats,
                 Some(item.favourited),
                 Some(item.reblogged),
                 None,

@@ -35,7 +35,7 @@ async fn test_local_post_to_activitypub_note() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -49,7 +49,7 @@ async fn test_local_post_to_activitypub_note() {
         // Verify the post can be retrieved as ActivityPub Note
         let ap_response = server
             .client
-            .get(&server.url(&format!("/users/testuser/statuses/{}", status_id)))
+            .get(server.url(&format!("/users/testuser/statuses/{}", status_id)))
             .header("Accept", "application/activity+json")
             .send()
             .await
@@ -77,17 +77,17 @@ async fn test_outbox_contains_create_activities() {
 
     // Create a status directly in DB
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/outbox-test".to_string(),
         content: "<p>Outbox test post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -97,7 +97,7 @@ async fn test_outbox_contains_create_activities() {
     // Fetch outbox
     let response = server
         .client
-        .get(&server.url("/users/testuser/outbox"))
+        .get(server.url("/users/testuser/outbox"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -134,17 +134,17 @@ async fn test_notification_api_returns_data() {
 
     // Create a status that will be referenced by the notification
     let our_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/notif-test".to_string(),
         content: "<p>Test status for notification</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -153,8 +153,8 @@ async fn test_notification_api_returns_data() {
 
     // Create a notification
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "favourite".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Favourite,
         origin_account_address: "alice@remote.example.com".to_string(),
         status_uri: Some(our_status.uri.clone()),
         read: false,
@@ -171,7 +171,7 @@ async fn test_notification_api_returns_data() {
     // Verify notification appears in API
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications"))
+        .get(server.url("/api/v1/notifications"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -198,7 +198,7 @@ async fn test_follow_notification_database() {
 
     // Simulate receiving a follow by creating a follower and notification
     let follower = Follower {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         follower_address: "bob@remote.example.com".to_string(),
         inbox_uri: "https://remote.example.com/users/bob/inbox".to_string(),
         uri: "https://remote.example.com/users/bob/follow/123".to_string(),
@@ -209,8 +209,8 @@ async fn test_follow_notification_database() {
 
     // Create follow notification
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "follow".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Follow,
         origin_account_address: "bob@remote.example.com".to_string(),
         status_uri: None,
         read: false,
@@ -235,7 +235,7 @@ async fn test_follow_notification_database() {
     assert!(
         notifications
             .iter()
-            .any(|n| n.notification_type == "follow"),
+            .any(|n| n.notification_type == rustresort::data::NotificationType::Follow),
         "Should have follow notification in database"
     );
 }
@@ -248,17 +248,17 @@ async fn test_mention_notification_with_status() {
 
     // Create a status that mentions us
     let remote_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example.com/users/carol/statuses/mention".to_string(),
         content: "<p>@testuser@test.example.com Check this out!</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "carol@remote.example.com".to_string(),
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: Some(Utc::now()),
     };
@@ -267,8 +267,8 @@ async fn test_mention_notification_with_status() {
 
     // Create mention notification
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "mention".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Mention,
         origin_account_address: "carol@remote.example.com".to_string(),
         status_uri: Some(remote_status.uri.clone()),
         read: false,
@@ -292,7 +292,7 @@ async fn test_mention_notification_with_status() {
 
     let mention_notif = notifications
         .iter()
-        .find(|n| n.notification_type == "mention")
+        .find(|n| n.notification_type == rustresort::data::NotificationType::Mention)
         .expect("Should have mention notification");
 
     assert!(
@@ -316,7 +316,7 @@ async fn test_follow_lifecycle_with_accept() {
     use rustresort::data::Follow;
 
     let follow = Follow {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         target_address: "alice@remote.example.com".to_string(),
         uri: "https://test.example.com/users/testuser/follow/456".to_string(),
         created_at: Utc::now(),
@@ -327,7 +327,7 @@ async fn test_follow_lifecycle_with_accept() {
     // Verify following collection includes the user
     let response = server
         .client
-        .get(&server.url("/users/testuser/following"))
+        .get(server.url("/users/testuser/following"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -349,7 +349,7 @@ async fn test_followers_collection_updates() {
     server.create_test_account().await;
 
     // Add multiple followers
-    let followers = vec![
+    let followers = [
         (
             "user1@instance1.com",
             "https://instance1.com/users/user1/inbox",
@@ -366,7 +366,7 @@ async fn test_followers_collection_updates() {
 
     for (i, (addr, inbox)) in followers.iter().enumerate() {
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: addr.to_string(),
             inbox_uri: inbox.to_string(),
             uri: format!("https://example.com/follow/{}", i),
@@ -378,7 +378,7 @@ async fn test_followers_collection_updates() {
     // Verify followers collection
     let response = server
         .client
-        .get(&server.url("/users/testuser/followers"))
+        .get(server.url("/users/testuser/followers"))
         .header("Accept", "application/activity+json")
         .send()
         .await
@@ -405,17 +405,17 @@ async fn test_boost_notification_database() {
 
     // Create our status that will be boosted
     let our_status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/boostme".to_string(),
         content: "<p>Boost this if you agree!</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -424,8 +424,8 @@ async fn test_boost_notification_database() {
 
     // Simulate receiving a boost (Announce activity)
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "reblog".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Reblog,
         origin_account_address: "dave@remote.example.com".to_string(),
         status_uri: Some(our_status.uri.clone()),
         read: false,
@@ -449,7 +449,7 @@ async fn test_boost_notification_database() {
 
     let reblog_notif = notifications
         .iter()
-        .find(|n| n.notification_type == "reblog")
+        .find(|n| n.notification_type == rustresort::data::NotificationType::Reblog)
         .expect("Should have reblog notification");
 
     assert_eq!(
@@ -470,51 +470,51 @@ async fn test_reply_chain_context() {
 
     // Create original status
     let original = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/original".to_string(),
         content: "<p>Original post</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now() - chrono::Duration::hours(2),
         fetched_at: None,
     };
 
     // Create reply from remote
     let reply = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://remote.example.com/users/eve/statuses/reply1".to_string(),
         content: "<p>This is a reply</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "eve@remote.example.com".to_string(),
         is_local: false,
         in_reply_to_uri: Some(original.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now() - chrono::Duration::hours(1),
         fetched_at: Some(Utc::now()),
     };
 
     // Create reply to reply
     let reply_to_reply = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/users/testuser/statuses/rereply".to_string(),
         content: "<p>Reply to reply</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: Some(reply.uri.clone()),
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -531,7 +531,7 @@ async fn test_reply_chain_context() {
     // Get context for the reply
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/statuses/{}/context", reply.id)))
+        .get(server.url(&format!("/api/v1/statuses/{}/context", reply.id)))
         .send()
         .await
         .unwrap();
@@ -566,7 +566,7 @@ async fn test_inbox_requires_signature() {
 
     let response = server
         .client
-        .post(&server.url("/users/testuser/inbox"))
+        .post(server.url("/users/testuser/inbox"))
         .header("Content-Type", "application/activity+json")
         .json(&activity)
         .send()
@@ -597,7 +597,7 @@ async fn test_shared_inbox_requires_signature() {
 
     let response = server
         .client
-        .post(&server.url("/inbox"))
+        .post(server.url("/inbox"))
         .header("Content-Type", "application/activity+json")
         .json(&activity)
         .send()
@@ -623,8 +623,8 @@ async fn test_dismiss_single_notification_database() {
 
     // Create a notification
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "follow".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Follow,
         origin_account_address: "follower@example.com".to_string(),
         status_uri: None,
         read: false,
@@ -671,8 +671,8 @@ async fn test_clear_all_notifications_database() {
     // Create multiple notifications
     for i in 0..5 {
         let notification = Notification {
-            id: EntityId::new().0,
-            notification_type: "favourite".to_string(),
+            id: EntityId::new_string(),
+            notification_type: rustresort::data::NotificationType::Favourite,
             origin_account_address: format!("user{}@example.com", i),
             status_uri: None,
             read: false,
@@ -713,17 +713,17 @@ async fn test_home_timeline_aggregation() {
 
     // Create local status
     let local_status = Status {
-        id: format!("local-{}", EntityId::new().0),
+        id: format!("local-{}", EntityId::new_string()),
         uri: "https://test.example.com/users/testuser/statuses/hometest".to_string(),
         content: "<p>Local post for home timeline</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -733,7 +733,7 @@ async fn test_home_timeline_aggregation() {
     // Get home timeline
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home"))
+        .get(server.url("/api/v1/timelines/home"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -746,7 +746,7 @@ async fn test_home_timeline_aggregation() {
         let has_local = timeline.iter().any(|s| {
             s["content"]
                 .as_str()
-                .map_or(false, |c| c.contains("Local post"))
+                .is_some_and(|c| c.contains("Local post"))
         });
 
         assert!(has_local, "Home timeline should include local posts");
@@ -760,21 +760,28 @@ async fn test_public_timeline_visibility_filter() {
     server.create_test_account().await;
 
     // Create posts with different visibility
-    let visibilities = vec!["public", "unlisted", "private", "direct"];
+    let visibilities = ["public", "unlisted", "private", "direct"];
 
     for (i, vis) in visibilities.iter().enumerate() {
+        let parsed_visibility = match *vis {
+            "public" => rustresort::data::StatusVisibility::Public,
+            "unlisted" => rustresort::data::StatusVisibility::Unlisted,
+            "private" => rustresort::data::StatusVisibility::Private,
+            "direct" => rustresort::data::StatusVisibility::Direct,
+            _ => unreachable!("test visibility fixture should be valid"),
+        };
         let status = Status {
-            id: format!("vis-{}-{}", i, EntityId::new().0),
+            id: format!("vis-{}-{}", i, EntityId::new_string()),
             uri: format!("https://test.example.com/statuses/vis-{}", i),
             content: format!("<p>Post with visibility: {}</p>", vis),
             content_warning: None,
-            visibility: vis.to_string(),
+            visibility: parsed_visibility,
             language: Some("en".to_string()),
             account_address: "testuser@test.example.com".to_string(),
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
-            persisted_reason: "own".to_string(),
+            persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
         };
@@ -784,7 +791,7 @@ async fn test_public_timeline_visibility_filter() {
     // Get public timeline
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -812,17 +819,17 @@ async fn test_public_timeline_returns_local_statuses() {
 
     // Create a public status
     let status = Status {
-        id: EntityId::new().0,
+        id: EntityId::new_string(),
         uri: "https://test.example.com/statuses/public-test".to_string(),
         content: "<p>Public timeline test</p>".to_string(),
         content_warning: None,
-        visibility: "public".to_string(),
+        visibility: rustresort::data::StatusVisibility::Public,
         language: Some("en".to_string()),
         account_address: "testuser@test.example.com".to_string(),
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
-        persisted_reason: "own".to_string(),
+        persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
     };
@@ -831,7 +838,7 @@ async fn test_public_timeline_returns_local_statuses() {
     // Get public timeline
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -854,7 +861,7 @@ async fn test_webfinger_for_local_user() {
 
     let response = server
         .client
-        .get(&server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
+        .get(server.url("/.well-known/webfinger?resource=acct:testuser@test.example.com"))
         .header("Accept", "application/jrd+json")
         .send()
         .await
@@ -871,7 +878,7 @@ async fn test_webfinger_for_local_user() {
         let ap_link = links.iter().find(|l| {
             l["type"]
                 .as_str()
-                .map_or(false, |t| t.contains("activity+json"))
+                .is_some_and(|t| t.contains("activity+json"))
         });
 
         assert!(ap_link.is_some(), "Should have ActivityPub self link");
@@ -900,7 +907,7 @@ async fn test_delivery_target_collection() {
 
     for (addr, inbox) in followers_data {
         let follower = Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: addr.to_string(),
             inbox_uri: inbox.to_string(),
             uri: format!("https://example.com/follow/{}", addr),
@@ -934,8 +941,8 @@ async fn test_notification_api_structure() {
 
     // Create test data
     let notification = Notification {
-        id: EntityId::new().0,
-        notification_type: "follow".to_string(),
+        id: EntityId::new_string(),
+        notification_type: rustresort::data::NotificationType::Follow,
         origin_account_address: "test@example.com".to_string(),
         status_uri: None,
         read: false,
@@ -951,7 +958,7 @@ async fn test_notification_api_structure() {
     // Get notifications via API
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications"))
+        .get(server.url("/api/v1/notifications"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

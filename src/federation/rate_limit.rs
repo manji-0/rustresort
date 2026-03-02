@@ -232,10 +232,10 @@ pub fn extract_domain(uri: &str) -> String {
         return String::new();
     }
 
-    if let Ok(parsed) = url::Url::parse(trimmed) {
-        if let Some(host) = parsed.host_str() {
-            return format_domain_key(host, parsed.port(), parsed.scheme());
-        }
+    if let Ok(parsed) = url::Url::parse(trimmed)
+        && let Some(host) = parsed.host_str()
+    {
+        return format_domain_key(host, parsed.port(), parsed.scheme());
     }
 
     let fallback = trimmed.split("://").nth(1).unwrap_or(trimmed);
@@ -254,10 +254,10 @@ pub fn extract_domain(uri: &str) -> String {
         return String::new();
     }
 
-    if let Ok(parsed_authority) = url::Url::parse(&format!("https://{}", authority)) {
-        if let Some(host) = parsed_authority.host_str() {
-            return format_domain_key(host, parsed_authority.port(), "https");
-        }
+    if let Ok(parsed_authority) = url::Url::parse(&format!("https://{}", authority))
+        && let Some(host) = parsed_authority.host_str()
+    {
+        return format_domain_key(host, parsed_authority.port(), "https");
     }
 
     authority.trim_end_matches('.').to_ascii_lowercase()

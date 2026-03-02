@@ -74,7 +74,7 @@ async fn test_instance_info() {
     let server = TestServer::new().await;
     let response = server
         .client
-        .get(&server.url("/api/v1/instance"))
+        .get(server.url("/api/v1/instance"))
         .send()
         .await
         .unwrap();
@@ -86,7 +86,7 @@ async fn test_instance_v2() {
     let server = TestServer::new().await;
     let response = server
         .client
-        .get(&server.url("/api/v2/instance"))
+        .get(server.url("/api/v2/instance"))
         .send()
         .await
         .unwrap();
@@ -98,7 +98,7 @@ async fn test_instance_peers() {
     let server = TestServer::new().await;
     let response = server
         .client
-        .get(&server.url("/api/v1/instance/peers"))
+        .get(server.url("/api/v1/instance/peers"))
         .send()
         .await
         .unwrap();
@@ -110,7 +110,7 @@ async fn test_instance_activity() {
     let server = TestServer::new().await;
     let response = server
         .client
-        .get(&server.url("/api/v1/instance/activity"))
+        .get(server.url("/api/v1/instance/activity"))
         .send()
         .await
         .unwrap();
@@ -122,7 +122,7 @@ async fn test_instance_rules() {
     let server = TestServer::new().await;
     let response = server
         .client
-        .get(&server.url("/api/v1/instance/rules"))
+        .get(server.url("/api/v1/instance/rules"))
         .send()
         .await
         .unwrap();
@@ -144,7 +144,7 @@ async fn test_create_app() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/apps"))
+        .post(server.url("/api/v1/apps"))
         .json(&app_data)
         .send()
         .await
@@ -161,7 +161,7 @@ async fn test_verify_app_credentials() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/apps/verify_credentials"))
+        .get(server.url("/api/v1/apps/verify_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -191,7 +191,7 @@ async fn test_create_account() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts"))
+        .post(server.url("/api/v1/accounts"))
         .json(&account_data)
         .send()
         .await
@@ -208,7 +208,7 @@ async fn test_verify_credentials() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/verify_credentials"))
+        .get(server.url("/api/v1/accounts/verify_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -230,7 +230,7 @@ async fn test_update_credentials() {
 
     let response = server
         .client
-        .patch(&server.url("/api/v1/accounts/update_credentials"))
+        .patch(server.url("/api/v1/accounts/update_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -247,7 +247,7 @@ async fn test_get_account() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}", account.id)))
         .send()
         .await
         .unwrap();
@@ -263,7 +263,7 @@ async fn test_account_statuses() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -280,7 +280,7 @@ async fn test_account_followers() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -297,7 +297,7 @@ async fn test_account_following() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -324,7 +324,7 @@ async fn test_account_followers_applies_max_id_cursor() {
             .state
             .db
             .insert_follower(&Follower {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 follower_address: address.to_string(),
                 inbox_uri: format!("https://remote.example/inbox/{}", address),
                 uri: format!("https://remote.example/follows/{}", address),
@@ -336,7 +336,7 @@ async fn test_account_followers_applies_max_id_cursor() {
 
     let first_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/followers?limit=1",
             account.id
         )))
@@ -353,7 +353,7 @@ async fn test_account_followers_applies_max_id_cursor() {
 
     let second_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/followers?limit=1&max_id={}",
             account.id, first_id
         )))
@@ -386,7 +386,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
             .state
             .db
             .insert_follower(&Follower {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 follower_address: address.to_string(),
                 inbox_uri: format!("https://remote.example/inbox/{}", address),
                 uri: format!("https://remote.example/follows/{}", address),
@@ -398,7 +398,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
 
     let first_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/followers?limit=1",
             account.id
         )))
@@ -415,7 +415,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
 
     let second_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/followers?limit=1&max_id={}",
             account.id, first_id
         )))
@@ -449,7 +449,7 @@ async fn test_account_following_applies_max_id_cursor() {
             .state
             .db
             .insert_follow(&Follow {
-                id: EntityId::new().0,
+                id: EntityId::new_string(),
                 target_address: address.to_string(),
                 uri: format!("https://remote.example/follows/{}", address),
                 created_at: Utc::now(),
@@ -460,7 +460,7 @@ async fn test_account_following_applies_max_id_cursor() {
 
     let first_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/following?limit=1",
             account.id
         )))
@@ -477,7 +477,7 @@ async fn test_account_following_applies_max_id_cursor() {
 
     let second_page_response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/{}/following?limit=1&max_id={}",
             account.id, first_id
         )))
@@ -507,7 +507,7 @@ async fn test_account_followers_returns_remote_account_data_from_cache() {
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: remote_address.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/1".to_string(),
@@ -519,7 +519,7 @@ async fn test_account_followers_returns_remote_account_data_from_cache() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -548,7 +548,7 @@ async fn test_account_following_returns_remote_account_data_from_cache() {
         .state
         .db
         .insert_follow(&Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: remote_address.to_string(),
             uri: "https://remote.example/follows/2".to_string(),
             created_at: Utc::now(),
@@ -559,7 +559,7 @@ async fn test_account_following_returns_remote_account_data_from_cache() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -588,7 +588,7 @@ async fn test_account_followers_actor_uri_uses_cached_profile_by_uri_alias() {
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri-cached".to_string(),
@@ -601,7 +601,7 @@ async fn test_account_followers_actor_uri_uses_cached_profile_by_uri_alias() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -631,7 +631,7 @@ async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_account
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri".to_string(),
@@ -642,7 +642,7 @@ async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_account
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -671,7 +671,7 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
         .state
         .db
         .insert_follow(&Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: actor_uri_address.to_string(),
             uri: "https://remote.example/follows/actor-uri".to_string(),
             created_at: Utc::now(),
@@ -681,7 +681,7 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -710,7 +710,7 @@ async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri-at".to_string(),
@@ -721,7 +721,7 @@ async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -745,7 +745,7 @@ async fn test_follow_account() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/accounts/alice@remote.example/follow"))
+        .post(server.url("/api/v1/accounts/alice@remote.example/follow"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -762,7 +762,7 @@ async fn test_unfollow_account() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unfollow", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unfollow", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -779,7 +779,7 @@ async fn test_block_account() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/block", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/block", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -796,7 +796,7 @@ async fn test_unblock_account() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unblock", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unblock", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -813,7 +813,7 @@ async fn test_mute_account() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/mute", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/mute", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -830,7 +830,7 @@ async fn test_unmute_account() {
 
     let response = server
         .client
-        .post(&server.url(&format!("/api/v1/accounts/{}/unmute", account.id)))
+        .post(server.url(&format!("/api/v1/accounts/{}/unmute", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -847,7 +847,7 @@ async fn test_get_blocks() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/blocks"))
+        .get(server.url("/api/v1/blocks"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -864,7 +864,7 @@ async fn test_get_mutes() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/mutes"))
+        .get(server.url("/api/v1/mutes"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -881,7 +881,7 @@ async fn test_get_relationships() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/relationships?id[]={}",
             account.id
         )))
@@ -901,7 +901,7 @@ async fn test_get_relationships_decodes_percent_encoded_ids() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/relationships?id[]=alice%40example.com"))
+        .get(server.url("/api/v1/accounts/relationships?id[]=alice%40example.com"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -926,7 +926,7 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
         .state
         .db
         .insert_follow(&Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: target_with_port.to_string(),
             uri: "https://remote.example/follow/1".to_string(),
             created_at: Utc::now(),
@@ -937,7 +937,7 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: target_with_port.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follow/2".to_string(),
@@ -948,7 +948,7 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/relationships"))
+        .get(server.url("/api/v1/accounts/relationships"))
         .header("Authorization", format!("Bearer {}", token))
         .query(&[("id[]", "alice@remote.example")])
         .send()
@@ -975,7 +975,7 @@ async fn test_get_relationships_matches_actor_uri_ids() {
         .state
         .db
         .insert_follow(&Follow {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             target_address: actor_uri.to_string(),
             uri: "https://remote.example/follow/uri-1".to_string(),
             created_at: Utc::now(),
@@ -986,7 +986,7 @@ async fn test_get_relationships_matches_actor_uri_ids() {
         .state
         .db
         .insert_follower(&Follower {
-            id: EntityId::new().0,
+            id: EntityId::new_string(),
             follower_address: actor_uri.to_string(),
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follow/uri-2".to_string(),
@@ -997,7 +997,7 @@ async fn test_get_relationships_matches_actor_uri_ids() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/relationships"))
+        .get(server.url("/api/v1/accounts/relationships"))
         .header("Authorization", format!("Bearer {}", token))
         .query(&[("id[]", actor_uri)])
         .send()
@@ -1030,7 +1030,7 @@ async fn test_get_relationships_matches_default_port_equivalent_follow_requests(
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/relationships"))
+        .get(server.url("/api/v1/accounts/relationships"))
         .header("Authorization", format!("Bearer {}", token))
         .query(&[("id[]", "alice@remote.example")])
         .send()
@@ -1057,7 +1057,7 @@ async fn test_get_relationships_returns_persisted_mute_notifications_flag() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/relationships"))
+        .get(server.url("/api/v1/accounts/relationships"))
         .header("Authorization", format!("Bearer {}", token))
         .query(&[("id[]", "alice@remote.example")])
         .send()
@@ -1078,7 +1078,7 @@ async fn test_search_accounts() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/search?q=test"))
+        .get(server.url("/api/v1/accounts/search?q=test"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1097,7 +1097,7 @@ async fn test_search_accounts_resolve_returns_remote_account_data() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/search?q={}&resolve=true",
             remote_address
         )))
@@ -1127,7 +1127,7 @@ async fn test_search_accounts_resolve_actor_uri_query_uses_cached_alias_profile(
     let encoded_query = urlencoding::encode(actor_uri).into_owned();
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/search?q={encoded_query}&resolve=true"
         )))
         .header("Authorization", format!("Bearer {}", token))
@@ -1156,7 +1156,7 @@ async fn test_search_accounts_resolve_deduplicates_local_account_identity() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v1/accounts/search?q={}&resolve=true",
             local_full_address
         )))
@@ -1193,7 +1193,7 @@ async fn test_search_accounts_resolve_local_address_skips_remote_lookup() {
         Duration::from_secs(3),
         server
             .client
-            .get(&server.url(&format!(
+            .get(server.url(&format!(
                 "/api/v1/accounts/search?q={}&resolve=true",
                 local_full_address
             )))
@@ -1224,7 +1224,7 @@ async fn test_search_accounts_resolve_local_address_with_leading_at_skips_remote
         Duration::from_secs(3),
         server
             .client
-            .get(&server.url(&format!(
+            .get(server.url(&format!(
                 "/api/v1/accounts/search?q={}&resolve=true",
                 local_full_address
             )))
@@ -1250,7 +1250,7 @@ async fn test_get_account_lists() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/lists", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/lists", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1280,7 +1280,7 @@ async fn test_get_account_lists_matches_default_port_equivalent_members() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/accounts/alice@remote.example/lists"))
+        .get(server.url("/api/v1/accounts/alice@remote.example/lists"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1304,7 +1304,7 @@ async fn test_get_account_identity_proofs() {
 
     let response = server
         .client
-        .get(&server.url(&format!("/api/v1/accounts/{}/identity_proofs", account.id)))
+        .get(server.url(&format!("/api/v1/accounts/{}/identity_proofs", account.id)))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1325,7 +1325,7 @@ async fn test_get_follow_requests() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/follow_requests"))
+        .get(server.url("/api/v1/follow_requests"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1342,7 +1342,7 @@ async fn test_get_follow_request() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/follow_requests/test_id"))
+        .get(server.url("/api/v1/follow_requests/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1359,7 +1359,7 @@ async fn test_authorize_follow_request() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/follow_requests/test_id/authorize"))
+        .post(server.url("/api/v1/follow_requests/test_id/authorize"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1376,7 +1376,7 @@ async fn test_reject_follow_request() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/follow_requests/test_id/reject"))
+        .post(server.url("/api/v1/follow_requests/test_id/reject"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1402,7 +1402,7 @@ async fn test_create_status() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1422,7 +1422,7 @@ async fn test_get_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1435,7 +1435,7 @@ async fn test_get_status() {
 
         let response = server
             .client
-            .get(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+            .get(server.url(&format!("/api/v1/statuses/{}", status_id)))
             .send()
             .await
             .unwrap();
@@ -1454,7 +1454,7 @@ async fn test_delete_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1467,7 +1467,7 @@ async fn test_delete_status() {
 
         let response = server
             .client
-            .delete(&server.url(&format!("/api/v1/statuses/{}", status_id)))
+            .delete(server.url(&format!("/api/v1/statuses/{}", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1487,7 +1487,7 @@ async fn test_get_status_context() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1500,7 +1500,7 @@ async fn test_get_status_context() {
 
         let response = server
             .client
-            .get(&server.url(&format!("/api/v1/statuses/{}/context", status_id)))
+            .get(server.url(&format!("/api/v1/statuses/{}/context", status_id)))
             .send()
             .await
             .unwrap();
@@ -1519,7 +1519,7 @@ async fn test_favourite_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1532,7 +1532,7 @@ async fn test_favourite_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/favourite", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/favourite", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1552,7 +1552,7 @@ async fn test_unfavourite_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1565,7 +1565,7 @@ async fn test_unfavourite_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/unfavourite", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/unfavourite", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1585,7 +1585,7 @@ async fn test_reblog_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1598,7 +1598,7 @@ async fn test_reblog_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/reblog", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/reblog", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1618,7 +1618,7 @@ async fn test_unreblog_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1631,7 +1631,7 @@ async fn test_unreblog_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/unreblog", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/unreblog", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1651,7 +1651,7 @@ async fn test_bookmark_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1664,7 +1664,7 @@ async fn test_bookmark_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/bookmark", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/bookmark", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1684,7 +1684,7 @@ async fn test_unbookmark_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1697,7 +1697,7 @@ async fn test_unbookmark_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/unbookmark", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/unbookmark", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1717,7 +1717,7 @@ async fn test_pin_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1730,7 +1730,7 @@ async fn test_pin_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/pin", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1750,7 +1750,7 @@ async fn test_unpin_status() {
     let status_data = json!({"status": "Test", "visibility": "public"});
     let create_response = server
         .client
-        .post(&server.url("/api/v1/statuses"))
+        .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&status_data)
         .send()
@@ -1763,7 +1763,7 @@ async fn test_unpin_status() {
 
         let response = server
             .client
-            .post(&server.url(&format!("/api/v1/statuses/{}/unpin", status_id)))
+            .post(server.url(&format!("/api/v1/statuses/{}/unpin", status_id)))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -1785,7 +1785,7 @@ async fn test_home_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/home"))
+        .get(server.url("/api/v1/timelines/home"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1800,7 +1800,7 @@ async fn test_public_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/public"))
+        .get(server.url("/api/v1/timelines/public"))
         .send()
         .await
         .unwrap();
@@ -1816,7 +1816,7 @@ async fn test_tag_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/tag/test"))
+        .get(server.url("/api/v1/timelines/tag/test"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1833,7 +1833,7 @@ async fn test_list_timeline() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/timelines/list/test_list_id"))
+        .get(server.url("/api/v1/timelines/list/test_list_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1854,7 +1854,7 @@ async fn test_get_notifications() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications"))
+        .get(server.url("/api/v1/notifications"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1871,7 +1871,7 @@ async fn test_get_notification() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications/test_id"))
+        .get(server.url("/api/v1/notifications/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1888,7 +1888,7 @@ async fn test_dismiss_notification() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/notifications/test_id/dismiss"))
+        .post(server.url("/api/v1/notifications/test_id/dismiss"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1905,7 +1905,7 @@ async fn test_clear_notifications() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/notifications/clear"))
+        .post(server.url("/api/v1/notifications/clear"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1922,7 +1922,7 @@ async fn test_get_unread_count() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/notifications/unread_count"))
+        .get(server.url("/api/v1/notifications/unread_count"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1944,7 +1944,7 @@ async fn test_upload_media() {
     // Note: This is a basic test without actual file upload
     let response = server
         .client
-        .post(&server.url("/api/v1/media"))
+        .post(server.url("/api/v1/media"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1962,7 +1962,7 @@ async fn test_upload_media_v2() {
     // Note: This is a basic test without actual file upload
     let response = server
         .client
-        .post(&server.url("/api/v2/media"))
+        .post(server.url("/api/v2/media"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -1979,7 +1979,7 @@ async fn test_get_media() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/media/test_media_id"))
+        .get(server.url("/api/v1/media/test_media_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2000,7 +2000,7 @@ async fn test_update_media() {
 
     let response = server
         .client
-        .put(&server.url("/api/v1/media/test_media_id"))
+        .put(server.url("/api/v1/media/test_media_id"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -2022,7 +2022,7 @@ async fn test_get_lists() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/lists"))
+        .get(server.url("/api/v1/lists"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2043,7 +2043,7 @@ async fn test_create_list() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/lists"))
+        .post(server.url("/api/v1/lists"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&list_data)
         .send()
@@ -2061,7 +2061,7 @@ async fn test_get_list() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/lists/test_list_id"))
+        .get(server.url("/api/v1/lists/test_list_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2082,7 +2082,7 @@ async fn test_update_list() {
 
     let response = server
         .client
-        .put(&server.url("/api/v1/lists/test_list_id"))
+        .put(server.url("/api/v1/lists/test_list_id"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -2100,7 +2100,7 @@ async fn test_delete_list() {
 
     let response = server
         .client
-        .delete(&server.url("/api/v1/lists/test_list_id"))
+        .delete(server.url("/api/v1/lists/test_list_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2117,7 +2117,7 @@ async fn test_get_list_accounts() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/lists/test_list_id/accounts"))
+        .get(server.url("/api/v1/lists/test_list_id/accounts"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2138,7 +2138,7 @@ async fn test_add_list_accounts() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/lists/test_list_id/accounts"))
+        .post(server.url("/api/v1/lists/test_list_id/accounts"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&add_data)
         .send()
@@ -2160,7 +2160,7 @@ async fn test_get_filters() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/filters"))
+        .get(server.url("/api/v1/filters"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2184,7 +2184,7 @@ async fn test_create_filter() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/filters"))
+        .post(server.url("/api/v1/filters"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&filter_data)
         .send()
@@ -2202,7 +2202,7 @@ async fn test_get_filter() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/filters/test_filter_id"))
+        .get(server.url("/api/v1/filters/test_filter_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2223,7 +2223,7 @@ async fn test_update_filter() {
 
     let response = server
         .client
-        .put(&server.url("/api/v1/filters/test_filter_id"))
+        .put(server.url("/api/v1/filters/test_filter_id"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -2241,7 +2241,7 @@ async fn test_delete_filter() {
 
     let response = server
         .client
-        .delete(&server.url("/api/v1/filters/test_filter_id"))
+        .delete(server.url("/api/v1/filters/test_filter_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2258,7 +2258,7 @@ async fn test_get_filters_v2() {
 
     let response = server
         .client
-        .get(&server.url("/api/v2/filters"))
+        .get(server.url("/api/v2/filters"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2279,7 +2279,7 @@ async fn test_get_bookmarks() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/bookmarks"))
+        .get(server.url("/api/v1/bookmarks"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2296,7 +2296,7 @@ async fn test_get_favourites() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/favourites"))
+        .get(server.url("/api/v1/favourites"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2317,7 +2317,7 @@ async fn test_search_v1() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/search?q=test"))
+        .get(server.url("/api/v1/search?q=test"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2334,7 +2334,7 @@ async fn test_search_v2() {
 
     let response = server
         .client
-        .get(&server.url("/api/v2/search?q=test"))
+        .get(server.url("/api/v2/search?q=test"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2353,7 +2353,7 @@ async fn test_search_v2_resolve_returns_remote_account_data() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v2/search?q={}&type=accounts&resolve=true",
             remote_address
         )))
@@ -2385,7 +2385,7 @@ async fn test_search_v2_resolve_actor_uri_query_uses_cached_alias_profile() {
     let encoded_query = urlencoding::encode(actor_uri).into_owned();
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v2/search?q={encoded_query}&type=accounts&resolve=true"
         )))
         .header("Authorization", format!("Bearer {}", token))
@@ -2416,7 +2416,7 @@ async fn test_search_v2_resolve_deduplicates_local_account_identity() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v2/search?q={}&type=accounts&resolve=true",
             local_full_address
         )))
@@ -2452,7 +2452,7 @@ async fn test_search_v2_accounts_respects_limit() {
 
     let response = server
         .client
-        .get(&server.url(&format!(
+        .get(server.url(&format!(
             "/api/v2/search?q={}&type=accounts&resolve=true&limit=0",
             local_full_address
         )))
@@ -2482,7 +2482,7 @@ async fn test_search_v2_resolve_local_address_skips_remote_lookup() {
         Duration::from_secs(3),
         server
             .client
-            .get(&server.url(&format!(
+            .get(server.url(&format!(
                 "/api/v2/search?q={}&type=accounts&resolve=true",
                 local_full_address
             )))
@@ -2515,7 +2515,7 @@ async fn test_search_v2_resolve_local_address_with_leading_at_skips_remote_looku
         Duration::from_secs(3),
         server
             .client
-            .get(&server.url(&format!(
+            .get(server.url(&format!(
                 "/api/v2/search?q={}&type=accounts&resolve=true",
                 local_full_address
             )))
@@ -2547,7 +2547,7 @@ async fn test_get_poll() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/polls/test_poll_id"))
+        .get(server.url("/api/v1/polls/test_poll_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2568,7 +2568,7 @@ async fn test_vote_in_poll() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/polls/test_poll_id/votes"))
+        .post(server.url("/api/v1/polls/test_poll_id/votes"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&vote_data)
         .send()
@@ -2590,7 +2590,7 @@ async fn test_get_scheduled_statuses() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/scheduled_statuses"))
+        .get(server.url("/api/v1/scheduled_statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2607,7 +2607,7 @@ async fn test_get_scheduled_status() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/scheduled_statuses/test_id"))
+        .get(server.url("/api/v1/scheduled_statuses/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2629,7 +2629,7 @@ async fn test_update_scheduled_status() {
 
     let response = server
         .client
-        .put(&server.url("/api/v1/scheduled_statuses/test_id"))
+        .put(server.url("/api/v1/scheduled_statuses/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&update_data)
         .send()
@@ -2647,7 +2647,7 @@ async fn test_delete_scheduled_status() {
 
     let response = server
         .client
-        .delete(&server.url("/api/v1/scheduled_statuses/test_id"))
+        .delete(server.url("/api/v1/scheduled_statuses/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2668,7 +2668,7 @@ async fn test_get_conversations() {
 
     let response = server
         .client
-        .get(&server.url("/api/v1/conversations"))
+        .get(server.url("/api/v1/conversations"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2685,7 +2685,7 @@ async fn test_delete_conversation() {
 
     let response = server
         .client
-        .delete(&server.url("/api/v1/conversations/test_id"))
+        .delete(server.url("/api/v1/conversations/test_id"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -2702,7 +2702,7 @@ async fn test_mark_conversation_read() {
 
     let response = server
         .client
-        .post(&server.url("/api/v1/conversations/test_id/read"))
+        .post(server.url("/api/v1/conversations/test_id/read"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

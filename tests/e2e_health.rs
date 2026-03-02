@@ -10,7 +10,7 @@ async fn test_health_check() {
 
     let response = server
         .client
-        .get(&server.url("/health"))
+        .get(server.url("/health"))
         .send()
         .await
         .unwrap();
@@ -25,7 +25,7 @@ async fn test_server_starts_successfully() {
     let server = TestServer::new().await;
 
     // Verify server is accessible
-    let response = server.client.get(&server.url("/health")).send().await;
+    let response = server.client.get(server.url("/health")).send().await;
 
     assert!(response.is_ok());
 }
@@ -36,7 +36,7 @@ async fn test_cors_headers() {
 
     let response = server
         .client
-        .get(&server.url("/health"))
+        .get(server.url("/health"))
         .header("Origin", "https://test.example.com")
         .send()
         .await
@@ -56,7 +56,7 @@ async fn test_404_for_unknown_routes() {
 
     let response = server
         .client
-        .get(&server.url("/unknown/route"))
+        .get(server.url("/unknown/route"))
         .send()
         .await
         .unwrap();
@@ -70,7 +70,7 @@ async fn test_metrics_is_public_without_auth_token() {
 
     let response = server
         .client
-        .get(&server.url("/metrics"))
+        .get(server.url("/metrics"))
         .send()
         .await
         .unwrap();
@@ -84,7 +84,7 @@ async fn test_metrics_requires_configured_bearer_token() {
 
     let unauthorized = server
         .client
-        .get(&server.url("/metrics"))
+        .get(server.url("/metrics"))
         .send()
         .await
         .unwrap();
@@ -92,7 +92,7 @@ async fn test_metrics_requires_configured_bearer_token() {
 
     let wrong_token = server
         .client
-        .get(&server.url("/metrics"))
+        .get(server.url("/metrics"))
         .header("Authorization", "Bearer not-the-secret")
         .send()
         .await
@@ -101,7 +101,7 @@ async fn test_metrics_requires_configured_bearer_token() {
 
     let response = server
         .client
-        .get(&server.url("/metrics"))
+        .get(server.url("/metrics"))
         .header("Authorization", "Bearer metrics-secret")
         .send()
         .await

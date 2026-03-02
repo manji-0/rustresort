@@ -6,27 +6,42 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::AdminApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
 
 #[derive(Debug, Deserialize)]
 pub struct AdminAccountParams {
-    pub local: Option<bool>,
-    pub remote: Option<bool>,
-    pub active: Option<bool>,
-    pub pending: Option<bool>,
-    pub disabled: Option<bool>,
-    pub silenced: Option<bool>,
-    pub suspended: Option<bool>,
-    pub username: Option<String>,
-    pub display_name: Option<String>,
-    pub email: Option<String>,
-    pub ip: Option<String>,
-    pub max_id: Option<String>,
-    pub since_id: Option<String>,
-    pub min_id: Option<String>,
-    pub limit: Option<usize>,
+    #[serde(rename = "local")]
+    _local: Option<bool>,
+    #[serde(rename = "remote")]
+    _remote: Option<bool>,
+    #[serde(rename = "active")]
+    _active: Option<bool>,
+    #[serde(rename = "pending")]
+    _pending: Option<bool>,
+    #[serde(rename = "disabled")]
+    _disabled: Option<bool>,
+    #[serde(rename = "silenced")]
+    _silenced: Option<bool>,
+    #[serde(rename = "suspended")]
+    _suspended: Option<bool>,
+    #[serde(rename = "username")]
+    _username: Option<String>,
+    #[serde(rename = "display_name")]
+    _display_name: Option<String>,
+    #[serde(rename = "email")]
+    _email: Option<String>,
+    #[serde(rename = "ip")]
+    _ip: Option<String>,
+    #[serde(rename = "max_id")]
+    _max_id: Option<String>,
+    #[serde(rename = "since_id")]
+    _since_id: Option<String>,
+    #[serde(rename = "min_id")]
+    _min_id: Option<String>,
+    #[serde(rename = "limit")]
+    _limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,19 +64,21 @@ pub struct AdminAccount {
 #[derive(Debug, Deserialize)]
 pub struct AdminActionRequest {
     pub action: String,
-    pub reason: Option<String>,
+    #[serde(rename = "reason")]
+    pub _reason: Option<String>,
 }
 
 /// GET /api/v1/admin/accounts
 pub async fn list_accounts(
-    State(state): State<AppState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Query(_params): Query<AdminAccountParams>,
 ) -> Result<Json<Vec<AdminAccount>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let admin_account = AdminAccount {
-        id: account.id.clone(),
+        id: account.id.to_string(),
         username: account.username.clone(),
         domain: None,
         created_at: account.created_at.to_rfc3339(),
@@ -73,8 +90,12 @@ pub async fn list_accounts(
         silenced: false,
         disabled: false,
         approved: true,
-        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config))
-            .unwrap(),
+        account: serde_json::to_value(crate::api::account_to_response_with_stats(
+            &account,
+            &state.config,
+            account_stats,
+        ))
+        .unwrap(),
     };
 
     Ok(Json(vec![admin_account]))
@@ -82,18 +103,19 @@ pub async fn list_accounts(
 
 /// GET /api/v1/admin/accounts/:id
 pub async fn get_account(
-    State(state): State<AppState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<AdminAccount>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    if account.id != id {
+    if account.id.as_str() != id {
         return Err(AppError::NotFound);
     }
 
     let admin_account = AdminAccount {
-        id: account.id.clone(),
+        id: account.id.to_string(),
         username: account.username.clone(),
         domain: None,
         created_at: account.created_at.to_rfc3339(),
@@ -105,8 +127,12 @@ pub async fn get_account(
         silenced: false,
         disabled: false,
         approved: true,
-        account: serde_json::to_value(crate::api::account_to_response(&account, &state.config))
-            .unwrap(),
+        account: serde_json::to_value(crate::api::account_to_response_with_stats(
+            &account,
+            &state.config,
+            account_stats,
+        ))
+        .unwrap(),
     };
 
     Ok(Json(admin_account))
@@ -114,7 +140,7 @@ pub async fn get_account(
 
 /// POST /api/v1/admin/accounts/:id/action
 pub async fn account_action(
-    State(_state): State<AppState>,
+    State(_state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<AdminActionRequest>,
@@ -142,7 +168,7 @@ pub struct AdminReport {
 
 /// GET /api/v1/admin/reports
 pub async fn list_reports(
-    State(_state): State<AppState>,
+    State(_state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<AdminReport>>, AppError> {
     Ok(Json(vec![]))
@@ -174,7 +200,7 @@ pub struct CreateDomainBlockRequest {
 
 /// GET /api/v1/admin/domain_blocks
 pub async fn list_domain_blocks_v1(
-    State(state): State<AppState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<DomainBlock>>, AppError> {
     let blocks = state.db.get_all_domain_blocks().await?;
@@ -199,14 +225,14 @@ pub async fn list_domain_blocks_v1(
 
 /// POST /api/v1/admin/domain_blocks
 pub async fn create_domain_block_v1(
-    State(state): State<AppState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Json(req): Json<CreateDomainBlockRequest>,
 ) -> Result<Json<DomainBlock>, AppError> {
     use crate::data::EntityId;
     use chrono::Utc;
 
-    let id = EntityId::new().0;
+    let id = EntityId::new_string();
     state.db.insert_domain_block(&req.domain).await?;
 
     Ok(Json(DomainBlock {
@@ -224,7 +250,7 @@ pub async fn create_domain_block_v1(
 
 /// DELETE /api/v1/admin/domain_blocks/:id
 pub async fn delete_domain_block_v1(
-    State(_state): State<AppState>,
+    State(_state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Path(_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {

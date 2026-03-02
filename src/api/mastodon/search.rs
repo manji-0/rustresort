@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::accounts::resolve_remote_account_response;
-use crate::{AppState, auth::CurrentUser, error::AppError};
+use crate::{SearchApiState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -21,12 +21,15 @@ pub struct SearchParams {
     resolve: bool,
     /// Only include accounts that the user is following
     #[serde(default)]
-    following: bool,
+    #[serde(rename = "following")]
+    _following: bool,
     /// If provided, will only return statuses authored by this account
-    account_id: Option<String>,
+    #[serde(rename = "account_id")]
+    _account_id: Option<String>,
     /// Filter out unreviewed tags
     #[serde(default)]
-    exclude_unreviewed: bool,
+    #[serde(rename = "exclude_unreviewed")]
+    _exclude_unreviewed: bool,
     /// Maximum number of results to return (default 40)
     limit: Option<usize>,
     /// Offset in search results
@@ -49,7 +52,7 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
 ///
 /// Search for accounts, hashtags, and statuses.
 pub async fn search_v2(
-    State(state): State<AppState>,
+    State(state): State<SearchApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -87,6 +90,9 @@ pub async fn search_v2(
 
             // For single-user instance, check if it's our account
             if let Ok(Some(account)) = state.db.get_account().await {
+                let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+                    .await
+                    .unwrap_or_default();
                 let account_address =
                     format!("{}@{}", account.username, state.config.server.domain);
                 local_account_identity =
@@ -96,7 +102,11 @@ pub async fn search_v2(
                     .contains(&query.to_lowercase())
                     || local_account_identity.as_deref() == Some(query_identity.as_str())
                 {
-                    accounts.push(crate::api::account_to_response(&account, &state.config));
+                    accounts.push(crate::api::account_to_response_with_stats(
+                        &account,
+                        &state.config,
+                        account_stats,
+                    ));
                     matched_local_account = true;
                 }
             }
@@ -104,25 +114,32 @@ pub async fn search_v2(
             if params.resolve {
                 let should_skip_resolve = matched_local_account
                     && local_account_identity.as_deref() == Some(query_identity.as_str());
-                if !should_skip_resolve {
-                    if let Some(remote_account) =
-                        resolve_remote_account_response(&state, query).await
-                    {
-                        let remote_identity =
-                            canonical_account_identity(&remote_account.acct, &local_domain);
-                        let already_present = accounts.iter().any(|account| {
-                            canonical_account_identity(&account.acct, &local_domain)
-                                == remote_identity
-                        });
-                        if !already_present {
-                            accounts.push(remote_account);
-                        }
+                if !should_skip_resolve
+                    && let Some(remote_account) = resolve_remote_account_response(
+                        state.config.as_ref(),
+                        state.db.as_ref(),
+                        state.profile_cache.as_ref(),
+                        state.federation_fetch_client.as_ref(),
+                        query,
+                    )
+                    .await
+                {
+                    let remote_identity =
+                        canonical_account_identity(&remote_account.acct, &local_domain);
+                    let already_present = accounts.iter().any(|account| {
+                        canonical_account_identity(&account.acct, &local_domain) == remote_identity
+                    });
+                    if !already_present {
+                        accounts.push(remote_account);
                     }
                 }
             }
         } else {
             // Search by username
             if let Ok(Some(account)) = state.db.get_account().await {
+                let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+                    .await
+                    .unwrap_or_default();
                 let display_name_matches = account
                     .display_name
                     .as_ref()
@@ -135,7 +152,11 @@ pub async fn search_v2(
                     .contains(&query.to_lowercase())
                     || display_name_matches
                 {
-                    accounts.push(crate::api::account_to_response(&account, &state.config));
+                    accounts.push(crate::api::account_to_response_with_stats(
+                        &account,
+                        &state.config,
+                        account_stats,
+                    ));
                 }
             }
         }
@@ -151,17 +172,34 @@ pub async fn search_v2(
             Ok(found_statuses) => {
                 // Get account for status responses
                 if let Ok(Some(account)) = state.db.get_account().await {
+                    let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+                        .await
+                        .unwrap_or_default();
+                    let remote_account_stats = crate::api::load_remote_account_stats_map(
+                        state.db.as_ref(),
+                        state.profile_cache.as_ref(),
+                        &state.config.server.protocol,
+                        &found_statuses,
+                    )
+                    .await
+                    .unwrap_or_default();
                     for status in found_statuses {
-                        let status_response = crate::api::status_to_response(
-                            &status,
-                            &account,
-                            &state.config,
-                            Some(false), // favourited
-                            Some(false), // reblogged
-                            Some(false), // muted
-                            Some(false), // bookmarked
-                            Some(false), // pinned
-                        );
+                        let remote_stats = remote_account_stats
+                            .get(status.account_address.trim())
+                            .copied();
+                        let status_response =
+                            crate::api::status_to_response_with_account_stats_and_remote_stats(
+                                &status,
+                                &account,
+                                &state.config,
+                                account_stats,
+                                remote_stats,
+                                Some(false), // favourited
+                                Some(false), // reblogged
+                                Some(false), // muted
+                                Some(false), // bookmarked
+                                Some(false), // pinned
+                            );
                         statuses.push(serde_json::to_value(status_response).unwrap_or_default());
                     }
                 }
@@ -222,7 +260,7 @@ pub async fn search_v2(
 ///
 /// Legacy search endpoint. Redirects to v2.
 pub async fn search_v1(
-    state: State<AppState>,
+    state: State<SearchApiState>,
     user: CurrentUser,
     params: Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {

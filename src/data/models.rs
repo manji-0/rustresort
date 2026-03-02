@@ -13,25 +13,13 @@ use serde::{Deserialize, Serialize};
 /// Entity ID wrapper (ULID format, 26 characters)
 ///
 /// Example: "01ARZ3NDEKTSV4RRFFQ69G5FAV"
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EntityId(pub String);
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EntityId;
 
 impl EntityId {
-    /// Generate a new ULID
-    pub fn new() -> Self {
-        Self(ulid::Ulid::new().to_string())
-    }
-
-    /// Create from existing string
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl Default for EntityId {
-    fn default() -> Self {
-        Self::new()
+    /// Generate a new ULID as a plain string.
+    pub fn new_string() -> String {
+        ulid::Ulid::new().to_string()
     }
 }
 
@@ -79,7 +67,7 @@ pub struct Status {
     /// Content warning text
     pub content_warning: Option<String>,
     /// Visibility: public, unlisted, private, direct
-    pub visibility: String,
+    pub visibility: StatusVisibility,
     /// Language code (ISO 639-1)
     pub language: Option<String>,
     /// Account address for remote posts (user@domain), empty for local
@@ -92,14 +80,54 @@ pub struct Status {
     pub boost_of_uri: Option<String>,
     /// Why this remote status was persisted
     /// Values: own, reposted, favourited, bookmarked, reply_to_own
-    pub persisted_reason: String,
+    pub persisted_reason: PersistedReason,
     pub created_at: DateTime<Utc>,
     /// When this remote status was fetched
     pub fetched_at: Option<DateTime<Utc>>,
 }
 
+/// Status visibility
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum StatusVisibility {
+    Public,
+    Unlisted,
+    Private,
+    Direct,
+}
+
+impl StatusVisibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Unlisted => "unlisted",
+            Self::Private => "private",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "public" => Some(Self::Public),
+            "unlisted" => Some(Self::Unlisted),
+            "private" => Some(Self::Private),
+            "direct" => Some(Self::Direct),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for StatusVisibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Reason for persisting a remote status
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PersistedReason {
     /// User's own post
     Own,
@@ -111,6 +139,10 @@ pub enum PersistedReason {
     Bookmarked,
     /// Reply to user's own post
     ReplyToOwn,
+    /// Ephemeral cache-only status placeholder
+    CacheOnly,
+    /// Timeline fixture placeholder status
+    Timeline,
 }
 
 impl PersistedReason {
@@ -121,7 +153,15 @@ impl PersistedReason {
             Self::Favourited => "favourited",
             Self::Bookmarked => "bookmarked",
             Self::ReplyToOwn => "reply_to_own",
+            Self::CacheOnly => "cache_only",
+            Self::Timeline => "timeline",
         }
+    }
+}
+
+impl std::fmt::Display for PersistedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -202,7 +242,7 @@ pub struct Follower {
 pub struct Notification {
     pub id: String,
     /// Type: mention, favourite, reblog, follow, follow_request
-    pub notification_type: String,
+    pub notification_type: NotificationType,
     /// Who triggered this notification (user@domain)
     pub origin_account_address: String,
     /// Related status URI (if applicable)
@@ -213,7 +253,9 @@ pub struct Notification {
 }
 
 /// Notification types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum NotificationType {
     Mention,
     Favourite,
@@ -231,6 +273,12 @@ impl NotificationType {
             Self::Follow => "follow",
             Self::FollowRequest => "follow_request",
         }
+    }
+}
+
+impl std::fmt::Display for NotificationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

@@ -69,12 +69,12 @@ fn validate_account_domain(domain: &str) -> Result<(), AppError> {
             "address host is not allowed".to_string(),
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip_address(ip) {
-            return Err(AppError::Validation(
-                "address host is not allowed".to_string(),
-            ));
-        }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_blocked_ip_address(ip)
+    {
+        return Err(AppError::Validation(
+            "address host is not allowed".to_string(),
+        ));
     }
 
     Ok(())
@@ -121,12 +121,12 @@ async fn resolve_validated_remote_actor_fetch_target(
             "actor URI host is not allowed".to_string(),
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip_address(ip) {
-            return Err(AppError::Validation(
-                "actor URI host is not allowed".to_string(),
-            ));
-        }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_blocked_ip_address(ip)
+    {
+        return Err(AppError::Validation(
+            "actor URI host is not allowed".to_string(),
+        ));
     }
 
     let port = url.port_or_known_default().ok_or_else(|| {
@@ -319,6 +319,7 @@ fn extract_profile_url_from_webfinger(webfinger: &serde_json::Value) -> Option<S
         })
 }
 
+#[cfg(test)]
 fn extract_url(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(url) => Some(url.to_string()),
@@ -496,6 +497,7 @@ pub fn generate_webfinger_response(
 ///
 /// # Returns
 /// Actor JSON document
+#[cfg(test)]
 pub async fn fetch_actor(
     actor_uri: &str,
     http_client: &reqwest::Client,
@@ -534,6 +536,7 @@ pub async fn fetch_actor(
 ///
 /// # Returns
 /// Parsed actor data
+#[cfg(test)]
 pub fn parse_actor(actor: &serde_json::Value) -> Result<ParsedActor, AppError> {
     let id = actor
         .get("id")
@@ -610,6 +613,11 @@ pub fn parse_actor(actor: &serde_json::Value) -> Result<ParsedActor, AppError> {
 
 /// Parsed actor data
 #[derive(Debug, Clone)]
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "test-only parsed actor fixture includes fields not asserted in every test"
+)]
 pub struct ParsedActor {
     pub id: String,
     pub username: String,
