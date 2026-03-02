@@ -4,7 +4,7 @@
 //! Uses SQLx for compile-time checked queries.
 
 use chrono::{DateTime, Utc};
-use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{Pool, QueryBuilder, Row, Sqlite, sqlite::SqlitePoolOptions};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
@@ -80,8 +80,25 @@ impl Database {
         // Create connection string
         let connection_string = format!("sqlite:{}?mode=rwc", path.display());
 
-        // Create connection pool
-        let pool = SqlitePool::connect(&connection_string).await?;
+        // Create connection pool with WAL mode and explicit pool sizing
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA journal_mode=WAL")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA busy_timeout=5000")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("PRAGMA foreign_keys=ON")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&connection_string)
+            .await?;
 
         // Run migrations
         sqlx::migrate!("./migrations")

@@ -201,7 +201,9 @@ impl StatusService {
     ) -> Result<(), AppError> {
         self.db
             .insert_status_with_media_and_poll(status, media_ids, poll)
-            .await
+            .await?;
+        self.invalidate_cached_status(status).await;
+        Ok(())
     }
 
     /// Get status by ID
@@ -250,7 +252,9 @@ impl StatusService {
 
     /// Update an existing status record.
     pub async fn update_loaded(&self, status: &Status) -> Result<(), AppError> {
-        self.db.update_status(status).await
+        self.db.update_status(status).await?;
+        self.invalidate_cached_status(status).await;
+        Ok(())
     }
 
     /// Persist status update with atomic edit-history snapshot.
@@ -261,7 +265,10 @@ impl StatusService {
     ) -> Result<(), AppError> {
         self.db
             .update_status_with_edit_snapshot(previous, updated)
-            .await
+            .await?;
+        self.invalidate_cached_status(previous).await;
+        self.invalidate_cached_status(updated).await;
+        Ok(())
     }
 
     /// Persist status update with atomic edit snapshot and optional media replacement.
@@ -273,7 +280,10 @@ impl StatusService {
     ) -> Result<(), AppError> {
         self.db
             .update_status_with_edit_snapshot_and_media(previous, updated, media_ids)
-            .await
+            .await?;
+        self.invalidate_cached_status(previous).await;
+        self.invalidate_cached_status(updated).await;
+        Ok(())
     }
 
     /// Get media attachments linked to a status.
@@ -448,6 +458,7 @@ impl StatusService {
         }
 
         self.db.delete_status(&status.id).await?;
+        self.invalidate_cached_status(status).await;
         Ok(())
     }
 
@@ -662,6 +673,7 @@ impl StatusService {
                 fetched_at: Some(chrono::Utc::now()),
             };
             self.db.insert_status(&status).await?;
+            self.invalidate_cached_status(&status).await;
             return Ok(status);
         }
 
@@ -689,6 +701,7 @@ impl StatusService {
                     fetched_at: Some(chrono::Utc::now()),
                 };
                 self.db.insert_status(&status).await?;
+                self.invalidate_cached_status(&status).await;
                 return Ok(status);
             }
         }
@@ -712,7 +725,13 @@ impl StatusService {
             fetched_at: Some(now),
         };
         self.db.insert_status(&placeholder).await?;
+        self.invalidate_cached_status(&placeholder).await;
         Ok(placeholder)
+    }
+
+    async fn invalidate_cached_status(&self, status: &Status) {
+        self.cache.remove(&status.id).await;
+        self.cache.remove_by_uri(&status.uri).await;
     }
 
     /// Favourite by local status ID

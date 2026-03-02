@@ -1,7 +1,7 @@
 //! Apps and OAuth endpoints
 
 use axum::{
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
@@ -18,6 +18,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use url::Url;
 
 use crate::AppsApiState;
@@ -192,11 +193,16 @@ fn hash_client_secret(secret: &str) -> String {
 }
 
 fn verify_client_secret(stored_secret: &str, provided_secret: &str) -> bool {
+    use subtle::ConstantTimeEq;
     if stored_secret.starts_with(OAUTH_CLIENT_SECRET_HASH_PREFIX) {
-        stored_secret == hash_client_secret(provided_secret)
+        let hashed = hash_client_secret(provided_secret);
+        stored_secret.as_bytes().ct_eq(hashed.as_bytes()).into()
     } else {
         // Backward compatibility for legacy plaintext rows.
-        stored_secret == provided_secret
+        stored_secret
+            .as_bytes()
+            .ct_eq(provided_secret.as_bytes())
+            .into()
     }
 }
 fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
@@ -581,9 +587,21 @@ pub async fn verify_app_credentials(
 /// POST /oauth/token
 pub async fn create_token(
     State(state): State<AppsApiState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, OAuthToken};
+
+    let peer_addr = connect_info.as_ref().map(|ConnectInfo(addr)| *addr);
+    crate::auth::check_auth_rate_limit(
+        state.auth_rate_limiter.as_ref(),
+        peer_addr,
+        &headers,
+        &state.config.server.trusted_proxy_ips,
+        "oauth_token",
+    )
+    .await?;
 
     // Validate grant_type
     if req.grant_type != "client_credentials" && req.grant_type != "authorization_code" {

@@ -67,8 +67,8 @@ jobs:
             fi
           fi
 
-      - name: Cargo nextest (lib)
-        run: cargo nextest run --locked --lib
+      - name: Cargo nextest (lib + schema)
+        run: cargo nextest run --locked --lib --test schema_validation
 
   e2e:
     name: E2E

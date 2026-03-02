@@ -1147,6 +1147,56 @@ async fn test_status_pin_and_mute_operations() {
 }
 
 #[tokio::test]
+async fn test_resolve_thread_root_uri_handles_reply_chains_deeper_than_256() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let root_uri = "https://example.com/status/deep-root".to_string();
+    let root = Status {
+        id: "deep-root".to_string(),
+        uri: root_uri.clone(),
+        content: "<p>Root</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&root).await.unwrap();
+
+    let mut parent_uri = root_uri.clone();
+    let mut leaf_status: Option<Status> = None;
+    for depth in 0..300 {
+        let status = Status {
+            id: format!("deep-reply-{depth}"),
+            uri: format!("https://example.com/status/deep-reply-{depth}"),
+            content: format!("<p>Reply {depth}</p>"),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "".to_string(),
+            is_local: true,
+            in_reply_to_uri: Some(parent_uri.clone()),
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        db.insert_status(&status).await.unwrap();
+        parent_uri = status.uri.clone();
+        leaf_status = Some(status);
+    }
+
+    let leaf_status = leaf_status.expect("leaf status must exist");
+    let resolved = db.resolve_thread_root_uri(&leaf_status).await.unwrap();
+    assert_eq!(resolved, root_uri);
+}
+
+#[tokio::test]
 async fn test_status_reply_lookup_and_edit_history_operations() {
     let (db, _temp_dir) = create_test_db().await;
 

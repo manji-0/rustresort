@@ -249,7 +249,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "vote_in_poll").await;
                 Err(error)
             }
         }

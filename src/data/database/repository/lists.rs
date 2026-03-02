@@ -136,7 +136,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "add_accounts_to_list").await;
                 Err(error)
             }
         }
@@ -190,7 +190,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "remove_accounts_from_list").await;
                 Err(error)
             }
         }

@@ -51,6 +51,75 @@ async fn test_cors_headers() {
 }
 
 #[tokio::test]
+async fn test_cors_preflight_is_restricted() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .request(reqwest::Method::OPTIONS, server.url("/health"))
+        .header("Origin", "https://test.example.com")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization,content-type,idempotency-key",
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let allowed_methods = response
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(!allowed_methods.contains('*'));
+
+    let allowed_headers = response
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(!allowed_headers.contains('*'));
+}
+
+#[tokio::test]
+async fn test_security_headers_are_present() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .get(server.url("/health"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-frame-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("strict-transport-security")
+            .and_then(|value| value.to_str().ok()),
+        Some("max-age=31536000; includeSubDomains")
+    );
+}
+
+#[tokio::test]
 async fn test_404_for_unknown_routes() {
     let server = TestServer::new().await;
 

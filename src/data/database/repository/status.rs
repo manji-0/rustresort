@@ -31,21 +31,39 @@ impl Database {
     /// Returns the top-most known ancestor URI, or an unknown parent URI when
     /// the chain leaves local persistence.
     pub async fn resolve_thread_root_uri(&self, status: &Status) -> Result<String, AppError> {
-        let mut thread_uri = status.uri.clone();
-        let mut current_parent_uri = status.in_reply_to_uri.clone();
-        let mut seen = HashSet::from([status.uri.clone()]);
-
-        while let Some(parent_uri) = current_parent_uri {
-            if !seen.insert(parent_uri.clone()) {
-                break;
-            }
-            thread_uri = parent_uri.clone();
-
-            let Some(parent_status) = self.get_status_by_uri(&parent_uri).await? else {
-                break;
-            };
-            current_parent_uri = parent_status.in_reply_to_uri;
-        }
+        // Resolve the reply chain in one SQL statement so reads observe one snapshot.
+        let thread_uri = sqlx::query_scalar::<_, String>(
+            r#"
+            WITH RECURSIVE thread(uri, parent_uri, visited, depth) AS (
+                SELECT ?, ?, printf('|%s|', ?), 0
+                UNION ALL
+                SELECT
+                    COALESCE(parent.uri, thread.parent_uri),
+                    CASE
+                        WHEN parent.uri IS NULL THEN NULL
+                        ELSE parent.in_reply_to_uri
+                    END,
+                    thread.visited || COALESCE(parent.uri, thread.parent_uri) || '|',
+                    thread.depth + 1
+                FROM thread
+                LEFT JOIN statuses AS parent ON parent.uri = thread.parent_uri
+                WHERE thread.parent_uri IS NOT NULL
+                  AND instr(
+                        thread.visited,
+                        printf('|%s|', COALESCE(parent.uri, thread.parent_uri))
+                  ) = 0
+            )
+            SELECT uri
+            FROM thread
+            ORDER BY depth DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&status.uri)
+        .bind(&status.in_reply_to_uri)
+        .bind(&status.uri)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(thread_uri)
     }
@@ -127,18 +145,15 @@ impl Database {
 
         let hashtags = extract_hashtags_from_content(content);
         for hashtag in hashtags {
-            let hashtag_insert_id = EntityId::new_string();
-            sqlx::query(
-                "INSERT OR IGNORE INTO hashtags (id, name, created_at) VALUES (?, ?, datetime('now'))",
-            )
-            .bind(&hashtag_insert_id)
-            .bind(&hashtag)
-            .execute(&mut **conn)
-            .await?;
-
             let hashtag_id = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM hashtags WHERE name = ? COLLATE NOCASE LIMIT 1",
+                r#"
+                INSERT INTO hashtags (id, name, created_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(name) DO UPDATE SET name = excluded.name
+                RETURNING id
+                "#,
             )
+            .bind(EntityId::new_string())
             .bind(&hashtag)
             .fetch_one(&mut **conn)
             .await?;
@@ -201,7 +216,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "insert_status").await;
                 Err(error)
             }
         }
@@ -320,7 +335,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "insert_status_with_media_and_poll").await;
                 Err(error)
             }
         }
@@ -365,7 +380,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "update_status").await;
                 Err(error)
             }
         }
@@ -431,7 +446,7 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "update_status_with_edit_snapshot").await;
                 Err(error)
             }
         }
@@ -536,7 +551,8 @@ impl Database {
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "update_status_with_edit_snapshot_and_media")
+                    .await;
                 Err(error)
             }
         }

@@ -48,6 +48,8 @@ pub mod storage;
 use axum::extract::FromRef;
 use std::sync::Arc;
 
+pub const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Application state shared across all handlers
 ///
 /// This struct is cloned for each request and contains
@@ -80,6 +82,9 @@ pub struct AppState {
 
     /// Federation inbound rate limiter
     pub federation_rate_limiter: Arc<federation::RateLimiter>,
+
+    /// Auth endpoint rate limiter (GitHub callback and OAuth token exchange)
+    pub auth_rate_limiter: Arc<federation::RateLimiter>,
 }
 
 /// Minimal state required for authentication middleware.
@@ -94,6 +99,7 @@ pub struct AuthState {
 pub struct OAuthWebState {
     pub config: Arc<config::AppConfig>,
     pub http_client: Arc<reqwest::Client>,
+    pub auth_rate_limiter: Arc<federation::RateLimiter>,
 }
 
 /// Minimal state required for Mastodon timeline endpoints.
@@ -156,6 +162,7 @@ pub struct AccountApiState {
 pub struct AppsApiState {
     pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
+    pub auth_rate_limiter: Arc<federation::RateLimiter>,
 }
 
 /// Minimal state required for Mastodon media endpoints.
@@ -252,7 +259,8 @@ impl_from_ref_field!(Arc<data::Database>, db);
 impl_from_ref_state!(AuthState { config, db });
 impl_from_ref_state!(OAuthWebState {
     config,
-    http_client
+    http_client,
+    auth_rate_limiter,
 });
 impl_from_ref_state!(TimelineApiState {
     config,
@@ -285,7 +293,11 @@ impl_from_ref_state!(AccountApiState {
     http_client,
     federation_fetch_client,
 });
-impl_from_ref_state!(AppsApiState { config, db });
+impl_from_ref_state!(AppsApiState {
+    config,
+    db,
+    auth_rate_limiter,
+});
 impl_from_ref_state!(MediaApiState {
     config,
     db,
@@ -392,12 +404,12 @@ impl AppState {
 
         // 3. Initialize HTTP client
         let http_client = reqwest::Client::builder()
-            .user_agent("RustResort/0.1.0")
+            .user_agent(APP_USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(error::AppError::internal)?;
         let federation_fetch_client = reqwest::Client::builder()
-            .user_agent("RustResort/0.1.0")
+            .user_agent(APP_USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -405,6 +417,8 @@ impl AppState {
 
         // 4. Initialize federation inbound rate limiter
         let federation_rate_limiter = federation::RateLimiter::new(None, None);
+        let auth_rate_limiter =
+            federation::RateLimiter::new(Some(30), Some(std::time::Duration::from_secs(60)));
 
         // 5. Connect to R2 storage
         let storage = storage::MediaStorage::new(&config.storage.media, &config.cloudflare).await?;
@@ -450,6 +464,7 @@ impl AppState {
             http_client: Arc::new(http_client),
             federation_fetch_client: Arc::new(federation_fetch_client),
             federation_rate_limiter: Arc::new(federation_rate_limiter),
+            auth_rate_limiter: Arc::new(auth_rate_limiter),
         })
     }
 
@@ -566,6 +581,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     let cors_layer = build_cors_layer(&state.config.server);
     let auth_state = AuthState::from_ref(&state);
     let config_state: Arc<config::AppConfig> = Arc::from_ref(&state);
+    let security_headers_config = config_state.clone();
 
     Router::new()
         .route("/health", axum::routing::get(health_check))
@@ -591,28 +607,76 @@ pub fn build_router(state: AppState) -> axum::Router {
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
+        .layer(axum::middleware::from_fn_with_state(
+            security_headers_config,
+            append_security_headers,
+        ))
         .with_state(state)
 }
 
 fn build_cors_layer(server: &config::ServerConfig) -> tower_http::cors::CorsLayer {
-    use axum::http::HeaderValue;
-    use tower_http::cors::{Any, CorsLayer};
+    use axum::http::{HeaderName, HeaderValue, Method, header};
+    use tower_http::cors::CorsLayer;
+
+    let allowed_methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ];
+    let allowed_headers = [
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        HeaderName::from_static("idempotency-key"),
+    ];
 
     let allowed_origin = server.base_url();
     match HeaderValue::from_str(&allowed_origin) {
         Ok(origin) => CorsLayer::new()
             .allow_origin([origin])
-            .allow_methods(Any)
-            .allow_headers(Any),
+            .allow_methods(allowed_methods)
+            .allow_headers(allowed_headers),
         Err(error) => {
             tracing::error!(
                 %error,
                 origin = %allowed_origin,
                 "Failed to parse CORS origin from server base URL; denying cross-origin requests"
             );
-            CorsLayer::new().allow_methods(Any).allow_headers(Any)
+            CorsLayer::new()
+                .allow_methods(allowed_methods)
+                .allow_headers(allowed_headers)
         }
     }
+}
+
+async fn append_security_headers(
+    axum::extract::State(config): axum::extract::State<Arc<config::AppConfig>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+
+    if config.server.protocol.eq_ignore_ascii_case("https") {
+        headers
+            .entry(header::STRICT_TRANSPORT_SECURITY)
+            .or_insert(HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains",
+            ));
+    }
+
+    response
 }
 
 async fn health_check() -> &'static str {

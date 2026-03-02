@@ -49,6 +49,7 @@ rsa = "0.9"
 sha2 = "0.10"
 base64 = "0.21"
 hmac = "0.12"
+subtle = "2"
 aes-gcm = "0.10"
 rand = "0.8"
 
@@ -66,6 +67,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 config = "0.14"
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
+time = "0.3"
 html-escape = "0.2"
 ammonia = "4"
 image = { version = "0.25", default-features = false, features = ["webp"] }

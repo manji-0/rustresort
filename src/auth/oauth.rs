@@ -4,7 +4,8 @@
 
 use axum::{
     Router,
-    extract::{FromRef, Query, State},
+    extract::{ConnectInfo, FromRef, Query, State},
+    http::HeaderMap,
     response::{Html, IntoResponse, Redirect},
     routing::get,
 };
@@ -14,6 +15,8 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use rand::RngCore;
 use serde::Deserialize;
+use std::net::SocketAddr;
+use time::Duration as CookieDuration;
 
 use crate::OAuthWebState;
 use crate::auth::session::{Session, create_session_token};
@@ -24,6 +27,7 @@ const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token
 const GITHUB_USER_ENDPOINT: &str = "https://api.github.com/user";
 const OAUTH_CSRF_COOKIE: &str = "oauth_state";
 const SESSION_COOKIE: &str = "session";
+const OAUTH_CSRF_COOKIE_MAX_AGE_SECONDS: i64 = 600;
 
 /// Create authentication router
 ///
@@ -132,8 +136,20 @@ struct GitHubUser {
 async fn github_callback(
     State(state): State<OAuthWebState>,
     Query(query): Query<GitHubCallbackQuery>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
+    let peer_addr = connect_info.as_ref().map(|ConnectInfo(addr)| *addr);
+    crate::auth::check_auth_rate_limit(
+        state.auth_rate_limiter.as_ref(),
+        peer_addr,
+        &headers,
+        &state.config.server.trusted_proxy_ips,
+        "github_callback",
+    )
+    .await?;
+
     let secure_cookies = state.config.should_use_secure_cookies();
     verify_csrf_state(&query.state, &jar)?;
 
@@ -238,6 +254,7 @@ fn build_csrf_cookie(state: &str, secure: bool) -> Cookie<'static> {
         .http_only(true)
         .secure(secure)
         .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(OAUTH_CSRF_COOKIE_MAX_AGE_SECONDS))
         .build()
 }
 
@@ -307,7 +324,7 @@ async fn fetch_github_user(
         .get(GITHUB_USER_ENDPOINT)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Accept", "application/json")
-        .header("User-Agent", "RustResort")
+        .header("User-Agent", crate::APP_USER_AGENT)
         .send()
         .await?;
 
@@ -365,5 +382,9 @@ mod tests {
         assert_eq!(cookie.secure(), Some(true));
         assert_eq!(cookie.http_only(), Some(true));
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+        assert_eq!(
+            cookie.max_age(),
+            Some(CookieDuration::seconds(OAUTH_CSRF_COOKIE_MAX_AGE_SECONDS))
+        );
     }
 }
