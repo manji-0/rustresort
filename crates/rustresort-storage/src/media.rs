@@ -5,8 +5,8 @@
 
 use aws_sdk_s3::Client as S3Client;
 
-use crate::error::AppError;
-use crate::storage::build_r2_http_client;
+use crate::StorageError;
+use crate::build_r2_http_client;
 
 /// Media storage service
 ///
@@ -31,9 +31,9 @@ impl MediaStorage {
     /// # Errors
     /// Returns error if S3 client initialization fails
     pub async fn new(
-        config: &crate::config::MediaStorageConfig,
-        cloudflare: &crate::config::CloudflareConfig,
-    ) -> Result<Self, AppError> {
+        config: &crate::MediaStorageConfig,
+        cloudflare: &crate::CloudflareConfig,
+    ) -> Result<Self, StorageError> {
         use aws_sdk_s3::config::BehaviorVersion;
         use aws_sdk_s3::config::{Credentials, Region};
 
@@ -93,7 +93,7 @@ impl MediaStorage {
         key: &str,
         data: Vec<u8>,
         content_type: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, StorageError> {
         use aws_sdk_s3::primitives::ByteStream;
 
         self.client
@@ -105,7 +105,7 @@ impl MediaStorage {
             .cache_control("public, max-age=31536000") // 1 year
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("R2 upload failed: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("R2 upload failed: {}", e)))?;
 
         Ok(self.get_public_url(key))
     }
@@ -124,7 +124,7 @@ impl MediaStorage {
         &self,
         id: &str,
         data: Vec<u8>,
-    ) -> Result<(String, String), AppError> {
+    ) -> Result<(String, String), StorageError> {
         let key = format!("avatars/{}.webp", id);
         let url = self.upload(&key, data, "image/webp").await?;
         Ok((key, url))
@@ -137,7 +137,7 @@ impl MediaStorage {
         &self,
         id: &str,
         data: Vec<u8>,
-    ) -> Result<(String, String), AppError> {
+    ) -> Result<(String, String), StorageError> {
         let key = format!("headers/{}.webp", id);
         let url = self.upload(&key, data, "image/webp").await?;
         Ok((key, url))
@@ -159,7 +159,7 @@ impl MediaStorage {
         id: &str,
         data: Vec<u8>,
         content_type: &str,
-    ) -> Result<(String, String), AppError> {
+    ) -> Result<(String, String), StorageError> {
         // Determine file extension from content type
         let ext = match content_type {
             "image/jpeg" => "jpg",
@@ -183,7 +183,7 @@ impl MediaStorage {
         &self,
         id: &str,
         data: Vec<u8>,
-    ) -> Result<(String, String), AppError> {
+    ) -> Result<(String, String), StorageError> {
         let key = format!("thumbnails/{}.webp", id);
         let url = self.upload(&key, data, "image/webp").await?;
         Ok((key, url))
@@ -193,14 +193,14 @@ impl MediaStorage {
     ///
     /// # Arguments
     /// * `key` - S3 key to delete
-    pub async fn delete(&self, key: &str) -> Result<(), AppError> {
+    pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
         self.client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("R2 delete failed: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("R2 delete failed: {}", e)))?;
 
         Ok(())
     }

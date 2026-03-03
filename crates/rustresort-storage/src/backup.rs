@@ -12,15 +12,17 @@ use rand::RngCore;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::BackupStorageConfig;
-use crate::error::AppError;
-use crate::storage::build_r2_http_client;
+use crate::BackupStorageConfig;
+use crate::StorageError;
+use crate::build_r2_http_client;
 
 const AES_256_KEY_BYTES: usize = 32;
 const AES_GCM_NONCE_BYTES: usize = 12;
 const ENCRYPTED_BACKUP_SUFFIX: &str = ".enc";
 
-fn parse_backup_encryption_key(config: &BackupStorageConfig) -> Result<Option<Vec<u8>>, AppError> {
+fn parse_backup_encryption_key(
+    config: &BackupStorageConfig,
+) -> Result<Option<Vec<u8>>, StorageError> {
     if !config.enabled || !config.encryption.enabled {
         return Ok(None);
     }
@@ -32,19 +34,19 @@ fn parse_backup_encryption_key(config: &BackupStorageConfig) -> Result<Option<Ve
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            AppError::Config(
+            StorageError::Config(
                 "storage.backup.encryption.key is required when backup encryption is enabled"
                     .to_string(),
             )
         })?;
 
     let key = BASE64_STANDARD.decode(raw_key).map_err(|_| {
-        AppError::Config(
+        StorageError::Config(
             "storage.backup.encryption.key must be valid base64-encoded bytes".to_string(),
         )
     })?;
     if key.len() != AES_256_KEY_BYTES {
-        return Err(AppError::Config(format!(
+        return Err(StorageError::Config(format!(
             "storage.backup.encryption.key must decode to {} bytes",
             AES_256_KEY_BYTES
         )));
@@ -53,9 +55,9 @@ fn parse_backup_encryption_key(config: &BackupStorageConfig) -> Result<Option<Ve
     Ok(Some(key))
 }
 
-fn encrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+fn encrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, StorageError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
-        AppError::Encryption(format!(
+        StorageError::Encryption(format!(
             "invalid backup encryption key length (expected {} bytes)",
             AES_256_KEY_BYTES
         ))
@@ -66,7 +68,7 @@ fn encrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> 
     let nonce_value = Nonce::from_slice(&nonce);
     let ciphertext = cipher
         .encrypt(nonce_value, data)
-        .map_err(|_| AppError::Encryption("backup encryption failed".to_string()))?;
+        .map_err(|_| StorageError::Encryption("backup encryption failed".to_string()))?;
 
     let mut out = Vec::with_capacity(AES_GCM_NONCE_BYTES + ciphertext.len());
     out.extend_from_slice(&nonce);
@@ -74,15 +76,15 @@ fn encrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> 
     Ok(out)
 }
 
-fn decrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+fn decrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, StorageError> {
     if data.len() <= AES_GCM_NONCE_BYTES {
-        return Err(AppError::Encryption(
+        return Err(StorageError::Encryption(
             "encrypted backup payload is too short".to_string(),
         ));
     }
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
-        AppError::Encryption(format!(
+        StorageError::Encryption(format!(
             "invalid backup encryption key length (expected {} bytes)",
             AES_256_KEY_BYTES
         ))
@@ -92,14 +94,14 @@ fn decrypt_backup_payload(key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> 
     let nonce_value = Nonce::from_slice(nonce);
     cipher
         .decrypt(nonce_value, ciphertext)
-        .map_err(|_| AppError::Encryption("backup decryption failed".to_string()))
+        .map_err(|_| StorageError::Encryption("backup decryption failed".to_string()))
 }
 
-async fn create_sqlite_backup_snapshot(db_path: &Path) -> Result<Vec<u8>, AppError> {
+async fn create_sqlite_backup_snapshot(db_path: &Path) -> Result<Vec<u8>, StorageError> {
     use sqlx::Connection;
 
     let temp_dir = tempfile::tempdir()
-        .map_err(|error| AppError::Storage(format!("Failed to create temp dir: {}", error)))?;
+        .map_err(|error| StorageError::Storage(format!("Failed to create temp dir: {}", error)))?;
     let snapshot_path = temp_dir.path().join("backup_snapshot.db");
     let escaped_snapshot_path = snapshot_path.to_string_lossy().replace('\'', "''");
     let connection_string = format!("sqlite:{}?mode=rw", db_path.display());
@@ -107,7 +109,7 @@ async fn create_sqlite_backup_snapshot(db_path: &Path) -> Result<Vec<u8>, AppErr
     let mut connection = sqlx::SqliteConnection::connect(&connection_string)
         .await
         .map_err(|error| {
-            AppError::Storage(format!(
+            StorageError::Storage(format!(
                 "Failed to open SQLite connection for backup: {}",
                 error
             ))
@@ -116,21 +118,21 @@ async fn create_sqlite_backup_snapshot(db_path: &Path) -> Result<Vec<u8>, AppErr
         .execute(&mut connection)
         .await
         .map_err(|error| {
-            AppError::Storage(format!(
+            StorageError::Storage(format!(
                 "Failed to create SQLite backup snapshot: {}",
                 error
             ))
         })?;
     connection.close().await.map_err(|error| {
-        AppError::Storage(format!(
+        StorageError::Storage(format!(
             "Failed to close SQLite backup connection: {}",
             error
         ))
     })?;
 
-    tokio::fs::read(&snapshot_path)
-        .await
-        .map_err(|error| AppError::Storage(format!("Failed to read backup snapshot: {}", error)))
+    tokio::fs::read(&snapshot_path).await.map_err(|error| {
+        StorageError::Storage(format!("Failed to read backup snapshot: {}", error))
+    })
 }
 
 /// Backup service for SQLite database
@@ -175,9 +177,9 @@ impl BackupService {
     /// Returns error if S3 client initialization fails
     pub async fn new(
         config: &BackupStorageConfig,
-        cloudflare: &crate::config::CloudflareConfig,
+        cloudflare: &crate::CloudflareConfig,
         db_path: PathBuf,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Self, StorageError> {
         use aws_sdk_s3::config::BehaviorVersion;
         use aws_sdk_s3::config::{Credentials, Region};
 
@@ -242,7 +244,7 @@ impl BackupService {
     /// 2. Optionally encrypt the backup
     /// 3. Upload to R2
     /// 4. Delete local temporary file
-    pub async fn backup_now(&self) -> Result<String, AppError> {
+    pub async fn backup_now(&self) -> Result<String, StorageError> {
         tracing::info!("Starting database backup...");
 
         // 1. Create safe SQLite snapshot
@@ -271,7 +273,7 @@ impl BackupService {
     }
 
     /// Alias for backup_now()
-    pub async fn backup(&self) -> Result<String, AppError> {
+    pub async fn backup(&self) -> Result<String, StorageError> {
         self.backup_now().await
     }
 
@@ -282,7 +284,7 @@ impl BackupService {
     ///
     /// # Returns
     /// Backup data as bytes
-    async fn create_sqlite_backup(&self) -> Result<Vec<u8>, AppError> {
+    async fn create_sqlite_backup(&self) -> Result<Vec<u8>, StorageError> {
         create_sqlite_backup_snapshot(&self.db_path).await
     }
 
@@ -295,7 +297,7 @@ impl BackupService {
     ///
     /// # Returns
     /// nonce (12 bytes) + ciphertext
-    fn encrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    fn encrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, StorageError> {
         encrypt_backup_payload(key, data)
     }
 
@@ -306,7 +308,7 @@ impl BackupService {
     ///
     /// # Returns
     /// Decrypted data
-    fn decrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, AppError> {
+    fn decrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, StorageError> {
         decrypt_backup_payload(key, data)
     }
 
@@ -317,7 +319,7 @@ impl BackupService {
     ///
     /// # Returns
     /// S3 key of the uploaded file
-    async fn upload_backup(&self, data: Vec<u8>, encrypted: bool) -> Result<String, AppError> {
+    async fn upload_backup(&self, data: Vec<u8>, encrypted: bool) -> Result<String, StorageError> {
         use aws_sdk_s3::primitives::ByteStream;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
@@ -345,7 +347,7 @@ impl BackupService {
         request
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Backup upload failed: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("Backup upload failed: {}", e)))?;
 
         Ok(key)
     }
@@ -354,7 +356,7 @@ impl BackupService {
     ///
     /// # Returns
     /// List of backup info, sorted by date descending
-    pub async fn list_backups(&self) -> Result<Vec<BackupInfo>, AppError> {
+    pub async fn list_backups(&self) -> Result<Vec<BackupInfo>, StorageError> {
         let result = self
             .client
             .list_objects_v2()
@@ -362,7 +364,7 @@ impl BackupService {
             .prefix("backups/rustresort_")
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to list backups: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("Failed to list backups: {}", e)))?;
 
         let mut backups = Vec::new();
 
@@ -393,7 +395,7 @@ impl BackupService {
     /// Delete old backups beyond retention count
     ///
     /// Keeps the most recent `retention_count` backups.
-    async fn cleanup_old_backups(&self) -> Result<(), AppError> {
+    async fn cleanup_old_backups(&self) -> Result<(), StorageError> {
         let backups = self.list_backups().await?;
 
         // Keep only retention_count backups
@@ -409,7 +411,9 @@ impl BackupService {
                     .key(&backup.key)
                     .send()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Failed to delete backup: {}", e)))?;
+                    .map_err(|e| {
+                        StorageError::Storage(format!("Failed to delete backup: {}", e))
+                    })?;
             }
         }
 
@@ -423,7 +427,7 @@ impl BackupService {
     ///
     /// # Returns
     /// Decrypted backup data
-    pub async fn download_backup(&self, key: &str) -> Result<Vec<u8>, AppError> {
+    pub async fn download_backup(&self, key: &str) -> Result<Vec<u8>, StorageError> {
         let result = self
             .client
             .get_object()
@@ -431,19 +435,19 @@ impl BackupService {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to download backup: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("Failed to download backup: {}", e)))?;
 
         let data = result
             .body
             .collect()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to read backup data: {}", e)))?;
+            .map_err(|e| StorageError::Storage(format!("Failed to read backup data: {}", e)))?;
 
         let bytes = data.into_bytes().to_vec();
 
         if key.ends_with(ENCRYPTED_BACKUP_SUFFIX) {
             let encryption_key = self.encryption_key.as_deref().ok_or_else(|| {
-                AppError::Encryption(
+                StorageError::Encryption(
                     "backup is encrypted but no backup encryption key is configured".to_string(),
                 )
             })?;
@@ -460,7 +464,7 @@ mod tests {
         AES_256_KEY_BYTES, create_sqlite_backup_snapshot, decrypt_backup_payload,
         encrypt_backup_payload, parse_backup_encryption_key,
     };
-    use crate::config::{BackupEncryptionConfig, BackupStorageConfig};
+    use crate::{BackupEncryptionConfig, BackupStorageConfig};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use sqlx::Connection;
     use tempfile::TempDir;
@@ -495,14 +499,14 @@ mod tests {
     fn parse_backup_encryption_key_rejects_missing_key_when_enabled() {
         let config = backup_config(true, true, None);
         let error = parse_backup_encryption_key(&config).unwrap_err();
-        assert!(matches!(error, crate::error::AppError::Config(_)));
+        assert!(matches!(error, crate::StorageError::Config(_)));
     }
 
     #[test]
     fn parse_backup_encryption_key_rejects_non_base64() {
         let config = backup_config(true, true, Some("not-base64".to_string()));
         let error = parse_backup_encryption_key(&config).unwrap_err();
-        assert!(matches!(error, crate::error::AppError::Config(_)));
+        assert!(matches!(error, crate::StorageError::Config(_)));
     }
 
     #[test]
@@ -510,7 +514,7 @@ mod tests {
         let short_key = BASE64_STANDARD.encode([1_u8; 16]);
         let config = backup_config(true, true, Some(short_key));
         let error = parse_backup_encryption_key(&config).unwrap_err();
-        assert!(matches!(error, crate::error::AppError::Config(_)));
+        assert!(matches!(error, crate::StorageError::Config(_)));
     }
 
     #[test]
@@ -534,7 +538,7 @@ mod tests {
     fn decrypt_rejects_short_payload() {
         let key = vec![9_u8; AES_256_KEY_BYTES];
         let error = decrypt_backup_payload(&key, &[0_u8; 8]).unwrap_err();
-        assert!(matches!(error, crate::error::AppError::Encryption(_)));
+        assert!(matches!(error, crate::StorageError::Encryption(_)));
     }
 
     #[tokio::test]

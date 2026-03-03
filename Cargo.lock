@@ -3585,8 +3585,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "ammonia",
- "aws-sdk-s3",
- "aws-smithy-runtime",
  "axum",
  "axum-extra",
  "base64 0.21.7",
@@ -3596,7 +3594,6 @@ dependencies = [
  "hmac",
  "html-escape",
  "http 1.4.0",
- "hyper-rustls 0.24.2",
  "image",
  "jsonschema",
  "mockall",
@@ -3605,6 +3602,8 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rsa",
+ "rustresort-models",
+ "rustresort-storage",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3623,6 +3622,34 @@ dependencies = [
  "ulid",
  "url",
  "urlencoding",
+]
+
+[[package]]
+name = "rustresort-models"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "sqlx",
+ "ulid",
+]
+
+[[package]]
+name = "rustresort-storage"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "aws-sdk-s3",
+ "aws-smithy-runtime",
+ "base64 0.21.7",
+ "chrono",
+ "hyper-rustls 0.24.2",
+ "rand 0.8.5",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
