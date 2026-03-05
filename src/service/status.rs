@@ -791,9 +791,11 @@ impl StatusService {
         status: &Status,
     ) -> Result<Vec<StreamTarget>, AppError> {
         let mut targets: HashSet<StreamTarget> = HashSet::new();
-        targets.insert(StreamTarget::User {
-            account_id: self.local_username.clone(),
-        });
+        if self.should_publish_to_user_stream(status) {
+            targets.insert(StreamTarget::User {
+                account_id: self.local_username.clone(),
+            });
+        }
 
         match status.visibility {
             StatusVisibility::Public => {
@@ -847,6 +849,20 @@ impl StatusService {
         Ok(targets.into_iter().collect())
     }
 
+    fn should_publish_to_user_stream(&self, status: &Status) -> bool {
+        if status.is_local {
+            return true;
+        }
+
+        matches!(
+            status.persisted_reason,
+            PersistedReason::Reposted
+                | PersistedReason::Favourited
+                | PersistedReason::Bookmarked
+                | PersistedReason::ReplyToOwn
+        )
+    }
+
     async fn publish_status_update(&self, status: &Status) -> Result<(), AppError> {
         let event = StreamEvent::Update {
             payload: serde_json::json!({
@@ -870,7 +886,6 @@ impl StatusService {
         };
         self.streaming_event_bus.publish(event).await
     }
-
     async fn invalidate_cached_status(&self, status: &Status) {
         self.cache.remove(&status.id).await;
         self.cache.remove_by_uri(&status.uri).await;
@@ -1704,6 +1719,40 @@ mod tests {
         assert!(
             maybe_event.is_err(),
             "CW-only hashtag must not be delivered to hashtag stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_timeline_update_does_not_publish_to_user_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_user("testuser").await.unwrap();
+        let service = create_service_with_bus(db.clone(), bus).await;
+
+        let status = Status {
+            id: EntityId::new_string(),
+            uri: "https://remote.example/users/alice/statuses/timeline".to_string(),
+            content: "<p>remote timeline update</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Timeline,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        service.update_loaded(&status).await.unwrap();
+
+        let maybe_event = timeout(Duration::from_millis(200), receiver.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "remote timeline status must not be delivered to user stream"
         );
     }
 
