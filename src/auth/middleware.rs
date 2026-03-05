@@ -22,15 +22,37 @@ use crate::error::AppError;
 #[derive(Debug, Clone, Copy)]
 pub struct OAuthScopeRequirement(pub &'static [&'static str]);
 
+/// OAuth scope requirement that enforces all declared scopes.
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthScopeAllRequirement(pub &'static [&'static str]);
+
+#[derive(Debug, Clone, Copy)]
+enum OAuthScopeMatch {
+    Any(&'static [&'static str]),
+    All(&'static [&'static str]),
+}
+
+impl OAuthScopeMatch {
+    fn scopes(self) -> &'static [&'static str] {
+        match self {
+            Self::Any(scopes) | Self::All(scopes) => scopes,
+        }
+    }
+}
+
 fn normalize_mastodon_path(path: &str) -> &str {
     path.strip_prefix("/api").unwrap_or(path)
 }
 
-fn required_oauth_scopes(request: &Request<axum::body::Body>) -> Option<&'static [&'static str]> {
+fn required_oauth_scopes(request: &Request<axum::body::Body>) -> Option<OAuthScopeMatch> {
+    if let Some(requirement) = request.extensions().get::<OAuthScopeAllRequirement>() {
+        return Some(OAuthScopeMatch::All(requirement.0));
+    }
+
     request
         .extensions()
         .get::<OAuthScopeRequirement>()
-        .map(|requirement| requirement.0)
+        .map(|requirement| OAuthScopeMatch::Any(requirement.0))
 }
 
 fn scope_grants(scope_set: &HashSet<String>, required: &str) -> bool {
@@ -48,10 +70,16 @@ fn scope_grants(scope_set: &HashSet<String>, required: &str) -> bool {
     false
 }
 
-fn has_required_scope(scope_set: &HashSet<String>, required_scopes: &[&str]) -> bool {
+fn has_any_required_scope(scope_set: &HashSet<String>, required_scopes: &[&str]) -> bool {
     required_scopes
         .iter()
         .any(|required| scope_grants(scope_set, required))
+}
+
+fn has_all_required_scopes(scope_set: &HashSet<String>, required_scopes: &[&str]) -> bool {
+    required_scopes
+        .iter()
+        .all(|required| scope_grants(scope_set, required))
 }
 
 fn parse_scope_set(scopes: &str) -> HashSet<String> {
@@ -169,12 +197,17 @@ pub async fn require_auth(
             }
 
             let scope_set = parse_scope_set(&oauth_token.scopes);
-            if let Some(required_scopes) = required_oauth_scopes(&request) {
+            if let Some(scope_requirement) = required_oauth_scopes(&request) {
+                let required_scopes = scope_requirement.scopes();
                 // Empty required scope list means session-only endpoint.
                 if required_scopes.is_empty() {
                     return Err(AppError::Forbidden);
                 }
-                if !has_required_scope(&scope_set, required_scopes) {
+                let has_scope = match scope_requirement {
+                    OAuthScopeMatch::Any(scopes) => has_any_required_scope(&scope_set, scopes),
+                    OAuthScopeMatch::All(scopes) => has_all_required_scopes(&scope_set, scopes),
+                };
+                if !has_scope {
                     return Err(AppError::Forbidden);
                 }
             } else {

@@ -53,6 +53,7 @@ fn build_activity_processor(
         state.config.server.protocol.clone(),
     )
     .with_delivery(delivery)
+    .with_streaming_event_bus(state.streaming_event_bus.clone())
 }
 
 /// Create ActivityPub router

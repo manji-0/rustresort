@@ -44,6 +44,7 @@ mod helpers;
 mod repository;
 
 use bootstrap::{backfill_missing_status_hashtags, migrate_legacy_oauth_tokens};
+pub(crate) use helpers::extract_hashtags_from_content;
 use helpers::*;
 
 impl Database {

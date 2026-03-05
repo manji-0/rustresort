@@ -85,6 +85,9 @@ pub struct AppState {
 
     /// Auth endpoint rate limiter (GitHub callback and OAuth token exchange)
     pub auth_rate_limiter: Arc<federation::RateLimiter>,
+
+    /// Real-time streaming event bus
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for authentication middleware.
@@ -121,6 +124,7 @@ pub struct StatusApiState {
     pub storage: Arc<dyn storage::MediaStorageRepository>,
     pub http_client: Arc<reqwest::Client>,
     pub federation_fetch_client: Arc<reqwest::Client>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for Mastodon search endpoints.
@@ -172,6 +176,7 @@ pub struct MediaApiState {
     pub db: Arc<data::Database>,
     pub timeline_cache: Arc<data::TimelineCache>,
     pub storage: Arc<dyn storage::MediaStorageRepository>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for Mastodon list endpoints.
@@ -215,6 +220,17 @@ pub struct ActivityPubState {
     pub storage: Arc<dyn storage::MediaStorageRepository>,
     pub http_client: Arc<reqwest::Client>,
     pub federation_rate_limiter: Arc<federation::RateLimiter>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
+}
+
+/// Minimal state required for Mastodon streaming endpoints.
+#[derive(Clone)]
+pub struct StreamingApiState {
+    pub config: Arc<config::AppConfig>,
+    pub db: Arc<data::Database>,
+    pub timeline_cache: Arc<data::TimelineCache>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for admin API endpoints.
@@ -276,6 +292,7 @@ impl_from_ref_state!(StatusApiState {
     storage,
     http_client,
     federation_fetch_client,
+    streaming_event_bus,
 });
 impl_from_ref_state!(SearchApiState {
     config,
@@ -303,6 +320,7 @@ impl_from_ref_state!(MediaApiState {
     db,
     timeline_cache,
     storage,
+    streaming_event_bus,
 });
 impl_from_ref_state!(ListsApiState { db });
 impl_from_ref_state!(FiltersApiState { db });
@@ -317,9 +335,17 @@ impl_from_ref_state!(ActivityPubState {
     storage,
     http_client,
     federation_rate_limiter,
+    streaming_event_bus,
 });
 impl_from_ref_state!(SystemAdminState { db, backup });
 impl_from_ref_state!(WellKnownState { config, db });
+impl_from_ref_state!(StreamingApiState {
+    config,
+    db,
+    timeline_cache,
+    profile_cache,
+    streaming_event_bus,
+});
 
 impl AppState {
     /// Initialize application state
@@ -419,6 +445,7 @@ impl AppState {
         let federation_rate_limiter = federation::RateLimiter::new(None, None);
         let auth_rate_limiter =
             federation::RateLimiter::new(Some(30), Some(std::time::Duration::from_secs(60)));
+        let streaming_event_bus = service::BroadcastEventBus::new(1024);
 
         // 5. Connect to R2 storage
         let storage = storage::MediaStorage::new(&config.storage.media, &config.cloudflare).await?;
@@ -465,6 +492,7 @@ impl AppState {
             federation_fetch_client: Arc::new(federation_fetch_client),
             federation_rate_limiter: Arc::new(federation_rate_limiter),
             auth_rate_limiter: Arc::new(auth_rate_limiter),
+            streaming_event_bus: Arc::new(streaming_event_bus),
         })
     }
 

@@ -230,3 +230,69 @@ async fn test_scope_follow_required_for_follow_endpoints() {
         .unwrap();
     assert_eq!(allowed_follow_response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_stream_user_requires_statuses_and_notifications_scopes() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let read_statuses_token = create_scoped_oauth_token(&server, "read:statuses").await;
+    let blocked_statuses_response = server
+        .client
+        .get(server.url("/api/v1/streaming/user"))
+        .bearer_auth(&read_statuses_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_statuses_response.status(), StatusCode::FORBIDDEN);
+
+    let read_notifications_token = create_scoped_oauth_token(&server, "read:notifications").await;
+    let blocked_notifications_response = server
+        .client
+        .get(server.url("/api/v1/streaming/user"))
+        .bearer_auth(&read_notifications_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked_notifications_response.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let combined_token =
+        create_scoped_oauth_token(&server, "read:statuses read:notifications").await;
+    let allowed_response = server
+        .client
+        .get(server.url("/api/v1/streaming/user"))
+        .bearer_auth(&combined_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_stream_direct_requires_read_statuses_scope() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let read_notifications_token = create_scoped_oauth_token(&server, "read:notifications").await;
+    let blocked_response = server
+        .client
+        .get(server.url("/api/v1/streaming/direct"))
+        .bearer_auth(&read_notifications_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked_response.status(), StatusCode::FORBIDDEN);
+
+    let read_statuses_token = create_scoped_oauth_token(&server, "read:statuses").await;
+    let allowed_response = server
+        .client
+        .get(server.url("/api/v1/streaming/direct"))
+        .bearer_auth(&read_statuses_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed_response.status(), StatusCode::OK);
+}

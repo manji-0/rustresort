@@ -227,6 +227,7 @@ fn build_status_service(state: &StatusApiState) -> StatusService {
         state.db.clone(),
         state.timeline_cache.clone(),
         state.storage.clone(),
+        state.streaming_event_bus.clone(),
         state.config.server.base_url().to_string(),
         state.config.admin.username.clone(),
     )

@@ -12,6 +12,7 @@ mod repository;
 mod sync;
 
 pub use cache::{CachedAttachment, CachedProfile, CachedStatus, ProfileCache, TimelineCache};
+pub(crate) use database::extract_hashtags_from_content;
 pub use database::{Database, TursoSyncOptions};
 pub use models::*;
 pub use repository::{

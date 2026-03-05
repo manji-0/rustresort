@@ -224,4 +224,38 @@ impl Database {
 
         Ok(count > 0)
     }
+
+    /// Get list IDs that contain the given account address.
+    pub async fn get_list_ids_for_account(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Vec<String>, AppError> {
+        let normalized_candidates: Vec<String> =
+            equivalent_account_address_candidates(account_address, default_port)
+                .into_iter()
+                .map(|candidate| candidate.to_ascii_lowercase())
+                .collect();
+        if normalized_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT list_id FROM list_accounts WHERE LOWER(account_address) IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in normalized_candidates {
+                separated.push_bind(candidate);
+            }
+        }
+        query_builder.push(")");
+
+        let list_ids = query_builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(list_ids)
+    }
 }

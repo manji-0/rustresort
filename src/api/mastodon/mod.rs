@@ -10,11 +10,11 @@ use axum::{
     routing::{MethodRouter, delete, get, post, put},
 };
 
-use crate::auth::OAuthScopeRequirement;
+use crate::auth::{OAuthScopeAllRequirement, OAuthScopeRequirement};
 use crate::{
     AccountApiState, AdminApiState, AppsApiState, AuthState, ConversationsApiState,
     FiltersApiState, InstanceApiState, ListsApiState, MediaApiState, PollsApiState,
-    ScheduledStatusesApiState, SearchApiState, StatusApiState, TimelineApiState,
+    ScheduledStatusesApiState, SearchApiState, StatusApiState, StreamingApiState, TimelineApiState,
 };
 
 pub mod accounts;
@@ -43,6 +43,7 @@ const READ_STATUSES: &[&str] = &["read:statuses"];
 const WRITE_STATUSES: &[&str] = &["write:statuses"];
 const WRITE_FAVOURITES: &[&str] = &["write:favourites"];
 const READ_NOTIFICATIONS: &[&str] = &["read:notifications"];
+const READ_USER_STREAM: &[&str] = &["read:statuses", "read:notifications"];
 const WRITE_NOTIFICATIONS: &[&str] = &["write:notifications"];
 const WRITE_MEDIA: &[&str] = &["write:media"];
 const READ_LISTS: &[&str] = &["read:lists"];
@@ -69,6 +70,7 @@ where
     ScheduledStatusesApiState: FromRef<S>,
     SearchApiState: FromRef<S>,
     StatusApiState: FromRef<S>,
+    StreamingApiState: FromRef<S>,
     TimelineApiState: FromRef<S>,
 {
     let scoped = |router: MethodRouter<S>, scopes: &'static [&'static str]| {
@@ -79,6 +81,15 @@ where
             ))
             // Route-level scope metadata must be attached before require_auth executes.
             .layer(Extension(OAuthScopeRequirement(scopes)))
+    };
+    let scoped_all = |router: MethodRouter<S>, scopes: &'static [&'static str]| {
+        router
+            .route_layer(middleware::from_fn_with_state(
+                auth_state.clone(),
+                crate::auth::require_auth,
+            ))
+            // Route-level scope metadata must be attached before require_auth executes.
+            .layer(Extension(OAuthScopeAllRequirement(scopes)))
     };
 
     // Public endpoints (no authentication required)
@@ -433,7 +444,7 @@ where
         )
         .route(
             "/v1/streaming/user",
-            scoped(get(streaming::stream_user), READ_STATUSES),
+            scoped_all(get(streaming::stream_user), READ_USER_STREAM),
         )
         .route(
             "/v1/streaming/public",
@@ -453,7 +464,7 @@ where
         )
         .route(
             "/v1/streaming/direct",
-            scoped(get(streaming::stream_direct), READ_NOTIFICATIONS),
+            scoped(get(streaming::stream_direct), READ_STATUSES),
         )
         // Admin API
         .route(
