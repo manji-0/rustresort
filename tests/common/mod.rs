@@ -1,6 +1,7 @@
 //! Common test utilities for E2E tests
 
 use rustresort::{AppState, config};
+use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -34,6 +35,7 @@ impl TestServer {
                 port: 0, // Let OS assign port
                 domain: "test.example.com".to_string(),
                 protocol: "https".to_string(),
+                trusted_proxy_ips: Vec::new(),
             },
             database: config::DatabaseConfig {
                 path: db_path.clone(),
@@ -132,7 +134,12 @@ impl TestServer {
 
         // Spawn server in background
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Poll health endpoint instead of fixed sleep to minimize startup wait.

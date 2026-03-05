@@ -1081,11 +1081,11 @@ async fn test_pin_and_mute_state_persists_across_reads() {
         .unwrap();
     assert_eq!(read_after_set.status(), 200);
     let set_json: Value = read_after_set.json().await.unwrap();
-    assert!(set_json["favourited"].is_null());
-    assert!(set_json["reblogged"].is_null());
-    assert!(set_json["pinned"].is_null());
-    assert!(set_json["muted"].is_null());
-    assert!(set_json["bookmarked"].is_null());
+    assert_eq!(set_json["favourited"], false);
+    assert_eq!(set_json["reblogged"], false);
+    assert_eq!(set_json["pinned"], false);
+    assert_eq!(set_json["muted"], false);
+    assert_eq!(set_json["bookmarked"], false);
 
     let unpin_response = server
         .client
@@ -1117,11 +1117,11 @@ async fn test_pin_and_mute_state_persists_across_reads() {
         .unwrap();
     assert_eq!(read_after_clear.status(), 200);
     let cleared_json: Value = read_after_clear.json().await.unwrap();
-    assert!(cleared_json["favourited"].is_null());
-    assert!(cleared_json["reblogged"].is_null());
-    assert!(cleared_json["pinned"].is_null());
-    assert!(cleared_json["muted"].is_null());
-    assert!(cleared_json["bookmarked"].is_null());
+    assert_eq!(cleared_json["favourited"], false);
+    assert_eq!(cleared_json["reblogged"], false);
+    assert_eq!(cleared_json["pinned"], false);
+    assert_eq!(cleared_json["muted"], false);
+    assert_eq!(cleared_json["bookmarked"], false);
 }
 
 #[tokio::test]
@@ -1183,7 +1183,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
         .unwrap();
     assert_eq!(root_response.status(), 200);
     let root_json: Value = root_response.json().await.unwrap();
-    assert!(root_json["muted"].is_null());
+    assert_eq!(root_json["muted"], false);
 
     let reply_response = server
         .client
@@ -1193,7 +1193,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
         .unwrap();
     assert_eq!(reply_response.status(), 200);
     let reply_json: Value = reply_response.json().await.unwrap();
-    assert!(reply_json["muted"].is_null());
+    assert_eq!(reply_json["muted"], false);
     assert!(server.state.db.is_thread_muted(&root.uri).await.unwrap());
 
     let unmute_response = server
@@ -1213,7 +1213,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
         .unwrap();
     assert_eq!(root_after_unmute.status(), 200);
     let root_after_unmute_json: Value = root_after_unmute.json().await.unwrap();
-    assert!(root_after_unmute_json["muted"].is_null());
+    assert_eq!(root_after_unmute_json["muted"], false);
     assert!(!server.state.db.is_thread_muted(&root.uri).await.unwrap());
 }
 

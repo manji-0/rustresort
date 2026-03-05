@@ -166,7 +166,7 @@ async fn fetch_with_validated_redirects(
         let (resolved_host, resolved_addrs) =
             resolve_validated_remote_actor_fetch_target(&current).await?;
         let validated_client = reqwest::Client::builder()
-            .user_agent("RustResort/0.1.0")
+            .user_agent(crate::APP_USER_AGENT)
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&resolved_host, &resolved_addrs)

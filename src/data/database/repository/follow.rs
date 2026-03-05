@@ -157,7 +157,7 @@ impl Database {
                 Ok(inserted)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "insert_follow_if_absent").await;
                 Err(error)
             }
         }

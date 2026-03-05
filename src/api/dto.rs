@@ -57,11 +57,11 @@ pub struct StatusResponse {
     pub emojis: Vec<serde_json::Value>,
     pub card: Option<serde_json::Value>,
     pub poll: Option<serde_json::Value>,
-    pub favourited: Option<bool>,
-    pub reblogged: Option<bool>,
-    pub muted: Option<bool>,
-    pub bookmarked: Option<bool>,
-    pub pinned: Option<bool>,
+    pub favourited: bool,
+    pub reblogged: bool,
+    pub muted: bool,
+    pub bookmarked: bool,
+    pub pinned: bool,
 }
 
 /// Media attachment response

@@ -8,6 +8,10 @@
 use serde::Deserialize;
 use std::{net::IpAddr, path::PathBuf};
 
+pub use rustresort_storage::{
+    BackupEncryptionConfig, BackupStorageConfig, CloudflareConfig, MediaStorageConfig,
+};
+
 /// Main application configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -35,6 +39,9 @@ pub struct ServerConfig {
     pub domain: String,
     /// Protocol ("http" or "https")
     pub protocol: String,
+    /// Trusted reverse proxy peer IPs allowed to provide forwarded client IP headers.
+    #[serde(default)]
+    pub trusted_proxy_ips: Vec<IpAddr>,
 }
 
 impl ServerConfig {
@@ -148,55 +155,8 @@ pub struct StorageConfig {
     pub backup: BackupStorageConfig,
 }
 
-/// Media storage configuration
-#[derive(Debug, Clone, Deserialize)]
-pub struct MediaStorageConfig {
-    /// R2 bucket name for media
-    pub bucket: String,
-    /// Public URL for media (Custom Domain)
-    /// e.g., "https://media.example.com"
-    pub public_url: String,
-}
-
-/// Backup storage configuration
-#[derive(Debug, Clone, Deserialize)]
-pub struct BackupStorageConfig {
-    /// Enable automatic backups
-    pub enabled: bool,
-    /// R2 bucket name for backups (separate from media)
-    pub bucket: String,
-    /// Backup interval in seconds (default: 86400 = 24h)
-    pub interval_seconds: u64,
-    /// Number of backup generations to keep
-    pub retention_count: usize,
-    /// Optional client-side backup encryption.
-    #[serde(default)]
-    pub encryption: BackupEncryptionConfig,
-}
-
-/// Backup encryption configuration
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct BackupEncryptionConfig {
-    /// Enable AES-256-GCM encryption for backup payloads.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Base64-encoded 32-byte encryption key.
-    pub key: Option<String>,
-}
-
-/// Cloudflare credentials
-#[derive(Debug, Clone, Deserialize)]
-pub struct CloudflareConfig {
-    /// Cloudflare account ID
-    pub account_id: String,
-    /// R2 access key ID
-    pub r2_access_key_id: String,
-    /// R2 secret access key
-    pub r2_secret_access_key: String,
-}
-
 /// Authentication configuration (GitHub OAuth)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     /// Allowed GitHub username (single user)
     pub github_username: String,
@@ -208,10 +168,30 @@ pub struct AuthConfig {
 }
 
 /// GitHub OAuth configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct GitHubOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("github_username", &self.github_username)
+            .field("session_secret", &"<redacted>")
+            .field("session_max_age", &self.session_max_age)
+            .field("github", &self.github)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for GitHubOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Instance metadata
@@ -291,6 +271,7 @@ impl AppConfig {
             .set_default("server.host", "127.0.0.1")?
             .set_default("server.port", 8080)?
             .set_default("server.protocol", "http")?
+            .set_default("server.trusted_proxy_ips", Vec::<String>::new())?
             .set_default("database.sync.mode", "none")?
             .set_default("database.sync.interval_seconds", 300)?
             .set_default("database.sync.d1.remote", false)?
@@ -406,6 +387,7 @@ mod tests {
                 port: 8080,
                 domain: "localhost".to_string(),
                 protocol: "http".to_string(),
+                trusted_proxy_ips: Vec::new(),
             },
             database: DatabaseConfig {
                 path: PathBuf::from("/tmp/rustresort-test.db"),

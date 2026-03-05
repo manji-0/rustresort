@@ -467,11 +467,11 @@ fn boost_stub_status(
         emojis: vec![],
         card: None,
         poll: None,
-        favourited: None,
-        reblogged: None,
-        muted: None,
-        bookmarked: None,
-        pinned: None,
+        favourited: false,
+        reblogged: false,
+        muted: false,
+        bookmarked: false,
+        pinned: false,
     }
 }
 
@@ -644,11 +644,11 @@ pub fn status_to_response_with_media(
         emojis: vec![],
         card: None,
         poll: None,
-        favourited: interactions.favourited,
-        reblogged: interactions.reblogged,
-        muted: interactions.muted,
-        bookmarked: interactions.bookmarked,
-        pinned: interactions.pinned,
+        favourited: interactions.favourited.unwrap_or(false),
+        reblogged: interactions.reblogged.unwrap_or(false),
+        muted: interactions.muted.unwrap_or(false),
+        bookmarked: interactions.bookmarked.unwrap_or(false),
+        pinned: interactions.pinned.unwrap_or(false),
     }
 }
 
@@ -666,6 +666,7 @@ mod tests {
                 port: 8080,
                 domain: "test.example.com".to_string(),
                 protocol: "https".to_string(),
+                trusted_proxy_ips: Vec::new(),
             },
             database: DatabaseConfig {
                 path: "test.db".into(),
@@ -802,11 +803,11 @@ mod tests {
         assert_eq!(response.visibility, "public");
         assert_eq!(response.language, Some("en".to_string()));
         assert!(response.sensitive);
-        assert_eq!(response.favourited, Some(true));
-        assert_eq!(response.reblogged, Some(false));
-        assert_eq!(response.muted, Some(false));
-        assert_eq!(response.bookmarked, Some(false));
-        assert_eq!(response.pinned, Some(false));
+        assert!(response.favourited);
+        assert!(!response.reblogged);
+        assert!(!response.muted);
+        assert!(!response.bookmarked);
+        assert!(!response.pinned);
         assert_eq!(response.account.username, "testuser");
     }
 
@@ -852,11 +853,11 @@ mod tests {
             response.account.created_at,
             chrono::DateTime::from_timestamp(0, 0).unwrap()
         );
-        assert_eq!(response.favourited, None);
-        assert_eq!(response.reblogged, None);
-        assert_eq!(response.muted, None);
-        assert_eq!(response.bookmarked, None);
-        assert_eq!(response.pinned, None);
+        assert!(!response.favourited);
+        assert!(!response.reblogged);
+        assert!(!response.muted);
+        assert!(!response.bookmarked);
+        assert!(!response.pinned);
     }
 
     #[test]

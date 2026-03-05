@@ -139,7 +139,7 @@ impl Database {
                 Ok(accepted)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                super::rollback_with_log(&mut conn, "accept_follow_request").await;
                 Err(error)
             }
         }

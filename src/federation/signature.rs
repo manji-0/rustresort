@@ -271,7 +271,12 @@ pub fn verify_signature(
     }
 
     // 2. Verify Date is recent (within 5 minutes)
-    if let Some(date_header) = headers.get("date") {
+    // Date header is required (it's in the signed headers set) to prevent replay attacks.
+    let date_header = headers
+        .get("date")
+        .ok_or_else(|| AppError::Validation("Missing required Date header".to_string()))?;
+
+    {
         let date_str = date_header
             .to_str()
             .map_err(|_| AppError::Validation("Invalid Date header".to_string()))?;

@@ -126,7 +126,10 @@ pub async fn require_metrics_auth(
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer "));
 
-    if provided.is_some_and(|token| token == expected_token) {
+    if provided.is_some_and(|token| {
+        use subtle::ConstantTimeEq;
+        token.as_bytes().ct_eq(expected_token.as_bytes()).into()
+    }) {
         return Ok(next.run(request).await);
     }
 
