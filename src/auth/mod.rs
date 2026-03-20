@@ -14,7 +14,8 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 
 pub use middleware::{
-    CurrentUser, OAuthScopeRequirement, require_auth, require_metrics_auth, require_session_auth,
+    CurrentUser, OAuthScopeAllRequirement, OAuthScopeRequirement, require_auth,
+    require_metrics_auth, require_session_auth,
 };
 pub use oauth::auth_router;
 pub use session::{Session, create_session_token, verify_session_token};

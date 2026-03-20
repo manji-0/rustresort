@@ -179,6 +179,12 @@ pub trait StatusRepository: Send + Sync {
     async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError>;
     async fn is_thread_muted(&self, thread_uri: &str) -> Result<bool, AppError>;
     async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError>;
+    async fn get_account(&self) -> Result<Option<Account>, AppError>;
+    async fn get_list_ids_for_account(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Vec<String>, AppError>;
 }
 
 /// Data access used by `TimelineService`.
@@ -516,6 +522,18 @@ impl StatusRepository for Database {
 
     async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError> {
         Database::is_status_pinned(self, status_id).await
+    }
+
+    async fn get_account(&self) -> Result<Option<Account>, AppError> {
+        Database::get_account(self).await
+    }
+
+    async fn get_list_ids_for_account(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Vec<String>, AppError> {
+        Database::get_list_ids_for_account(self, account_address, default_port).await
     }
 }
 

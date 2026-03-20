@@ -3,8 +3,9 @@
 //! Handles status (post/toot) operations including
 //! create, delete, favourite, boost, bookmark.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
+use super::{StreamEvent, StreamTarget, StreamingEventBus};
 #[cfg(test)]
 use crate::data::Database;
 use crate::data::{
@@ -89,13 +90,48 @@ fn derive_remote_account_address(status_uri: &url::Url) -> String {
     format!("{}@{}", username, domain)
 }
 
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn format_authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+fn local_account_address_candidates(base_url: &str, local_username: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return Vec::new();
+    };
+    let Some(host) = parsed.host_str() else {
+        return Vec::new();
+    };
+
+    let authority_host = format_authority_host(host);
+    let mut candidates = vec![format!("{}@{}", local_username, authority_host)];
+    if let Some(port) = parsed.port() {
+        candidates.push(format!("{}@{}:{}", local_username, authority_host, port));
+    }
+    candidates
+}
+
 /// Status service
 pub struct StatusService {
     db: Arc<dyn StatusRepository>,
     cache: Arc<TimelineCache>,
     storage: Arc<dyn MediaStorageRepository>,
+    streaming_event_bus: Arc<dyn StreamingEventBus>,
     base_url: String,
     local_username: String,
+    local_default_port: Option<u16>,
+    local_account_address_candidates: Vec<String>,
 }
 
 impl StatusService {
@@ -104,18 +140,32 @@ impl StatusService {
         db: Arc<R>,
         cache: Arc<TimelineCache>,
         storage: Arc<dyn MediaStorageRepository>,
+        streaming_event_bus: Arc<dyn StreamingEventBus>,
         base_url: String,
         local_username: String,
     ) -> Self
     where
         R: StatusRepository + 'static,
     {
+        let (local_default_port, local_account_address_candidates) = url::Url::parse(&base_url)
+            .ok()
+            .map(|parsed| {
+                (
+                    default_port_for_scheme(parsed.scheme()),
+                    local_account_address_candidates(&base_url, &local_username),
+                )
+            })
+            .unwrap_or_else(|| (None, Vec::new()));
+
         Self {
             db,
             cache,
             storage,
+            streaming_event_bus,
             base_url,
             local_username,
+            local_default_port,
+            local_account_address_candidates,
         }
     }
 
@@ -203,6 +253,7 @@ impl StatusService {
             .insert_status_with_media_and_poll(status, media_ids, poll)
             .await?;
         self.invalidate_cached_status(status).await;
+        self.publish_status_update(status).await?;
         Ok(())
     }
 
@@ -254,6 +305,7 @@ impl StatusService {
     pub async fn update_loaded(&self, status: &Status) -> Result<(), AppError> {
         self.db.update_status(status).await?;
         self.invalidate_cached_status(status).await;
+        self.publish_status_update(status).await?;
         Ok(())
     }
 
@@ -268,6 +320,7 @@ impl StatusService {
             .await?;
         self.invalidate_cached_status(previous).await;
         self.invalidate_cached_status(updated).await;
+        self.publish_status_update(updated).await?;
         Ok(())
     }
 
@@ -283,6 +336,7 @@ impl StatusService {
             .await?;
         self.invalidate_cached_status(previous).await;
         self.invalidate_cached_status(updated).await;
+        self.publish_status_update(updated).await?;
         Ok(())
     }
 
@@ -459,6 +513,7 @@ impl StatusService {
 
         self.db.delete_status(&status.id).await?;
         self.invalidate_cached_status(status).await;
+        self.publish_status_delete(status).await?;
         Ok(())
     }
 
@@ -484,6 +539,7 @@ impl StatusService {
             .await?;
 
         let favourite_id = self.db.insert_favourite(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok((status, favourite_id))
     }
 
@@ -504,6 +560,7 @@ impl StatusService {
             .await?;
 
         self.db.insert_bookmark(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
@@ -729,6 +786,91 @@ impl StatusService {
         Ok(placeholder)
     }
 
+    async fn stream_targets_for_status(
+        &self,
+        status: &Status,
+    ) -> Result<Vec<StreamTarget>, AppError> {
+        let mut targets: HashSet<StreamTarget> = HashSet::new();
+        targets.insert(StreamTarget::User {
+            account_id: self.local_username.clone(),
+        });
+
+        match status.visibility {
+            StatusVisibility::Public => {
+                targets.insert(StreamTarget::Public);
+                if status.is_local {
+                    targets.insert(StreamTarget::PublicLocal);
+                }
+            }
+            StatusVisibility::Unlisted => {}
+            StatusVisibility::Direct => {
+                targets.insert(StreamTarget::Direct {
+                    account_id: self.local_username.clone(),
+                });
+            }
+            StatusVisibility::Private => {}
+        }
+
+        if matches!(status.visibility, StatusVisibility::Public) {
+            for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
+                targets.insert(StreamTarget::Hashtag { hashtag });
+            }
+        }
+
+        if status.is_local && status.account_address.trim().is_empty() {
+            let mut local_keys = self.local_account_address_candidates.clone();
+            if let Some(account) = self.db.get_account().await? {
+                local_keys.push(account.id);
+            }
+            for local_key in local_keys {
+                for list_id in self
+                    .db
+                    .get_list_ids_for_account(local_key.as_str(), self.local_default_port)
+                    .await?
+                {
+                    targets.insert(StreamTarget::List { list_id });
+                }
+            }
+        } else {
+            let account_address = status.account_address.trim();
+            if !account_address.is_empty() {
+                for list_id in self
+                    .db
+                    .get_list_ids_for_account(account_address, self.local_default_port)
+                    .await?
+                {
+                    targets.insert(StreamTarget::List { list_id });
+                }
+            }
+        }
+
+        Ok(targets.into_iter().collect())
+    }
+
+    async fn publish_status_update(&self, status: &Status) -> Result<(), AppError> {
+        let event = StreamEvent::Update {
+            payload: serde_json::json!({
+                "id": status.id.as_str(),
+                "uri": status.uri.as_str(),
+                "visibility": status.visibility.as_str(),
+                "created_at": status.created_at.to_rfc3339(),
+            }),
+            targets: self.stream_targets_for_status(status).await?,
+        };
+        self.streaming_event_bus.publish(event).await
+    }
+
+    async fn publish_status_delete(&self, status: &Status) -> Result<(), AppError> {
+        let event = StreamEvent::Delete {
+            payload: serde_json::json!({
+                "id": status.id.as_str(),
+                "uri": status.uri.as_str(),
+            }),
+            targets: self.stream_targets_for_status(status).await?,
+        };
+        self.streaming_event_bus.publish(event).await
+    }
+
     async fn invalidate_cached_status(&self, status: &Status) {
         self.cache.remove(&status.id).await;
         self.cache.remove_by_uri(&status.uri).await;
@@ -747,6 +889,7 @@ impl StatusService {
     ) -> Result<(Status, String), AppError> {
         let status = self.get(status_id).await?;
         let favourite_id = self.db.insert_favourite(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok((status, favourite_id))
     }
 
@@ -761,6 +904,7 @@ impl StatusService {
     pub async fn bookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
         self.db.insert_bookmark(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
@@ -779,6 +923,7 @@ impl StatusService {
     ) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
         self.db.insert_repost(&status.id, repost_uri).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
@@ -792,18 +937,21 @@ impl StatusService {
             .ensure_remote_status_persisted(status_uri, PersistedReason::Reposted)
             .await?;
         self.db.insert_repost(&status.id, repost_uri).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
     /// Unfavourite preloaded status.
     pub async fn unfavourite_loaded(&self, status: &Status) -> Result<(), AppError> {
         self.db.delete_favourite(&status.id).await?;
+        self.publish_status_update(status).await?;
         Ok(())
     }
 
     /// Unbookmark preloaded status.
     pub async fn unbookmark_loaded(&self, status: &Status) -> Result<(), AppError> {
         self.db.delete_bookmark(&status.id).await?;
+        self.publish_status_update(status).await?;
         Ok(())
     }
 
@@ -811,6 +959,7 @@ impl StatusService {
     pub async fn unrepost_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let status = self.get(status_id).await?;
         self.db.delete_repost(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
@@ -820,6 +969,7 @@ impl StatusService {
             .ensure_remote_status_persisted(status_uri, PersistedReason::Reposted)
             .await?;
         self.db.delete_repost(&status.id).await?;
+        self.publish_status_update(&status).await?;
         Ok(status)
     }
 
@@ -901,8 +1051,10 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::time::{Duration, timeout};
 
     use crate::data::{Account, CachedStatus, EntityId};
+    use crate::service::{BroadcastEventBus, StreamEvent, StreamingEventBus};
 
     async fn create_test_db() -> (Arc<Database>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -942,12 +1094,20 @@ mod tests {
     }
 
     async fn create_service(db: Arc<Database>) -> StatusService {
+        create_service_with_bus(db, Arc::new(BroadcastEventBus::new(64))).await
+    }
+
+    async fn create_service_with_bus(
+        db: Arc<Database>,
+        bus: Arc<BroadcastEventBus>,
+    ) -> StatusService {
         let cache = Arc::new(TimelineCache::new(64).await.unwrap());
         let storage = create_test_storage().await;
         StatusService::new(
             db,
             cache,
             storage,
+            bus,
             "https://test.example.com".to_string(),
             "testuser".to_string(),
         )
@@ -1239,6 +1399,312 @@ mod tests {
 
         let error = service.favourite("not-a-valid-uri").await.unwrap_err();
         assert!(matches!(error, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn create_publishes_update_to_hashtag_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_hashtag("rust").await.unwrap();
+        let service = create_service_with_bus(db, bus).await;
+
+        let status = service
+            .create(
+                "hello #Rust".to_string(),
+                None,
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        match event {
+            StreamEvent::Update { payload, .. } => {
+                assert_eq!(
+                    payload.get("id").and_then(serde_json::Value::as_str),
+                    Some(status.id.as_str())
+                );
+            }
+            other => panic!("expected update event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn favourite_by_id_publishes_update_to_user_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let service = create_service_with_bus(db, bus.clone()).await;
+
+        let status = service
+            .create(
+                "interaction target".to_string(),
+                None,
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let mut receiver = bus.subscribe_user("testuser").await.unwrap();
+        let _ = service.favourite_by_id(&status.id).await.unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            StreamEvent::Update { payload, .. } => {
+                assert_eq!(
+                    payload.get("id").and_then(serde_json::Value::as_str),
+                    Some(status.id.as_str())
+                );
+            }
+            other => panic!("expected update event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bookmark_by_id_publishes_update_to_user_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let service = create_service_with_bus(db, bus.clone()).await;
+
+        let status = service
+            .create(
+                "bookmark target".to_string(),
+                None,
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let mut receiver = bus.subscribe_user("testuser").await.unwrap();
+        let _ = service.bookmark_by_id(&status.id).await.unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            StreamEvent::Update { payload, .. } => {
+                assert_eq!(
+                    payload.get("id").and_then(serde_json::Value::as_str),
+                    Some(status.id.as_str())
+                );
+            }
+            other => panic!("expected update event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repost_by_id_publishes_update_to_user_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let service = create_service_with_bus(db, bus.clone()).await;
+
+        let status = service
+            .create(
+                "repost target".to_string(),
+                None,
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let repost_uri = format!(
+            "https://test.example.com/users/testuser/statuses/{}/activity",
+            EntityId::new_string()
+        );
+        let mut receiver = bus.subscribe_user("testuser").await.unwrap();
+        let _ = service
+            .repost_by_id(&status.id, repost_uri.as_str())
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            StreamEvent::Update { payload, .. } => {
+                assert_eq!(
+                    payload.get("id").and_then(serde_json::Value::as_str),
+                    Some(status.id.as_str())
+                );
+            }
+            other => panic!("expected update event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_publishes_update_to_matching_list_stream_with_equivalent_default_port_address()
+    {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let list_id = db.create_list("friends", "list").await.unwrap();
+        db.add_account_to_list(&list_id, "alice@example.com:443")
+            .await
+            .unwrap();
+
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_list(&list_id).await.unwrap();
+        let service = create_service_with_bus(db.clone(), bus).await;
+
+        let status = Status {
+            id: EntityId::new_string(),
+            uri: "https://remote.example/users/alice/statuses/list-target".to_string(),
+            content: "<p>remote #tag</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "alice@example.com".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            persisted_reason: PersistedReason::Favourited,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        service.update_loaded(&status).await.unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, StreamEvent::Update { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_local_status_publishes_to_list_stream_when_list_contains_local_account_id() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let account = db.get_account().await.unwrap().unwrap();
+        let list_id = db.create_list("local-posts", "list").await.unwrap();
+        db.add_account_to_list(&list_id, &account.id).await.unwrap();
+
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_list(&list_id).await.unwrap();
+        let service = create_service_with_bus(db, bus).await;
+
+        let _status = service
+            .create(
+                "hello local list stream".to_string(),
+                None,
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, StreamEvent::Update { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_unlisted_does_not_publish_to_public_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_public().await.unwrap();
+        let service = create_service_with_bus(db, bus).await;
+
+        let _status = service
+            .create(
+                "hello #Rust".to_string(),
+                None,
+                "unlisted".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let maybe_event = timeout(Duration::from_millis(200), receiver.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "unlisted status must not be delivered to public stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_unlisted_does_not_publish_to_hashtag_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_hashtag("rust").await.unwrap();
+        let service = create_service_with_bus(db, bus).await;
+
+        let _status = service
+            .create(
+                "hello #Rust".to_string(),
+                None,
+                "unlisted".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let maybe_event = timeout(Duration::from_millis(200), receiver.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "unlisted status must not be delivered to hashtag stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_public_with_cw_only_hashtag_does_not_publish_to_hashtag_stream() {
+        let (db, _temp_dir) = create_test_db().await;
+        seed_account(db.as_ref(), "testuser").await;
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let mut receiver = bus.subscribe_hashtag("rust").await.unwrap();
+        let service = create_service_with_bus(db, bus).await;
+
+        let _status = service
+            .create(
+                "hello world".to_string(),
+                Some("#Rust".to_string()),
+                "public".to_string(),
+                Some("en".to_string()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let maybe_event = timeout(Duration::from_millis(200), receiver.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "CW-only hashtag must not be delivered to hashtag stream"
+        );
     }
 
     #[tokio::test]

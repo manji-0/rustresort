@@ -10,6 +10,7 @@ use crate::data::{
     CachedAttachment, CachedStatus, Database, NotificationType, ProfileCache, TimelineCache,
 };
 use crate::error::AppError;
+use crate::service::{StreamEvent, StreamTarget, StreamingEventBus};
 
 /// Return true when a Follow target references the local actor.
 ///
@@ -321,6 +322,8 @@ pub struct ActivityProcessor {
     local_protocol: String,
     /// Activity delivery service for sending responses
     delivery: Option<Arc<super::ActivityDelivery>>,
+    /// Real-time event bus for notifications and timeline updates.
+    streaming_event_bus: Option<Arc<dyn StreamingEventBus>>,
 }
 
 impl ActivityProcessor {
@@ -339,6 +342,7 @@ impl ActivityProcessor {
             local_address,
             local_protocol,
             delivery: None,
+            streaming_event_bus: None,
         }
     }
 
@@ -347,6 +351,15 @@ impl ActivityProcessor {
     /// This allows the processor to send activities (like Accept) in response to incoming activities.
     pub fn with_delivery(mut self, delivery: Arc<super::ActivityDelivery>) -> Self {
         self.delivery = Some(delivery);
+        self
+    }
+
+    /// Set streaming event bus for real-time notification fan-out.
+    pub fn with_streaming_event_bus(
+        mut self,
+        streaming_event_bus: Arc<dyn StreamingEventBus>,
+    ) -> Self {
+        self.streaming_event_bus = Some(streaming_event_bus);
         self
     }
 
@@ -558,7 +571,7 @@ impl ActivityProcessor {
                 created_at: chrono::Utc::now(),
             };
 
-            self.db.insert_notification(&notification).await?;
+            self.insert_notification_and_publish(&notification).await?;
         }
 
         // 4. Check if reply to our post -> create notification
@@ -583,7 +596,7 @@ impl ActivityProcessor {
                     created_at: chrono::Utc::now(),
                 };
 
-                self.db.insert_notification(&notification).await?;
+                self.insert_notification_and_publish(&notification).await?;
             }
         }
 
@@ -748,7 +761,7 @@ impl ActivityProcessor {
             created_at: chrono::Utc::now(),
         };
 
-        self.db.insert_notification(&notification).await?;
+        self.insert_notification_and_publish(&notification).await?;
 
         // 5. Send Accept activity
         if let Some(ref delivery) = self.delivery {
@@ -920,7 +933,7 @@ impl ActivityProcessor {
             created_at: chrono::Utc::now(),
         };
 
-        self.db.insert_notification(&notification).await?;
+        self.insert_notification_and_publish(&notification).await?;
 
         Ok(())
     }
@@ -959,7 +972,7 @@ impl ActivityProcessor {
                     created_at: chrono::Utc::now(),
                 };
 
-                self.db.insert_notification(&notification).await?;
+                self.insert_notification_and_publish(&notification).await?;
             }
             // If quote doesn't mention us, ignore (future: could cache if from followee)
         } else if let Some(object_uri) = object.as_str() {
@@ -976,12 +989,52 @@ impl ActivityProcessor {
                     created_at: chrono::Utc::now(),
                 };
 
-                self.db.insert_notification(&notification).await?;
+                self.insert_notification_and_publish(&notification).await?;
             }
             // If boosting someone else's status, ignore (future: could cache if from followee)
         }
 
         Ok(())
+    }
+
+    fn local_account_id(&self) -> &str {
+        self.local_address
+            .split_once('@')
+            .map(|(username, _)| username)
+            .unwrap_or(self.local_address.as_str())
+    }
+
+    async fn insert_notification_and_publish(
+        &self,
+        notification: &crate::data::Notification,
+    ) -> Result<(), AppError> {
+        self.db.insert_notification(notification).await?;
+        self.publish_notification(notification).await;
+        Ok(())
+    }
+
+    async fn publish_notification(&self, notification: &crate::data::Notification) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let local_account_id = self.local_account_id().to_string();
+        let event = StreamEvent::Notification {
+            payload: serde_json::json!({
+                "id": notification.id.as_str(),
+                "type": notification.notification_type.as_str(),
+                "status_uri": notification.status_uri.as_deref(),
+                "origin_account_address": notification.origin_account_address.as_str(),
+                "created_at": notification.created_at.to_rfc3339(),
+            }),
+            targets: vec![StreamTarget::User {
+                account_id: local_account_id,
+            }],
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish notification stream event");
+        }
     }
 
     // =========================================================================

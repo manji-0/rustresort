@@ -46,7 +46,7 @@ fn skip_html_tag(content: &str, start: usize) -> Option<usize> {
     None
 }
 
-pub(super) fn extract_hashtags_from_content(content: &str) -> Vec<String> {
+pub(crate) fn extract_hashtags_from_content(content: &str) -> Vec<String> {
     let mut hashtags = Vec::new();
     let mut seen = HashSet::new();
     let mut chars = content.char_indices().peekable();
