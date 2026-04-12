@@ -231,6 +231,7 @@ impl StatusService {
             is_local: true,
             in_reply_to_uri,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: chrono::Utc::now(),
             fetched_at: None,
@@ -725,6 +726,7 @@ impl StatusService {
                 is_local: false,
                 in_reply_to_uri: cached.reply_to_uri.clone(),
                 boost_of_uri: cached.boost_of_uri.clone(),
+                quote_of_uri: cached.quote_of_uri.clone(),
                 persisted_reason: reason,
                 created_at: cached.created_at,
                 fetched_at: Some(chrono::Utc::now()),
@@ -753,6 +755,7 @@ impl StatusService {
                     is_local: false,
                     in_reply_to_uri: cached.reply_to_uri.clone(),
                     boost_of_uri: cached.boost_of_uri.clone(),
+                    quote_of_uri: cached.quote_of_uri.clone(),
                     persisted_reason: reason,
                     created_at: cached.created_at,
                     fetched_at: Some(chrono::Utc::now()),
@@ -777,6 +780,7 @@ impl StatusService {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: reason,
             created_at: now,
             fetched_at: Some(now),
@@ -856,7 +860,9 @@ impl StatusService {
 
         matches!(
             status.persisted_reason,
-            PersistedReason::Reposted
+            PersistedReason::Timeline
+                | PersistedReason::CacheOnly
+                | PersistedReason::Reposted
                 | PersistedReason::Favourited
                 | PersistedReason::Bookmarked
                 | PersistedReason::ReplyToOwn
@@ -1098,6 +1104,8 @@ mod tests {
             username: username.to_string(),
             display_name: Some(username.to_string()),
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private-key".to_string(),
@@ -1206,6 +1214,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -1240,6 +1249,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -1277,6 +1287,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1306,6 +1317,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -1357,6 +1369,7 @@ mod tests {
                 attachments: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
+                quote_of_uri: None,
             })
             .await;
 
@@ -1595,6 +1608,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -1723,7 +1737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_timeline_update_does_not_publish_to_user_stream() {
+    async fn remote_timeline_update_publishes_to_user_stream() {
         let (db, _temp_dir) = create_test_db().await;
         seed_account(db.as_ref(), "testuser").await;
         let bus = Arc::new(BroadcastEventBus::new(64));
@@ -1741,6 +1755,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Timeline,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -1749,11 +1764,11 @@ mod tests {
 
         service.update_loaded(&status).await.unwrap();
 
-        let maybe_event = timeout(Duration::from_millis(200), receiver.recv()).await;
-        assert!(
-            maybe_event.is_err(),
-            "remote timeline status must not be delivered to user stream"
-        );
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, StreamEvent::Update { .. }));
     }
 
     #[tokio::test]

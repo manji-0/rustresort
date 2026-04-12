@@ -11,8 +11,9 @@ use std::collections::{HashSet, VecDeque};
 
 use super::accounts::PaginationParams;
 use super::federation_delivery::{
-    resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_batch_delivery,
-    spawn_best_effort_delivery,
+    ResolvedRemoteRecipient, extract_remote_mentions_from_content,
+    resolve_remote_actor_and_inbox_with_dependencies, resolve_remote_recipients_with_dependencies,
+    spawn_best_effort_batch_delivery, spawn_best_effort_delivery,
 };
 use crate::StatusApiState;
 use crate::auth::CurrentUser;
@@ -96,6 +97,13 @@ fn should_federate_to_followers(visibility: StatusVisibility) -> bool {
     )
 }
 
+fn should_deliver_to_followers_collection(visibility: StatusVisibility) -> bool {
+    matches!(
+        visibility,
+        StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private
+    )
+}
+
 fn ensure_public_visibility_for_public_endpoint(
     visibility: StatusVisibility,
 ) -> Result<(), AppError> {
@@ -119,6 +127,67 @@ fn normalize_visibility_input(
             "visibility must be one of: public, unlisted, private, direct".to_string(),
         )
     })
+}
+
+fn normalize_optional_identifier(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+#[derive(Debug)]
+struct ResolvedQuoteTarget {
+    uri: String,
+    remote_account_address: Option<String>,
+}
+
+async fn resolve_quote_target_uri(
+    state: &StatusApiState,
+    status_service: &StatusService,
+    quoted_status_id: Option<&str>,
+) -> Result<Option<ResolvedQuoteTarget>, AppError> {
+    let Some(quoted_status_id) = quoted_status_id else {
+        return Ok(None);
+    };
+
+    if let Some(quoted_target) = status_service.find(quoted_status_id).await? {
+        return Ok(Some(ResolvedQuoteTarget {
+            uri: quoted_target.uri,
+            remote_account_address: (!quoted_target.is_local
+                && !quoted_target.account_address.is_empty())
+            .then_some(quoted_target.account_address),
+        }));
+    }
+    if let Some(quoted_target) = status_service.find_by_uri(quoted_status_id).await? {
+        return Ok(Some(ResolvedQuoteTarget {
+            uri: quoted_target.uri,
+            remote_account_address: (!quoted_target.is_local
+                && !quoted_target.account_address.is_empty())
+            .then_some(quoted_target.account_address),
+        }));
+    }
+    if let Some(cached_target) = state.timeline_cache.get_by_uri(quoted_status_id).await {
+        return Ok(Some(ResolvedQuoteTarget {
+            uri: cached_target.uri.clone(),
+            remote_account_address: (!cached_target.account_address.is_empty())
+                .then_some(cached_target.account_address.clone()),
+        }));
+    }
+    if quoted_status_id.starts_with("http://") || quoted_status_id.starts_with("https://") {
+        let quoted_target = status_service
+            .ensure_remote_status_persisted(quoted_status_id, PersistedReason::Own)
+            .await?;
+        return Ok(Some(ResolvedQuoteTarget {
+            uri: quoted_target.uri,
+            remote_account_address: (!quoted_target.account_address.is_empty())
+                .then_some(quoted_target.account_address),
+        }));
+    }
+
+    Err(AppError::Validation(
+        "quoted_status_id does not exist".to_string(),
+    ))
 }
 
 #[derive(Debug)]
@@ -246,7 +315,7 @@ fn build_status_service(state: &StatusApiState) -> StatusService {
         state.storage.clone(),
         state.streaming_event_bus.clone(),
         state.config.server.base_url().to_string(),
-        state.config.admin.username.clone(),
+        state.config.auth.username.clone(),
     )
 }
 
@@ -269,19 +338,21 @@ fn build_delivery(
     )
 }
 
-fn status_response_without_interaction_state(
+async fn status_response_without_interaction_state(
     state: &StatusApiState,
     account: &crate::data::Account,
     account_stats: crate::api::AccountStats,
     status: &crate::data::Status,
-) -> crate::api::StatusResponse {
-    crate::api::status_to_response_with_account_stats(
+) -> Result<crate::api::StatusResponse, AppError> {
+    crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         status,
         account,
         &state.config,
         account_stats,
         crate::api::StatusInteractions::default(),
     )
+    .await
 }
 
 fn status_content_to_source_text(content: &str) -> String {
@@ -324,6 +395,74 @@ fn status_content_to_source_text(content: &str) -> String {
         previous_blank = is_blank;
     }
     output.trim().to_string()
+}
+
+async fn remote_account_address_for_status_uri(
+    state: &StatusApiState,
+    status_service: &StatusService,
+    status_uri: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let Some(status_uri) = status_uri else {
+        return Ok(None);
+    };
+
+    if let Some(status) = status_service.find_by_uri(status_uri).await? {
+        return Ok((!status.is_local && !status.account_address.is_empty())
+            .then_some(status.account_address));
+    }
+    if let Some(cached_status) = state.timeline_cache.get_by_uri(status_uri).await {
+        return Ok((!cached_status.account_address.is_empty())
+            .then_some(cached_status.account_address.clone()));
+    }
+
+    Ok(None)
+}
+
+async fn resolve_explicit_remote_recipients(
+    state: &StatusApiState,
+    content: &str,
+    extra_addresses: impl IntoIterator<Item = String>,
+) -> (Vec<ResolvedRemoteRecipient>, Vec<serde_json::Value>) {
+    let mut addresses = extract_remote_mentions_from_content(content, &state.config.server.domain);
+    let mention_addresses = addresses
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    addresses.extend(extra_addresses);
+
+    let recipients = resolve_remote_recipients_with_dependencies(
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        addresses,
+    )
+    .await;
+
+    let mention_tags = recipients
+        .iter()
+        .filter(|recipient| mention_addresses.contains(&recipient.address))
+        .map(|recipient| {
+            serde_json::json!({
+                "type": "Mention",
+                "href": recipient.actor_uri,
+                "name": format!("@{}", recipient.address),
+            })
+        })
+        .collect();
+
+    (recipients, mention_tags)
+}
+
+fn merge_delivery_targets(
+    mut follower_inboxes: Vec<String>,
+    recipients: &[ResolvedRemoteRecipient],
+) -> Vec<String> {
+    let mut seen = follower_inboxes.iter().cloned().collect::<HashSet<_>>();
+    for recipient in recipients {
+        if seen.insert(recipient.inbox_uri.clone()) {
+            follower_inboxes.push(recipient.inbox_uri.clone());
+        }
+    }
+    follower_inboxes
 }
 
 /// Status source response
@@ -432,20 +571,12 @@ pub async fn create_status(
         let poll = normalize_poll_input(poll)?;
         let scheduled_at = normalize_scheduled_at(scheduled_at)?;
         let media_ids = media_ids.unwrap_or_default();
+        let quoted_status_id = normalize_optional_identifier(quoted_status_id);
         let content_warning = normalize_content_warning(spoiler_text, sensitive, None);
 
         if poll.is_some() && !media_ids.is_empty() {
             return Err(AppError::Unprocessable(
                 "poll and media_ids cannot be used together".to_string(),
-            ));
-        }
-
-        if quoted_status_id
-            .as_deref()
-            .is_some_and(|quoted_status_id| !quoted_status_id.trim().is_empty())
-        {
-            return Err(AppError::Validation(
-                "quoted_status_id parameter is not supported".to_string(),
             ));
         }
 
@@ -490,6 +621,10 @@ pub async fn create_status(
             }
         }
 
+        let quote_target =
+            resolve_quote_target_uri(&state, &status_service, quoted_status_id.as_deref()).await?;
+        let quote_of_uri = quote_target.as_ref().map(|target| target.uri.clone());
+
         if let Some(scheduled_at) = scheduled_at {
             let media_ids_json = if media_ids.is_empty() {
                 None
@@ -512,10 +647,12 @@ pub async fn create_status(
                     visibility: visibility.to_string(),
                     content_warning: content_warning.clone(),
                     in_reply_to_id: in_reply_to_id.clone(),
+                    quoted_status_id: quoted_status_id.clone(),
                     media_ids: media_ids_json,
                     poll_options: poll_options_json,
                     poll_expires_in: poll.as_ref().map(|poll| poll.expires_in),
                     poll_multiple: poll.as_ref().is_some_and(|poll| poll.multiple),
+                    language: language.clone(),
                 })
                 .await?;
             return status_service
@@ -543,13 +680,14 @@ pub async fn create_status(
             is_local: true,
             in_reply_to_uri,
             boost_of_uri: None,
+            quote_of_uri,
             persisted_reason,
             created_at: Utc::now(),
             fetched_at: None,
         };
 
-        let should_federate_create = should_federate_to_followers(status.visibility);
-        let create_delivery_targets = if should_federate_create {
+        let should_deliver_to_followers = should_deliver_to_followers_collection(status.visibility);
+        let create_delivery_targets = if should_deliver_to_followers {
             match account_service.get_follower_inboxes().await {
                 Ok(follower_inboxes) => follower_inboxes,
                 Err(error) => {
@@ -563,6 +701,19 @@ pub async fn create_status(
         } else {
             Vec::new()
         };
+
+        let mut extra_addresses = Vec::new();
+        if let Some(reply_target_account_address) = reply_target_account_address.clone() {
+            extra_addresses.push(reply_target_account_address);
+        }
+        if let Some(quote_target_account_address) = quote_target
+            .as_ref()
+            .and_then(|target| target.remote_account_address.clone())
+        {
+            extra_addresses.push(quote_target_account_address);
+        }
+        let (explicit_recipients, mention_tags) =
+            resolve_explicit_remote_recipients(&state, &content, extra_addresses).await;
 
         // Save to database
         let db_timer = DB_QUERY_DURATION_SECONDS
@@ -584,52 +735,32 @@ pub async fn create_status(
         // Update posts total metric
         POSTS_TOTAL.inc();
 
-        if should_federate_create {
+        let delivery_targets =
+            merge_delivery_targets(create_delivery_targets, &explicit_recipients);
+        if !delivery_targets.is_empty() {
             let delivery = build_delivery(&state, &account);
             let state_for_delivery = state.clone();
             let status_for_delivery = status.clone();
-            let reply_target_account_address_for_delivery = reply_target_account_address;
+            let explicit_recipient_actor_uris = explicit_recipients
+                .iter()
+                .map(|recipient| recipient.actor_uri.clone())
+                .collect::<Vec<_>>();
+            let mention_tags_for_delivery = mention_tags.clone();
             spawn_best_effort_batch_delivery("create_status", async move {
-                let mut delivery_targets = create_delivery_targets;
-
-                if let Some(reply_target_account_address) =
-                    reply_target_account_address_for_delivery
-                {
-                    match resolve_remote_actor_and_inbox_with_dependencies(
-                        state_for_delivery.profile_cache.as_ref(),
-                        state_for_delivery.federation_fetch_client.as_ref(),
-                        &reply_target_account_address,
+                delivery
+                    .queue_create_with_audience(
+                        state_for_delivery.db.as_ref(),
+                        &status_for_delivery,
+                        delivery_targets,
+                        &explicit_recipient_actor_uris,
+                        &mention_tags_for_delivery,
                     )
                     .await
-                    {
-                        Ok((_, reply_target_inbox_uri)) => {
-                            delivery_targets.push(reply_target_inbox_uri);
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                reply_target_account_address = %reply_target_account_address,
-                                %error,
-                                "Failed to resolve reply target inbox for Create delivery"
-                            );
-                        }
-                    }
-                }
-
-                if delivery_targets.is_empty() {
-                    tracing::debug!(
-                        "Skipping outbound Create delivery because no targets were found"
-                    );
-                    return Vec::new();
-                }
-
-                delivery
-                    .send_create(&status_for_delivery, delivery_targets)
-                    .await
             });
-        } else if !should_federate_create {
+        } else {
             tracing::debug!(
                 visibility = %status.visibility,
-                "Skipping outbound Create delivery for non-public visibility"
+                "Skipping outbound Create delivery because no remote targets were found"
             );
         }
 
@@ -673,7 +804,8 @@ pub async fn create_status(
         };
 
         let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-        let response = crate::api::status_to_response_with_media(
+        let response = crate::api::build_status_response_with_media(
+            state.db.as_ref(),
             &status,
             &account,
             &state.config,
@@ -687,7 +819,8 @@ pub async fn create_status(
                 Some(false),
             ),
             &media_attachments,
-        );
+        )
+        .await?;
         let mut response_value = serde_json::to_value(response)
             .map_err(|error| AppError::serialization("status response serialization", error))?;
         if let Some(obj) = response_value.as_object_mut()
@@ -761,7 +894,7 @@ pub async fn get_status(
 
     // Convert to API response
     let response =
-        status_response_without_interaction_state(&state, &account, account_stats, &status);
+        status_response_without_interaction_state(&state, &account, account_stats, &status).await?;
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -815,31 +948,71 @@ pub async fn delete_status(
         .inc();
     db_timer.observe_duration();
 
-    let should_federate_delete = should_federate_to_followers(status.visibility);
-    if should_federate_delete {
-        match build_account_service(&state).get_follower_inboxes().await {
-            Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
-                let delivery = build_delivery(&state, &account);
-                let status_uri = status.uri.clone();
-                let status_visibility = status.visibility;
-                spawn_best_effort_batch_delivery("delete_status", async move {
-                    delivery
-                        .send_delete(&status_uri, status_visibility.as_str(), follower_inboxes)
-                        .await
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
+    let extra_addresses = {
+        let mut extra_addresses = Vec::new();
+        if let Some(reply_target_account_address) = remote_account_address_for_status_uri(
+            &state,
+            &status_service,
+            status.in_reply_to_uri.as_deref(),
+        )
+        .await?
+        {
+            extra_addresses.push(reply_target_account_address);
+        }
+        if let Some(quote_target_account_address) = remote_account_address_for_status_uri(
+            &state,
+            &status_service,
+            status.quote_of_uri.as_deref(),
+        )
+        .await?
+        {
+            extra_addresses.push(quote_target_account_address);
+        }
+        extra_addresses
+    };
+    let source_text = status_content_to_source_text(&status.content);
+    let (explicit_recipients, _) =
+        resolve_explicit_remote_recipients(&state, &source_text, extra_addresses).await;
+    let should_deliver_to_followers = should_deliver_to_followers_collection(status.visibility);
+    let follower_inboxes = if should_deliver_to_followers {
+        build_account_service(&state)
+            .get_follower_inboxes()
+            .await
+            .unwrap_or_else(|error| {
                 tracing::warn!(
                     %error,
-                    "Skipping outbound Delete delivery because follower inbox lookup failed"
+                    "Skipping follower fan-out prefetch for Delete delivery"
                 );
-            }
-        }
-    } else if !should_federate_delete {
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
+    let delivery_targets = merge_delivery_targets(follower_inboxes, &explicit_recipients);
+    if !delivery_targets.is_empty() {
+        let explicit_recipient_actor_uris = explicit_recipients
+            .iter()
+            .map(|recipient| recipient.actor_uri.clone())
+            .collect::<Vec<_>>();
+        let delivery = build_delivery(&state, &account);
+        let state_for_delivery = state.clone();
+        let status_uri = status.uri.clone();
+        let status_visibility = status.visibility;
+        spawn_best_effort_batch_delivery("delete_status", async move {
+            delivery
+                .queue_delete_with_audience(
+                    state_for_delivery.db.as_ref(),
+                    &status_uri,
+                    status_visibility.as_str(),
+                    delivery_targets,
+                    &explicit_recipient_actor_uris,
+                )
+                .await
+        });
+    } else {
         tracing::debug!(
             visibility = %status.visibility,
-            "Skipping outbound Delete delivery for non-public visibility"
+            "Skipping outbound Delete delivery because no remote targets were found"
         );
     }
 
@@ -847,7 +1020,8 @@ pub async fn delete_status(
     POSTS_TOTAL.dec();
 
     // Return the deleted status
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -859,7 +1033,8 @@ pub async fn delete_status(
             Some(false),
             Some(false),
         ),
-    );
+    )
+    .await?;
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -939,22 +1114,18 @@ pub async fn get_status_context(
 
     let mut ancestor_responses = Vec::with_capacity(ancestors.len());
     for ancestor in &ancestors {
-        ancestor_responses.push(status_response_without_interaction_state(
-            &state,
-            &account,
-            account_stats,
-            ancestor,
-        ));
+        ancestor_responses.push(
+            status_response_without_interaction_state(&state, &account, account_stats, ancestor)
+                .await?,
+        );
     }
 
     let mut descendant_responses = Vec::with_capacity(descendants.len());
     for descendant in &descendants {
-        descendant_responses.push(status_response_without_interaction_state(
-            &state,
-            &account,
-            account_stats,
-            descendant,
-        ));
+        descendant_responses.push(
+            status_response_without_interaction_state(&state, &account, account_stats, descendant)
+                .await?,
+        );
     }
 
     let context = ContextResponse {
@@ -1073,21 +1244,29 @@ pub async fn favourite_status(
         );
         let status_uri = status.uri.clone();
         spawn_best_effort_delivery("favourite_status", async move {
-            let (_, target_inbox_uri) = resolve_remote_actor_and_inbox_with_dependencies(
-                state_for_delivery.profile_cache.as_ref(),
-                state_for_delivery.federation_fetch_client.as_ref(),
-                &account_address_for_delivery,
-            )
-            .await?;
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox_with_dependencies(
+                    state_for_delivery.profile_cache.as_ref(),
+                    state_for_delivery.federation_fetch_client.as_ref(),
+                    &account_address_for_delivery,
+                )
+                .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
-                .send_like_with_id(&like_activity_uri, &status_uri, &target_inbox_uri)
+                .queue_like_with_id(
+                    state_for_delivery.db.as_ref(),
+                    &like_activity_uri,
+                    &status_uri,
+                    &target_inbox_uri,
+                    &target_actor_uri,
+                )
                 .await
         });
     }
 
     // Return status with favourited=true
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1099,7 +1278,8 @@ pub async fn favourite_status(
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1146,21 +1326,30 @@ pub async fn unfavourite_status(
         let account_for_delivery = account.clone();
         let account_address_for_delivery = status.account_address.clone();
         spawn_best_effort_delivery("unfavourite_status", async move {
-            let (_, target_inbox_uri) = resolve_remote_actor_and_inbox_with_dependencies(
-                state_for_delivery.profile_cache.as_ref(),
-                state_for_delivery.federation_fetch_client.as_ref(),
-                &account_address_for_delivery,
-            )
-            .await?;
+            let (target_actor_uri, target_inbox_uri) =
+                resolve_remote_actor_and_inbox_with_dependencies(
+                    state_for_delivery.profile_cache.as_ref(),
+                    state_for_delivery.federation_fetch_client.as_ref(),
+                    &account_address_for_delivery,
+                )
+                .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
-                .send_undo_to_inbox_with_type(&like_activity_uri, Some("Like"), &target_inbox_uri)
+                .queue_undo_to_inbox_with_type_and_object(
+                    state_for_delivery.db.as_ref(),
+                    &like_activity_uri,
+                    Some("Like"),
+                    None,
+                    Some(&target_actor_uri),
+                    &target_inbox_uri,
+                )
                 .await
         });
     }
 
     // Return status with favourited=false
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1172,7 +1361,8 @@ pub async fn unfavourite_status(
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1221,12 +1411,14 @@ pub async fn reblog_status(
         match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                 let delivery = build_delivery(&state, &account);
+                let state_for_delivery = state.clone();
                 let announce_activity_uri = repost_uri.clone();
                 let announced_status_uri = status.uri.clone();
                 let announced_status_visibility = status.visibility;
                 spawn_best_effort_batch_delivery("reblog_status", async move {
                     delivery
-                        .send_announce_with_id(
+                        .queue_announce_with_id(
+                            state_for_delivery.db.as_ref(),
                             &announce_activity_uri,
                             &announced_status_uri,
                             announced_status_visibility.as_str(),
@@ -1251,7 +1443,8 @@ pub async fn reblog_status(
     }
 
     // Return the original status with reblogged=true
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1263,7 +1456,8 @@ pub async fn reblog_status(
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1303,9 +1497,15 @@ pub async fn unreblog_status(
             match build_account_service(&state).get_follower_inboxes().await {
                 Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
                     let delivery = build_delivery(&state, &account);
+                    let state_for_delivery = state.clone();
                     spawn_best_effort_batch_delivery("unreblog_status", async move {
                         delivery
-                            .send_undo_with_type(&repost_uri, Some("Announce"), follower_inboxes)
+                            .queue_undo_with_type(
+                                state_for_delivery.db.as_ref(),
+                                &repost_uri,
+                                Some("Announce"),
+                                follower_inboxes,
+                            )
                             .await
                     });
                 }
@@ -1326,7 +1526,8 @@ pub async fn unreblog_status(
     }
 
     // Return status with reblogged=false
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1338,7 +1539,8 @@ pub async fn unreblog_status(
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1365,7 +1567,8 @@ pub async fn bookmark_status(
     let status_id = status.id.clone();
 
     // Return status with bookmarked=true
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1377,7 +1580,8 @@ pub async fn bookmark_status(
             Some(true),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1408,7 +1612,8 @@ pub async fn unbookmark_status(
     let status_id = status.id.clone();
 
     // Return status with bookmarked=false
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1420,7 +1625,8 @@ pub async fn unbookmark_status(
             Some(false),
             status_service.is_pinned(&status_id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1519,10 +1725,71 @@ pub async fn update_status(
                 media_ids_to_replace.as_deref(),
             )
             .await?;
+
+        let mut extra_addresses = Vec::new();
+        if let Some(reply_target_account_address) = remote_account_address_for_status_uri(
+            &state,
+            &status_service,
+            status.in_reply_to_uri.as_deref(),
+        )
+        .await?
+        {
+            extra_addresses.push(reply_target_account_address);
+        }
+        if let Some(quote_target_account_address) = remote_account_address_for_status_uri(
+            &state,
+            &status_service,
+            status.quote_of_uri.as_deref(),
+        )
+        .await?
+        {
+            extra_addresses.push(quote_target_account_address);
+        }
+
+        let source_text = status_content_to_source_text(&status.content);
+        let (explicit_recipients, mention_tags) =
+            resolve_explicit_remote_recipients(&state, &source_text, extra_addresses).await;
+        let follower_inboxes = if should_deliver_to_followers_collection(status.visibility) {
+            build_account_service(&state)
+                .get_follower_inboxes()
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        %error,
+                        status_id = %status.id,
+                        "Skipping follower fan-out prefetch for Update delivery"
+                    );
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
+        let delivery_targets = merge_delivery_targets(follower_inboxes, &explicit_recipients);
+        if !delivery_targets.is_empty() {
+            let delivery = build_delivery(&state, &account);
+            let state_for_delivery = state.clone();
+            let status_for_delivery = status.clone();
+            let explicit_recipient_actor_uris = explicit_recipients
+                .iter()
+                .map(|recipient| recipient.actor_uri.clone())
+                .collect::<Vec<_>>();
+            spawn_best_effort_batch_delivery("update_status", async move {
+                delivery
+                    .queue_update_status(
+                        state_for_delivery.db.as_ref(),
+                        &status_for_delivery,
+                        delivery_targets,
+                        &explicit_recipient_actor_uris,
+                        &mention_tags,
+                    )
+                    .await
+            });
+        }
     }
 
     // Return updated status
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1534,7 +1801,8 @@ pub async fn update_status(
             status_service.is_bookmarked(&status.id).await.ok(),
             status_service.is_pinned(&status.id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1609,7 +1877,8 @@ pub async fn pin_status(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1621,7 +1890,8 @@ pub async fn pin_status(
             status_service.is_bookmarked(&status.id).await.ok(),
             Some(true),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1643,7 +1913,8 @@ pub async fn unpin_status(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1655,7 +1926,8 @@ pub async fn unpin_status(
             status_service.is_bookmarked(&status.id).await.ok(),
             Some(false),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1677,7 +1949,8 @@ pub async fn mute_status(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1689,7 +1962,8 @@ pub async fn mute_status(
             status_service.is_bookmarked(&status.id).await.ok(),
             status_service.is_pinned(&status.id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -1711,7 +1985,8 @@ pub async fn unmute_status(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let response = crate::api::status_to_response_with_account_stats(
+    let response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
         &status,
         &account,
         &state.config,
@@ -1723,7 +1998,8 @@ pub async fn unmute_status(
             status_service.is_bookmarked(&status.id).await.ok(),
             status_service.is_pinned(&status.id).await.ok(),
         ),
-    );
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }

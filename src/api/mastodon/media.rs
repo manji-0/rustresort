@@ -256,7 +256,7 @@ async fn upload_media_response_value(
         state.storage.clone(),
         state.streaming_event_bus.clone(),
         state.config.server.base_url().to_string(),
-        state.config.admin.username.clone(),
+        state.config.auth.username.clone(),
     );
     let mut media = status_service
         .upload_media(parsed.file_data, parsed.content_type, parsed.description)

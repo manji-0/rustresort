@@ -10,6 +10,7 @@ This guide covers local setup, configuration, test commands, and day-to-day work
 - SQLite `3.35+`
 - Optional: MinIO (local S3/R2 emulation)
 - Optional: `jj` (Jujutsu) for project VCS workflow
+- Optional: `direnv` for automatic `devbox` activation
 
 ## Setup
 
@@ -20,6 +21,35 @@ git clone https://github.com/yourusername/rustresort.git
 cd rustresort
 cargo build
 ```
+
+### 1a. devbox setup
+
+If you want a reproducible development shell, use `devbox.json` at the repo root.
+
+```bash
+devbox shell
+devbox run bootstrap
+```
+
+If you prefer automatic activation, this repository also ships with `.envrc`.
+After installing `direnv` and enabling its shell hook, run:
+
+```bash
+direnv allow
+devbox run bootstrap
+```
+
+After that, entering the repository directory will automatically expose the
+`devbox` toolchain to your shell.
+
+This installs or prepares:
+
+- Rust toolchain via `rustup`
+- `wasm32-unknown-unknown` target and `wasm-bindgen` for the integrated UI
+- Node.js and npm
+- Playwright browser binaries
+- SQLite and common build tooling
+- `jj`, `git`, `curl`, and `jq`
 
 ### 2. Create local configuration
 
@@ -52,17 +82,13 @@ description = "Development instance"
 contact_email = "admin@example.com"
 
 [admin]
-username = "admin"
 display_name = "Admin"
 
 [auth]
-github_username = "your-github-username"
-session_secret = "replace-with-a-random-secret"
+username = "admin"
+password = "set-this-on-first-start"
+session_secret = "replace-with-a-random-secret-of-at-least-32-bytes"
 session_max_age = 604800
-
-[auth.github]
-client_id = "your-github-client-id"
-client_secret = "your-github-client-secret"
 
 [logging]
 level = "debug"
@@ -72,8 +98,43 @@ format = "pretty"
 ### 3. Run the server
 
 ```bash
-cargo run
+devbox run dev
 ```
+
+This flow:
+
+- builds the integrated Rust/WASM UI bundle
+- starts the app with `--enable-ui`
+- binds the dev server for `http://localhost:3000`
+- serves the unified UI at `http://localhost:3000/ui`
+
+If you need the old server-only startup path, run:
+
+```bash
+devbox run dev:legacy
+```
+
+For the normal edit-save-restart loop, use:
+
+```bash
+devbox run dev:watch
+```
+
+This watches the Rust server code, shared crates, config files, migrations, and
+the Rust/WASM UI crate.
+
+- UI crate changes: rebuilds the wasm/js/css bundle in place
+- Server/config/shared crate changes: rebuilds `rustresort` and restarts the debug binary directly
+
+The dev server sets `RUSTRESORT__UI__DEV_DIR=crates/rustresort-ui/dist`, so `/ui`
+serves the latest local bundle from disk during development instead of requiring
+the server binary to embed fresh UI assets on every edit.
+
+Recommended auth workflow for local development:
+
+1. sign in once with the configured bootstrap password
+2. register a passkey from the settings UI
+3. use passkey login for routine development after that
 
 Health check:
 

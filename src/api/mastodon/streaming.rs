@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 use tokio::sync::broadcast;
 
+use super::accounts::resolve_account_response_for_identity;
 use crate::StreamingApiState;
 use crate::auth::CurrentUser;
 use crate::data::{PersistedReason, Status, StatusVisibility};
@@ -37,15 +38,8 @@ fn json_value_to_string(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
-async fn get_notification_status(state: &StreamingApiState, status_uri: &str) -> Option<Status> {
-    if let Ok(status) = state.db.get_status_by_uri(status_uri).await
-        && status.is_some()
-    {
-        return status;
-    }
-
-    let cached = state.timeline_cache.get_by_uri(status_uri).await?;
-    Some(Status {
+fn cached_status_to_status(cached: &crate::data::CachedStatus) -> Status {
+    Status {
         id: cached.id.clone(),
         uri: cached.uri.clone(),
         content: cached.content.clone(),
@@ -57,10 +51,22 @@ async fn get_notification_status(state: &StreamingApiState, status_uri: &str) ->
         is_local: false,
         in_reply_to_uri: cached.reply_to_uri.clone(),
         boost_of_uri: cached.boost_of_uri.clone(),
+        quote_of_uri: cached.quote_of_uri.clone(),
         persisted_reason: PersistedReason::CacheOnly,
         created_at: cached.created_at,
         fetched_at: Some(chrono::Utc::now()),
-    })
+    }
+}
+
+async fn get_notification_status(state: &StreamingApiState, status_uri: &str) -> Option<Status> {
+    if let Ok(status) = state.db.get_status_by_uri(status_uri).await
+        && status.is_some()
+    {
+        return status;
+    }
+
+    let cached = state.timeline_cache.get_by_uri(status_uri).await?;
+    Some(cached_status_to_status(&cached))
 }
 
 async fn load_stream_status(
@@ -72,11 +78,21 @@ async fn load_stream_status(
     {
         return Ok(Some(status));
     }
+    if let Some(status_id) = payload.get("id").and_then(Value::as_str)
+        && let Some(status) = state.timeline_cache.get(status_id).await
+    {
+        return Ok(Some(cached_status_to_status(&status)));
+    }
 
     if let Some(status_uri) = payload.get("uri").and_then(Value::as_str)
         && let Some(status) = state.db.get_status_by_uri(status_uri).await?
     {
         return Ok(Some(status));
+    }
+    if let Some(status_uri) = payload.get("uri").and_then(Value::as_str)
+        && let Some(status) = state.timeline_cache.get_by_uri(status_uri).await
+    {
+        return Ok(Some(cached_status_to_status(&status)));
     }
 
     Ok(None)
@@ -110,17 +126,28 @@ async fn build_status_response_value(
         Some(state.db.is_status_pinned(&status.id).await?),
     );
 
-    let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
+    let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        state.db.as_ref(),
         status,
         &account,
         &state.config,
         account_stats,
         remote_stats,
         interactions,
-    );
+    )
+    .await?;
 
     serde_json::to_value(response)
         .map_err(|error| AppError::serialization("streaming status payload", error))
+}
+
+async fn build_status_response(
+    state: &StreamingApiState,
+    status: &Status,
+) -> Result<crate::api::dto::StatusResponse, AppError> {
+    let value = build_status_response_value(state, status).await?;
+    serde_json::from_value(value)
+        .map_err(|error| AppError::serialization("streaming status response decode", error))
 }
 
 async fn build_notification_response_value(
@@ -140,28 +167,7 @@ async fn build_notification_response_value(
 
     let status_response = if let Some(status_uri) = notification.status_uri.as_deref() {
         if let Some(status) = get_notification_status(state, status_uri).await {
-            let status_batch = vec![status.clone()];
-            let remote_account_stats = crate::api::load_remote_account_stats_map(
-                state.db.as_ref(),
-                state.profile_cache.as_ref(),
-                &state.config.server.protocol,
-                &status_batch,
-            )
-            .await
-            .unwrap_or_default();
-            let remote_stats = remote_account_stats
-                .get(status.account_address.trim())
-                .copied();
-            Some(
-                crate::api::status_to_response_with_account_stats_and_remote_stats(
-                    &status,
-                    &account,
-                    &state.config,
-                    account_stats,
-                    remote_stats,
-                    crate::api::StatusInteractions::default(),
-                ),
-            )
+            Some(build_status_response(state, &status).await?)
         } else {
             None
         }
@@ -169,12 +175,27 @@ async fn build_notification_response_value(
         None
     };
 
+    let notification_id = notification.id.clone();
     let response = crate::api::NotificationResponse {
-        id: notification.id,
+        id: notification_id.clone(),
         notification_type: notification.notification_type.to_string(),
+        group_key: format!("ungrouped-{}", notification_id),
         created_at: notification.created_at,
-        account: crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
+        account: resolve_account_response_for_identity(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            None,
+            &notification.origin_account_address,
+        )
+        .await
+        .unwrap_or_else(|| {
+            crate::api::account_to_response_with_stats(&account, &state.config, account_stats)
+        }),
         status: status_response,
+        report: None,
+        event: None,
+        moderation_warning: None,
     };
 
     serde_json::to_value(response)
@@ -250,7 +271,7 @@ pub async fn stream_user(
     State(state): State<StreamingApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let account_id = state.config.admin.username.as_str();
+    let account_id = state.config.auth.username.as_str();
     let receiver = state.streaming_event_bus.subscribe_user(account_id).await?;
     Ok(build_sse_stream(state, receiver))
 }
@@ -315,7 +336,7 @@ pub async fn stream_direct(
     State(state): State<StreamingApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let account_id = state.config.admin.username.as_str();
+    let account_id = state.config.auth.username.as_str();
     let receiver = state
         .streaming_event_bus
         .subscribe_direct(account_id)

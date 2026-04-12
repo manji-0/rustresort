@@ -26,15 +26,17 @@ impl Database {
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO account (
-                id, username, display_name, note, avatar_s3_key, header_s3_key,
+                id, username, display_name, note, also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
                 private_key_pem, public_key_pem, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&account.id)
         .bind(&account.username)
         .bind(&account.display_name)
         .bind(&account.note)
+        .bind(&account.also_known_as)
+        .bind(&account.moved_to_uri)
         .bind(&account.avatar_s3_key)
         .bind(&account.header_s3_key)
         .bind(&account.private_key_pem)
@@ -58,10 +60,10 @@ impl Database {
         let result = sqlx::query(
             r#"
             INSERT INTO account (
-                id, username, display_name, note, avatar_s3_key, header_s3_key,
+                id, username, display_name, note, also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
                 private_key_pem, public_key_pem, created_at, updated_at
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM account)
             "#,
         )
@@ -69,6 +71,8 @@ impl Database {
         .bind(&account.username)
         .bind(&account.display_name)
         .bind(&account.note)
+        .bind(&account.also_known_as)
+        .bind(&account.moved_to_uri)
         .bind(&account.avatar_s3_key)
         .bind(&account.header_s3_key)
         .bind(&account.private_key_pem)
@@ -267,6 +271,39 @@ impl Database {
         .bind(patch.account_id.as_str())
         .bind(patch.expected_current_avatar_s3_key.as_deref())
         .bind(patch.expected_current_header_s3_key.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Patch migration-related actor fields by account ID.
+    ///
+    /// Use `None` for omitted fields (no change), and `Some(None)` to clear a
+    /// field.
+    pub async fn patch_account_migration(
+        &self,
+        account_id: &str,
+        also_known_as: Option<Option<&str>>,
+        moved_to_uri: Option<Option<&str>>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE account
+            SET
+                also_known_as = CASE WHEN ? THEN ? ELSE also_known_as END,
+                moved_to_uri = CASE WHEN ? THEN ? ELSE moved_to_uri END,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(also_known_as.is_some())
+        .bind(also_known_as.flatten())
+        .bind(moved_to_uri.is_some())
+        .bind(moved_to_uri.flatten())
+        .bind(updated_at)
+        .bind(account_id)
         .execute(&self.pool)
         .await?;
 

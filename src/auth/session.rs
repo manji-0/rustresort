@@ -8,18 +8,16 @@ use serde::{Deserialize, Serialize};
 
 /// User session data
 ///
-/// Stored in a signed cookie. Contains minimal user info
-/// from GitHub OAuth.
+/// Stored in a signed cookie or reused as a bearer token for the
+/// single built-in local account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    /// GitHub username
-    pub github_username: String,
-    /// GitHub user ID
-    pub github_id: u64,
-    /// Avatar URL from GitHub
-    pub avatar_url: String,
-    /// Display name from GitHub
-    pub name: Option<String>,
+    /// Local username
+    pub username: String,
+    /// Optional display name
+    pub display_name: Option<String>,
+    /// Which local factor established this session.
+    pub auth_method: String,
     /// When session was created
     pub created_at: DateTime<Utc>,
     /// When session expires

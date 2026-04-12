@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Set up public key cache
     let key_cache = Arc::new(PublicKeyCache::new(
         http_client.clone(),
+        None,
         Some(Duration::from_secs(3600)), // 1 hour TTL
     ));
 

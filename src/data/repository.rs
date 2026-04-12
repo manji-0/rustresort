@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::error::AppError;
 
-use super::{Account, Database, MediaAttachment, Status};
+use super::{Account, Database, Follow, MediaAttachment, Status};
 
 #[derive(Debug, Clone)]
 pub struct AccountCredentialsPatch {
@@ -30,10 +30,12 @@ pub struct ScheduledStatusInsert {
     pub visibility: String,
     pub content_warning: Option<String>,
     pub in_reply_to_id: Option<String>,
+    pub quoted_status_id: Option<String>,
     pub media_ids: Option<String>,
     pub poll_options: Option<String>,
     pub poll_expires_in: Option<i64>,
     pub poll_multiple: bool,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +192,15 @@ pub trait StatusRepository: Send + Sync {
 /// Data access used by `TimelineService`.
 #[async_trait]
 pub trait TimelineRepository: Send + Sync {
+    async fn get_all_follows(&self) -> Result<Vec<Follow>, AppError>;
+    async fn get_statuses_by_account_address_in_window(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError>;
     async fn get_local_statuses_in_window(
         &self,
         limit: usize,
@@ -226,6 +237,8 @@ pub trait TimelineRepository: Send + Sync {
         &self,
         status_ids: &[String],
     ) -> Result<HashSet<String>, AppError>;
+    async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
+    async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError>;
     async fn get_favourited_status_ids_batch(
         &self,
         status_ids: &[String],
@@ -539,6 +552,29 @@ impl StatusRepository for Database {
 
 #[async_trait]
 impl TimelineRepository for Database {
+    async fn get_all_follows(&self) -> Result<Vec<Follow>, AppError> {
+        Database::get_all_follows(self).await
+    }
+
+    async fn get_statuses_by_account_address_in_window(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_statuses_by_account_address_in_window(
+            self,
+            account_address,
+            default_port,
+            limit,
+            max_id,
+            min_id,
+        )
+        .await
+    }
+
     async fn get_local_statuses_in_window(
         &self,
         limit: usize,
@@ -594,6 +630,14 @@ impl TimelineRepository for Database {
         status_ids: &[String],
     ) -> Result<HashSet<String>, AppError> {
         Database::get_bookmarked_status_ids_batch(self, status_ids).await
+    }
+
+    async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
+        Database::get_media_by_status(self, status_id).await
+    }
+
+    async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError> {
+        Database::is_status_pinned(self, status_id).await
     }
 
     async fn get_favourited_status_ids_batch(

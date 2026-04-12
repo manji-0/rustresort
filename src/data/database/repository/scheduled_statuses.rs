@@ -16,9 +16,9 @@ impl Database {
             r#"
             INSERT INTO scheduled_statuses (
                 id, scheduled_at, status_text, visibility, content_warning,
-                in_reply_to_id, media_ids, poll_options, poll_expires_in, poll_multiple,
+                in_reply_to_id, quoted_status_id, media_ids, poll_options, poll_expires_in, poll_multiple, language,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             "#,
         )
         .bind(&id)
@@ -27,10 +27,12 @@ impl Database {
         .bind(request.visibility.as_str())
         .bind(request.content_warning.as_deref())
         .bind(request.in_reply_to_id.as_deref())
+        .bind(request.quoted_status_id.as_deref())
         .bind(request.media_ids.as_deref())
         .bind(request.poll_options.as_deref())
         .bind(request.poll_expires_in)
         .bind(request.poll_multiple as i64)
+        .bind(request.language.as_deref())
         .execute(&self.pool)
         .await?;
 
@@ -45,8 +47,10 @@ impl Database {
         let result = sqlx::query(
             r#"
             SELECT id, scheduled_at, status_text, visibility, content_warning,
-                   in_reply_to_id, media_ids, poll_options, poll_expires_in, poll_multiple
-            FROM scheduled_statuses WHERE id = ?
+                   in_reply_to_id, quoted_status_id, media_ids, poll_options, poll_expires_in, poll_multiple,
+                   language, error
+            FROM scheduled_statuses
+            WHERE id = ? AND published_at IS NULL
             "#,
         )
         .bind(id)
@@ -64,6 +68,8 @@ impl Database {
                     "visibility": row.get::<String, _>("visibility"),
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
+                    "quoted_status_id": row.get::<Option<String>, _>("quoted_status_id"),
+                    "language": row.get::<Option<String>, _>("language"),
                     "media_ids": media_ids,
                     "poll": if poll_options.is_some() {
                         Some(serde_json::json!({
@@ -75,7 +81,8 @@ impl Database {
                         None
                     }
                 },
-                "media_attachments": []
+                "media_attachments": [],
+                "error": row.get::<Option<String>, _>("error")
             })))
         } else {
             Ok(None)
@@ -90,8 +97,10 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, scheduled_at, status_text, visibility, content_warning,
-                   in_reply_to_id, media_ids, poll_options, poll_expires_in, poll_multiple
+                   in_reply_to_id, quoted_status_id, media_ids, poll_options, poll_expires_in, poll_multiple,
+                   language, error
             FROM scheduled_statuses
+            WHERE published_at IS NULL
             ORDER BY scheduled_at ASC
             LIMIT ?
             "#,
@@ -112,6 +121,8 @@ impl Database {
                     "visibility": row.get::<String, _>("visibility"),
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
+                    "quoted_status_id": row.get::<Option<String>, _>("quoted_status_id"),
+                    "language": row.get::<Option<String>, _>("language"),
                     "media_ids": media_ids,
                     "poll": if poll_options.is_some() {
                         Some(serde_json::json!({
@@ -123,7 +134,8 @@ impl Database {
                         None
                     }
                 },
-                "media_attachments": []
+                "media_attachments": [],
+                "error": row.get::<Option<String>, _>("error")
             }));
         }
 
@@ -137,7 +149,7 @@ impl Database {
         scheduled_at: &str,
     ) -> Result<bool, AppError> {
         let result = sqlx::query(
-            "UPDATE scheduled_statuses SET scheduled_at = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE scheduled_statuses SET scheduled_at = ?, error = NULL, updated_at = datetime('now') WHERE id = ? AND published_at IS NULL",
         )
         .bind(scheduled_at)
         .bind(id)
@@ -155,5 +167,68 @@ impl Database {
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Get due scheduled statuses that have not yet been published or failed.
+    pub async fn get_due_scheduled_statuses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ScheduledStatus>, AppError> {
+        let rows = sqlx::query_as::<_, ScheduledStatus>(
+            r#"
+            SELECT *
+            FROM scheduled_statuses
+            WHERE published_at IS NULL
+              AND error IS NULL
+              AND datetime(scheduled_at) <= datetime('now')
+            ORDER BY datetime(scheduled_at) ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Mark a scheduled status as successfully published.
+    pub async fn mark_scheduled_status_published(&self, id: &str) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE scheduled_statuses
+            SET published_at = datetime('now'),
+                error = NULL,
+                updated_at = datetime('now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark a scheduled status as failed so it will not be retried automatically.
+    pub async fn mark_scheduled_status_failed(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            UPDATE scheduled_statuses
+            SET error = ?,
+                updated_at = datetime('now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 }

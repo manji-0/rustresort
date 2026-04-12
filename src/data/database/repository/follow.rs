@@ -111,9 +111,16 @@ impl Database {
 
     /// Get follower inbox URIs for activity delivery
     pub async fn get_follower_inboxes(&self) -> Result<Vec<String>, AppError> {
-        let inboxes = sqlx::query_scalar::<_, String>("SELECT DISTINCT inbox_uri FROM followers")
-            .fetch_all(&self.pool)
-            .await?;
+        let inboxes = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT followers.inbox_uri
+            FROM followers
+            LEFT JOIN remote_blocks ON remote_blocks.actor_uri = followers.actor_uri
+            WHERE remote_blocks.actor_uri IS NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(inboxes)
     }
@@ -264,6 +271,60 @@ impl Database {
         Ok(())
     }
 
+    /// Mark a follow relationship as accepted and refresh the canonical actor URI.
+    pub async fn mark_follow_accepted(
+        &self,
+        target_address: &str,
+        actor_uri: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let existing_addresses = self.get_all_follow_addresses().await?;
+        let matches = find_matching_addresses(&existing_addresses, target_address, default_port);
+        let mut updated = false;
+        for existing in matches {
+            let result = sqlx::query(
+                "UPDATE follows SET actor_uri = ?, accepted_at = datetime('now') WHERE target_address COLLATE NOCASE = ?",
+            )
+            .bind(actor_uri)
+            .bind(existing)
+            .execute(&self.pool)
+            .await?;
+            updated |= result.rows_affected() > 0;
+        }
+
+        Ok(updated)
+    }
+
+    /// Return whether a follow relationship has been marked as accepted.
+    pub async fn is_follow_accepted(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let candidates = equivalent_account_address_candidates(target_address, default_port);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM follows WHERE accepted_at IS NOT NULL AND target_address COLLATE NOCASE IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in &candidates {
+                separated.push_bind(candidate);
+            }
+        }
+        query_builder.push(")");
+
+        let count: i64 = query_builder
+            .build_query_scalar()
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(count > 0)
+    }
+
     /// Delete follow relationship
     pub async fn delete_follow(
         &self,
@@ -285,7 +346,8 @@ impl Database {
     /// Insert new follower
     pub async fn insert_follower(&self, follower: &Follower) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO followers (id, follower_address, actor_uri, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO followers (id, follower_address, actor_uri, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(follower_address) DO UPDATE SET actor_uri = excluded.actor_uri, inbox_uri = excluded.inbox_uri, uri = excluded.uri, created_at = excluded.created_at"
         )
         .bind(&follower.id)
         .bind(&follower.follower_address)
@@ -339,5 +401,36 @@ impl Database {
         }
 
         Ok(removed)
+    }
+
+    /// Get a follower row matching the provided address, accounting for
+    /// case-insensitive and default-port-equivalent variants.
+    pub async fn get_follower(
+        &self,
+        follower_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<Follower>, AppError> {
+        let candidates = equivalent_account_address_candidates(follower_address, default_port);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT * FROM followers WHERE follower_address COLLATE NOCASE IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in &candidates {
+                separated.push_bind(candidate);
+            }
+        }
+        query_builder.push(") ORDER BY created_at DESC LIMIT 1");
+
+        let follower = query_builder
+            .build_query_as::<Follower>()
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(follower)
     }
 }

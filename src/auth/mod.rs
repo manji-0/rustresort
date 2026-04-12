@@ -1,23 +1,23 @@
-//! GitHub OAuth authentication
+//! Built-in local authentication
 //!
 //! Handles:
-//! - GitHub OAuth flow
+//! - Built-in local authentication
 //! - Session management
 //! - Authentication middleware
 
+mod local;
 mod middleware;
-mod oauth;
 pub mod session;
 
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
+pub use local::{LocalAuthService, auth_router, ensure_local_auth_config};
 pub use middleware::{
-    CurrentUser, OAuthScopeAllRequirement, OAuthScopeRequirement, require_auth,
-    require_metrics_auth, require_session_auth,
+    CurrentUser, OAuthAccess, ScopePolicy, require_auth, require_auth_scopes,
+    require_auth_scopes_with_policy, require_metrics_auth, require_session_auth,
 };
-pub use oauth::auth_router;
 pub use session::{Session, create_session_token, verify_session_token};
 
 fn forwarded_client_ip(headers: &HeaderMap, trusted_proxy_ips: &[IpAddr]) -> Option<IpAddr> {
@@ -170,7 +170,7 @@ mod tests {
             crate::federation::RateLimiter::new(Some(1), Some(std::time::Duration::from_secs(60)));
         let headers = HeaderMap::new();
 
-        let error = check_auth_rate_limit(&limiter, None, &headers, &[], "oauth_token")
+        let error = check_auth_rate_limit(&limiter, None, &headers, &[], "auth")
             .await
             .expect_err("missing peer address must fail closed");
         assert!(matches!(error, crate::error::AppError::Internal(_)));
@@ -183,11 +183,10 @@ mod tests {
         let headers = HeaderMap::new();
 
         let peer = SocketAddr::from(([198, 51, 100, 9], 4567));
-        check_auth_rate_limit(&limiter, Some(peer), &headers, &[], "oauth_token")
+        check_auth_rate_limit(&limiter, Some(peer), &headers, &[], "auth")
             .await
             .expect("first request should pass");
-        let blocked =
-            check_auth_rate_limit(&limiter, Some(peer), &headers, &[], "oauth_token").await;
+        let blocked = check_auth_rate_limit(&limiter, Some(peer), &headers, &[], "auth").await;
         assert!(matches!(blocked, Err(crate::error::AppError::RateLimited)));
     }
 }

@@ -48,7 +48,8 @@ pub async fn get_bookmarks(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .copied();
-        let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
             &item.status,
             &account,
             &state.config,
@@ -61,7 +62,8 @@ pub async fn get_bookmarks(
                 Some(item.bookmarked),
                 None,
             ),
-        );
+        )
+        .await?;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -105,7 +107,8 @@ pub async fn get_favourites(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .copied();
-        let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
             &item.status,
             &account,
             &state.config,
@@ -118,7 +121,8 @@ pub async fn get_favourites(
                 Some(item.bookmarked),
                 None,
             ),
-        );
+        )
+        .await?;
         responses.push(serde_json::to_value(response).unwrap());
     }
 

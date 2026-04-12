@@ -159,7 +159,7 @@ rustresort/
 - `mastodon/`: Mastodon API-compatible endpoints
 - `activitypub.rs`: ActivityPub protocol endpoints
 - `wellknown.rs`: `.well-known` endpoints
-- `oauth.rs`: OAuth token/authorization endpoints
+- `auth/`: built-in local authentication and passkey routes
 
 ### 2. Auth Layer (`src/auth/`)
 

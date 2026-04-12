@@ -10,10 +10,42 @@ impl Database {
         &self,
         participant_addresses: &[String],
     ) -> Result<String, AppError> {
-        // For simplicity, we'll create a new conversation
-        // In a full implementation, we'd check for existing conversations with the same participants
-        let conversation_id = EntityId::new_string();
+        let mut normalized_participants = participant_addresses
+            .iter()
+            .map(|address| address.trim())
+            .filter(|address| !address.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        normalized_participants.sort();
+        normalized_participants.dedup();
+        if normalized_participants.is_empty() {
+            return Err(AppError::Validation(
+                "conversation participants must not be empty".to_string(),
+            ));
+        }
 
+        let placeholders = vec!["?"; normalized_participants.len()].join(", ");
+        let query = format!(
+            r#"
+            SELECT conversation_id
+            FROM conversation_participants
+            GROUP BY conversation_id
+            HAVING COUNT(*) = ?
+               AND SUM(CASE WHEN LOWER(account_address) IN ({placeholders}) THEN 1 ELSE 0 END) = ?
+            LIMIT 1
+            "#
+        );
+        let mut existing_query =
+            sqlx::query_scalar::<_, String>(&query).bind(normalized_participants.len() as i64);
+        for address in &normalized_participants {
+            existing_query = existing_query.bind(address);
+        }
+        existing_query = existing_query.bind(normalized_participants.len() as i64);
+        if let Some(existing_conversation_id) = existing_query.fetch_optional(&self.pool).await? {
+            return Ok(existing_conversation_id);
+        }
+
+        let conversation_id = EntityId::new_string();
         sqlx::query(
             "INSERT INTO conversations (id, unread, created_at, updated_at) VALUES (?, 1, datetime('now'), datetime('now'))",
         )
@@ -22,7 +54,7 @@ impl Database {
         .await?;
 
         // Add participants
-        for address in participant_addresses {
+        for address in &normalized_participants {
             let participant_id = EntityId::new_string();
             sqlx::query(
                 "INSERT INTO conversation_participants (id, conversation_id, account_address, created_at) VALUES (?, ?, ?, datetime('now'))",
@@ -81,6 +113,21 @@ impl Database {
             .into_iter()
             .map(|(id, last_status_id, unread)| (id, last_status_id, unread != 0))
             .collect())
+    }
+
+    /// Get one conversation by ID.
+    pub async fn get_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, Option<String>, bool)>, AppError> {
+        let conversation = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT id, last_status_id, unread FROM conversations WHERE id = ? LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(conversation.map(|(id, last_status_id, unread)| (id, last_status_id, unread != 0)))
     }
 
     /// Get conversation participants

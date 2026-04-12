@@ -4,11 +4,65 @@
 
 use std::sync::Arc;
 
+use axum::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
-use crate::data::Account;
+use crate::data::{Account, EntityId, Status};
 use crate::error::AppError;
+
+const DELIVERY_WORKER_BATCH_SIZE: usize = 32;
+const DELIVERY_WORKER_IDLE_MILLIS: u64 = 250;
+const DELIVERY_WORKER_MAX_ATTEMPTS: u32 = 8;
+
+/// Persistent queue for outbound federation deliveries.
+#[async_trait]
+pub trait DeliveryQueue: Send + Sync {
+    async fn enqueue(
+        &self,
+        inbox_url: &str,
+        activity_json: &str,
+        actor_key_id: &str,
+    ) -> Result<(), AppError>;
+    async fn claim_pending(&self, limit: usize) -> Result<Vec<crate::data::DeliveryJob>, AppError>;
+    async fn mark_delivered(&self, job_id: &str) -> Result<(), AppError>;
+    async fn mark_failed(&self, job_id: &str, error: &str) -> Result<(), AppError>;
+    async fn reap_dead_jobs(&self, max_attempts: u32) -> Result<u64, AppError>;
+    async fn is_blocked_by_remote(&self, actor_uri: &str) -> Result<bool, AppError>;
+}
+
+#[async_trait]
+impl DeliveryQueue for crate::data::Database {
+    async fn enqueue(
+        &self,
+        inbox_url: &str,
+        activity_json: &str,
+        actor_key_id: &str,
+    ) -> Result<(), AppError> {
+        self.enqueue_delivery_job(inbox_url, activity_json, actor_key_id)
+            .await
+    }
+
+    async fn claim_pending(&self, limit: usize) -> Result<Vec<crate::data::DeliveryJob>, AppError> {
+        self.claim_pending_delivery_jobs(limit).await
+    }
+
+    async fn mark_delivered(&self, job_id: &str) -> Result<(), AppError> {
+        self.mark_delivery_job_delivered(job_id).await
+    }
+
+    async fn mark_failed(&self, job_id: &str, error: &str) -> Result<(), AppError> {
+        self.mark_delivery_job_failed(job_id, error).await
+    }
+
+    async fn reap_dead_jobs(&self, max_attempts: u32) -> Result<u64, AppError> {
+        self.reap_dead_delivery_jobs(max_attempts).await
+    }
+
+    async fn is_blocked_by_remote(&self, actor_uri: &str) -> Result<bool, AppError> {
+        crate::data::Database::is_blocked_by_remote(self, actor_uri).await
+    }
+}
 
 /// Activity delivery service
 ///
@@ -79,6 +133,30 @@ fn audience_for_visibility(actor_uri: &str, visibility: &str) -> (Vec<String>, V
     }
 }
 
+fn push_unique_values(target: &mut Vec<String>, values: &[String]) {
+    use std::collections::HashSet;
+
+    let mut seen = target.iter().cloned().collect::<HashSet<_>>();
+    for value in values {
+        if seen.insert(value.clone()) {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn merge_explicit_recipient_audience(
+    actor_uri: &str,
+    visibility: &str,
+    explicit_recipient_actor_uris: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let (mut to_audience, mut cc_audience) = audience_for_visibility(actor_uri, visibility);
+    match visibility {
+        "private" | "direct" => push_unique_values(&mut to_audience, explicit_recipient_actor_uris),
+        _ => push_unique_values(&mut cc_audience, explicit_recipient_actor_uris),
+    }
+    (to_audience, cc_audience)
+}
+
 fn build_undo_object(
     activity_uri: &str,
     activity_type: Option<&str>,
@@ -115,6 +193,350 @@ impl ActivityDelivery {
             key_id,
             private_key_pem,
         }
+    }
+
+    fn serialize_activity(activity: &serde_json::Value) -> Result<String, AppError> {
+        serde_json::to_string(activity)
+            .map_err(|e| AppError::Validation(format!("Failed to serialize activity: {}", e)))
+    }
+
+    async fn enqueue_serialized_activity(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        inbox_uri: &str,
+        activity_json: &str,
+    ) -> Result<(), AppError> {
+        queue.enqueue(inbox_uri, activity_json, &self.key_id).await
+    }
+
+    async fn enqueue_activity(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        inbox_uri: &str,
+        activity: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let activity_json = Self::serialize_activity(activity)?;
+        self.enqueue_serialized_activity(queue, inbox_uri, &activity_json)
+            .await
+    }
+
+    async fn should_skip_remote_delivery(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        target_actor_uri: &str,
+    ) -> Result<bool, AppError> {
+        if queue.is_blocked_by_remote(target_actor_uri).await? {
+            tracing::info!(
+                target_actor_uri,
+                "Skipping outbound delivery because remote actor has blocked the local account"
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn enqueue_activity_to_followers(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        activity: &serde_json::Value,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let delivery_targets = unique_inbox_targets(inbox_uris);
+        let activity_json = match Self::serialize_activity(activity) {
+            Ok(value) => value,
+            Err(error) => {
+                return delivery_targets
+                    .into_iter()
+                    .map(|inbox_uri| DeliveryResult {
+                        inbox_uri,
+                        success: false,
+                        error: Some(error.to_string()),
+                        status_code: None,
+                    })
+                    .collect();
+            }
+        };
+
+        let mut results = Vec::with_capacity(delivery_targets.len());
+        for inbox_uri in delivery_targets {
+            let result = self
+                .enqueue_serialized_activity(queue, &inbox_uri, &activity_json)
+                .await;
+            results.push(DeliveryResult {
+                inbox_uri,
+                success: result.is_ok(),
+                error: result.err().map(|e| e.to_string()),
+                status_code: None,
+            });
+        }
+        results
+    }
+
+    fn build_follow_activity(
+        &self,
+        follow_activity_uri: &str,
+        target_actor_uri: &str,
+    ) -> serde_json::Value {
+        builder::follow(follow_activity_uri, &self.actor_uri, target_actor_uri)
+    }
+
+    fn build_block_activity(
+        &self,
+        block_activity_uri: &str,
+        target_actor_uri: &str,
+    ) -> serde_json::Value {
+        builder::block(block_activity_uri, &self.actor_uri, target_actor_uri)
+    }
+
+    fn build_accept_activity(&self, follow_activity_uri: &str) -> serde_json::Value {
+        let accept_id = format!(
+            "{}/accept/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
+        builder::accept(
+            &accept_id,
+            &self.actor_uri,
+            serde_json::json!({
+                "type": "Follow",
+                "id": follow_activity_uri
+            }),
+        )
+    }
+
+    fn build_reject_activity(&self, follow_activity_uri: &str) -> serde_json::Value {
+        let reject_id = format!(
+            "{}/reject/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
+        builder::reject(
+            &reject_id,
+            &self.actor_uri,
+            serde_json::json!({
+                "type": "Follow",
+                "id": follow_activity_uri
+            }),
+        )
+    }
+
+    fn build_create_activity(&self, status: &Status) -> serde_json::Value {
+        self.build_create_activity_with_audience(status, &[], &[])
+    }
+
+    fn build_create_activity_with_audience(
+        &self,
+        status: &Status,
+        explicit_recipient_actor_uris: &[String],
+        mention_tags: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let (to_audience, cc_audience) = merge_explicit_recipient_audience(
+            &self.actor_uri,
+            status.visibility.as_str(),
+            explicit_recipient_actor_uris,
+        );
+        let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
+        let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
+        let mut note = if let Some(ref in_reply_to) = status.in_reply_to_uri {
+            builder::note_reply(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                in_reply_to,
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        } else {
+            builder::note(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        };
+        if let Some(ref quote_of_uri) = status.quote_of_uri
+            && let Some(note_object) = note.as_object_mut()
+        {
+            note_object.insert(
+                "quoteUri".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            note_object.insert(
+                "quoteUrl".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            if !mention_tags.is_empty() {
+                note_object.insert(
+                    "tag".to_string(),
+                    serde_json::Value::Array(mention_tags.to_vec()),
+                );
+            }
+        } else if let Some(note_object) = note.as_object_mut()
+            && !mention_tags.is_empty()
+        {
+            note_object.insert(
+                "tag".to_string(),
+                serde_json::Value::Array(mention_tags.to_vec()),
+            );
+        }
+        let create_id = format!("{}/activity", status.uri);
+        builder::create(&create_id, &self.actor_uri, note, note_to, note_cc)
+    }
+
+    fn build_update_status_activity(
+        &self,
+        status: &Status,
+        explicit_recipient_actor_uris: &[String],
+        mention_tags: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let (to_audience, cc_audience) = merge_explicit_recipient_audience(
+            &self.actor_uri,
+            status.visibility.as_str(),
+            explicit_recipient_actor_uris,
+        );
+        let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
+        let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
+        let mut object = if let Some(ref in_reply_to) = status.in_reply_to_uri {
+            builder::note_reply(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                in_reply_to,
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        } else {
+            builder::note(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        };
+        if let Some(ref quote_of_uri) = status.quote_of_uri
+            && let Some(object_map) = object.as_object_mut()
+        {
+            object_map.insert(
+                "quoteUri".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            object_map.insert(
+                "quoteUrl".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            if !mention_tags.is_empty() {
+                object_map.insert(
+                    "tag".to_string(),
+                    serde_json::Value::Array(mention_tags.to_vec()),
+                );
+            }
+        } else if let Some(object_map) = object.as_object_mut()
+            && !mention_tags.is_empty()
+        {
+            object_map.insert(
+                "tag".to_string(),
+                serde_json::Value::Array(mention_tags.to_vec()),
+            );
+        }
+
+        builder::update(
+            &format!("{}/activity/update/{}", status.uri, EntityId::new_string()),
+            &self.actor_uri,
+            object,
+            note_to,
+            note_cc,
+        )
+    }
+
+    fn build_delete_activity(
+        &self,
+        object_uri: &str,
+        object_visibility: &str,
+        explicit_recipient_actor_uris: &[String],
+    ) -> serde_json::Value {
+        let delete_id = format!("{}/delete/{}", self.actor_uri, EntityId::new_string());
+        let (to_audience, cc_audience) = merge_explicit_recipient_audience(
+            &self.actor_uri,
+            object_visibility,
+            explicit_recipient_actor_uris,
+        );
+        builder::delete(
+            &delete_id,
+            &self.actor_uri,
+            object_uri,
+            to_audience.iter().map(String::as_str).collect(),
+            cc_audience.iter().map(String::as_str).collect(),
+        )
+    }
+
+    fn build_like_activity(&self, like_activity_uri: &str, status_uri: &str) -> serde_json::Value {
+        builder::like(like_activity_uri, &self.actor_uri, status_uri)
+    }
+
+    fn build_undo_activity(
+        &self,
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        activity_object: Option<&str>,
+    ) -> serde_json::Value {
+        let undo_id = format!(
+            "{}/undo/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
+        let object = build_undo_object(activity_uri, activity_type, activity_object);
+        builder::undo(&undo_id, &self.actor_uri, object)
+    }
+
+    fn build_announce_activity(
+        &self,
+        announce_activity_uri: &str,
+        status_uri: &str,
+        status_visibility: &str,
+    ) -> serde_json::Value {
+        let (to_audience, cc_audience) =
+            audience_for_visibility(&self.actor_uri, status_visibility);
+        builder::announce(
+            announce_activity_uri,
+            &self.actor_uri,
+            status_uri,
+            to_audience.iter().map(String::as_str).collect(),
+            cc_audience.iter().map(String::as_str).collect(),
+        )
+    }
+
+    fn build_move_activity(&self, new_account_uri: &str) -> serde_json::Value {
+        let move_id = format!(
+            "{}/move/{}",
+            self.actor_uri,
+            crate::data::EntityId::new_string()
+        );
+        builder::move_activity(
+            &move_id,
+            &self.actor_uri,
+            new_account_uri,
+            vec![&format!("{}/followers", self.actor_uri)],
+        )
+    }
+
+    fn build_update_actor_activity(
+        &self,
+        actor_object: serde_json::Value,
+        follower_actor_uris: &[String],
+    ) -> serde_json::Value {
+        builder::update(
+            &format!("{}/update/{}", self.actor_uri, EntityId::new_string()),
+            &self.actor_uri,
+            actor_object,
+            vec![&format!("{}/followers", self.actor_uri)],
+            follower_actor_uris.iter().map(String::as_str).collect(),
+        )
     }
 
     /// Deliver activity to a single inbox
@@ -282,7 +704,7 @@ impl ActivityDelivery {
         target_actor_uri: &str,
         target_inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let activity = builder::follow(follow_activity_uri, &self.actor_uri, target_actor_uri);
+        let activity = self.build_follow_activity(follow_activity_uri, target_actor_uri);
 
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
@@ -294,6 +716,24 @@ impl ActivityDelivery {
         );
 
         Ok(())
+    }
+
+    pub async fn queue_follow_with_id(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        follow_activity_uri: &str,
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        if self
+            .should_skip_remote_delivery(queue, target_actor_uri)
+            .await?
+        {
+            return Ok(());
+        }
+        let activity = self.build_follow_activity(follow_activity_uri, target_actor_uri);
+        self.enqueue_activity(queue, target_inbox_uri, &activity)
+            .await
     }
 
     /// Compute deterministic Block activity URI for a target actor.
@@ -320,7 +760,7 @@ impl ActivityDelivery {
         target_actor_uri: &str,
         target_inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let activity = builder::block(block_activity_uri, &self.actor_uri, target_actor_uri);
+        let activity = self.build_block_activity(block_activity_uri, target_actor_uri);
 
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
@@ -334,6 +774,24 @@ impl ActivityDelivery {
         Ok(())
     }
 
+    pub async fn queue_block_with_id(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        block_activity_uri: &str,
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        if self
+            .should_skip_remote_delivery(queue, target_actor_uri)
+            .await?
+        {
+            return Ok(());
+        }
+        let activity = self.build_block_activity(block_activity_uri, target_actor_uri);
+        self.enqueue_activity(queue, target_inbox_uri, &activity)
+            .await
+    }
+
     /// Send Accept activity (for follow request)
     ///
     /// # Arguments
@@ -345,20 +803,7 @@ impl ActivityDelivery {
         follower_inbox_uri: &str,
     ) -> Result<(), AppError> {
         // 1. Generate Accept activity wrapping Follow
-        let accept_id = format!(
-            "{}/accept/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-
-        let activity = builder::accept(
-            &accept_id,
-            &self.actor_uri,
-            serde_json::json!({
-                "type": "Follow",
-                "id": follow_activity_uri
-            }),
-        );
+        let activity = self.build_accept_activity(follow_activity_uri);
 
         // 2. Deliver to inbox
         self.deliver_to_inbox(follower_inbox_uri, activity).await?;
@@ -371,26 +816,24 @@ impl ActivityDelivery {
         Ok(())
     }
 
+    pub async fn queue_accept(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        follow_activity_uri: &str,
+        follower_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let activity = self.build_accept_activity(follow_activity_uri);
+        self.enqueue_activity(queue, follower_inbox_uri, &activity)
+            .await
+    }
+
     /// Send Reject activity (for follow request rejection)
     pub async fn send_reject(
         &self,
         follow_activity_uri: &str,
         follower_inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let reject_id = format!(
-            "{}/reject/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-
-        let activity = builder::reject(
-            &reject_id,
-            &self.actor_uri,
-            serde_json::json!({
-                "type": "Follow",
-                "id": follow_activity_uri
-            }),
-        );
+        let activity = self.build_reject_activity(follow_activity_uri);
 
         self.deliver_to_inbox(follower_inbox_uri, activity).await?;
 
@@ -403,6 +846,17 @@ impl ActivityDelivery {
         Ok(())
     }
 
+    pub async fn queue_reject(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        follow_activity_uri: &str,
+        follower_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        let activity = self.build_reject_activity(follow_activity_uri);
+        self.enqueue_activity(queue, follower_inbox_uri, &activity)
+            .await
+    }
+
     /// Send Create activity (for new status)
     ///
     /// # Arguments
@@ -413,43 +867,59 @@ impl ActivityDelivery {
         status: &crate::data::Status,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
-        let (to_audience, cc_audience) =
-            audience_for_visibility(&self.actor_uri, status.visibility.as_str());
-        let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
-        let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
-
-        // 1. Build Note object
-        let note = if let Some(ref in_reply_to) = status.in_reply_to_uri {
-            builder::note_reply(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                in_reply_to,
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        } else {
-            builder::note(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        };
-
-        // 2. Wrap in Create activity
-        let create_id = format!(
-            "{}/create/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-        let activity = builder::create(&create_id, &self.actor_uri, note, note_to, note_cc);
+        let activity = self.build_create_activity(status);
 
         // 3. Deliver to inboxes
         self.deliver_to_followers(activity, inbox_uris).await
+    }
+
+    pub async fn queue_create(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_create_activity(status);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_create_with_audience(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+        inbox_uris: Vec<String>,
+        explicit_recipient_actor_uris: &[String],
+        mention_tags: &[serde_json::Value],
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_create_activity_with_audience(
+            status,
+            explicit_recipient_actor_uris,
+            mention_tags,
+        );
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    /// Send Move activity to current followers.
+    pub async fn send_move(
+        &self,
+        new_account_uri: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_move_activity(new_account_uri);
+        self.deliver_to_followers(activity, inbox_uris).await
+    }
+
+    pub async fn queue_move(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        new_account_uri: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_move_activity(new_account_uri);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
     }
 
     /// Send Delete activity
@@ -460,22 +930,64 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         // Build and deliver Delete activity
-        let delete_id = format!(
-            "{}/delete/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-        let (to_audience, cc_audience) =
-            audience_for_visibility(&self.actor_uri, object_visibility);
-        let activity = builder::delete(
-            &delete_id,
-            &self.actor_uri,
-            object_uri,
-            to_audience.iter().map(String::as_str).collect(),
-            cc_audience.iter().map(String::as_str).collect(),
-        );
+        let activity = self.build_delete_activity(object_uri, object_visibility, &[]);
 
         self.deliver_to_followers(activity, inbox_uris).await
+    }
+
+    pub async fn queue_delete(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        object_uri: &str,
+        object_visibility: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_delete_activity(object_uri, object_visibility, &[]);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_delete_with_audience(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        object_uri: &str,
+        object_visibility: &str,
+        inbox_uris: Vec<String>,
+        explicit_recipient_actor_uris: &[String],
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_delete_activity(
+            object_uri,
+            object_visibility,
+            explicit_recipient_actor_uris,
+        );
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_update_status(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+        inbox_uris: Vec<String>,
+        explicit_recipient_actor_uris: &[String],
+        mention_tags: &[serde_json::Value],
+    ) -> Vec<DeliveryResult> {
+        let activity =
+            self.build_update_status_activity(status, explicit_recipient_actor_uris, mention_tags);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_update_actor(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        actor_object: serde_json::Value,
+        inbox_uris: Vec<String>,
+        follower_actor_uris: &[String],
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_update_actor_activity(actor_object, follower_actor_uris);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
     }
 
     /// Send Like activity
@@ -502,7 +1014,7 @@ impl ActivityDelivery {
         status_uri: &str,
         target_inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let activity = builder::like(like_activity_uri, &self.actor_uri, status_uri);
+        let activity = self.build_like_activity(like_activity_uri, status_uri);
 
         self.deliver_to_inbox(target_inbox_uri, activity).await?;
 
@@ -514,6 +1026,25 @@ impl ActivityDelivery {
         );
 
         Ok(())
+    }
+
+    pub async fn queue_like_with_id(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        like_activity_uri: &str,
+        status_uri: &str,
+        target_inbox_uri: &str,
+        target_actor_uri: &str,
+    ) -> Result<(), AppError> {
+        if self
+            .should_skip_remote_delivery(queue, target_actor_uri)
+            .await?
+        {
+            return Ok(());
+        }
+        let activity = self.build_like_activity(like_activity_uri, status_uri);
+        self.enqueue_activity(queue, target_inbox_uri, &activity)
+            .await
     }
 
     /// Send Undo activity
@@ -534,15 +1065,21 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         // Build and deliver Undo activity
-        let undo_id = format!(
-            "{}/undo/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-        let object = build_undo_object(activity_uri, activity_type, None);
-        let activity = builder::undo(&undo_id, &self.actor_uri, object);
+        let activity = self.build_undo_activity(activity_uri, activity_type, None);
 
         self.deliver_to_followers(activity, inbox_uris).await
+    }
+
+    pub async fn queue_undo_with_type(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_undo_activity(activity_uri, activity_type, None);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
     }
 
     /// Send Undo activity to a single inbox.
@@ -574,18 +1111,32 @@ impl ActivityDelivery {
         activity_object: Option<&str>,
         inbox_uri: &str,
     ) -> Result<(), AppError> {
-        let undo_id = format!(
-            "{}/undo/{}",
-            self.actor_uri,
-            crate::data::EntityId::new_string()
-        );
-        let object = build_undo_object(activity_uri, activity_type, activity_object);
-        let activity = builder::undo(&undo_id, &self.actor_uri, object);
+        let activity = self.build_undo_activity(activity_uri, activity_type, activity_object);
 
         self.deliver_to_inbox(inbox_uri, activity).await?;
 
         tracing::info!("Sent Undo {} to {}", activity_uri, inbox_uri);
         Ok(())
+    }
+
+    pub async fn queue_undo_to_inbox_with_type_and_object(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        activity_uri: &str,
+        activity_type: Option<&str>,
+        activity_object: Option<&str>,
+        target_actor_uri: Option<&str>,
+        inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        if let Some(target_actor_uri) = target_actor_uri
+            && self
+                .should_skip_remote_delivery(queue, target_actor_uri)
+                .await?
+        {
+            return Ok(());
+        }
+        let activity = self.build_undo_activity(activity_uri, activity_type, activity_object);
+        self.enqueue_activity(queue, inbox_uri, &activity).await
     }
 
     /// Send Announce activity (boost)
@@ -622,18 +1173,106 @@ impl ActivityDelivery {
         status_visibility: &str,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
-        let (to_audience, cc_audience) =
-            audience_for_visibility(&self.actor_uri, status_visibility);
-        let activity = builder::announce(
-            announce_activity_uri,
-            &self.actor_uri,
-            status_uri,
-            to_audience.iter().map(String::as_str).collect(),
-            cc_audience.iter().map(String::as_str).collect(),
-        );
+        let activity =
+            self.build_announce_activity(announce_activity_uri, status_uri, status_visibility);
 
         self.deliver_to_followers(activity, inbox_uris).await
     }
+
+    pub async fn queue_announce_with_id(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        announce_activity_uri: &str,
+        status_uri: &str,
+        status_visibility: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity =
+            self.build_announce_activity(announce_activity_uri, status_uri, status_visibility);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+}
+
+pub fn spawn_delivery_worker(state: crate::AppState) {
+    tokio::spawn(async move {
+        loop {
+            match run_delivery_worker_once(&state).await {
+                Ok(0) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        DELIVERY_WORKER_IDLE_MILLIS,
+                    ))
+                    .await;
+                }
+                Ok(_) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Delivery worker iteration failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+
+    tracing::info!("Delivery worker spawned");
+}
+
+async fn run_delivery_worker_once(state: &crate::AppState) -> Result<usize, AppError> {
+    let jobs = state.db.claim_pending(DELIVERY_WORKER_BATCH_SIZE).await?;
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+
+    let account = state.db.get_account().await?.ok_or_else(|| {
+        AppError::internal("local account missing while processing delivery queue")
+    })?;
+    let expected_key_id = local_key_id(&local_actor_uri(
+        &state.config.server.base_url(),
+        &account.username,
+    ));
+    let delivery = build_local_delivery(
+        state.http_client.clone(),
+        &state.config.server.base_url(),
+        &account,
+    );
+
+    for job in &jobs {
+        if job.actor_key_id != expected_key_id {
+            tracing::warn!(
+                job_id = %job.id,
+                queued_key_id = %job.actor_key_id,
+                current_key_id = %expected_key_id,
+                "Queued delivery job key id differs from current local key id; using current key"
+            );
+        }
+
+        let activity = match serde_json::from_str::<serde_json::Value>(&job.activity_json) {
+            Ok(activity) => activity,
+            Err(error) => {
+                state
+                    .db
+                    .mark_failed(&job.id, &format!("invalid queued activity JSON: {}", error))
+                    .await?;
+                continue;
+            }
+        };
+
+        match delivery.deliver_to_inbox(&job.inbox_url, activity).await {
+            Ok(()) => state.db.mark_delivered(&job.id).await?,
+            Err(error) => state.db.mark_failed(&job.id, &error.to_string()).await?,
+        }
+    }
+
+    let reaped = state
+        .db
+        .reap_dead_jobs(DELIVERY_WORKER_MAX_ATTEMPTS)
+        .await?;
+    if reaped > 0 {
+        tracing::warn!(reaped, "Dropped permanently failing delivery jobs");
+    }
+
+    Ok(jobs.len())
 }
 
 /// Result of a delivery attempt
@@ -749,6 +1388,20 @@ pub mod builder {
         })
     }
 
+    /// Build an Update activity.
+    pub fn update(id: &str, actor: &str, object: Value, to: Vec<&str>, cc: Vec<&str>) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Update",
+            "id": id,
+            "actor": actor,
+            "object": object,
+            "to": to,
+            "cc": cc,
+            "published": chrono::Utc::now().to_rfc3339()
+        })
+    }
+
     /// Build a Like activity
     ///
     /// # Arguments
@@ -782,6 +1435,20 @@ pub mod builder {
             "object": object,
             "to": to,
             "cc": cc,
+            "published": chrono::Utc::now().to_rfc3339()
+        })
+    }
+
+    /// Build a Move activity.
+    pub fn move_activity(id: &str, actor: &str, target: &str, to: Vec<&str>) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Move",
+            "id": id,
+            "actor": actor,
+            "object": actor,
+            "target": target,
+            "to": to,
             "published": chrono::Utc::now().to_rfc3339()
         })
     }
@@ -881,6 +1548,7 @@ mod tests {
     use super::{
         audience_for_visibility, block_activity_uri, build_undo_object, unique_inbox_targets,
     };
+    use std::sync::Arc;
 
     #[test]
     fn unique_inbox_targets_keeps_distinct_personal_inboxes_on_same_domain() {
@@ -990,5 +1658,41 @@ mod tests {
         assert_eq!(activity["id"], "https://local.example/block/1");
         assert_eq!(activity["actor"], "https://local.example/users/alice");
         assert_eq!(activity["object"], "https://remote.example/users/bob");
+    }
+
+    #[test]
+    fn build_create_activity_includes_quote_fields_on_note() {
+        let delivery = super::ActivityDelivery::new(
+            Arc::new(reqwest::Client::new()),
+            "https://local.example/users/alice".to_string(),
+            "https://local.example/users/alice#main-key".to_string(),
+            "private-key".to_string(),
+        );
+        let status = crate::data::Status {
+            id: "status-1".to_string(),
+            uri: "https://local.example/users/alice/statuses/status-1".to_string(),
+            content: "<p>Hello</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: String::new(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: Some("https://remote.example/users/bob/statuses/quoted".to_string()),
+            persisted_reason: crate::data::PersistedReason::Own,
+            created_at: chrono::Utc::now(),
+            fetched_at: None,
+        };
+
+        let activity = delivery.build_create_activity(&status);
+        assert_eq!(
+            activity["object"]["quoteUri"],
+            "https://remote.example/users/bob/statuses/quoted"
+        );
+        assert_eq!(
+            activity["object"]["quoteUrl"],
+            "https://remote.example/users/bob/statuses/quoted"
+        );
     }
 }

@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub admin: AdminConfig,
     pub cache: CacheConfig,
     #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
 }
@@ -155,41 +157,26 @@ pub struct StorageConfig {
     pub backup: BackupStorageConfig,
 }
 
-/// Authentication configuration (GitHub OAuth)
+/// Built-in single-user authentication configuration.
 #[derive(Clone, Deserialize)]
 pub struct AuthConfig {
-    /// Allowed GitHub username (single user)
-    pub github_username: String,
+    /// Single local username for this instance.
+    pub username: String,
+    /// Optional bootstrap password used to initialize local auth on first startup.
+    pub password: Option<String>,
     /// Session secret key (32+ bytes)
     pub session_secret: String,
     /// Session max age in seconds (default: 604800 = 7 days)
     pub session_max_age: i64,
-    pub github: GitHubOAuthConfig,
-}
-
-/// GitHub OAuth configuration
-#[derive(Clone, Deserialize)]
-pub struct GitHubOAuthConfig {
-    pub client_id: String,
-    pub client_secret: String,
 }
 
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthConfig")
-            .field("github_username", &self.github_username)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("session_secret", &"<redacted>")
             .field("session_max_age", &self.session_max_age)
-            .field("github", &self.github)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for GitHubOAuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitHubOAuthConfig")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
             .finish()
     }
 }
@@ -205,9 +192,6 @@ pub struct InstanceConfig {
 /// Admin user configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminConfig {
-    /// Admin username (default: "admin")
-    #[serde(default = "default_admin_username")]
-    pub username: String,
     /// Admin display name (default: "Admin")
     #[serde(default = "default_admin_display_name")]
     pub display_name: String,
@@ -215,10 +199,6 @@ pub struct AdminConfig {
     pub email: Option<String>,
     /// Admin bio/note
     pub note: Option<String>,
-}
-
-fn default_admin_username() -> String {
-    "admin".to_string()
 }
 
 fn default_admin_display_name() -> String {
@@ -232,6 +212,16 @@ pub struct CacheConfig {
     pub timeline_max_items: usize,
     /// Profile cache TTL in seconds (default: 86400)
     pub profile_ttl: u64,
+}
+
+/// Built-in web UI configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UiConfig {
+    /// Enables serving the integrated Rust/WASM UI from `/ui`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional development directory used to serve live UI assets from disk.
+    pub dev_dir: Option<PathBuf>,
 }
 
 /// Metrics endpoint authentication configuration
@@ -282,6 +272,8 @@ impl AppConfig {
             .set_default("storage.backup.interval_seconds", 86400)?
             .set_default("storage.backup.retention_count", 7)?
             .set_default("storage.backup.encryption.enabled", false)?
+            .set_default("ui.enabled", false)?
+            .set_default("ui.dev_dir", Option::<String>::None)?
             .set_default("auth.session_max_age", 604800)?
             .set_default("logging.level", "info")?
             .set_default("logging.format", "pretty")?
@@ -323,6 +315,23 @@ impl AppConfig {
         if self.auth.session_max_age <= 0 {
             return Err(crate::error::AppError::Config(
                 "auth.session_max_age must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.auth.username.trim().is_empty() {
+            return Err(crate::error::AppError::Config(
+                "auth.username must not be empty".to_string(),
+            ));
+        }
+
+        if self
+            .auth
+            .password
+            .as_ref()
+            .is_some_and(|password| password.trim().is_empty())
+        {
+            return Err(crate::error::AppError::Config(
+                "auth.password must not be blank when provided".to_string(),
             ));
         }
 
@@ -412,13 +421,10 @@ mod tests {
                 r2_secret_access_key: "secret-key".to_string(),
             },
             auth: AuthConfig {
-                github_username: "admin".to_string(),
+                username: "admin".to_string(),
+                password: Some("admin-password".to_string()),
                 session_secret: "x".repeat(32),
                 session_max_age: 604_800,
-                github: GitHubOAuthConfig {
-                    client_id: "github-client-id".to_string(),
-                    client_secret: "github-client-secret".to_string(),
-                },
             },
             instance: InstanceConfig {
                 title: "RustResort".to_string(),
@@ -426,7 +432,6 @@ mod tests {
                 contact_email: "admin@example.com".to_string(),
             },
             admin: AdminConfig {
-                username: "admin".to_string(),
                 display_name: "Admin".to_string(),
                 email: None,
                 note: None,
@@ -435,6 +440,7 @@ mod tests {
                 timeline_max_items: 2000,
                 profile_ttl: 86_400,
             },
+            ui: UiConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),

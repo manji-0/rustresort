@@ -65,6 +65,15 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Count favourites for a status.
+    pub async fn count_favourites(&self, status_id: &str) -> Result<i64, AppError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM favourites WHERE status_id = ?")
+            .bind(status_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Get favourited status IDs
     pub async fn get_favourited_status_ids(&self, limit: usize) -> Result<Vec<String>, AppError> {
         let ids = sqlx::query_scalar::<_, String>(
@@ -332,6 +341,48 @@ impl Database {
         Ok(uri)
     }
 
+    /// Get a repost row by its Announce activity URI.
+    pub async fn get_repost_by_uri(&self, uri: &str) -> Result<Option<Repost>, AppError> {
+        sqlx::query_as::<_, Repost>("SELECT * FROM reposts WHERE uri = ? LIMIT 1")
+            .bind(uri)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get repost rows safe to expose in ActivityPub outbox.
+    pub async fn get_local_outbox_reposts(&self, limit: usize) -> Result<Vec<Repost>, AppError> {
+        sqlx::query_as::<_, Repost>(
+            r#"
+            SELECT r.*
+            FROM reposts r
+            INNER JOIN statuses s ON s.id = r.status_id
+            WHERE s.visibility IN ('public', 'unlisted')
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Count reposts safe to expose in ActivityPub outbox.
+    pub async fn count_local_outbox_reposts(&self) -> Result<i64, AppError> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM reposts r
+            INNER JOIN statuses s ON s.id = r.status_id
+            WHERE s.visibility IN ('public', 'unlisted')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Check if status is reposted
     pub async fn is_reposted(&self, status_id: &str) -> Result<bool, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reposts WHERE status_id = ?")
@@ -340,6 +391,15 @@ impl Database {
             .await?;
 
         Ok(count > 0)
+    }
+
+    /// Count reposts for a status.
+    pub async fn count_reposts(&self, status_id: &str) -> Result<i64, AppError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM reposts WHERE status_id = ?")
+            .bind(status_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     /// Insert status pin marker.

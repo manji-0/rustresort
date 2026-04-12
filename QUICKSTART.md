@@ -134,52 +134,19 @@ curl "http://localhost:3000/.well-known/webfinger?resource=acct:admin@localhost:
 curl -H "Accept: application/activity+json" http://localhost:3000/users/admin
 ```
 
-### 6. Get OAuth Token
+### 6. Sign In And Get A Session Token
 
-To use Mastodon-compatible clients, you need an OAuth token.
+RustResort is a single-user server. OAuth app registration and token exchange are disabled.
+Sign in with the built-in credentials you configured on first start.
 
-#### Register Application
-
-```bash
-curl -X POST http://localhost:3000/api/v1/apps \
-  -H "Content-Type: application/json" \
-  -d '{
-    "client_name": "My App",
-    "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
-    "scopes": "read write follow push"
-  }'
-```
-
-Response:
-```json
-{
-  "id": "01H...",
-  "client_id": "abc123...",
-  "client_secret": "def456...",
-  "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"
-}
-```
-
-#### Get Authorization Code
-
-Open in browser:
-```
-http://localhost:3000/oauth/authorize?client_id=<CLIENT_ID>&redirect_uri=urn:ietf:wg:oauth:2.0:oob&response_type=code&scope=read+write+follow+push
-```
-
-Authorize the application and copy the authorization code.
-
-#### Exchange for Access Token
+#### Password Login
 
 ```bash
-curl -X POST http://localhost:3000/oauth/token \
+curl -X POST http://localhost:3000/auth/login \
   -H "Content-Type: application/json" \
   -d '{
-    "client_id": "<CLIENT_ID>",
-    "client_secret": "<CLIENT_SECRET>",
-    "grant_type": "authorization_code",
-    "code": "<AUTHORIZATION_CODE>",
-    "redirect_uri": "urn:ietf:wg:oauth:2.0:oob"
+    "username": "admin",
+    "password": "change-this-on-first-start"
   }'
 ```
 
@@ -188,12 +155,12 @@ Response:
 {
   "access_token": "xyz789...",
   "token_type": "Bearer",
-  "scope": "read write follow push",
-  "created_at": 1234567890
+  "username": "admin",
+  "auth_method": "password"
 }
 ```
 
-#### Use Access Token
+#### Use Session Token
 
 ```bash
 # Verify credentials
@@ -207,19 +174,12 @@ curl -X POST http://localhost:3000/api/v1/statuses \
   -d '{"status": "Hello, Fediverse!"}'
 ```
 
-## 📱 Connect Mastodon Clients
+#### Passkey Registration
 
-You can use any Mastodon-compatible client:
-
-1. **Tusky** (Android)
-2. **Toot!** (iOS)
-3. **Elk** (Web)
-4. **Ivory** (iOS/macOS)
-
-**Setup:**
-1. Enter your instance URL: `https://your-domain.com`
-2. Authorize the application
-3. Start posting!
+1. Open `http://localhost:3000/login` in a browser.
+2. Sign in with password once.
+3. Use `Register current device passkey` to attach a passkey.
+4. Future logins can use `Sign in with passkey`.
 
 ## Configuration
 
@@ -234,8 +194,7 @@ export RUSTRESORT__SERVER__PORT=3000
 export RUSTRESORT__SERVER__DOMAIN=example.com
 export RUSTRESORT__SERVER__PROTOCOL=https
 
-# Admin user
-export RUSTRESORT__ADMIN__USERNAME=alice
+# Admin profile
 export RUSTRESORT__ADMIN__DISPLAY_NAME="Alice"
 export RUSTRESORT__ADMIN__EMAIL=alice@example.com
 
@@ -246,11 +205,10 @@ export RUSTRESORT__DATABASE__PATH=data/rustresort.db
 export RUSTRESORT__LOGGING__LEVEL=info
 export RUSTRESORT__LOGGING__FORMAT=json
 
-# Auth (GitHub OAuth config)
-export RUSTRESORT__AUTH__GITHUB_USERNAME=your-github-username
-export RUSTRESORT__AUTH__SESSION_SECRET=your-session-secret
-export RUSTRESORT__AUTH__GITHUB__CLIENT_ID=your-github-client-id
-export RUSTRESORT__AUTH__GITHUB__CLIENT_SECRET=your-github-client-secret
+# Auth
+export RUSTRESORT__AUTH__USERNAME=alice
+export RUSTRESORT__AUTH__PASSWORD=change-this-on-first-start
+export RUSTRESORT__AUTH__SESSION_SECRET=your-session-secret-with-at-least-32-bytes
 
 # Cloudflare R2
 export CLOUDFLARE_ACCOUNT_ID=your-account-id

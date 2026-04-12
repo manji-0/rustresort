@@ -97,6 +97,7 @@ async fn test_get_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -380,6 +381,67 @@ async fn test_create_status_with_scheduled_poll_returns_poll_options_array() {
 }
 
 #[tokio::test]
+async fn test_scheduled_status_is_published_by_runner() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let scheduled_at = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    let status_data = serde_json::json!({
+        "status": "Publish me later",
+        "scheduled_at": scheduled_at,
+        "visibility": "public",
+        "language": "ja"
+    });
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&status_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let scheduled_json: Value = response.json().await.unwrap();
+    let scheduled_id = scheduled_json["id"].as_str().unwrap().to_string();
+
+    let mut published = false;
+    for _ in 0..80 {
+        let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+        if statuses
+            .iter()
+            .any(|status| status.content.contains("Publish me later"))
+        {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        published,
+        "scheduled status should be published by the runner"
+    );
+
+    let scheduled_fetch = server
+        .client
+        .get(server.url(&format!("/api/v1/scheduled_statuses/{}", scheduled_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scheduled_fetch.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let statuses = server.state.db.get_local_statuses(20, None).await.unwrap();
+    let published_status = statuses
+        .into_iter()
+        .find(|status| status.content.contains("Publish me later"))
+        .expect("published scheduled status missing");
+    assert_eq!(published_status.language.as_deref(), Some("ja"));
+}
+
+#[tokio::test]
 async fn test_create_status_is_idempotent_with_idempotency_key() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -506,10 +568,25 @@ async fn test_create_status_idempotency_recovers_after_pending_is_cleared() {
 }
 
 #[tokio::test]
-async fn test_create_status_rejects_quoted_status_id_parameter() {
+async fn test_create_status_accepts_quoted_status_id_and_updates_quote_counts() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+
+    let root_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "Quoted root",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root_response.status(), 200);
+    let root_json: Value = root_response.json().await.unwrap();
+    let root_id = root_json["id"].as_str().unwrap().to_string();
 
     let quote_response = server
         .client
@@ -517,12 +594,46 @@ async fn test_create_status_rejects_quoted_status_id_parameter() {
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
             "status": "Quote",
-            "quoted_status_id": "https://remote.example/users/alice/statuses/1"
+            "quoted_status_id": root_id,
+            "visibility": "public"
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(quote_response.status(), 400);
+    assert_eq!(quote_response.status(), 200);
+
+    let quote_json: Value = quote_response.json().await.unwrap();
+    let quote_id = quote_json["id"].as_str().unwrap().to_string();
+    let quote = quote_json["quote"]
+        .as_object()
+        .expect("embedded quoted status");
+    assert_eq!(quote["id"], root_json["id"]);
+    assert_eq!(quote_json["quotes_count"], 0);
+
+    let stored_quote = server
+        .state
+        .db
+        .get_status(&quote_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_quote.quote_of_uri.as_deref(),
+        root_json["uri"].as_str()
+    );
+
+    let refreshed_root = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/statuses/{}",
+            root_json["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refreshed_root.status(), 200);
+    let refreshed_root_json: Value = refreshed_root.json().await.unwrap();
+    assert_eq!(refreshed_root_json["quotes_count"], 1);
 }
 
 #[tokio::test]
@@ -546,6 +657,7 @@ async fn test_delete_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -596,6 +708,7 @@ async fn test_favourite_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -638,6 +751,7 @@ async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -692,6 +806,7 @@ async fn test_boost_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -734,6 +849,7 @@ async fn test_status_context() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -775,6 +891,7 @@ async fn test_status_context_includes_ancestors_and_descendants() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -790,6 +907,7 @@ async fn test_status_context_includes_ancestors_and_descendants() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -805,6 +923,7 @@ async fn test_status_context_includes_ancestors_and_descendants() {
         is_local: true,
         in_reply_to_uri: Some(middle.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -851,6 +970,7 @@ async fn test_status_context_limits_descendants() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
@@ -870,6 +990,7 @@ async fn test_status_context_limits_descendants() {
             is_local: true,
             in_reply_to_uri: Some(root.uri.clone()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: base_time + Duration::seconds((index + 1) as i64),
             fetched_at: None,
@@ -1013,6 +1134,7 @@ async fn test_status_history_rejects_remote_status() {
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Timeline,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1144,6 +1266,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1159,6 +1282,7 @@ async fn test_muting_reply_marks_whole_thread_as_muted() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1237,6 +1361,7 @@ async fn test_create_reply_status_persists_reply_metadata() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1302,6 +1427,7 @@ async fn test_create_reply_status_accepts_cache_only_remote_target() {
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1412,6 +1538,7 @@ async fn test_create_reply_status_delivers_to_remote_reply_target_inbox_without_
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1448,6 +1575,113 @@ async fn test_create_reply_status_delivers_to_remote_reply_target_inbox_without_
 }
 
 #[tokio::test]
+async fn test_create_quote_status_delivers_to_remote_quote_target_inbox_without_followers() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, CachedStatus};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn record_inbox_delivery(
+        State(counter): State<Arc<AtomicUsize>>,
+        _body: String,
+    ) -> StatusCode {
+        counter.fetch_add(1, Ordering::SeqCst);
+        StatusCode::ACCEPTED
+    }
+
+    let inbox_delivery_count = Arc::new(AtomicUsize::new(0));
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(inbox_delivery_count.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    let remote_status_uri = format!("{}/users/alice/statuses/quote-target", remote_base_url);
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: remote_address.to_string(),
+            uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: remote_status_uri.clone(),
+            uri: remote_status_uri.clone(),
+            content: "<p>Remote status</p>".to_string(),
+            account_address: remote_address.to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let payload = serde_json::json!({
+        "status": "Quoting remote status",
+        "visibility": "public",
+        "quoted_status_id": remote_status_uri
+    });
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+
+    let mut delivered = false;
+    for _ in 0..600 {
+        if inbox_delivery_count.load(Ordering::SeqCst) > 0 {
+            delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        delivered,
+        "expected outbound Create delivery to include remote quote target inbox"
+    );
+}
+
+#[tokio::test]
 async fn test_favourite_remote_status_by_uri_persists_from_cache() {
     use chrono::Utc;
     use rustresort::data::CachedStatus;
@@ -1470,6 +1704,7 @@ async fn test_favourite_remote_status_by_uri_persists_from_cache() {
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1545,6 +1780,7 @@ async fn test_favourite_remote_status_by_path_id_uri_fallback_persists_from_cach
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1595,6 +1831,7 @@ async fn test_bookmark_remote_status_by_uri_persists_from_cache() {
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1653,6 +1890,7 @@ async fn test_bookmark_remote_status_by_path_id_uri_fallback_persists_from_cache
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1703,6 +1941,7 @@ async fn test_reblog_remote_status_by_uri_persists_from_cache() {
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 
@@ -1763,6 +2002,7 @@ async fn test_notifications_fallback_to_cached_status() {
             attachments: vec![],
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         })
         .await;
 

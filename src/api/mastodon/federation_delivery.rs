@@ -222,6 +222,147 @@ pub async fn resolve_remote_actor_and_inbox_with_dependencies(
     Ok((discovered.actor_uri, discovered.inbox_uri))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRemoteRecipient {
+    pub address: String,
+    pub actor_uri: String,
+    pub inbox_uri: String,
+}
+
+fn is_mention_boundary(previous: Option<char>) -> bool {
+    previous
+        .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '@'))
+        .unwrap_or(true)
+}
+
+fn extract_mentions_from_text(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut mentions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] != '@' || !is_mention_boundary(index.checked_sub(1).map(|i| chars[i])) {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        let mut username = String::new();
+        while cursor < chars.len() {
+            let ch = chars[cursor];
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
+                username.push(ch);
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if username.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        if cursor < chars.len() && chars[cursor] == '@' {
+            cursor += 1;
+            let mut domain = String::new();
+            while cursor < chars.len() {
+                let ch = chars[cursor];
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+                    domain.push(ch);
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            if !domain.is_empty() {
+                let mention = format!("{}@{}", username, domain).to_ascii_lowercase();
+                if seen.insert(mention.clone()) {
+                    mentions.push(mention);
+                }
+            }
+        }
+
+        index = cursor;
+    }
+
+    mentions
+}
+
+pub fn extract_remote_mentions_from_content(content: &str, local_domain: &str) -> Vec<String> {
+    let normalized = content
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("</p>", "\n\n")
+        .replace("<p>", "");
+
+    let mut without_tags = String::with_capacity(normalized.len());
+    let mut in_tag = false;
+    for ch in normalized.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => without_tags.push(ch),
+            _ => {}
+        }
+    }
+
+    extract_mentions_from_text(&html_escape::decode_html_entities(without_tags.trim()))
+        .into_iter()
+        .filter(|mention| {
+            mention
+                .split_once('@')
+                .map(|(_, domain)| !domain.eq_ignore_ascii_case(local_domain))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+pub async fn resolve_remote_recipients_with_dependencies(
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
+    addresses: impl IntoIterator<Item = String>,
+) -> Vec<ResolvedRemoteRecipient> {
+    let mut resolved = Vec::new();
+    let mut seen_addresses = std::collections::HashSet::new();
+    let mut seen_inboxes = std::collections::HashSet::new();
+
+    for address in addresses {
+        let normalized = address.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen_addresses.insert(normalized.clone()) {
+            continue;
+        }
+
+        match resolve_remote_actor_and_inbox_with_dependencies(
+            profile_cache,
+            federation_fetch_client,
+            &normalized,
+        )
+        .await
+        {
+            Ok((actor_uri, inbox_uri)) => {
+                if seen_inboxes.insert(inbox_uri.clone()) {
+                    resolved.push(ResolvedRemoteRecipient {
+                        address: normalized,
+                        actor_uri,
+                        inbox_uri,
+                    });
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    address = %normalized,
+                    %error,
+                    "Failed to resolve remote federation recipient"
+                );
+            }
+        }
+    }
+
+    resolved
+}
+
 pub fn spawn_best_effort_delivery<F>(action: &'static str, future: F)
 where
     F: Future<Output = Result<(), AppError>> + Send + 'static,

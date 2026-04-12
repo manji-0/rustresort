@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS remote_blocks (
+    actor_uri TEXT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

@@ -11,11 +11,13 @@ pub struct AccountResponse {
     pub id: String,
     pub username: String,
     pub acct: String,
+    pub uri: String,
     pub display_name: String,
     pub locked: bool,
     pub bot: bool,
     pub discoverable: bool,
     pub group: bool,
+    pub indexable: bool,
     pub created_at: DateTime<Utc>,
     pub note: String,
     pub url: String,
@@ -29,6 +31,11 @@ pub struct AccountResponse {
     pub last_status_at: Option<String>,
     pub emojis: Vec<serde_json::Value>,
     pub fields: Vec<serde_json::Value>,
+    pub roles: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved: Option<Box<AccountResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<serde_json::Value>,
 }
 
 /// Status response (Mastodon API compatible)
@@ -47,16 +54,22 @@ pub struct StatusResponse {
     pub replies_count: i32,
     pub reblogs_count: i32,
     pub favourites_count: i32,
+    pub quotes_count: i32,
     pub edited_at: Option<DateTime<Utc>>,
     pub content: String,
+    pub text: String,
     pub reblog: Option<Box<StatusResponse>>,
+    pub application: Option<serde_json::Value>,
     pub account: AccountResponse,
     pub media_attachments: Vec<MediaAttachmentResponse>,
     pub mentions: Vec<serde_json::Value>,
     pub tags: Vec<serde_json::Value>,
     pub emojis: Vec<serde_json::Value>,
+    pub quote: Option<serde_json::Value>,
+    pub quote_approval: Option<serde_json::Value>,
     pub card: Option<serde_json::Value>,
     pub poll: Option<serde_json::Value>,
+    pub filtered: Vec<serde_json::Value>,
     pub favourited: bool,
     pub reblogged: bool,
     pub muted: bool,
@@ -110,9 +123,16 @@ pub struct NotificationResponse {
     pub id: String,
     #[serde(rename = "type")]
     pub notification_type: String,
+    pub group_key: String,
     pub created_at: DateTime<Utc>,
     pub account: AccountResponse,
     pub status: Option<StatusResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation_warning: Option<serde_json::Value>,
 }
 
 /// Instance response (Mastodon API compatible)

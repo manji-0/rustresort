@@ -1,0 +1,510 @@
+:root {
+  color-scheme: dark;
+  --bg: #000000;
+  --panel: #111111;
+  --panel-soft: #16181c;
+  --line: #2f3336;
+  --text: #e7e9ea;
+  --muted: #71767b;
+  --accent: #1d9bf0;
+  --accent-soft: rgba(29, 155, 240, 0.16);
+  --warning: #f4212e;
+  --success: #00ba7c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(29, 155, 240, 0.1), transparent 22%),
+    radial-gradient(circle at top right, rgba(255, 255, 255, 0.06), transparent 18%),
+    var(--bg);
+  color: var(--text);
+  font-family: Chirp, "Avenir Next", "Segoe UI", sans-serif;
+}
+
+body {
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.shell-loading {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.x-shell {
+  width: min(1380px, calc(100vw - 32px));
+  margin: 0 auto;
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr) 360px;
+  gap: 24px;
+  padding: 0 8px;
+}
+
+.left-rail,
+.center-column,
+.right-rail {
+  min-width: 0;
+}
+
+.left-rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  display: grid;
+  gap: 20px;
+  padding: 24px 0 32px;
+}
+
+.brand-mark {
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(145deg, #ffffff, #6cc6ff);
+  color: #000;
+  font-weight: 800;
+  letter-spacing: -0.08em;
+  text-transform: lowercase;
+}
+
+.brand-block h1,
+.timeline-head h2,
+.rail-card h3,
+.profile-card h3,
+.admin-split h4 {
+  margin: 0;
+}
+
+.brand-kicker,
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.brand-copy,
+.muted-copy,
+.profile-handle,
+.status-meta span,
+.notification-meta span,
+.notification-user span,
+.mini-row small,
+.session-chip {
+  color: var(--muted);
+}
+
+.nav-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.nav-pill,
+.nav-link,
+.primary-button,
+.ghost-button {
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.nav-pill,
+.nav-link {
+  padding: 14px 18px;
+  text-align: left;
+  background: transparent;
+  color: var(--text);
+}
+
+.nav-pill:hover,
+.nav-link:hover,
+.ghost-button:hover,
+.primary-button:hover {
+  transform: translateY(-1px);
+}
+
+.nav-pill:hover,
+.nav-link:hover {
+  background: var(--panel-soft);
+}
+
+.nav-pill.active {
+  background: var(--accent-soft);
+  border-color: rgba(29, 155, 240, 0.32);
+}
+
+.nav-link.destructive {
+  color: #ff9aa2;
+}
+
+.profile-card,
+.composer-card,
+.timeline-card,
+.rail-card,
+.flash-banner {
+  background: rgba(17, 17, 17, 0.92);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(16px);
+}
+
+.profile-card,
+.rail-card {
+  border-radius: 28px;
+  padding: 20px;
+  display: grid;
+  gap: 14px;
+}
+
+.profile-avatar,
+.status-avatar {
+  border-radius: 999px;
+  object-fit: cover;
+  background: var(--panel-soft);
+}
+
+.profile-avatar {
+  width: 68px;
+  height: 68px;
+}
+
+.status-avatar {
+  width: 44px;
+  height: 44px;
+}
+
+.status-avatar.tiny {
+  width: 36px;
+  height: 36px;
+}
+
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stats-row span {
+  display: grid;
+  gap: 2px;
+}
+
+.stats-row strong {
+  font-size: 1.15rem;
+}
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+
+.center-column {
+  border-inline: 1px solid var(--line);
+  padding-bottom: 48px;
+}
+
+.timeline-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: 20px 24px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  backdrop-filter: blur(16px);
+  background: rgba(0, 0, 0, 0.72);
+  border-bottom: 1px solid var(--line);
+}
+
+.composer-card {
+  margin: 0 24px 20px;
+  border-radius: 28px;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
+}
+
+.composer-avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, var(--accent), #78c8ff);
+  color: #00131f;
+  font-weight: 800;
+  font-size: 1.1rem;
+}
+
+.composer-body {
+  display: grid;
+  gap: 14px;
+}
+
+.composer-body textarea,
+.field input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  padding: 16px 18px;
+}
+
+.composer-body textarea {
+  min-height: 132px;
+  resize: vertical;
+}
+
+.composer-actions,
+.rail-card-head,
+.inline-form,
+.status-head,
+.status-actions,
+.notification-user,
+.mini-row {
+  display: flex;
+  gap: 12px;
+}
+
+.composer-actions,
+.rail-card-head,
+.status-actions,
+.mini-row {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.primary-button,
+.ghost-button {
+  padding: 10px 18px;
+}
+
+.primary-button {
+  background: var(--accent);
+  color: #fff;
+}
+
+.ghost-button {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.ghost-button.small {
+  padding: 6px 12px;
+  font-size: 0.9rem;
+}
+
+.flash-banner {
+  margin: 0 24px 20px;
+  border-radius: 18px;
+  padding: 14px 16px;
+  color: #b8ecff;
+}
+
+.timeline-list {
+  display: grid;
+}
+
+.timeline-card {
+  padding: 18px 24px 20px;
+  border-inline: 0;
+  border-top: 0;
+}
+
+.timeline-card:first-child {
+  border-top: 1px solid var(--line);
+}
+
+.status-head {
+  align-items: flex-start;
+}
+
+.status-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.status-visibility {
+  margin-top: 4px;
+  display: inline-flex;
+  width: fit-content;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.status-content {
+  margin: 14px 0 18px 56px;
+  line-height: 1.5;
+}
+
+.status-content p {
+  margin: 0 0 12px;
+}
+
+.status-actions {
+  margin-left: 56px;
+  flex-wrap: wrap;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+.status-actions a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.right-rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  display: grid;
+  gap: 18px;
+  padding: 20px 0 32px;
+}
+
+.rail-list,
+.admin-split {
+  display: grid;
+  gap: 12px;
+}
+
+.notification-card {
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  display: grid;
+  gap: 10px;
+}
+
+.notification-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  text-transform: capitalize;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.inline-form {
+  align-items: center;
+}
+
+.admin-split h4 {
+  margin-bottom: 8px;
+}
+
+.mini-row {
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+}
+
+.mini-row.removable {
+  align-items: center;
+}
+
+@media (max-width: 1180px) {
+  .x-shell {
+    grid-template-columns: 88px minmax(0, 1fr) 320px;
+  }
+
+  .brand-block,
+  .profile-card,
+  .nav-link,
+  .nav-pill {
+    overflow: hidden;
+  }
+
+  .brand-block h1,
+  .brand-copy,
+  .profile-card p,
+  .stats-row,
+  .session-chip {
+    display: none;
+  }
+
+  .nav-pill,
+  .nav-link {
+    text-align: center;
+    padding-inline: 12px;
+  }
+}
+
+@media (max-width: 960px) {
+  .x-shell {
+    width: 100%;
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0;
+  }
+
+  .left-rail,
+  .right-rail {
+    position: static;
+    padding: 16px;
+  }
+
+  .center-column {
+    border-inline: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .timeline-head,
+  .composer-card,
+  .flash-banner,
+  .timeline-card,
+  .left-rail,
+  .right-rail {
+    padding-inline: 16px;
+  }
+
+  .composer-card {
+    margin-inline: 16px;
+    grid-template-columns: 1fr;
+  }
+
+  .status-content,
+  .status-actions {
+    margin-left: 0;
+  }
+}

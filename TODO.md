@@ -14,7 +14,7 @@ Conventions follow the existing codebase:
 
 ## 1. Streaming Event Bus
 
-Real-time SSE streams currently return heartbeat-only placeholders.
+Implemented with broadcast-backed SSE streams and exercised by E2E coverage.
 
 **Define trait** in `src/service/streaming.rs` (new file):
 
@@ -49,7 +49,7 @@ pub trait StreamingEventBus: Send + Sync {
 
 ## 2. Web Push Notifications
 
-No implementation exists for `POST /api/v1/push/subscription`.
+Implemented for the single-user deployment model, including VAPID key generation and E2E delivery tests.
 
 **Define trait** in `src/data/repository.rs`:
 
@@ -86,13 +86,13 @@ pub trait WebPushSender: Send + Sync {
 ```
 
 **Impl tasks:**
-- [ ] Add `push_subscriptions` migration (endpoint, p256dh, auth, alerts JSON, created_at)
-- [ ] Define `PushSubscription`, `PushAlerts`, `PushPayload` structs in `src/data/models.rs`
-- [ ] Implement `PushSubscriptionRepository` on `Database`
-- [ ] Implement `WebPushSender` using the `web-push` crate (VAPID + AES-GCM-128 encryption)
-- [ ] Add VAPID key generation/storage to config
-- [ ] Add API handlers in `src/api/mastodon/` for `GET/POST/DELETE /api/v1/push/subscription`
-- [ ] Call `WebPushSender::send` from `NotificationService` after inserting a notification
+- [x] Add `push_subscriptions` migration (endpoint, p256dh, auth, alerts JSON, created_at)
+- [x] Define `PushSubscription`, `PushAlerts`, `PushPayload` structs in `src/data/models.rs`
+- [x] Implement `PushSubscriptionRepository` on `Database`
+- [x] Implement `WebPushSender` using the `web-push` crate (VAPID + AES-GCM-128 encryption)
+- [x] Add VAPID key generation/storage to config
+- [x] Add API handlers in `src/api/mastodon/` for `GET/POST/DELETE /api/v1/push/subscription`
+- [x] Call `WebPushSender::send` from notification insertion flow after creating a notification
 
 ---
 
@@ -124,12 +124,12 @@ pub trait DeliveryQueue: Send + Sync {
 ```
 
 **Impl tasks:**
-- [ ] Add `delivery_jobs` migration (id, inbox_url, activity_json, actor_key_id, attempts, last_error, next_attempt_at, delivered_at)
-- [ ] Define `DeliveryJob` struct in `src/data/models.rs`
-- [ ] Implement `DeliveryQueue` on `Database`
-- [ ] Implement a `DeliveryWorker` that polls `claim_pending`, attempts delivery, and calls `mark_delivered`/`mark_failed` with exponential backoff
-- [ ] Spawn `DeliveryWorker` as a background `tokio::task` at startup
-- [ ] Replace fire-and-forget delivery calls with `DeliveryQueue::enqueue`
+- [x] Add `delivery_jobs` migration (id, inbox_url, activity_json, actor_key_id, attempts, last_error, next_attempt_at, delivered_at)
+- [x] Define `DeliveryJob` struct in `src/data/models.rs`
+- [x] Implement `DeliveryQueue` on `Database`
+- [x] Implement a `DeliveryWorker` that polls `claim_pending`, attempts delivery, and calls `mark_delivered`/`mark_failed` with exponential backoff
+- [x] Spawn `DeliveryWorker` as a background `tokio::task` at startup
+- [x] Replace fire-and-forget delivery calls with `DeliveryQueue::enqueue`
 
 ---
 
@@ -171,12 +171,12 @@ pub trait MigrationRepository: Send + Sync {
 ```
 
 **Impl tasks:**
-- [ ] Add `also_known_as` column to `account` table migration
-- [ ] Implement `MigrationRepository` on `Database`
-- [ ] Implement `AccountMigrationHandler`; call `DeliveryQueue::enqueue` for `Move` activity
-- [ ] Expose `PUT /api/v1/accounts/update_credentials` `moved_to_account_id` field
-- [ ] Handle incoming `Move` in `src/federation/activity.rs` `process_inbox`
-- [ ] Include `alsoKnownAs` and `movedTo` in the actor JSON in `src/api/activitypub.rs`
+- [x] Add `also_known_as` column to `account` table migration
+- [x] Implement `MigrationRepository` on `Database`
+- [x] Implement `AccountMigrationHandler`; call `DeliveryQueue::enqueue` for `Move` activity
+- [x] Expose `PUT /api/v1/accounts/update_credentials` `moved_to_account_id` field
+- [x] Handle incoming `Move` in `src/federation/activity.rs` `process_inbox`
+- [x] Include `alsoKnownAs` and `movedTo` in the actor JSON in `src/api/activitypub.rs`
 
 ---
 
@@ -205,10 +205,10 @@ pub trait SchedulerRunner: Send + Sync {
 ```
 
 **Impl tasks:**
-- [ ] Add `error` and `published_at` columns to `scheduled_statuses` migration
-- [ ] Implement `ScheduledStatusRepository` on `Database`
-- [ ] Implement `SchedulerRunner` that calls `get_due_statuses`, creates each via `StatusService`, calls `mark_published`/`mark_failed`
-- [ ] Spawn `SchedulerRunner` as a background `tokio::task` with `tokio::time::interval` (e.g., every 60 s)
+- [x] Add `error` and `published_at` columns to `scheduled_statuses` migration
+- [x] Implement `ScheduledStatusRepository` on `Database`
+- [x] Implement `SchedulerRunner` that calls `get_due_statuses`, creates each via `StatusService`, calls `mark_published`/`mark_failed`
+- [x] Spawn `SchedulerRunner` as a background `tokio::task` with `tokio::time::interval` (e.g., every 60 s)
 
 ---
 
@@ -243,7 +243,7 @@ pub trait TotpRepository: Send + Sync {
 - [ ] Implement `TotpRepository` on `Database`
 - [ ] Implement TOTP verification using the `totp-rs` crate
 - [ ] Add `POST /api/v1/totp/enroll`, `POST /api/v1/totp/confirm`, `DELETE /api/v1/totp` endpoints
-- [ ] Enforce TOTP check in the OAuth token endpoint when enabled
+- [ ] Enforce TOTP check in built-in local login and passkey management flows when enabled
 
 ---
 
@@ -358,34 +358,13 @@ pub trait PersistentKeyCache: Send + Sync {
 ```
 
 **Impl tasks:**
-- [ ] Add `public_key_cache` migration (key_id PRIMARY KEY, pem TEXT, expires_at TIMESTAMP)
-- [ ] Implement `PersistentKeyCache` on `Database`
-- [ ] Modify `PublicKeyCache` in `key_cache.rs` to fall back to `PersistentKeyCache` on L1 miss and write through on fetch
+- [x] Add `public_key_cache` migration (key_id PRIMARY KEY, pem TEXT, expires_at TIMESTAMP)
+- [x] Implement `PersistentKeyCache` on `Database`
+- [x] Modify `PublicKeyCache` in `key_cache.rs` to fall back to `PersistentKeyCache` on L1 miss and write through on fetch
 
 ---
 
-## 11. OAuth PKCE Support
-
-Mobile/native clients require PKCE (`code_challenge` / `code_verifier`).
-
-**Define trait** in `src/auth/` (extend `oauth.rs`):
-
-```rust
-pub trait PkceVerifier: Send + Sync {
-    /// Validate that `code_verifier` matches the stored `code_challenge`.
-    fn verify(&self, code_verifier: &str, code_challenge: &str, method: PkceMethod) -> Result<(), AppError>;
-}
-```
-
-**Impl tasks:**
-- [ ] Add `code_challenge` and `code_challenge_method` columns to `oauth_authorization_codes` migration
-- [ ] Implement `PkceVerifier` (SHA-256 for S256, plain for plain)
-- [ ] Accept and store `code_challenge`/`code_challenge_method` in `GET /oauth/authorize`
-- [ ] Verify `code_verifier` in `POST /oauth/token` before issuing access token
-
----
-
-## 12. Grouped Notifications (v2)
+## 11. Grouped Notifications (v2)
 
 `GET /api/v2/notifications` with server-side grouping is not implemented.
 

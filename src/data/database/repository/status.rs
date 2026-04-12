@@ -26,6 +26,69 @@ impl Database {
         Ok(status)
     }
 
+    /// Get local statuses that quote the specified status URI.
+    pub async fn get_local_statuses_by_quote_of_uri(
+        &self,
+        quote_of_uri: &str,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = sqlx::query_as::<_, Status>(
+            r#"
+            SELECT * FROM statuses
+            WHERE quote_of_uri = ? AND is_local = 1
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )
+        .bind(quote_of_uri)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(statuses)
+    }
+
+    /// Get statuses authored by a specific account in a pagination window.
+    pub async fn get_statuses_by_account_address_in_window(
+        &self,
+        account_address: &str,
+        default_port: Option<u16>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let candidates = equivalent_account_address_candidates(account_address, default_port);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let lowered_candidates = candidates
+            .iter()
+            .map(|candidate| candidate.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let placeholders = vec!["?"; lowered_candidates.len()].join(", ");
+        let mut query =
+            format!("SELECT * FROM statuses WHERE LOWER(account_address) IN ({placeholders})");
+        if max_id.is_some() {
+            query.push_str(" AND id < ?");
+        }
+        if min_id.is_some() {
+            query.push_str(" AND id > ?");
+        }
+        query.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+
+        let mut builder = sqlx::query_as::<_, Status>(&query);
+        for candidate in &lowered_candidates {
+            builder = builder.bind(candidate);
+        }
+        if let Some(max_id) = max_id {
+            builder = builder.bind(max_id);
+        }
+        if let Some(min_id) = min_id {
+            builder = builder.bind(min_id);
+        }
+
+        let statuses = builder.bind(limit as i64).fetch_all(&self.pool).await?;
+        Ok(statuses)
+    }
+
     /// Resolve thread root URI by walking the reply chain from a status.
     ///
     /// Returns the top-most known ancestor URI, or an unknown parent URI when
@@ -182,9 +245,9 @@ impl Database {
                 r#"
                 INSERT INTO statuses (
                     id, uri, content, content_warning, visibility, language,
-                    account_address, is_local, in_reply_to_uri, boost_of_uri,
+                    account_address, is_local, in_reply_to_uri, boost_of_uri, quote_of_uri,
                     persisted_reason, created_at, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&status.id)
@@ -197,6 +260,7 @@ impl Database {
             .bind(status.is_local)
             .bind(&status.in_reply_to_uri)
             .bind(&status.boost_of_uri)
+            .bind(&status.quote_of_uri)
             .bind(status.persisted_reason)
             .bind(status.created_at)
             .bind(status.fetched_at)
@@ -251,9 +315,9 @@ impl Database {
                 r#"
                 INSERT INTO statuses (
                     id, uri, content, content_warning, visibility, language,
-                    account_address, is_local, in_reply_to_uri, boost_of_uri,
+                    account_address, is_local, in_reply_to_uri, boost_of_uri, quote_of_uri,
                     persisted_reason, created_at, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&status.id)
@@ -266,6 +330,7 @@ impl Database {
             .bind(status.is_local)
             .bind(&status.in_reply_to_uri)
             .bind(&status.boost_of_uri)
+            .bind(&status.quote_of_uri)
             .bind(status.persisted_reason)
             .bind(status.created_at)
             .bind(status.fetched_at)
@@ -351,7 +416,7 @@ impl Database {
                 r#"
                 UPDATE statuses
                 SET content = ?, content_warning = ?, visibility = ?, language = ?,
-                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                    in_reply_to_uri = ?, boost_of_uri = ?, quote_of_uri = ?, persisted_reason = ?, fetched_at = ?
                 WHERE id = ?
                 "#,
             )
@@ -361,6 +426,7 @@ impl Database {
             .bind(&status.language)
             .bind(&status.in_reply_to_uri)
             .bind(&status.boost_of_uri)
+            .bind(&status.quote_of_uri)
             .bind(status.persisted_reason)
             .bind(status.fetched_at)
             .bind(&status.id)
@@ -414,7 +480,7 @@ impl Database {
                 r#"
                 UPDATE statuses
                 SET content = ?, content_warning = ?, visibility = ?, language = ?,
-                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                    in_reply_to_uri = ?, boost_of_uri = ?, quote_of_uri = ?, persisted_reason = ?, fetched_at = ?
                 WHERE id = ?
                 "#,
             )
@@ -424,6 +490,7 @@ impl Database {
             .bind(&updated.language)
             .bind(&updated.in_reply_to_uri)
             .bind(&updated.boost_of_uri)
+            .bind(&updated.quote_of_uri)
             .bind(updated.persisted_reason)
             .bind(updated.fetched_at)
             .bind(&updated.id)
@@ -522,7 +589,7 @@ impl Database {
                 r#"
                 UPDATE statuses
                 SET content = ?, content_warning = ?, visibility = ?, language = ?,
-                    in_reply_to_uri = ?, boost_of_uri = ?, persisted_reason = ?, fetched_at = ?
+                    in_reply_to_uri = ?, boost_of_uri = ?, quote_of_uri = ?, persisted_reason = ?, fetched_at = ?
                 WHERE id = ?
                 "#,
             )
@@ -532,6 +599,7 @@ impl Database {
             .bind(&updated.language)
             .bind(&updated.in_reply_to_uri)
             .bind(&updated.boost_of_uri)
+            .bind(&updated.quote_of_uri)
             .bind(updated.persisted_reason)
             .bind(updated.fetched_at)
             .bind(&updated.id)
@@ -603,6 +671,48 @@ impl Database {
         .await?;
 
         Ok(edits)
+    }
+
+    /// Count replies by parent status URI.
+    pub async fn count_replies_by_uri(&self, status_uri: &str) -> Result<i64, AppError> {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM statuses WHERE in_reply_to_uri = ?")
+            .bind(status_uri)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Count quotes targeting a status URI.
+    pub async fn count_quotes_by_uri(&self, status_uri: &str) -> Result<i64, AppError> {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM statuses WHERE quote_of_uri = ?")
+            .bind(status_uri)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Count local public/unlisted statuses safe to expose in ActivityPub outbox.
+    pub async fn count_local_outbox_statuses(&self) -> Result<i64, AppError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM statuses WHERE is_local = 1 AND visibility IN ('public', 'unlisted')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Return the timestamp of the most recent stored edit for a status.
+    pub async fn get_latest_status_edit_at(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, AppError> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT MAX(created_at) FROM status_edits WHERE status_id = ?",
+        )
+        .bind(status_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Delete status by ID

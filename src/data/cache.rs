@@ -33,6 +33,7 @@ pub struct CachedStatus {
     pub attachments: Vec<CachedAttachment>,
     pub reply_to_uri: Option<String>,
     pub boost_of_uri: Option<String>,
+    pub quote_of_uri: Option<String>,
 }
 
 /// Cached media attachment
@@ -996,6 +997,7 @@ mod tests {
             attachments: Vec::new(),
             reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
         }
     }
 

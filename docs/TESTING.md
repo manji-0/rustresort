@@ -177,6 +177,35 @@ cargo test federation
 cargo test -- --nocapture
 ```
 
+### Browser UI E2E
+
+`/settings` の実ブラウザ検証は Playwright で実行できます。
+
+```bash
+# inside devbox
+devbox run test:ui
+
+# one-shot: clean DB, start local server, run browser test, stop server
+scripts/run-settings-ui-e2e.sh
+
+# manual mode
+npm install
+npm run install:browsers
+RUSTRESORT_UI_BASE_URL=http://localhost:3010 npm run test:settings-ui
+```
+
+この Playwright フローでは以下を検証します。
+
+- `/settings` の未認証 redirect
+- password login
+- profile update
+- passkey registration
+- passkey rename
+- password change
+- logout
+- passkey login
+- passkey delete
+
 ### Single Test
 ```bash
 cargo test test_account_schema -- --exact

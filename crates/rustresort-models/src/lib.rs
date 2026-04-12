@@ -36,6 +36,8 @@ pub struct Account {
     pub username: String,
     pub display_name: Option<String>,
     pub note: Option<String>,
+    pub also_known_as: Option<String>,
+    pub moved_to_uri: Option<String>,
     /// S3 key for avatar image
     pub avatar_s3_key: Option<String>,
     /// S3 key for header image
@@ -46,6 +48,115 @@ pub struct Account {
     pub public_key_pem: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// A registered passkey for the single local account.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PasskeyCredential {
+    pub id: String,
+    pub credential_id: String,
+    pub name: Option<String>,
+    pub passkey_json: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+/// A queued outbound ActivityPub delivery job.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DeliveryJob {
+    pub id: String,
+    pub inbox_url: String,
+    pub activity_json: String,
+    pub actor_key_id: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A scheduled local status waiting to be published.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ScheduledStatus {
+    pub id: String,
+    pub scheduled_at: DateTime<Utc>,
+    pub status_text: String,
+    pub visibility: String,
+    pub content_warning: Option<String>,
+    pub in_reply_to_id: Option<String>,
+    pub quoted_status_id: Option<String>,
+    pub media_ids: Option<String>,
+    pub poll_options: Option<String>,
+    pub poll_expires_in: Option<i64>,
+    pub poll_multiple: bool,
+    pub language: Option<String>,
+    pub error: Option<String>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A persisted remote public key cache entry.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PublicKeyCacheEntry {
+    pub key_id: String,
+    pub pem: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A remote actor that has blocked the local user.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RemoteBlock {
+    pub actor_uri: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A stored Web Push subscription for the single local user.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PushSubscription {
+    pub id: String,
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub alerts_json: String,
+    pub policy: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Notification categories enabled for Web Push.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PushAlerts {
+    pub mention: bool,
+    pub quote: bool,
+    pub status: bool,
+    pub reblog: bool,
+    pub follow: bool,
+    pub follow_request: bool,
+    pub favourite: bool,
+    pub poll: bool,
+    pub update: bool,
+    pub quoted_update: bool,
+    #[serde(rename = "admin.sign_up")]
+    pub admin_sign_up: bool,
+    #[serde(rename = "admin.report")]
+    pub admin_report: bool,
+}
+
+/// A Web Push payload derived from a local notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushPayload {
+    pub notification_id: String,
+    pub notification_type: String,
+    pub title: String,
+    pub body: String,
+    pub status_uri: Option<String>,
 }
 
 // =============================================================================
@@ -78,6 +189,8 @@ pub struct Status {
     pub in_reply_to_uri: Option<String>,
     /// URI of the post this boosts
     pub boost_of_uri: Option<String>,
+    /// URI of the post this quotes
+    pub quote_of_uri: Option<String>,
     /// Why this remote status was persisted
     /// Values: own, reposted, favourited, bookmarked, reply_to_own
     pub persisted_reason: PersistedReason,
@@ -139,6 +252,8 @@ pub enum PersistedReason {
     Bookmarked,
     /// Reply to user's own post
     ReplyToOwn,
+    /// Mention or quote mentioning the local user
+    Mentioned,
     /// Ephemeral cache-only status placeholder
     CacheOnly,
     /// Timeline fixture placeholder status
@@ -153,6 +268,7 @@ impl PersistedReason {
             Self::Favourited => "favourited",
             Self::Bookmarked => "bookmarked",
             Self::ReplyToOwn => "reply_to_own",
+            Self::Mentioned => "mentioned",
             Self::CacheOnly => "cache_only",
             Self::Timeline => "timeline",
         }
@@ -266,6 +382,19 @@ pub enum NotificationType {
     Reblog,
     Follow,
     FollowRequest,
+    Status,
+    Poll,
+    Update,
+    #[serde(rename = "admin.sign_up")]
+    #[sqlx(rename = "admin.sign_up")]
+    AdminSignUp,
+    #[serde(rename = "admin.report")]
+    #[sqlx(rename = "admin.report")]
+    AdminReport,
+    SeveredRelationships,
+    ModerationWarning,
+    Quote,
+    QuotedUpdate,
 }
 
 impl NotificationType {
@@ -276,6 +405,15 @@ impl NotificationType {
             Self::Reblog => "reblog",
             Self::Follow => "follow",
             Self::FollowRequest => "follow_request",
+            Self::Status => "status",
+            Self::Poll => "poll",
+            Self::Update => "update",
+            Self::AdminSignUp => "admin.sign_up",
+            Self::AdminReport => "admin.report",
+            Self::SeveredRelationships => "severed_relationships",
+            Self::ModerationWarning => "moderation_warning",
+            Self::Quote => "quote",
+            Self::QuotedUpdate => "quoted_update",
         }
     }
 }

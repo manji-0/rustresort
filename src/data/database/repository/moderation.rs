@@ -169,6 +169,23 @@ impl Database {
         Ok(rows)
     }
 
+    /// Check if a remote actor URI is explicitly blocked locally.
+    pub async fn is_actor_uri_blocked(&self, actor_uri: &str) -> Result<bool, AppError> {
+        let normalized = actor_uri.trim().trim_end_matches('/');
+        let is_blocked = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM account_blocks
+                WHERE lower(rtrim(actor_uri, '/')) = lower(?)
+            )",
+        )
+        .bind(normalized)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(is_blocked != 0)
+    }
+
     /// Mute an account
     pub async fn mute_account(
         &self,

@@ -50,10 +50,10 @@
 # r2_secret_access_key = "minioadmin"
 
 [auth]
-# github_client_id = "your-github-client-id"
-# github_client_secret = "your-github-client-secret"
-# github_allowed_username = "your-github-username"
-# session_secret = "dev-secret-key-change-in-production"
+# username = "admin"
+# password = "set-this-only-for-first-start-or-password-reset"
+# session_secret = "dev-secret-key-change-in-production-with-at-least-32-bytes"
+# session_max_age = 604800
 
 [instance]
 # title = "RustResort Dev"
@@ -62,13 +62,16 @@
 
 [admin]
 # Admin user configuration (single-user instance)
-# username = "admin"
 # display_name = "Admin"
 # email = "admin@example.com"  # Falls back to instance.contact_email if not set
 # note = "Instance administrator"
 
 [cache]
 # timeline_max_items = 2000
+
+[ui]
+# enabled = true
+# dev_dir = "crates/rustresort-ui/dist"
 
 [logging]
 # level = "debug"

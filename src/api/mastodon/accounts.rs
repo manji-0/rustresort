@@ -21,6 +21,7 @@ use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, FOLLOWERS_TOTAL, FOLLOWING_TOTAL,
     HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };
+use crate::service::TimelineService;
 
 /// Pagination parameters
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,7 @@ pub struct UpdateCredentialsRequest {
     pub note: Option<String>,
     pub avatar: Option<String>, // Base64 encoded image
     pub header: Option<String>, // Base64 encoded image
+    pub moved_to_account_id: Option<String>,
     #[serde(rename = "locked")]
     pub _locked: Option<bool>,
     #[serde(rename = "bot")]
@@ -617,11 +619,13 @@ fn build_remote_account_response_with_profile(
         id: normalized_address.to_string(),
         username: username.to_string(),
         acct: normalized_address.to_string(),
+        uri: profile.uri.clone(),
         display_name,
         locked: false,
         bot: false,
         discoverable: true,
         group: false,
+        indexable: true,
         created_at: profile.fetched_at,
         note: profile.note.clone().unwrap_or_default(),
         url,
@@ -635,10 +639,13 @@ fn build_remote_account_response_with_profile(
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
+        roles: vec![],
+        moved: None,
+        source: None,
     })
 }
 
-fn build_remote_account_placeholder_response(
+pub(crate) fn build_remote_account_placeholder_response(
     address: &str,
     config: &crate::config::AppConfig,
     statuses_count: i32,
@@ -675,11 +682,13 @@ fn build_remote_account_placeholder_response(
         id,
         username: username.clone(),
         acct,
+        uri: url.clone(),
         display_name: username,
         locked: false,
         bot: false,
         discoverable: true,
         group: false,
+        indexable: true,
         created_at: remote_account_placeholder_created_at(),
         note: String::new(),
         url,
@@ -693,6 +702,9 @@ fn build_remote_account_placeholder_response(
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
+        roles: vec![],
+        moved: None,
+        source: None,
     })
 }
 
@@ -736,36 +748,43 @@ pub(crate) async fn resolve_remote_account_response(
     )
 }
 
-async fn resolve_cached_remote_account_response(
-    state: &AccountApiState,
+pub(crate) async fn resolve_cached_remote_account_response(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
     raw_address: &str,
 ) -> Option<AccountResponse> {
     let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
-    let profile = if let Some(profile) = state.profile_cache.get(&normalized_address).await {
+    let profile = if let Some(profile) = profile_cache.get(&normalized_address).await {
         profile
     } else {
-        state.profile_cache.get_by_uri(raw_address.trim()).await?
+        profile_cache.get_by_uri(raw_address.trim()).await?
     };
     let statuses_count = observed_statuses_count_for_address(
-        state.db.as_ref(),
-        default_port_for_protocol(&state.config.server.protocol),
+        db,
+        default_port_for_protocol(&config.server.protocol),
         &normalized_address,
     )
     .await;
     build_remote_account_response_with_profile(
         &normalized_address,
         &profile,
-        state.config.as_ref(),
+        config,
         statuses_count,
     )
 }
 
-async fn resolve_remote_account_response_for_list(
-    state: &AccountApiState,
+pub(crate) async fn resolve_remote_account_response_for_list(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
     raw_address: &str,
     default_port: Option<u16>,
 ) -> Option<AccountResponse> {
-    if let Some(response) = resolve_cached_remote_account_response(state, raw_address).await {
+    if let Some(response) =
+        resolve_cached_remote_account_response(config, db, profile_cache, raw_address).await
+    {
         return Some(response);
     }
 
@@ -773,10 +792,10 @@ async fn resolve_remote_account_response_for_list(
     if let Ok(Some(response)) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         resolve_remote_account_response(
-            state.config.as_ref(),
-            state.db.as_ref(),
-            state.profile_cache.as_ref(),
-            state.federation_fetch_client.as_ref(),
+            config,
+            db,
+            profile_cache,
+            federation_fetch_client,
             raw_address,
         ),
     )
@@ -785,9 +804,132 @@ async fn resolve_remote_account_response_for_list(
         return Some(response);
     }
 
-    let statuses_count =
-        observed_statuses_count_for_address(state.db.as_ref(), default_port, raw_address).await;
-    build_remote_account_placeholder_response(raw_address, state.config.as_ref(), statuses_count)
+    let statuses_count = observed_statuses_count_for_address(db, default_port, raw_address).await;
+    build_remote_account_placeholder_response(raw_address, config, statuses_count)
+}
+
+async fn resolve_moved_account_response(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: Option<&reqwest::Client>,
+    moved_to_uri: &str,
+) -> Option<Box<AccountResponse>> {
+    let response = if let Some(response) =
+        resolve_cached_remote_account_response(config, db, profile_cache, moved_to_uri).await
+    {
+        response
+    } else if let Some(client) = federation_fetch_client {
+        if let Some(response) =
+            resolve_remote_account_response(config, db, profile_cache, client, moved_to_uri).await
+        {
+            response
+        } else {
+            let default_port = default_port_for_protocol(&config.server.protocol);
+            let statuses_count =
+                observed_statuses_count_for_address(db, default_port, moved_to_uri).await;
+            build_remote_account_placeholder_response(moved_to_uri, config, statuses_count)?
+        }
+    } else {
+        let default_port = default_port_for_protocol(&config.server.protocol);
+        let statuses_count =
+            observed_statuses_count_for_address(db, default_port, moved_to_uri).await;
+        build_remote_account_placeholder_response(moved_to_uri, config, statuses_count)?
+    };
+    Some(Box::new(response))
+}
+
+async fn populate_local_account_compat_fields(
+    state: &AccountApiState,
+    account: &Account,
+    response: &mut AccountResponse,
+) {
+    if let Some(moved_to_uri) = account
+        .moved_to_uri
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        response.moved = resolve_moved_account_response(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            Some(state.federation_fetch_client.as_ref()),
+            moved_to_uri,
+        )
+        .await;
+    }
+}
+
+fn local_account_matches_identity(
+    account: &Account,
+    config: &crate::config::AppConfig,
+    identity: &str,
+) -> bool {
+    let trimmed = identity.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if account.id.as_str() == trimmed {
+        return true;
+    }
+
+    let local_address = format!("{}@{}", account.username, config.server.domain);
+    if normalize_account_address(trimmed).ok().as_deref()
+        == normalize_account_address(&local_address).ok().as_deref()
+    {
+        return true;
+    }
+
+    let actor_uri = format!("{}/users/{}", config.server.base_url(), account.username);
+    trimmed.eq_ignore_ascii_case(actor_uri.as_str())
+}
+
+pub(crate) async fn resolve_account_response_for_identity(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: Option<&reqwest::Client>,
+    raw_identity: &str,
+) -> Option<AccountResponse> {
+    let account = db.get_account().await.ok().flatten()?;
+    if local_account_matches_identity(&account, config, raw_identity) {
+        let stats = crate::api::load_local_account_stats(db).await.ok()?;
+        let mut response = crate::api::account_to_response_with_stats(&account, config, stats);
+        if let Some(moved_to_uri) = account
+            .moved_to_uri
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            response.moved = resolve_moved_account_response(
+                config,
+                db,
+                profile_cache,
+                federation_fetch_client,
+                moved_to_uri,
+            )
+            .await;
+        }
+        return Some(response);
+    }
+
+    if let Some(response) =
+        resolve_cached_remote_account_response(config, db, profile_cache, raw_identity).await
+    {
+        return Some(response);
+    }
+
+    if let Some(client) = federation_fetch_client {
+        if let Some(response) =
+            resolve_remote_account_response(config, db, profile_cache, client, raw_identity).await
+        {
+            return Some(response);
+        }
+    }
+
+    let default_port = default_port_for_protocol(&config.server.protocol);
+    let statuses_count = observed_statuses_count_for_address(db, default_port, raw_identity).await;
+    build_remote_account_placeholder_response(raw_identity, config, statuses_count)
 }
 
 fn list_entry_identity(actor_uri: Option<&str>, address: &str) -> Option<String> {
@@ -896,12 +1038,52 @@ async fn resolve_remote_actor_and_inbox(
     .await
 }
 
+async fn normalize_moved_to_account_uri(
+    state: &AccountApiState,
+    moved_to_account_id: &str,
+) -> Result<Option<String>, AppError> {
+    let trimmed = moved_to_account_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(Some(trimmed.trim_end_matches('/').to_string()));
+    }
+
+    let (actor_uri, _) = resolve_remote_actor_and_inbox(state, trimmed).await?;
+    Ok(Some(actor_uri))
+}
+
+async fn account_source_payload(
+    state: &AccountApiState,
+    account: &crate::data::Account,
+) -> serde_json::Value {
+    let follow_requests_count = state
+        .db
+        .get_follow_request_addresses(500)
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
+    serde_json::json!({
+        "note": account.note.clone().unwrap_or_default(),
+        "fields": [],
+        "privacy": "public",
+        "sensitive": false,
+        "language": serde_json::Value::Null,
+        "follow_requests_count": follow_requests_count,
+    })
+}
+
 async fn resolve_remote_actor_and_inbox_with_hint(
     state: &AccountApiState,
     address: &str,
     actor_uri_hint: Option<&str>,
 ) -> Result<(String, String), AppError> {
-    if let Some(actor_uri) = actor_uri_hint.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(actor_uri) = actor_uri_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if let Some(profile) = state.profile_cache.get_by_uri(actor_uri).await {
             if !profile.address.eq_ignore_ascii_case(address) {
                 let mut aliased = (*profile).clone();
@@ -998,8 +1180,15 @@ async fn resolve_remote_account_or_stub(
     address: String,
     default_port: Option<u16>,
 ) -> serde_json::Value {
-    if let Some(response) =
-        resolve_remote_account_response_for_list(&state, &address, default_port).await
+    if let Some(response) = resolve_remote_account_response_for_list(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        &address,
+        default_port,
+    )
+    .await
     {
         return serde_json::to_value(response)
             .unwrap_or_else(|_| build_remote_account_stub(&address));
@@ -1056,7 +1245,7 @@ pub async fn verify_credentials(
     db_timer.observe_duration();
 
     // Convert to API response
-    let response = crate::api::account_to_response_with_stats(
+    let mut response = crate::api::account_to_response_with_stats(
         &account,
         &state.config,
         crate::api::AccountStats {
@@ -1065,6 +1254,7 @@ pub async fn verify_credentials(
             statuses_count,
         },
     );
+    populate_local_account_compat_fields(&state, &account, &mut response).await;
 
     // Update metrics
     FOLLOWERS_TOTAL.set(followers_count as i64);
@@ -1075,7 +1265,21 @@ pub async fn verify_credentials(
         .with_label_values(&["GET", "/api/v1/accounts/verify_credentials", "200"])
         .inc();
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    let moved_value = response
+        .moved
+        .as_ref()
+        .map(|moved| serde_json::to_value(moved).unwrap());
+    let mut value = serde_json::to_value(response).unwrap();
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(moved) = moved_value {
+            obj.insert("moved".to_string(), moved);
+        }
+        obj.insert(
+            "source".to_string(),
+            account_source_payload(&state, &account).await,
+        );
+    }
+    Ok(Json(value))
 }
 
 /// PATCH /api/v1/accounts/update_credentials
@@ -1092,10 +1296,16 @@ pub async fn update_credentials(
         note,
         avatar,
         header,
+        moved_to_account_id,
         _locked: _,
         _bot: _,
         _discoverable: _,
     } = req;
+
+    let normalized_moved_to_uri = match moved_to_account_id.as_deref() {
+        Some(value) => normalize_moved_to_account_uri(&state, value).await?,
+        None => None,
+    };
 
     let avatar_bytes = avatar
         .as_deref()
@@ -1116,9 +1326,83 @@ pub async fn update_credentials(
         None => None,
     };
 
-    let account = account_service
+    let mut account = account_service
         .update_credentials(display_name, note, avatar_bytes, header_bytes)
         .await?;
+
+    if moved_to_account_id.is_some() {
+        let local_actor_uri = format!(
+            "{}/users/{}",
+            state.config.server.base_url(),
+            account.username
+        );
+        if normalized_moved_to_uri.as_deref() == Some(local_actor_uri.as_str()) {
+            return Err(AppError::Validation(
+                "moved_to_account_id must not point to the local actor".to_string(),
+            ));
+        }
+
+        let updated = state
+            .db
+            .patch_account_migration(
+                &account.id,
+                None,
+                Some(normalized_moved_to_uri.as_deref()),
+                chrono::Utc::now(),
+            )
+            .await?;
+        if !updated {
+            return Err(AppError::NotFound);
+        }
+
+        if let Some(moved_to_uri) = normalized_moved_to_uri.as_deref() {
+            let follower_inboxes = state.db.get_follower_inboxes().await?;
+            if !follower_inboxes.is_empty() {
+                let delivery = build_delivery(&state, &account);
+                let _ = delivery
+                    .queue_move(state.db.as_ref(), moved_to_uri, follower_inboxes)
+                    .await;
+            }
+        }
+
+        account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    }
+
+    let follower_inboxes = state
+        .db
+        .get_follower_inboxes()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "Skipping follower inbox prefetch for outbound actor Update delivery"
+            );
+            Vec::new()
+        });
+    if !follower_inboxes.is_empty() {
+        let follower_actor_uris = state
+            .db
+            .get_all_followers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|follower| follower.actor_uri)
+            .collect::<Vec<_>>();
+        let actor_object = crate::api::activitypub::build_local_actor_document(
+            state.storage.as_ref(),
+            &state.config.server.base_url(),
+            &account,
+        );
+        let delivery = build_delivery(&state, &account);
+        let _ = delivery
+            .queue_update_actor(
+                state.db.as_ref(),
+                actor_object,
+                follower_inboxes,
+                &follower_actor_uris,
+            )
+            .await;
+    }
 
     // Get counts
     let followers_count = state.db.count_follower_addresses().await? as i32;
@@ -1126,7 +1410,7 @@ pub async fn update_credentials(
     let statuses_count = state.db.count_local_statuses().await? as i32;
 
     // Return updated account
-    let response = crate::api::account_to_response_with_stats(
+    let mut response = crate::api::account_to_response_with_stats(
         &account,
         &state.config,
         crate::api::AccountStats {
@@ -1135,8 +1419,23 @@ pub async fn update_credentials(
             statuses_count,
         },
     );
+    populate_local_account_compat_fields(&state, &account, &mut response).await;
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    let moved_value = response
+        .moved
+        .as_ref()
+        .map(|moved| serde_json::to_value(moved).unwrap());
+    let mut value = serde_json::to_value(response).unwrap();
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(moved) = moved_value {
+            obj.insert("moved".to_string(), moved);
+        }
+        obj.insert(
+            "source".to_string(),
+            account_source_payload(&state, &account).await,
+        );
+    }
+    Ok(Json(value))
 }
 
 /// GET /api/v1/accounts/:id
@@ -1144,30 +1443,24 @@ pub async fn get_account(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get the account from database
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-
-    // Check if ID matches
-    if account.id.as_str() != id {
-        return Err(AppError::NotFound);
-    }
-    // Get counts
-    let followers_count = state.db.count_follower_addresses().await? as i32;
-    let following_count = state.db.count_follow_addresses().await? as i32;
-    let statuses_count = state.db.count_local_statuses().await? as i32;
-
-    // Convert to API response
-    let response = crate::api::account_to_response_with_stats(
-        &account,
-        &state.config,
-        crate::api::AccountStats {
-            followers_count,
-            following_count,
-            statuses_count,
-        },
-    );
+    let response = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        Some(state.federation_fetch_client.as_ref()),
+        &id,
+    )
+    .await
+    .ok_or(AppError::NotFound)?;
 
     Ok(Json(serde_json::to_value(response).unwrap()))
+}
+
+fn is_public_account_status_visibility(visibility: crate::data::StatusVisibility) -> bool {
+    matches!(
+        visibility,
+        crate::data::StatusVisibility::Public | crate::data::StatusVisibility::Unlisted
+    )
 }
 
 /// GET /api/v1/accounts/:id/statuses
@@ -1176,91 +1469,78 @@ pub async fn account_statuses(
     Path(id): Path<String>,
     Query(params): Query<AccountStatusesParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-
-    if account.id.as_str() != id {
-        return Err(AppError::NotFound);
-    }
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let requested_identity = if local_account_matches_identity(&account, state.config.as_ref(), &id)
+    {
+        None
+    } else {
+        Some(resolve_target_address(&state, &id).await?)
+    };
 
-    // Get local statuses in pagination window.
     let limit = params.limit.unwrap_or(20).min(40);
     let only_pinned = params.pinned.unwrap_or(false);
     let exclude_reblogs = params.exclude_reblogs.unwrap_or(false);
     let exclude_replies = params.exclude_replies.unwrap_or(false);
     let only_media = params.only_media.unwrap_or(false);
     let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
-    let has_filters = only_pinned || exclude_reblogs || exclude_replies || only_media;
-    let fetch_limit = if has_filters {
-        limit.saturating_mul(5).min(200)
-    } else {
-        limit
-    };
-
-    // Convert to API responses with optional filters.
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let timeline_items = timeline_service
+        .account_timeline(
+            requested_identity.as_deref(),
+            default_port,
+            limit,
+            params.max_id.as_deref(),
+            effective_min_id,
+            only_media,
+            exclude_replies,
+            exclude_reblogs,
+            only_pinned,
+        )
+        .await?;
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await
+    .unwrap_or_default();
     let mut responses = Vec::with_capacity(limit);
-    let mut page_max_id = params.max_id.clone();
-    loop {
-        let statuses = state
-            .db
-            .get_local_statuses_in_window(fetch_limit, page_max_id.as_deref(), effective_min_id)
-            .await?;
-
-        if statuses.is_empty() {
-            break;
+    for item in timeline_items {
+        if !is_public_account_status_visibility(item.status.visibility) {
+            continue;
         }
-
-        let batch_len = statuses.len();
-        let mut last_status_id: Option<String> = None;
-        for status in statuses {
-            last_status_id = Some(status.id.clone());
-
-            if exclude_reblogs && status.boost_of_uri.is_some() {
-                continue;
-            }
-            if exclude_replies && status.in_reply_to_uri.is_some() {
-                continue;
-            }
-
-            let is_pinned = state.db.is_status_pinned(&status.id).await?;
-            if only_pinned && !is_pinned {
-                continue;
-            }
-            if only_media && state.db.get_media_by_status(&status.id).await?.is_empty() {
-                continue;
-            }
-
-            let response = crate::api::status_to_response_with_account_stats(
-                &status,
-                &account,
-                &state.config,
-                account_stats,
-                crate::api::StatusInteractions::new(None, None, None, None, Some(is_pinned)),
-            );
-            responses.push(serde_json::to_value(response).unwrap());
-            if responses.len() >= limit {
-                break;
-            }
-        }
-
-        if responses.len() >= limit {
-            break;
-        }
-
-        // No more rows to page through.
-        if last_status_id.is_none() || batch_len < fetch_limit {
-            break;
-        }
-
-        let Some(next_max_id) = last_status_id else {
-            break;
-        };
-        if page_max_id.as_deref() == Some(next_max_id.as_str()) {
-            break;
-        }
-
-        page_max_id = Some(next_max_id);
+        let is_pinned = state.db.is_status_pinned(&item.status.id).await?;
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .copied();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                Some(is_pinned),
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
     }
 
     Ok(Json(responses))
@@ -1312,8 +1592,15 @@ pub async fn get_account_followers(
 
     let paged_addresses = apply_account_address_pagination(identities, &params);
     for address in paged_addresses.into_iter().take(limit) {
-        let Some(response) =
-            resolve_remote_account_response_for_list(&state, &address, default_port).await
+        let Some(response) = resolve_remote_account_response_for_list(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            &address,
+            default_port,
+        )
+        .await
         else {
             continue;
         };
@@ -1344,7 +1631,8 @@ pub async fn get_account_following(
     let mut following = Vec::new();
 
     for follow in following_entries {
-        let Some(candidate) = list_entry_identity(follow.actor_uri.as_deref(), &follow.target_address)
+        let Some(candidate) =
+            list_entry_identity(follow.actor_uri.as_deref(), &follow.target_address)
         else {
             continue;
         };
@@ -1368,8 +1656,15 @@ pub async fn get_account_following(
 
     let paged_addresses = apply_account_address_pagination(identities, &params);
     for address in paged_addresses.into_iter().take(limit) {
-        let Some(response) =
-            resolve_remote_account_response_for_list(&state, &address, default_port).await
+        let Some(response) = resolve_remote_account_response_for_list(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            &address,
+            default_port,
+        )
+        .await
         else {
             continue;
         };
@@ -1453,7 +1748,12 @@ pub async fn follow_account(
             }
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
-                .send_follow_with_id(&follow_uri, &target_actor_uri, &target_inbox_uri)
+                .queue_follow_with_id(
+                    state_for_delivery.db.as_ref(),
+                    &follow_uri,
+                    &target_actor_uri,
+                    &target_inbox_uri,
+                )
                 .await
         });
     }
@@ -1533,18 +1833,19 @@ pub async fn unfollow_account(
         let target_address_for_delivery = target_address.clone();
         let target_actor_uri_hint = follow.and_then(|follow| follow.actor_uri);
         spawn_best_effort_delivery("unfollow", async move {
-            let (target_actor_uri, target_inbox_uri) =
-                resolve_remote_actor_and_inbox_with_hint(
-                    &state_for_delivery,
-                    &target_address_for_delivery,
-                    target_actor_uri_hint.as_deref(),
-                )
-                .await?;
+            let (target_actor_uri, target_inbox_uri) = resolve_remote_actor_and_inbox_with_hint(
+                &state_for_delivery,
+                &target_address_for_delivery,
+                target_actor_uri_hint.as_deref(),
+            )
+            .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
-                .send_undo_to_inbox_with_type_and_object(
+                .queue_undo_to_inbox_with_type_and_object(
+                    state_for_delivery.db.as_ref(),
                     &follow_uri,
                     Some("Follow"),
+                    Some(&target_actor_uri),
                     Some(&target_actor_uri),
                     &target_inbox_uri,
                 )
@@ -1750,7 +2051,7 @@ pub async fn search_accounts(
             .as_deref()
             .is_some_and(|identity| identity == local_account_identity)
     {
-        let account_response = crate::api::account_to_response_with_stats(
+        let mut account_response = crate::api::account_to_response_with_stats(
             &account,
             &state.config,
             crate::api::AccountStats {
@@ -1759,6 +2060,7 @@ pub async fn search_accounts(
                 statuses_count: state.db.count_local_statuses().await? as i32,
             },
         );
+        populate_local_account_compat_fields(&state, &account, &mut account_response).await;
         results.push(serde_json::to_value(account_response).unwrap());
         matched_local_account = true;
     }
@@ -1837,36 +2139,6 @@ pub async fn search_accounts(
     results.truncate(limit);
 
     Ok(Json(results))
-}
-
-/// Create account request
-#[derive(Debug, Deserialize)]
-pub struct CreateAccountRequest {
-    #[serde(rename = "username")]
-    pub _username: String,
-    #[serde(rename = "email")]
-    pub _email: String,
-    #[serde(rename = "password")]
-    pub _password: String,
-    #[serde(rename = "agreement")]
-    pub _agreement: Option<bool>,
-    #[serde(rename = "locale")]
-    pub _locale: Option<String>,
-}
-
-/// POST /api/v1/accounts
-/// Create a new account
-///
-/// For single-user instance, this endpoint returns an error
-/// as account creation is not supported.
-pub async fn create_account(
-    State(_state): State<AccountApiState>,
-    Json(_req): Json<CreateAccountRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // Single-user instance doesn't support account creation via API
-    Err(AppError::Unprocessable(
-        "Account creation is not supported on this single-user instance".to_string(),
-    ))
 }
 
 /// GET /api/v1/accounts/:id/lists
@@ -1957,8 +2229,12 @@ pub async fn block_account(
     )
     .await
     .ok();
-    let resolved_actor_uri = resolved_remote.as_ref().map(|(actor_uri, _)| actor_uri.as_str());
-    let resolved_inbox_uri = resolved_remote.as_ref().map(|(_, inbox_uri)| inbox_uri.as_str());
+    let resolved_actor_uri = resolved_remote
+        .as_ref()
+        .map(|(actor_uri, _)| actor_uri.as_str());
+    let resolved_inbox_uri = resolved_remote
+        .as_ref()
+        .map(|(_, inbox_uri)| inbox_uri.as_str());
 
     // Store block in database
     let newly_blocked = state
@@ -1977,19 +2253,25 @@ pub async fn block_account(
         let target_address_for_delivery = target_address.clone();
         let resolved_remote_for_delivery = resolved_remote.clone();
         spawn_best_effort_delivery("block", async move {
-            let (target_actor_uri, target_inbox_uri) = if let Some(resolved) = resolved_remote_for_delivery {
-                resolved
-            } else {
-                resolve_remote_actor_and_inbox_with_hint(
-                    &state_for_delivery,
-                    &target_address_for_delivery,
-                    follow_actor_uri_hint.as_deref(),
-                )
-                .await?
-            };
+            let (target_actor_uri, target_inbox_uri) =
+                if let Some(resolved) = resolved_remote_for_delivery {
+                    resolved
+                } else {
+                    resolve_remote_actor_and_inbox_with_hint(
+                        &state_for_delivery,
+                        &target_address_for_delivery,
+                        follow_actor_uri_hint.as_deref(),
+                    )
+                    .await?
+                };
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
-                .send_block(&target_actor_uri, &target_inbox_uri)
+                .queue_block_with_id(
+                    state_for_delivery.db.as_ref(),
+                    &delivery.block_activity_uri_for_target(&target_actor_uri),
+                    &target_actor_uri,
+                    &target_inbox_uri,
+                )
                 .await?;
             Ok(())
         });
@@ -2030,7 +2312,10 @@ pub async fn unblock_account(
 
     // Remove block from database
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    let block_target = state.db.get_block_target(&target_address, default_port).await?;
+    let block_target = state
+        .db
+        .get_block_target(&target_address, default_port)
+        .await?;
     let unblocked = state
         .db
         .unblock_account(&target_address, default_port)
@@ -2040,8 +2325,12 @@ pub async fn unblock_account(
         let state_for_delivery = state.clone();
         let account_for_delivery = account_for_delivery.clone();
         let target_address_for_delivery = target_address.clone();
-        let target_actor_uri_hint = block_target.as_ref().and_then(|(_, actor_uri, _)| actor_uri.clone());
-        let target_inbox_uri_hint = block_target.as_ref().and_then(|(_, _, inbox_uri)| inbox_uri.clone());
+        let target_actor_uri_hint = block_target
+            .as_ref()
+            .and_then(|(_, actor_uri, _)| actor_uri.clone());
+        let target_inbox_uri_hint = block_target
+            .as_ref()
+            .and_then(|(_, _, inbox_uri)| inbox_uri.clone());
         spawn_best_effort_delivery("unblock", async move {
             let (target_actor_uri, target_inbox_uri) =
                 resolve_remote_actor_and_inbox_with_stored_hints(
@@ -2054,9 +2343,11 @@ pub async fn unblock_account(
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             let block_activity_uri = delivery.block_activity_uri_for_target(&target_actor_uri);
             delivery
-                .send_undo_to_inbox_with_type_and_object(
+                .queue_undo_to_inbox_with_type_and_object(
+                    state_for_delivery.db.as_ref(),
                     &block_activity_uri,
                     Some("Block"),
+                    Some(&target_actor_uri),
                     Some(&target_actor_uri),
                     &target_inbox_uri,
                 )
@@ -2288,8 +2579,15 @@ pub async fn get_follow_request(
         .await?
         .and_then(|(_, _, actor_uri)| actor_uri)
         .unwrap_or_else(|| requester_address.clone());
-    let account = if let Some(response) =
-        resolve_remote_account_response_for_list(&state, &actor_identity, default_port).await
+    let account = if let Some(response) = resolve_remote_account_response_for_list(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        &actor_identity,
+        default_port,
+    )
+    .await
     {
         serde_json::to_value(response)
             .unwrap_or_else(|_| build_remote_account_stub(&actor_identity))
@@ -2324,7 +2622,9 @@ pub async fn authorize_follow_request(
 
     let delivery = build_delivery(&state, &account_for_delivery);
     spawn_best_effort_delivery("authorize_follow_request", async move {
-        delivery.send_accept(&follow_activity_uri, &inbox_uri).await
+        delivery
+            .queue_accept(state.db.as_ref(), &follow_activity_uri, &inbox_uri)
+            .await
     });
 
     // Return relationship response
@@ -2374,7 +2674,9 @@ pub async fn reject_follow_request(
     {
         let delivery = build_delivery(&state, &account_for_delivery);
         spawn_best_effort_delivery("reject_follow_request", async move {
-            delivery.send_reject(&follow_activity_uri, &inbox_uri).await
+            delivery
+                .queue_reject(state.db.as_ref(), &follow_activity_uri, &inbox_uri)
+                .await
         });
     }
 

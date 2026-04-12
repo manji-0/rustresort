@@ -2,7 +2,7 @@
 
 use super::*;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -62,6 +62,176 @@ async fn oauth_hash_migration_state(pool: &SqlitePool) -> String {
 async fn test_database_connection() {
     let (_db, _temp_dir) = create_test_db().await;
     // Connection successful if we get here without panicking
+}
+
+#[tokio::test]
+async fn test_delivery_job_enqueue_claim_and_mark_delivered() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.enqueue_delivery_job(
+        "https://remote.example/inbox",
+        r#"{"type":"Follow"}"#,
+        "https://test.example/users/testuser#main-key",
+    )
+    .await
+    .unwrap();
+
+    let claimed = db.claim_pending_delivery_jobs(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].inbox_url, "https://remote.example/inbox");
+    assert!(claimed[0].claimed_at.is_some());
+
+    let second_claim = db.claim_pending_delivery_jobs(10).await.unwrap();
+    assert!(second_claim.is_empty());
+
+    db.mark_delivery_job_delivered(&claimed[0].id)
+        .await
+        .unwrap();
+
+    let third_claim = db.claim_pending_delivery_jobs(10).await.unwrap();
+    assert!(third_claim.is_empty());
+}
+
+#[tokio::test]
+async fn test_delivery_job_mark_failed_increments_attempts_and_clears_claim() {
+    let (db, temp_dir) = create_test_db().await;
+
+    db.enqueue_delivery_job(
+        "https://remote.example/inbox",
+        r#"{"type":"Like"}"#,
+        "https://test.example/users/testuser#main-key",
+    )
+    .await
+    .unwrap();
+
+    let claimed = db.claim_pending_delivery_jobs(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    db.mark_delivery_job_failed(&claimed[0].id, "temporary failure")
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT attempts, last_error, claimed_at, delivered_at FROM delivery_jobs WHERE id = ?",
+    )
+    .bind(&claimed[0].id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.get::<i64, _>("attempts"), 1);
+    assert_eq!(row.get::<String, _>("last_error"), "temporary failure");
+    assert_eq!(row.get::<Option<String>, _>("claimed_at"), None);
+    assert_eq!(row.get::<Option<String>, _>("delivered_at"), None);
+}
+
+#[tokio::test]
+async fn test_delivery_job_reap_dead_jobs_removes_exhausted_rows() {
+    let (db, temp_dir) = create_test_db().await;
+
+    db.enqueue_delivery_job(
+        "https://remote.example/inbox",
+        r#"{"type":"Undo"}"#,
+        "https://test.example/users/testuser#main-key",
+    )
+    .await
+    .unwrap();
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE delivery_jobs SET attempts = 8")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let reaped = db.reap_dead_delivery_jobs(8).await.unwrap();
+    assert_eq!(reaped, 1);
+
+    let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM delivery_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn test_due_scheduled_statuses_excludes_failed_and_published_rows() {
+    let (db, temp_dir) = create_test_db().await;
+
+    db.create_scheduled_status(&ScheduledStatusInsert {
+        scheduled_at: "2020-01-01T00:00:00Z".to_string(),
+        status_text: "publish me".to_string(),
+        visibility: "public".to_string(),
+        content_warning: None,
+        in_reply_to_id: None,
+        quoted_status_id: None,
+        media_ids: None,
+        poll_options: None,
+        poll_expires_in: None,
+        poll_multiple: false,
+        language: Some("en".to_string()),
+    })
+    .await
+    .unwrap();
+    let failed_id = db
+        .create_scheduled_status(&ScheduledStatusInsert {
+            scheduled_at: "2020-01-01T00:00:01Z".to_string(),
+            status_text: "fail me".to_string(),
+            visibility: "public".to_string(),
+            content_warning: None,
+            in_reply_to_id: None,
+            quoted_status_id: None,
+            media_ids: None,
+            poll_options: None,
+            poll_expires_in: None,
+            poll_multiple: false,
+            language: None,
+        })
+        .await
+        .unwrap();
+    let published_id = db
+        .create_scheduled_status(&ScheduledStatusInsert {
+            scheduled_at: "2020-01-01T00:00:02Z".to_string(),
+            status_text: "done".to_string(),
+            visibility: "public".to_string(),
+            content_warning: None,
+            in_reply_to_id: None,
+            quoted_status_id: None,
+            media_ids: None,
+            poll_options: None,
+            poll_expires_in: None,
+            poll_multiple: false,
+            language: None,
+        })
+        .await
+        .unwrap();
+
+    db.mark_scheduled_status_failed(&failed_id, "boom")
+        .await
+        .unwrap();
+    db.mark_scheduled_status_published(&published_id)
+        .await
+        .unwrap();
+
+    let due = db.get_due_scheduled_statuses(10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].status_text, "publish me");
+
+    let pool = SqlitePool::connect(&test_db_connection_string(&temp_dir))
+        .await
+        .unwrap();
+    let failed_error = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT error FROM scheduled_statuses WHERE id = ?",
+    )
+    .bind(&failed_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_error.as_deref(), Some("boom"));
 }
 
 #[tokio::test]
@@ -244,6 +414,50 @@ async fn test_oauth_token_revoke_works_with_hashed_storage() {
 }
 
 #[tokio::test]
+async fn test_get_or_create_conversation_reuses_existing_participant_set() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let first_id = db
+        .get_or_create_conversation(&[
+            "testuser@test.example.com".to_string(),
+            "alice@remote.example".to_string(),
+        ])
+        .await
+        .unwrap();
+    let second_id = db
+        .get_or_create_conversation(&[
+            "alice@remote.example".to_string(),
+            "testuser@test.example.com".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(first_id, second_id);
+}
+
+#[tokio::test]
+async fn test_get_or_create_conversation_reuses_existing_participant_set_case_insensitively() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let first_id = db
+        .get_or_create_conversation(&[
+            "testuser@test.example.com".to_string(),
+            "alice@remote.example".to_string(),
+        ])
+        .await
+        .unwrap();
+    let second_id = db
+        .get_or_create_conversation(&[
+            "TestUser@Test.Example.Com".to_string(),
+            "Alice@Remote.Example".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(first_id, second_id);
+}
+
+#[tokio::test]
 async fn test_oauth_token_lookup_rejects_expired_tokens() {
     let (db, _temp_dir) = create_test_db().await;
 
@@ -272,6 +486,8 @@ async fn test_account_upsert_and_get() {
         username: "testuser".to_string(),
         display_name: Some("Test User".to_string()),
         note: Some("Test bio".to_string()),
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: None,
         header_s3_key: None,
         private_key_pem: "test_private_key".to_string(),
@@ -300,6 +516,8 @@ async fn test_insert_account_if_empty_enforces_singleton() {
         username: "first".to_string(),
         display_name: Some("First".to_string()),
         note: None,
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: None,
         header_s3_key: None,
         private_key_pem: "first_private_key".to_string(),
@@ -313,6 +531,8 @@ async fn test_insert_account_if_empty_enforces_singleton() {
         username: "second".to_string(),
         display_name: Some("Second".to_string()),
         note: None,
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: None,
         header_s3_key: None,
         private_key_pem: "second_private_key".to_string(),
@@ -340,6 +560,8 @@ async fn test_patch_account_profile_noop_returns_success() {
         username: "patch-user".to_string(),
         display_name: Some("Patch User".to_string()),
         note: Some("original note".to_string()),
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: None,
         header_s3_key: None,
         private_key_pem: "private_key".to_string(),
@@ -369,6 +591,8 @@ async fn test_patch_account_credentials_if_matches_updates_profile_and_media_key
         username: "credential-user".to_string(),
         display_name: Some("Before".to_string()),
         note: Some("before-note".to_string()),
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: Some("media/old-avatar.webp".to_string()),
         header_s3_key: Some("media/old-header.webp".to_string()),
         private_key_pem: "private_key".to_string(),
@@ -415,6 +639,8 @@ async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_k
         username: "credential-user".to_string(),
         display_name: Some("Before".to_string()),
         note: Some("before-note".to_string()),
+        also_known_as: None,
+        moved_to_uri: None,
         avatar_s3_key: Some("media/old-avatar.webp".to_string()),
         header_s3_key: Some("media/old-header.webp".to_string()),
         private_key_pem: "private_key".to_string(),
@@ -453,6 +679,48 @@ async fn test_patch_account_credentials_if_matches_rejects_mismatched_expected_k
 }
 
 #[tokio::test]
+async fn test_patch_account_migration_updates_alias_and_move_target() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let account = Account {
+        id: EntityId::new_string(),
+        username: "migration-user".to_string(),
+        display_name: Some("Migration User".to_string()),
+        note: None,
+        also_known_as: None,
+        moved_to_uri: None,
+        avatar_s3_key: None,
+        header_s3_key: None,
+        private_key_pem: "private_key".to_string(),
+        public_key_pem: "public_key".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.upsert_account(&account).await.unwrap();
+
+    let updated = db
+        .patch_account_migration(
+            &account.id,
+            Some(Some("https://old.example/users/migration-user")),
+            Some(Some("https://new.example/users/migration-user")),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let stored = db.get_account().await.unwrap().unwrap();
+    assert_eq!(
+        stored.also_known_as.as_deref(),
+        Some("https://old.example/users/migration-user")
+    );
+    assert_eq!(
+        stored.moved_to_uri.as_deref(),
+        Some("https://new.example/users/migration-user")
+    );
+}
+
+#[tokio::test]
 async fn test_status_crud() {
     let (db, _temp_dir) = create_test_db().await;
 
@@ -467,6 +735,7 @@ async fn test_status_crud() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -535,6 +804,7 @@ async fn test_count_statuses_by_account_address_counts_remote_statuses_case_inse
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -552,6 +822,7 @@ async fn test_count_statuses_by_account_address_counts_remote_statuses_case_inse
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Reposted,
         created_at: Utc::now(),
         fetched_at: Some(Utc::now()),
@@ -569,6 +840,7 @@ async fn test_count_statuses_by_account_address_counts_remote_statuses_case_inse
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: Some(Utc::now()),
@@ -586,6 +858,7 @@ async fn test_count_statuses_by_account_address_counts_remote_statuses_case_inse
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Bookmarked,
         created_at: Utc::now(),
         fetched_at: Some(Utc::now()),
@@ -1038,6 +1311,59 @@ async fn test_notification_operations() {
 }
 
 #[tokio::test]
+async fn test_insert_notification_if_new_deduplicates_by_activity_identity() {
+    let (db, _temp_dir) = create_test_db().await;
+    let activity_uri = "https://remote.example/activities/update-1";
+
+    let first = Notification {
+        id: "notif-identity-1".to_string(),
+        notification_type: NotificationType::QuotedUpdate,
+        origin_account_address: "alice@remote.example".to_string(),
+        status_uri: Some("https://local.example/statuses/quote-1".to_string()),
+        read: false,
+        created_at: Utc::now(),
+    };
+    let duplicate = Notification {
+        id: "notif-identity-2".to_string(),
+        ..first.clone()
+    };
+    let second_target = Notification {
+        id: "notif-identity-3".to_string(),
+        status_uri: Some("https://local.example/statuses/quote-2".to_string()),
+        ..first.clone()
+    };
+    let second_type = Notification {
+        id: "notif-identity-4".to_string(),
+        notification_type: NotificationType::Mention,
+        ..first.clone()
+    };
+
+    assert!(
+        db.insert_notification_if_new(&first, Some(activity_uri))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.insert_notification_if_new(&duplicate, Some(activity_uri))
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.insert_notification_if_new(&second_target, Some(activity_uri))
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.insert_notification_if_new(&second_type, Some(activity_uri))
+            .await
+            .unwrap()
+    );
+
+    let notifications = db.get_notifications(10, None, false).await.unwrap();
+    assert_eq!(notifications.len(), 3);
+}
+
+#[tokio::test]
 async fn test_get_notifications_paginates_by_created_at_then_id() {
     let (db, _temp_dir) = create_test_db().await;
 
@@ -1099,6 +1425,7 @@ async fn test_favourite_operations() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1141,6 +1468,7 @@ async fn test_bookmark_operations() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1179,6 +1507,7 @@ async fn test_repost_operations() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1218,6 +1547,7 @@ async fn test_status_pin_and_mute_operations() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1233,6 +1563,7 @@ async fn test_status_pin_and_mute_operations() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1275,6 +1606,7 @@ async fn test_resolve_thread_root_uri_handles_reply_chains_deeper_than_256() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1295,6 +1627,7 @@ async fn test_resolve_thread_root_uri_handles_reply_chains_deeper_than_256() {
             is_local: true,
             in_reply_to_uri: Some(parent_uri.clone()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1324,6 +1657,7 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1339,6 +1673,7 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         is_local: true,
         in_reply_to_uri: Some(parent.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1354,6 +1689,7 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
         is_local: true,
         in_reply_to_uri: Some(parent.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1406,6 +1742,7 @@ async fn test_bookmarked_statuses_order_and_cursor_by_bookmark_time() {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1452,6 +1789,7 @@ async fn test_favourited_statuses_order_and_cursor_by_favourite_time() {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1580,6 +1918,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
@@ -1595,6 +1934,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(1),
         fetched_at: None,
@@ -1610,6 +1950,7 @@ async fn test_insert_status_indexes_hashtags_and_tag_timeline_query() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(2),
         fetched_at: None,
@@ -1657,6 +1998,7 @@ async fn test_insert_status_indexes_markup_wrapped_hashtags() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1692,6 +2034,7 @@ async fn test_database_connect_backfills_missing_status_hashtag_rows() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1736,6 +2079,7 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
@@ -1751,6 +2095,7 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(10),
         fetched_at: None,
@@ -1766,6 +2111,7 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(20),
         fetched_at: None,
@@ -1811,6 +2157,7 @@ async fn test_update_status_refreshes_hashtag_index() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1863,6 +2210,7 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: base_time + chrono::Duration::seconds(1),
         fetched_at: None,
@@ -1878,6 +2226,7 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Favourited,
         created_at: base_time + chrono::Duration::seconds(2),
         fetched_at: None,
@@ -1893,6 +2242,7 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Favourited,
         created_at: base_time,
         fetched_at: None,
@@ -1942,6 +2292,7 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -1988,6 +2339,7 @@ async fn test_list_timeline_query_matches_default_port_equivalent_remote_address
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2003,6 +2355,7 @@ async fn test_list_timeline_query_matches_default_port_equivalent_remote_address
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2042,6 +2395,7 @@ async fn test_insert_status_with_media_attaches_all_media_atomically() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2096,6 +2450,7 @@ async fn test_insert_status_with_media_rolls_back_when_media_missing() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2123,6 +2478,7 @@ async fn test_insert_status_with_media_rolls_back_when_media_already_attached() 
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2159,6 +2515,7 @@ async fn test_insert_status_with_media_rolls_back_when_media_already_attached() 
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2189,6 +2546,7 @@ async fn test_insert_status_with_media_and_poll_persists_poll_atomically() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2225,6 +2583,7 @@ async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() 
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2263,6 +2622,7 @@ async fn test_vote_in_poll_rejects_duplicate_option_and_rolls_back_counts() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2308,6 +2668,7 @@ async fn test_vote_in_poll_rejects_option_from_other_poll() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2323,6 +2684,7 @@ async fn test_vote_in_poll_rejects_option_from_other_poll() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2369,6 +2731,7 @@ async fn test_vote_in_poll_rejects_second_ballot_for_multiple_poll() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2423,6 +2786,7 @@ async fn test_get_poll_marks_immediately_expired_poll_as_expired() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2456,6 +2820,7 @@ async fn test_vote_in_poll_rejects_when_expires_at_has_passed() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2510,6 +2875,7 @@ async fn test_attach_media_to_status_rejects_reassign_to_another_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2525,6 +2891,7 @@ async fn test_attach_media_to_status_rejects_reassign_to_another_status() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2575,6 +2942,7 @@ async fn test_replace_status_media_detaches_and_attaches_expected_media() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -2660,6 +3028,7 @@ async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_s
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,

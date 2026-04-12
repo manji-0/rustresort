@@ -10,7 +10,7 @@ mod activitypub;
 mod admin;
 mod converters;
 mod dto;
-mod mastodon;
+pub(crate) mod mastodon;
 pub mod metrics;
 mod oauth;
 mod wellknown;

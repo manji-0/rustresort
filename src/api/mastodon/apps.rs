@@ -1,34 +1,29 @@
-//! Apps and OAuth endpoints
+//! Mastodon app registration and OAuth endpoints.
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    body::Bytes,
+    extract::{ConnectInfo, OriginalUri, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::{Cookie, SameSite};
-use base64::Engine;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use openssl::{
-    bn::BigNumContext,
-    ec::{EcGroup, EcKey, PointConversionForm},
-    nid::Nid,
-};
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Digest;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use subtle::ConstantTimeEq;
 use url::Url;
 
 use crate::AppsApiState;
-use crate::auth::{CurrentUser, verify_session_token};
+use crate::auth::verify_session_token;
 use crate::error::AppError;
 
-const OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX: &str = "oauth_authorize_confirm_";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS: i64 = 7_200;
 const OAUTH_CLIENT_SECRET_HASH_PREFIX: &str = "sha256:";
-/// App registration request
+const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
     pub client_name: String,
@@ -37,19 +32,19 @@ pub struct CreateAppRequest {
     pub website: Option<String>,
 }
 
-/// App response
 #[derive(Debug, Serialize)]
 pub struct AppResponse {
     pub id: String,
     pub name: String,
     pub website: Option<String>,
     pub redirect_uri: String,
+    pub redirect_uris: String,
     pub client_id: String,
     pub client_secret: String,
     pub vapid_key: Option<String>,
+    pub scopes: String,
 }
 
-/// OAuth token request
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
     pub grant_type: String,
@@ -60,7 +55,6 @@ pub struct TokenRequest {
     pub scope: Option<String>,
 }
 
-/// OAuth authorize request query
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
     pub response_type: Option<String>,
@@ -68,18 +62,29 @@ pub struct AuthorizeRequest {
     pub redirect_uri: Option<String>,
     pub scope: Option<String>,
     pub state: Option<String>,
-    pub approve: Option<bool>,
-    pub confirm: Option<String>,
 }
 
-/// OAuth token response
+#[derive(Debug, Deserialize)]
+pub struct RevokeTokenRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub token: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
     pub scope: String,
-    pub expires_in: i64,
     pub created_at: i64,
+    pub expires_in: i64,
+}
+
+struct AuthorizeContext {
+    app_id: String,
+    app_name: String,
+    redirect_uri: String,
+    requested_scopes: String,
 }
 
 fn normalize_scopes(scopes: &str) -> String {
@@ -98,6 +103,27 @@ fn is_registered_redirect_uri(registered_redirect_uris: &str, redirect_uri: &str
         .any(|registered| registered == redirect_uri)
 }
 
+fn hash_client_secret(secret: &str) -> String {
+    let digest = sha2::Sha256::digest(secret.as_bytes());
+    format!(
+        "{}{}",
+        OAUTH_CLIENT_SECRET_HASH_PREFIX,
+        URL_SAFE_NO_PAD.encode(digest)
+    )
+}
+
+fn verify_client_secret(stored_secret: &str, provided_secret: &str) -> bool {
+    if stored_secret.starts_with(OAUTH_CLIENT_SECRET_HASH_PREFIX) {
+        let hashed = hash_client_secret(provided_secret);
+        stored_secret.as_bytes().ct_eq(hashed.as_bytes()).into()
+    } else {
+        stored_secret
+            .as_bytes()
+            .ct_eq(provided_secret.as_bytes())
+            .into()
+    }
+}
+
 fn build_authorize_redirect_location(
     redirect_uri: &str,
     code: &str,
@@ -114,7 +140,6 @@ fn build_authorize_redirect_location(
         return redirect.to_string();
     }
 
-    // Fallback for unexpected non-URL values.
     let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     let mut location = format!(
         "{}{}code={}",
@@ -129,198 +154,56 @@ fn build_authorize_redirect_location(
     location
 }
 
-fn build_authorize_error_redirect_location(
-    redirect_uri: &str,
-    error: &str,
-    state: Option<&str>,
-) -> String {
-    if let Ok(mut redirect) = Url::parse(redirect_uri) {
-        let mut serializer =
-            url::form_urlencoded::Serializer::new(redirect.query().unwrap_or("").to_string());
-        serializer.append_pair("error", error);
-        if let Some(state) = state {
-            serializer.append_pair("state", state);
-        }
-        redirect.set_query(Some(&serializer.finish()));
-        return redirect.to_string();
-    }
-
-    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
-    let mut location = format!(
-        "{}{}error={}",
-        redirect_uri,
-        separator,
-        urlencoding::encode(error)
-    );
-    if let Some(state) = state {
-        location.push_str("&state=");
-        location.push_str(&urlencoding::encode(state));
-    }
-    location
-}
-
-fn generate_authorize_confirm_token() -> String {
-    let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn generate_vapid_key() -> Result<String, AppError> {
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-        .map_err(|error| AppError::internal(format!("failed to load P-256 group: {error}")))?;
-    let key = EcKey::generate(&group).map_err(|error| {
-        AppError::internal(format!("failed to generate VAPID P-256 keypair: {error}"))
-    })?;
-    let mut context = BigNumContext::new().map_err(|error| {
-        AppError::internal(format!("failed to allocate VAPID BN context: {error}"))
-    })?;
-    let public_bytes = key
-        .public_key()
-        .to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut context)
-        .map_err(|error| {
-            AppError::internal(format!("failed to serialize VAPID public key: {error}"))
-        })?;
-
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_bytes))
-}
-fn hash_client_secret(secret: &str) -> String {
-    let digest = sha2::Sha256::digest(secret.as_bytes());
-    format!(
-        "{}{}",
-        OAUTH_CLIENT_SECRET_HASH_PREFIX,
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-    )
-}
-
-fn verify_client_secret(stored_secret: &str, provided_secret: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    if stored_secret.starts_with(OAUTH_CLIENT_SECRET_HASH_PREFIX) {
-        let hashed = hash_client_secret(provided_secret);
-        stored_secret.as_bytes().ct_eq(hashed.as_bytes()).into()
-    } else {
-        // Backward compatibility for legacy plaintext rows.
-        stored_secret
-            .as_bytes()
-            .ct_eq(provided_secret.as_bytes())
-            .into()
-    }
-}
-fn authorize_confirm_cookie_name(confirm_token: &str) -> String {
-    format!("{}{}", OAUTH_AUTHORIZE_CONFIRM_COOKIE_PREFIX, confirm_token)
-}
-
-fn build_authorize_confirm_cookie(confirm_token: &str, secure: bool) -> Cookie<'static> {
-    Cookie::build((
-        authorize_confirm_cookie_name(confirm_token),
-        "1".to_string(),
-    ))
-    .path("/oauth/authorize")
-    .http_only(true)
-    .secure(secure)
-    .same_site(SameSite::Lax)
-    .build()
-}
-
-fn clear_authorize_confirm_cookie(confirm_token: &str) -> Cookie<'static> {
-    let mut cookie = Cookie::build((authorize_confirm_cookie_name(confirm_token), "".to_string()))
-        .path("/oauth/authorize")
-        .http_only(true)
-        .build();
-    cookie.make_removal();
-    cookie
-}
-
-fn escape_html_attr(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '&' => "&amp;".to_string(),
-            '<' => "&lt;".to_string(),
-            '>' => "&gt;".to_string(),
-            '"' => "&quot;".to_string(),
-            '\'' => "&#x27;".to_string(),
-            _ => ch.to_string(),
-        })
-        .collect::<String>()
-}
-
-fn render_hidden_input(name: &str, value: &str) -> String {
-    format!(
-        "<input type=\"hidden\" name=\"{}\" value=\"{}\" />",
-        escape_html_attr(name),
-        escape_html_attr(value)
-    )
-}
-
-fn render_authorize_consent_page(
-    app_name: &str,
-    client_id: &str,
-    redirect_uri: &str,
-    requested_scopes: &str,
-    state: Option<&str>,
-    confirm_token: &str,
-) -> String {
-    let escaped_app_name = html_escape::encode_text(app_name);
-    let escaped_redirect_uri = html_escape::encode_text(redirect_uri);
-    let escaped_scopes = html_escape::encode_text(requested_scopes);
-
-    let shared_inputs = [
-        render_hidden_input("response_type", "code"),
-        render_hidden_input("client_id", client_id),
-        render_hidden_input("redirect_uri", redirect_uri),
-        render_hidden_input("scope", requested_scopes),
-        render_hidden_input("confirm", confirm_token),
-    ]
-    .join("\n");
-    let state_input = state
-        .map(|value| render_hidden_input("state", value))
+fn parse_body<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<T, AppError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
 
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Authorize Application</title>
-</head>
-<body>
-  <h1>Authorize Application</h1>
-  <p><strong>{}</strong> is requesting access to your RustResort account.</p>
-  <p><strong>Redirect URI:</strong> {}</p>
-  <p><strong>Requested scopes:</strong> {}</p>
-  <form method="get" action="/oauth/authorize">
-    {}
-    {}
-    {}
-    <button type="submit">Authorize</button>
-  </form>
-  <form method="get" action="/oauth/authorize">
-    {}
-    {}
-    {}
-    <button type="submit">Deny</button>
-  </form>
-</body>
-</html>"#,
-        escaped_app_name,
-        escaped_redirect_uri,
-        escaped_scopes,
-        shared_inputs,
-        state_input,
-        render_hidden_input("approve", "true"),
-        shared_inputs,
-        state_input,
-        render_hidden_input("approve", "false"),
-    )
+    let parse_json = || {
+        serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")))
+    };
+    let parse_form = || {
+        serde_urlencoded::from_bytes(body)
+            .map_err(|error| AppError::Validation(format!("invalid form body: {error}")))
+    };
+
+    if content_type.starts_with("application/json") {
+        return parse_json();
+    }
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return parse_form();
+    }
+
+    parse_json().or_else(|_| parse_form())
 }
 
-struct AuthorizeContext {
-    app_id: String,
-    app_name: String,
-    client_id: String,
-    redirect_uri: String,
-    requested_scopes: String,
+fn current_local_session(
+    state: &AppsApiState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<crate::auth::Session> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(token) = bearer
+        && let Ok(session) = verify_session_token(token, &state.config.auth.session_secret)
+    {
+        return Some(session);
+    }
+
+    if let Some(token) = jar.get("session").map(|cookie| cookie.value())
+        && let Ok(session) = verify_session_token(token, &state.config.auth.session_secret)
+    {
+        return Some(session);
+    }
+
+    None
 }
 
 async fn validate_authorize_request(
@@ -358,7 +241,7 @@ async fn validate_authorize_request(
 
     if !is_registered_redirect_uri(&app.redirect_uri, redirect_uri) {
         return Err(AppError::Validation(
-            "redirect_uri does not match registered redirect URI".to_string(),
+            "redirect_uri does not match a registered redirect URI".to_string(),
         ));
     }
 
@@ -366,7 +249,7 @@ async fn validate_authorize_request(
         .scope
         .as_deref()
         .map(normalize_scopes)
-        .filter(|s| !s.is_empty())
+        .filter(|scopes| !scopes.is_empty())
         .unwrap_or_else(|| normalize_scopes(&app.scopes));
     if !scopes_are_subset(&requested_scopes, &app.scopes) {
         return Err(AppError::Unauthorized);
@@ -375,213 +258,170 @@ async fn validate_authorize_request(
     Ok(AuthorizeContext {
         app_id: app.id,
         app_name: app.name,
-        client_id: app.client_id,
         redirect_uri: redirect_uri.to_string(),
         requested_scopes,
     })
 }
 
-async fn issue_authorization_code(
+async fn issue_authorization_code_response(
     state: &AppsApiState,
-    app_id: &str,
-    redirect_uri: &str,
-    requested_scopes: &str,
+    context: AuthorizeContext,
     oauth_state: Option<&str>,
-) -> Result<Redirect, AppError> {
+) -> Result<Response, AppError> {
     use crate::data::{EntityId, OAuthAuthorizationCode};
 
     let code_value = EntityId::new_string();
     let authorization_code = OAuthAuthorizationCode {
         id: EntityId::new_string(),
-        app_id: app_id.to_string(),
+        app_id: context.app_id,
         code: code_value.clone(),
-        redirect_uri: redirect_uri.to_string(),
-        scopes: requested_scopes.to_string(),
+        redirect_uri: context.redirect_uri.clone(),
+        scopes: context.requested_scopes.clone(),
         created_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::minutes(10),
     };
-
     state
         .db
         .insert_oauth_authorization_code(&authorization_code)
         .await?;
 
-    let location = build_authorize_redirect_location(redirect_uri, &code_value, oauth_state);
-    Ok(Redirect::to(&location))
-}
+    if context.redirect_uri == OOB_REDIRECT_URI {
+        let escaped_code = html_escape::encode_text(&code_value);
+        let escaped_app_name = html_escape::encode_text(&context.app_name);
+        let html = format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Authorization Code</title>
+</head>
+<body>
+  <h1>Authorization Complete</h1>
+  <p><strong>{}</strong> can now be connected with this authorization code:</p>
+  <pre>{}</pre>
+</body>
+</html>"#,
+            escaped_app_name, escaped_code
+        );
+        return Ok(Html(html).into_response());
+    }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("Authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
+    Ok(Redirect::to(&build_authorize_redirect_location(
+        &context.redirect_uri,
+        &code_value,
+        oauth_state,
+    ))
+    .into_response())
 }
 
 /// POST /api/v1/apps
 pub async fn create_app(
     State(state): State<AppsApiState>,
-    Json(req): Json<CreateAppRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, OAuthApp};
 
-    // Validate
-    if req.client_name.is_empty() {
+    let req: CreateAppRequest = parse_body(&headers, &body)?;
+    if req.client_name.trim().is_empty() {
         return Err(AppError::Validation("client_name is required".to_string()));
     }
-
-    if req.redirect_uris.is_empty() {
+    if req.redirect_uris.trim().is_empty() {
         return Err(AppError::Validation(
             "redirect_uris is required".to_string(),
         ));
     }
 
-    // Generate app credentials
-    let app_id = EntityId::new_string();
-    let client_id = EntityId::new_string();
+    let scopes = req
+        .scopes
+        .as_deref()
+        .map(normalize_scopes)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "read".to_string());
     let client_secret = EntityId::new_string();
-    let vapid_key = generate_vapid_key()?;
-    let hashed_client_secret = hash_client_secret(&client_secret);
-
-    // Default scopes if not provided
-    let scopes = req.scopes.unwrap_or_else(|| "read".to_string());
-
-    // Create app
     let app = OAuthApp {
-        id: app_id.clone(),
-        name: req.client_name.clone(),
-        website: req.website.clone(),
-        redirect_uri: req.redirect_uris.clone(),
-        client_id: client_id.clone(),
-        client_secret: hashed_client_secret,
-        vapid_key: Some(vapid_key),
+        id: EntityId::new_string(),
+        name: req.client_name.trim().to_string(),
+        website: req.website.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }),
+        redirect_uri: req.redirect_uris.trim().to_string(),
+        client_id: EntityId::new_string(),
+        client_secret: hash_client_secret(&client_secret),
+        vapid_key: Some(state.web_push_sender.server_key().await?),
         scopes: scopes.clone(),
         created_at: Utc::now(),
     };
-
-    // Save to database
     state.db.insert_oauth_app(&app).await?;
 
-    // Return response
-    let response = AppResponse {
+    Ok(Json(serde_json::json!(AppResponse {
         id: app.id,
         name: app.name,
         website: app.website,
-        redirect_uri: app.redirect_uri,
+        redirect_uri: app.redirect_uri.clone(),
+        redirect_uris: app.redirect_uri,
         client_id: app.client_id,
         client_secret,
         vapid_key: app.vapid_key,
-    };
-
-    Ok(Json(serde_json::to_value(response).unwrap()))
+        scopes,
+    })))
 }
 
 /// GET /oauth/authorize
 pub async fn authorize(
     State(state): State<AppsApiState>,
     jar: CookieJar,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(req): Query<AuthorizeRequest>,
 ) -> Result<Response, AppError> {
+    let Some(_session) = current_local_session(&state, &jar, &headers) else {
+        let next = uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/oauth/authorize");
+        let login_url = format!("/login?next={}", urlencoding::encode(next));
+        return Ok(Redirect::to(&login_url).into_response());
+    };
+
     let context = validate_authorize_request(&state, &req).await?;
-
-    if let Some(confirm_token) = req.confirm.as_deref() {
-        if confirm_token.is_empty() {
-            return Err(AppError::Unauthorized);
-        }
-        let confirm_cookie_name = authorize_confirm_cookie_name(confirm_token);
-        if jar.get(&confirm_cookie_name).is_none() {
-            return Err(AppError::Unauthorized);
-        }
-
-        let clear_confirm_cookie = clear_authorize_confirm_cookie(confirm_token);
-        let jar = jar.remove(clear_confirm_cookie);
-
-        if !req.approve.unwrap_or(false) {
-            let denied_location = build_authorize_error_redirect_location(
-                &context.redirect_uri,
-                "access_denied",
-                req.state.as_deref(),
-            );
-            return Ok((jar, Redirect::to(&denied_location)).into_response());
-        }
-
-        let redirect = issue_authorization_code(
-            &state,
-            &context.app_id,
-            &context.redirect_uri,
-            &context.requested_scopes,
-            req.state.as_deref(),
-        )
-        .await?;
-        return Ok((jar, redirect).into_response());
-    }
-
-    let confirm_token = generate_authorize_confirm_token();
-    let confirm_cookie =
-        build_authorize_confirm_cookie(&confirm_token, state.config.server.protocol == "https");
-    let consent_page = render_authorize_consent_page(
-        &context.app_name,
-        &context.client_id,
-        &context.redirect_uri,
-        &context.requested_scopes,
-        req.state.as_deref(),
-        &confirm_token,
-    );
-
-    Ok((jar.add(confirm_cookie), Html(consent_page)).into_response())
+    issue_authorization_code_response(&state, context, req.state.as_deref()).await
 }
 
 /// GET /api/v1/apps/verify_credentials
 pub async fn verify_app_credentials(
     State(state): State<AppsApiState>,
     headers: HeaderMap,
-    CurrentUser(session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if let Some(access_token) = extract_bearer_token(&headers) {
-        if let Some(token) = state.db.get_oauth_token(access_token).await? {
-            let app = state
-                .db
-                .get_oauth_app_by_id(&token.app_id)
-                .await?
-                .ok_or(AppError::Unauthorized)?;
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-            let response = serde_json::json!({
-                "id": app.id,
-                "name": app.name,
-                "website": app.website,
-                "redirect_uri": app.redirect_uri,
-                "client_id": app.client_id,
-                "vapid_key": app.vapid_key,
-            });
-
-            return Ok(Json(response));
-        }
-
-        // `require_auth` accepts either OAuth bearer tokens or signed session tokens.
-        // If this Authorization value isn't an OAuth token, ensure it is a valid session token.
-        verify_session_token(access_token, &state.config.auth.session_secret)?;
-    }
-
-    // Session-authenticated fallback for callers authenticated via cookie or session bearer token.
-    // On single-user instances, return the most recently registered app when available.
-    if let Some(app) = state.db.get_latest_oauth_app().await? {
-        let response = serde_json::json!({
-            "id": app.id,
-            "name": app.name,
-            "website": app.website,
-            "redirect_uri": app.redirect_uri,
-            "client_id": app.client_id,
-            "vapid_key": app.vapid_key,
-        });
-        return Ok(Json(response));
-    }
-
-    let response = serde_json::json!({
-        "name": session.name.unwrap_or_else(|| "RustResort".to_string()),
-        "website": serde_json::Value::Null,
-    });
-    Ok(Json(response))
+    let token = bearer.ok_or(AppError::Unauthorized)?;
+    let oauth_token = state
+        .db
+        .get_oauth_token(token)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let app = state
+        .db
+        .get_oauth_app_by_id(&oauth_token.app_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    Ok(Json(serde_json::json!({
+        "id": app.id,
+        "name": app.name,
+        "website": app.website,
+        "redirect_uri": app.redirect_uri,
+        "redirect_uris": app.redirect_uri,
+        "client_id": app.client_id,
+        "vapid_key": app.vapid_key,
+        "scopes": app.scopes,
+    })))
 }
 
 /// POST /oauth/token
@@ -589,7 +429,7 @@ pub async fn create_token(
     State(state): State<AppsApiState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    Json(req): Json<TokenRequest>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, OAuthToken};
 
@@ -603,18 +443,16 @@ pub async fn create_token(
     )
     .await?;
 
-    // Validate grant_type
+    let req: TokenRequest = parse_body(&headers, &body)?;
     if req.grant_type != "client_credentials" && req.grant_type != "authorization_code" {
-        return Err(AppError::Validation("Invalid grant_type".to_string()));
+        return Err(AppError::Validation("invalid grant_type".to_string()));
     }
 
-    // Verify client credentials
     let app = state
         .db
         .get_oauth_app_by_client_id(&req.client_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-
     if !verify_client_secret(&app.client_secret, &req.client_secret) {
         return Err(AppError::Unauthorized);
     }
@@ -625,13 +463,11 @@ pub async fn create_token(
                 .scope
                 .as_deref()
                 .map(normalize_scopes)
-                .filter(|s| !s.is_empty())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| normalize_scopes(&app.scopes));
-
             if !scopes_are_subset(&requested_scopes, &app.scopes) {
                 return Err(AppError::Unauthorized);
             }
-
             requested_scopes
         }
         "authorization_code" => {
@@ -639,7 +475,7 @@ pub async fn create_token(
                 .code
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     AppError::Validation(
                         "code is required for authorization_code grant".to_string(),
@@ -649,169 +485,84 @@ pub async fn create_token(
                 .redirect_uri
                 .as_deref()
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     AppError::Validation(
                         "redirect_uri is required for authorization_code grant".to_string(),
                     )
                 })?;
-
             let authorization_code = state
                 .db
                 .consume_oauth_authorization_code(code, &app.id, redirect_uri, Utc::now())
                 .await?
                 .ok_or(AppError::Unauthorized)?;
-
             let requested_scopes = req
                 .scope
                 .as_deref()
                 .map(normalize_scopes)
-                .filter(|s| !s.is_empty())
+                .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| normalize_scopes(&authorization_code.scopes));
-
             if !scopes_are_subset(&requested_scopes, &authorization_code.scopes)
                 || !scopes_are_subset(&requested_scopes, &app.scopes)
             {
                 return Err(AppError::Unauthorized);
             }
-
             requested_scopes
         }
-        _ => {
-            return Err(AppError::Validation("Invalid grant_type".to_string()));
-        }
+        _ => unreachable!(),
     };
 
-    // Generate access token
-    let token_id = EntityId::new_string();
-    let access_token = EntityId::new_string();
-
-    // Create token
     let issued_at = Utc::now();
     let token = OAuthToken {
-        id: token_id.clone(),
-        app_id: app.id.clone(),
-        access_token: access_token.clone(),
-        grant_type: req.grant_type.clone(),
-        scopes,
+        id: EntityId::new_string(),
+        app_id: app.id,
+        access_token: EntityId::new_string(),
+        grant_type: req.grant_type,
+        scopes: scopes.clone(),
         created_at: issued_at,
         expires_at: issued_at + chrono::Duration::seconds(OAUTH_ACCESS_TOKEN_TTL_SECONDS),
         revoked: false,
     };
-
-    // Save to database
     state.db.insert_oauth_token(&token).await?;
 
-    // Return response
-    let response = TokenResponse {
+    Ok(Json(serde_json::json!(TokenResponse {
         access_token: token.access_token,
         token_type: "Bearer".to_string(),
         scope: token.scopes,
+        created_at: issued_at.timestamp(),
         expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-        created_at: token.created_at.timestamp(),
-    };
-
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    })))
 }
 
 /// POST /oauth/revoke
 pub async fn revoke_token(
     State(state): State<AppsApiState>,
-    Json(req): Json<RevokeTokenRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Verify client credentials
+    let req: RevokeTokenRequest = parse_body(&headers, &body)?;
     let app = state
         .db
         .get_oauth_app_by_client_id(&req.client_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-
     if !verify_client_secret(&app.client_secret, &req.client_secret) {
         return Err(AppError::Unauthorized);
     }
-
-    // Revoke the token
     state.db.revoke_oauth_token(&req.token).await?;
-
     Ok(Json(serde_json::json!({})))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RevokeTokenRequest {
-    pub client_id: String,
-    pub client_secret: String,
-    pub token: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        authorize_confirm_cookie_name, build_authorize_confirm_cookie, extract_bearer_token,
-        generate_vapid_key, hash_client_secret, verify_client_secret,
-    };
-    use axum::http::{HeaderMap, HeaderValue};
-    use base64::Engine;
-    use openssl::{
-        bn::BigNumContext,
-        ec::{EcGroup, EcKey, EcPoint},
-        nid::Nid,
-    };
+    use super::{hash_client_secret, normalize_scopes, verify_client_secret};
 
     #[test]
-    fn authorize_confirm_cookie_name_is_token_scoped() {
-        let first = authorize_confirm_cookie_name("token-a");
-        let second = authorize_confirm_cookie_name("token-b");
-        assert_ne!(first, second);
-        assert_eq!(first, "oauth_authorize_confirm_token-a");
-    }
-
-    #[test]
-    fn build_authorize_confirm_cookie_uses_token_scoped_name() {
-        let cookie = build_authorize_confirm_cookie("token-a", false);
-        assert_eq!(cookie.name(), "oauth_authorize_confirm_token-a");
-    }
-
-    #[test]
-    fn extract_bearer_token_reads_authorization_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            HeaderValue::from_static("Bearer token-value"),
+    fn normalize_scopes_collapses_whitespace() {
+        assert_eq!(
+            normalize_scopes(" read:accounts   write:statuses "),
+            "read:accounts write:statuses"
         );
-        assert_eq!(extract_bearer_token(&headers), Some("token-value"));
-    }
-
-    #[test]
-    fn extract_bearer_token_rejects_empty_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Authorization", HeaderValue::from_static("Bearer "));
-        assert_eq!(extract_bearer_token(&headers), None);
-    }
-    #[test]
-    fn generate_vapid_key_uses_url_safe_format() {
-        let key = generate_vapid_key().expect("vapid key generation should succeed");
-        assert!(!key.is_empty());
-        assert!(!key.contains('+'));
-        assert!(!key.contains('/'));
-        assert!(!key.contains('='));
-    }
-
-    #[test]
-    fn generate_vapid_key_returns_valid_uncompressed_p256_public_key() {
-        let encoded = generate_vapid_key().expect("vapid key generation should succeed");
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(encoded)
-            .expect("generated key should decode from base64url");
-        assert_eq!(decoded.len(), 65);
-        assert_eq!(decoded[0], 0x04);
-
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let mut context = BigNumContext::new().unwrap();
-        let point = EcPoint::from_bytes(&group, &decoded, &mut context)
-            .expect("public key bytes must be valid curve point");
-        let key = EcKey::from_public_key(&group, &point).expect("point should build EC key");
-        key.check_key()
-            .expect("generated public key should be valid");
     }
 
     #[test]
@@ -819,11 +570,5 @@ mod tests {
         let stored = hash_client_secret("plain-secret");
         assert!(verify_client_secret(&stored, "plain-secret"));
         assert!(!verify_client_secret(&stored, "wrong-secret"));
-    }
-
-    #[test]
-    fn verify_client_secret_accepts_legacy_plaintext_storage() {
-        assert!(verify_client_secret("legacy-secret", "legacy-secret"));
-        assert!(!verify_client_secret("legacy-secret", "wrong-secret"));
     }
 }

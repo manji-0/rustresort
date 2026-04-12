@@ -75,29 +75,29 @@ pub async fn home_timeline(
     db_timer.observe_duration();
 
     // Convert to API responses
-    let responses: Vec<_> = timeline_items
-        .iter()
-        .map(|item| {
-            let remote_stats = remote_account_stats
-                .get(item.status.account_address.trim())
-                .copied();
-            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
-                &item.status,
-                &account,
-                &state.config,
-                account_stats,
-                remote_stats,
-                crate::api::StatusInteractions::new(
-                    Some(item.favourited),
-                    Some(item.reblogged),
-                    None,
-                    Some(item.bookmarked),
-                    None,
-                ),
-            );
-            serde_json::to_value(response).unwrap()
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(timeline_items.len());
+    for item in &timeline_items {
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .copied();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
+    }
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -158,29 +158,29 @@ pub async fn public_timeline(
     db_timer.observe_duration();
 
     // Convert to API responses
-    let responses: Vec<_> = timeline_items
-        .iter()
-        .map(|item| {
-            let remote_stats = remote_account_stats
-                .get(item.status.account_address.trim())
-                .copied();
-            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
-                &item.status,
-                &account,
-                &state.config,
-                account_stats,
-                remote_stats,
-                crate::api::StatusInteractions::new(
-                    Some(item.favourited),
-                    Some(item.reblogged),
-                    None,
-                    Some(item.bookmarked),
-                    None,
-                ),
-            );
-            serde_json::to_value(response).unwrap()
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(timeline_items.len());
+    for item in &timeline_items {
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .copied();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
+    }
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -222,29 +222,29 @@ pub async fn tag_timeline(
     )
     .await?;
 
-    let responses: Vec<_> = timeline_items
-        .iter()
-        .map(|item| {
-            let remote_stats = remote_account_stats
-                .get(item.status.account_address.trim())
-                .copied();
-            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
-                &item.status,
-                &account,
-                &state.config,
-                account_stats,
-                remote_stats,
-                crate::api::StatusInteractions::new(
-                    Some(item.favourited),
-                    Some(item.reblogged),
-                    None,
-                    Some(item.bookmarked),
-                    None,
-                ),
-            );
-            serde_json::to_value(response).unwrap()
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(timeline_items.len());
+    for item in &timeline_items {
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .copied();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
+    }
 
     Ok(Json(responses))
 }
@@ -340,29 +340,29 @@ pub async fn list_timeline(
     )
     .await?;
 
-    let responses: Vec<_> = timeline_items
-        .iter()
-        .map(|item| {
-            let remote_stats = remote_account_stats
-                .get(item.status.account_address.trim())
-                .copied();
-            let response = crate::api::status_to_response_with_account_stats_and_remote_stats(
-                &item.status,
-                &account,
-                &state.config,
-                account_stats,
-                remote_stats,
-                crate::api::StatusInteractions::new(
-                    Some(item.favourited),
-                    Some(item.reblogged),
-                    None,
-                    Some(item.bookmarked),
-                    None,
-                ),
-            );
-            serde_json::to_value(response).unwrap()
-        })
-        .collect();
+    let mut responses = Vec::with_capacity(timeline_items.len());
+    for item in &timeline_items {
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .copied();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
+    }
 
     Ok(Json(responses))
 }

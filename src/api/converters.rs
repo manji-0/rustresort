@@ -48,6 +48,292 @@ fn default_port_for_protocol(protocol: &str) -> Option<u16> {
     }
 }
 
+fn status_content_to_source_text(content: &str) -> String {
+    let normalized = content
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n")
+        .replace("</p>", "\n\n")
+        .replace("<p>", "");
+
+    let mut without_tags = String::with_capacity(normalized.len());
+    let mut in_tag = false;
+    for ch in normalized.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => without_tags.push(ch),
+            _ => {}
+        }
+    }
+
+    let decoded = html_escape::decode_html_entities(without_tags.trim()).into_owned();
+    let mut lines = decoded.lines().map(str::trim_end).peekable();
+    let mut output = String::new();
+    let mut previous_blank = false;
+    while let Some(line) = lines.next() {
+        let is_blank = line.trim().is_empty();
+        if is_blank {
+            if !previous_blank && lines.peek().is_some() {
+                output.push('\n');
+            }
+        } else {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(line.trim_end());
+        }
+        previous_blank = is_blank;
+    }
+    output
+}
+
+fn build_status_tags(content: &str, base_url: &str) -> Vec<serde_json::Value> {
+    crate::data::extract_hashtags_from_content(content)
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "url": format!("{}/tags/{}", base_url, name),
+            })
+        })
+        .collect()
+}
+
+fn is_mention_boundary(previous: Option<char>) -> bool {
+    previous
+        .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '@'))
+        .unwrap_or(true)
+}
+
+fn extract_mentions_from_text(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut mentions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] != '@' || !is_mention_boundary(index.checked_sub(1).map(|i| chars[i])) {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        let mut username = String::new();
+        while cursor < chars.len() {
+            let ch = chars[cursor];
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
+                username.push(ch);
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if username.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let mut account = username;
+        if cursor < chars.len() && chars[cursor] == '@' {
+            cursor += 1;
+            let mut domain = String::new();
+            while cursor < chars.len() {
+                let ch = chars[cursor];
+                if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+                    domain.push(ch);
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            if !domain.is_empty() {
+                account.push('@');
+                account.push_str(&domain);
+            }
+        }
+
+        let normalized = account.to_ascii_lowercase();
+        if seen.insert(normalized.clone()) {
+            mentions.push(normalized);
+        }
+        index = cursor;
+    }
+
+    mentions
+}
+
+fn build_status_mentions(
+    content: &str,
+    base_url: &str,
+    local_username: &str,
+) -> Vec<serde_json::Value> {
+    let text = status_content_to_source_text(content);
+    extract_mentions_from_text(&text)
+        .into_iter()
+        .map(|acct| {
+            let (username, url) = if let Some((username, domain)) = acct.split_once('@') {
+                (
+                    username.to_string(),
+                    format!("https://{}/@{}", domain.to_ascii_lowercase(), username),
+                )
+            } else {
+                (
+                    acct.clone(),
+                    format!("{}/users/{}", base_url, acct.to_ascii_lowercase()),
+                )
+            };
+            let id = if acct == local_username {
+                format!("{}/users/{}", base_url, local_username)
+            } else if acct.contains('@') {
+                acct.clone()
+            } else {
+                format!("{}/users/{}", base_url, acct)
+            };
+            serde_json::json!({
+                "id": id,
+                "username": username,
+                "url": url,
+                "acct": acct,
+            })
+        })
+        .collect()
+}
+
+async fn enrich_status_response(
+    db: &Database,
+    status: &Status,
+    response: &mut StatusResponse,
+) -> Result<(), AppError> {
+    response.replies_count = saturating_i32(db.count_replies_by_uri(&status.uri).await?);
+    response.reblogs_count = saturating_i32(db.count_reposts(&status.id).await?);
+    response.favourites_count = saturating_i32(db.count_favourites(&status.id).await?);
+    response.quotes_count = saturating_i32(db.count_quotes_by_uri(&status.uri).await?);
+    response.edited_at = db.get_latest_status_edit_at(&status.id).await?;
+    Ok(())
+}
+
+async fn load_remote_account_stats_for_status(
+    db: &Database,
+    local_protocol: &str,
+    status: &Status,
+) -> Result<Option<RemoteAccountStats>, AppError> {
+    let account_address = status.account_address.trim();
+    if status.is_local || account_address.is_empty() {
+        return Ok(None);
+    }
+
+    let statuses_count = db
+        .count_statuses_by_account_address_with_default_port(
+            account_address,
+            default_port_for_protocol(local_protocol),
+        )
+        .await?;
+
+    Ok(Some(RemoteAccountStats {
+        statuses_count: saturating_i32(statuses_count),
+        ..RemoteAccountStats::default()
+    }))
+}
+
+async fn build_quote_response_value(
+    db: &Database,
+    quote_status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+) -> Result<serde_json::Value, AppError> {
+    let remote_account_stats =
+        load_remote_account_stats_for_status(db, &config.server.protocol, quote_status).await?;
+    let media_attachments = db.get_media_by_status(&quote_status.id).await?;
+    let mut response = status_to_response_with_media(
+        quote_status,
+        account,
+        config,
+        account_stats,
+        remote_account_stats,
+        StatusInteractions::default(),
+        &media_attachments,
+    );
+    enrich_status_response(db, quote_status, &mut response).await?;
+    response.quote = None;
+    response.quote_approval = None;
+    serde_json::to_value(response)
+        .map_err(|error| AppError::serialization("quoted status response serialization", error))
+}
+
+pub async fn build_status_response_with_media(
+    db: &Database,
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    remote_account_stats: Option<RemoteAccountStats>,
+    interactions: StatusInteractions,
+    media_attachments: &[MediaAttachment],
+) -> Result<StatusResponse, AppError> {
+    let mut response = status_to_response_with_media(
+        status,
+        account,
+        config,
+        account_stats,
+        remote_account_stats,
+        interactions,
+        media_attachments,
+    );
+    enrich_status_response(db, status, &mut response).await?;
+    if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
+        && let Some(quote_status) = db.get_status_by_uri(quote_of_uri).await?
+    {
+        response.quote = Some(
+            build_quote_response_value(db, &quote_status, account, config, account_stats).await?,
+        );
+    }
+    Ok(response)
+}
+
+pub async fn build_status_response_with_account_stats_and_remote_stats(
+    db: &Database,
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    remote_account_stats: Option<RemoteAccountStats>,
+    interactions: StatusInteractions,
+) -> Result<StatusResponse, AppError> {
+    build_status_response_with_media(
+        db,
+        status,
+        account,
+        config,
+        account_stats,
+        remote_account_stats,
+        interactions,
+        &[],
+    )
+    .await
+}
+
+pub async fn build_status_response_with_account_stats(
+    db: &Database,
+    status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+    interactions: StatusInteractions,
+) -> Result<StatusResponse, AppError> {
+    build_status_response_with_account_stats_and_remote_stats(
+        db,
+        status,
+        account,
+        config,
+        account_stats,
+        None,
+        interactions,
+    )
+    .await
+}
+
 /// Load local account counters from the database.
 pub async fn load_local_account_stats(db: &Database) -> Result<AccountStats, AppError> {
     Ok(AccountStats {
@@ -155,6 +441,7 @@ pub fn account_to_response_with_stats(
         id: account.id.to_string(),
         username: account.username.clone(),
         acct: account.username.clone(), // Local account, no @domain
+        uri: format!("{}/users/{}", base_url, account.username),
         display_name: account
             .display_name
             .clone()
@@ -163,6 +450,7 @@ pub fn account_to_response_with_stats(
         bot: false,
         discoverable: true,
         group: false,
+        indexable: true,
         created_at: account.created_at,
         note: account.note.clone().unwrap_or_default(),
         url: format!("{}/users/{}", base_url, account.username),
@@ -192,6 +480,9 @@ pub fn account_to_response_with_stats(
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
+        roles: vec![],
+        moved: None,
+        source: None,
     }
 }
 
@@ -215,11 +506,16 @@ fn remote_account_to_response(
         id: acct.clone(),
         username: normalized_username.clone(),
         acct,
+        uri: format!(
+            "https://{}/users/{}",
+            normalized_domain, normalized_username
+        ),
         display_name: normalized_username.clone(),
         locked: false,
         bot: false,
         discoverable: true,
         group: false,
+        indexable: true,
         // Remote account creation timestamp is unavailable; use a deterministic placeholder.
         created_at: placeholder_created_at,
         note: String::new(),
@@ -234,6 +530,9 @@ fn remote_account_to_response(
         last_status_at: None,
         emojis: vec![],
         fields: vec![],
+        roles: vec![],
+        moved: None,
+        source: None,
     }
 }
 
@@ -385,11 +684,18 @@ fn boost_stub_status(
             id: acct.clone(),
             username: normalized_username.clone(),
             acct,
+            uri: format!(
+                "{}://{}/users/{}",
+                parsed.scheme(),
+                authority,
+                normalized_username
+            ),
             display_name: normalized_username,
             locked: false,
             bot: false,
             discoverable: true,
             group: false,
+            indexable: true,
             created_at: placeholder_created_at,
             note: String::new(),
             url: profile_url,
@@ -409,17 +715,22 @@ fn boost_stub_status(
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
+            roles: vec![],
+            moved: None,
+            source: None,
         }
     } else {
         AccountResponse {
             id: "unknown@unknown.invalid".to_string(),
             username: "unknown".to_string(),
             acct: "unknown@unknown.invalid".to_string(),
+            uri: boost_of_uri.to_string(),
             display_name: "unknown".to_string(),
             locked: false,
             bot: false,
             discoverable: true,
             group: false,
+            indexable: true,
             created_at: placeholder_created_at,
             note: String::new(),
             url: boost_of_uri.to_string(),
@@ -439,6 +750,9 @@ fn boost_stub_status(
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
+            roles: vec![],
+            moved: None,
+            source: None,
         }
     };
 
@@ -457,16 +771,22 @@ fn boost_stub_status(
         replies_count: 0,
         reblogs_count: 0,
         favourites_count: 0,
+        quotes_count: 0,
         edited_at: None,
         content: String::new(),
+        text: String::new(),
         reblog: None,
+        application: None,
         account: boost_account,
         media_attachments: vec![],
         mentions: vec![],
         tags: vec![],
         emojis: vec![],
+        quote: None,
+        quote_approval: None,
         card: None,
         poll: None,
+        filtered: vec![],
         favourited: false,
         reblogged: false,
         muted: false,
@@ -597,6 +917,9 @@ pub fn status_to_response_with_media(
     } else {
         remote_account_to_response(status, config, remote_account_stats)
     };
+    let text = status_content_to_source_text(&status.content);
+    let tags = build_status_tags(&status.content, &base_url);
+    let mentions = build_status_mentions(&status.content, &base_url, &account.username);
 
     StatusResponse {
         id: status.id.clone(),
@@ -622,8 +945,10 @@ pub fn status_to_response_with_media(
         replies_count: 0,
         reblogs_count: 0,
         favourites_count: 0,
+        quotes_count: 0,
         edited_at: None,
         content: status.content.clone(),
+        text,
         reblog: status.boost_of_uri.as_deref().map(|uri| {
             Box::new(boost_stub_status(
                 uri,
@@ -634,16 +959,20 @@ pub fn status_to_response_with_media(
                 remote_account_stats,
             ))
         }),
+        application: None,
         account: account_response,
         media_attachments: media_attachments
             .iter()
             .map(|attachment| media_attachment_to_response(attachment, config))
             .collect(),
-        mentions: vec![],
-        tags: vec![],
+        mentions,
+        tags,
         emojis: vec![],
+        quote: None,
+        quote_approval: None,
         card: None,
         poll: None,
+        filtered: vec![],
         favourited: interactions.favourited.unwrap_or(false),
         reblogged: interactions.reblogged.unwrap_or(false),
         muted: interactions.muted.unwrap_or(false),
@@ -691,13 +1020,10 @@ mod tests {
                 r2_secret_access_key: "test".to_string(),
             },
             auth: AuthConfig {
-                github_username: "testuser".to_string(),
+                username: "testuser".to_string(),
+                password: Some("test-password".to_string()),
                 session_secret: "secret".to_string(),
                 session_max_age: 604800,
-                github: GitHubOAuthConfig {
-                    client_id: "test".to_string(),
-                    client_secret: "test".to_string(),
-                },
             },
             instance: InstanceConfig {
                 title: "Test".to_string(),
@@ -705,7 +1031,6 @@ mod tests {
                 contact_email: "test@example.com".to_string(),
             },
             admin: AdminConfig {
-                username: "admin".to_string(),
                 display_name: "Admin".to_string(),
                 email: Some("admin@test.example.com".to_string()),
                 note: Some("Test administrator".to_string()),
@@ -714,6 +1039,7 @@ mod tests {
                 timeline_max_items: 2000,
                 profile_ttl: 86400,
             },
+            ui: UiConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -730,6 +1056,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: Some("Test bio".to_string()),
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: Some("avatar.webp".to_string()),
             header_s3_key: Some("header.webp".to_string()),
             private_key_pem: "private".to_string(),
@@ -760,6 +1088,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -779,6 +1109,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -819,6 +1150,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -838,6 +1171,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
                 .unwrap()
@@ -868,6 +1202,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -886,6 +1222,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: Some("https://remote.example/users/alice/statuses/123".to_string()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -908,6 +1245,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -928,6 +1267,7 @@ mod tests {
                 "https://test.example.com/users/testuser/statuses/local-123".to_string(),
             ),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -946,6 +1286,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -966,6 +1308,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: Some(parent_uri.to_string()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -984,6 +1327,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1004,6 +1349,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: Some(parent_uri.to_string()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1022,6 +1368,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1040,6 +1388,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1069,6 +1418,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1089,6 +1440,7 @@ mod tests {
             boost_of_uri: Some(
                 "https://test.example.com/users/testuser/statuses/local-123".to_string(),
             ),
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1117,6 +1469,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1136,6 +1490,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Reposted,
             created_at: wrapper_created_at,
             fetched_at: None,
@@ -1161,6 +1516,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1179,6 +1536,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: Some("http://remote.example:8080/users/alice/statuses/999".to_string()),
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Reposted,
             created_at: Utc::now(),
             fetched_at: None,
@@ -1202,6 +1560,8 @@ mod tests {
             username: "testuser".to_string(),
             display_name: None,
             note: None,
+            also_known_as: None,
+            moved_to_uri: None,
             avatar_s3_key: None,
             header_s3_key: None,
             private_key_pem: "private".to_string(),
@@ -1220,6 +1580,7 @@ mod tests {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,

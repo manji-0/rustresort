@@ -18,7 +18,8 @@ mod webfinger;
 
 pub use activity::{ActivityProcessor, ActivityType};
 pub use delivery::{
-    ActivityDelivery, DeliveryResult, build_local_delivery, local_actor_uri, local_key_id,
+    ActivityDelivery, DeliveryQueue, DeliveryResult, build_local_delivery, local_actor_uri,
+    local_key_id, spawn_delivery_worker,
 };
 pub use key_cache::{CacheStats, PublicKeyCache};
 pub use rate_limit::{RateLimitStats, RateLimiter, extract_domain};

@@ -7,10 +7,11 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::data::{
-    CachedAttachment, CachedStatus, Database, NotificationType, ProfileCache, TimelineCache,
+    CachedAttachment, CachedStatus, Database, NotificationType, PersistedReason, ProfileCache,
+    PushAlerts, PushPayload, Status, StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
-use crate::service::{StreamEvent, StreamTarget, StreamingEventBus};
+use crate::service::{StreamEvent, StreamTarget, StreamingEventBus, WebPushSender};
 
 /// Return true when a Follow target references the local actor.
 ///
@@ -134,6 +135,89 @@ fn sanitize_remote_html(content: &str) -> String {
     ammonia::clean(content)
 }
 
+fn push_alert_enabled(alerts: &PushAlerts, notification_type: NotificationType) -> bool {
+    match notification_type {
+        NotificationType::Mention => alerts.mention,
+        NotificationType::Quote => alerts.quote,
+        NotificationType::Favourite => alerts.favourite,
+        NotificationType::Reblog => alerts.reblog,
+        NotificationType::Follow => alerts.follow,
+        NotificationType::FollowRequest => alerts.follow_request,
+        NotificationType::Status => alerts.status,
+        NotificationType::Poll => alerts.poll,
+        NotificationType::Update => alerts.update,
+        NotificationType::QuotedUpdate => alerts.quoted_update,
+        NotificationType::AdminSignUp => alerts.admin_sign_up,
+        NotificationType::AdminReport => alerts.admin_report,
+        NotificationType::SeveredRelationships | NotificationType::ModerationWarning => false,
+    }
+}
+
+fn push_notification_title(notification_type: NotificationType) -> &'static str {
+    match notification_type {
+        NotificationType::Mention => "New mention",
+        NotificationType::Quote => "New quote",
+        NotificationType::Favourite => "New favourite",
+        NotificationType::Reblog => "New reblog",
+        NotificationType::Follow => "New follower",
+        NotificationType::FollowRequest => "New follow request",
+        NotificationType::Status => "New status",
+        NotificationType::Poll => "Poll update",
+        NotificationType::Update => "Status updated",
+        NotificationType::QuotedUpdate => "Quoted status updated",
+        NotificationType::AdminSignUp => "New signup",
+        NotificationType::AdminReport => "New report",
+        NotificationType::SeveredRelationships => "Relationships severed",
+        NotificationType::ModerationWarning => "Moderation warning",
+    }
+}
+
+fn push_notification_body(notification: &crate::data::Notification) -> String {
+    match notification.notification_type {
+        NotificationType::Follow => {
+            format!("{} followed you", notification.origin_account_address)
+        }
+        NotificationType::FollowRequest => {
+            format!(
+                "{} requested to follow you",
+                notification.origin_account_address
+            )
+        }
+        NotificationType::Mention => {
+            format!("{} mentioned you", notification.origin_account_address)
+        }
+        NotificationType::Quote => {
+            format!("{} quoted your post", notification.origin_account_address)
+        }
+        NotificationType::Favourite => {
+            format!(
+                "{} favourited your post",
+                notification.origin_account_address
+            )
+        }
+        NotificationType::Reblog => {
+            format!("{} boosted your post", notification.origin_account_address)
+        }
+        NotificationType::Status => {
+            format!(
+                "{} posted a new status",
+                notification.origin_account_address
+            )
+        }
+        NotificationType::Poll => "A poll you participated in has ended".to_string(),
+        NotificationType::Update => "A status you interacted with was edited".to_string(),
+        NotificationType::QuotedUpdate => "A quoted status was edited".to_string(),
+        NotificationType::AdminSignUp => "A new user signed up".to_string(),
+        NotificationType::AdminReport => "A new report was filed".to_string(),
+        NotificationType::SeveredRelationships => "Some relationships were severed".to_string(),
+        NotificationType::ModerationWarning => "A moderation warning was issued".to_string(),
+    }
+}
+
+fn normalize_identity_candidate(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
+}
+
 fn extract_follow_target(activity: &serde_json::Value) -> Result<String, AppError> {
     let object = activity
         .get("object")
@@ -171,6 +255,103 @@ fn extract_delete_target_uri(activity: &serde_json::Value) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .or_else(|| object.get("object").and_then(serde_json::Value::as_str))
         .map(str::to_string)
+}
+
+fn extract_activity_object_id(object: Option<&serde_json::Value>) -> Option<&str> {
+    let object = object?;
+    object
+        .as_str()
+        .or_else(|| object.get("id").and_then(|id| id.as_str()))
+}
+
+fn extract_move_object_actor_uri(activity: &serde_json::Value) -> Option<String> {
+    extract_activity_object_id(activity.get("object"))
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+}
+
+fn extract_move_target_uri(activity: &serde_json::Value) -> Option<String> {
+    extract_activity_object_id(activity.get("target"))
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+}
+
+fn extract_move_target_inbox_uri(activity: &serde_json::Value) -> Option<String> {
+    activity
+        .get("target")
+        .and_then(|target| target.get("inbox"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn activity_value_contains_identity(value: &serde_json::Value, identity: &str) -> bool {
+    let normalized_identity = normalize_identity_candidate(identity);
+    match value {
+        serde_json::Value::String(raw) => {
+            normalize_identity_candidate(raw).eq_ignore_ascii_case(normalized_identity)
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|entry| activity_value_contains_identity(entry, identity)),
+        _ => false,
+    }
+}
+
+fn persisted_reason_priority(reason: PersistedReason) -> u8 {
+    match reason {
+        PersistedReason::Own => 6,
+        PersistedReason::Reposted | PersistedReason::Favourited | PersistedReason::Bookmarked => 5,
+        PersistedReason::ReplyToOwn => 4,
+        PersistedReason::Mentioned => 3,
+        PersistedReason::Timeline => 2,
+        PersistedReason::CacheOnly => 1,
+    }
+}
+
+fn merge_persisted_reason(existing: PersistedReason, incoming: PersistedReason) -> PersistedReason {
+    if persisted_reason_priority(existing) >= persisted_reason_priority(incoming) {
+        existing
+    } else {
+        incoming
+    }
+}
+
+fn status_changed(previous: Option<&Status>, current: &Status) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+
+    previous.content != current.content
+        || previous.content_warning != current.content_warning
+        || previous.visibility != current.visibility
+        || previous.language != current.language
+        || previous.in_reply_to_uri != current.in_reply_to_uri
+        || previous.boost_of_uri != current.boost_of_uri
+        || previous.quote_of_uri != current.quote_of_uri
+}
+
+fn extract_first_uri_reference(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(uri) if !uri.trim().is_empty() => Some(uri.to_string()),
+        serde_json::Value::Array(values) => values.iter().find_map(extract_first_uri_reference),
+        serde_json::Value::Object(_) => value
+            .get("id")
+            .or_else(|| value.get("href"))
+            .or_else(|| value.get("url"))
+            .and_then(extract_first_uri_reference),
+        _ => None,
+    }
+}
+
+fn normalize_actor_uri_for_compare(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
+}
+
+fn object_attributed_to_matches_actor(object: &serde_json::Value, actor_uri: &str) -> bool {
+    let expected = normalize_actor_uri_for_compare(actor_uri);
+    object
+        .get("attributedTo")
+        .and_then(extract_first_uri_reference)
+        .is_some_and(|attributed_to| normalize_actor_uri_for_compare(&attributed_to) == expected)
 }
 
 fn actor_domains_for_blocklist(actor_uri: &str) -> Vec<String> {
@@ -263,6 +444,22 @@ fn is_local_follow_target(local_address: &str, local_protocol: &str, object: &st
     path == format!("/users/{}", local_username) || path == format!("/@{}", local_username)
 }
 
+fn local_actor_uri_from_address(protocol: &str, address: &str) -> String {
+    let Some((username, domain)) = address.split_once('@') else {
+        return address.to_string();
+    };
+    format!(
+        "{}://{}/users/{}",
+        if protocol.eq_ignore_ascii_case("http") {
+            "http"
+        } else {
+            "https"
+        },
+        domain,
+        username
+    )
+}
+
 /// ActivityPub Activity types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityType {
@@ -276,6 +473,7 @@ pub enum ActivityType {
     Like,
     Announce,
     Block,
+    Move,
     // Add more as needed
 }
 
@@ -293,6 +491,7 @@ impl ActivityType {
             "Like" => Some(Self::Like),
             "Announce" => Some(Self::Announce),
             "Block" => Some(Self::Block),
+            "Move" => Some(Self::Move),
             _ => None,
         }
     }
@@ -316,6 +515,7 @@ pub struct ActivityProcessor {
     db: Arc<Database>,
     timeline_cache: Arc<TimelineCache>,
     profile_cache: Arc<ProfileCache>,
+    federation_fetch_client: Option<Arc<reqwest::Client>>,
     /// Local account address for comparison
     local_address: String,
     /// Local instance protocol
@@ -324,6 +524,8 @@ pub struct ActivityProcessor {
     delivery: Option<Arc<super::ActivityDelivery>>,
     /// Real-time event bus for notifications and timeline updates.
     streaming_event_bus: Option<Arc<dyn StreamingEventBus>>,
+    /// Optional Web Push sender for notification fan-out.
+    web_push_sender: Option<Arc<dyn WebPushSender>>,
 }
 
 impl ActivityProcessor {
@@ -339,11 +541,20 @@ impl ActivityProcessor {
             db,
             timeline_cache,
             profile_cache,
+            federation_fetch_client: None,
             local_address,
             local_protocol,
             delivery: None,
             streaming_event_bus: None,
+            web_push_sender: None,
         }
+    }
+
+    /// Set the HTTP client used for remote actor discovery when processing
+    /// inbound activities.
+    pub fn with_federation_fetch_client(mut self, client: Arc<reqwest::Client>) -> Self {
+        self.federation_fetch_client = Some(client);
+        self
     }
 
     /// Set activity delivery service
@@ -360,6 +571,11 @@ impl ActivityProcessor {
         streaming_event_bus: Arc<dyn StreamingEventBus>,
     ) -> Self {
         self.streaming_event_bus = Some(streaming_event_bus);
+        self
+    }
+
+    pub fn with_web_push_sender(mut self, web_push_sender: Arc<dyn WebPushSender>) -> Self {
+        self.web_push_sender = Some(web_push_sender);
         self
     }
 
@@ -403,15 +619,22 @@ impl ActivityProcessor {
             return Err(AppError::Forbidden);
         }
 
-        let actor_is_followee = if activity_type == ActivityType::Create {
-            self.is_followee(actor_uri).await
-        } else {
-            false
-        };
+        if self.is_actor_locally_blocked(actor_uri).await? {
+            return Err(AppError::Forbidden);
+        }
+
+        let actor_is_followee =
+            if matches!(activity_type, ActivityType::Create | ActivityType::Update) {
+                self.is_followee(actor_uri).await
+            } else {
+                false
+            };
 
         // 3. Decide whether this activity should be handled at all.
         let persistence_decision = self.decide_persistence(&activity, actor_is_followee);
-        if persistence_decision == PersistenceDecision::Ignore {
+        if persistence_decision == PersistenceDecision::Ignore
+            && activity_type != ActivityType::Update
+        {
             return Ok(());
         }
 
@@ -421,15 +644,19 @@ impl ActivityProcessor {
                 self.handle_create(activity, actor_uri, persistence_decision)
                     .await
             }
-            ActivityType::Update => self.handle_update(activity, actor_uri).await,
+            ActivityType::Update => {
+                self.handle_update(activity, actor_uri, persistence_decision, actor_is_followee)
+                    .await
+            }
             ActivityType::Delete => self.handle_delete(activity, actor_uri).await,
             ActivityType::Follow => self.handle_follow(activity, actor_uri).await,
             ActivityType::Accept => self.handle_accept(activity, actor_uri).await,
-            ActivityType::Reject => Ok(()), // Ignore for now
+            ActivityType::Reject => self.handle_reject(activity, actor_uri).await,
             ActivityType::Undo => self.handle_undo(activity, actor_uri).await,
             ActivityType::Like => self.handle_like(activity, actor_uri).await,
             ActivityType::Announce => self.handle_announce(activity, actor_uri).await,
-            ActivityType::Block => Ok(()), // Ignore blocks from remote
+            ActivityType::Block => self.handle_block(activity, actor_uri).await,
+            ActivityType::Move => self.handle_move(activity, actor_uri).await,
         }
     }
 
@@ -462,8 +689,13 @@ impl ActivityProcessor {
                 if let Some(object) = activity.get("object") {
                     // Quote boost: Announce activity with embedded Note/Article
                     if object.is_object() && object.get("type").is_some() {
-                        // Check if the quote mentions us
-                        if self.mentions_local_user(object) {
+                        // Check if the quote mentions us or quotes one of our posts.
+                        if self.mentions_local_user(object)
+                            || self
+                                .extract_quote_uri_from_object(object)
+                                .as_deref()
+                                .is_some_and(|quote_uri| self.is_local_status(quote_uri))
+                        {
                             // Quote boost mentioning us -> Persist
                             return PersistenceDecision::Persist;
                         }
@@ -493,8 +725,47 @@ impl ActivityProcessor {
                         // Reply to our post -> Persist (notification)
                         return PersistenceDecision::Persist;
                     }
+                    if self
+                        .extract_quote_uri_from_object(object)
+                        .as_deref()
+                        .is_some_and(|quote_uri| self.is_local_status(quote_uri))
+                    {
+                        return PersistenceDecision::Persist;
+                    }
                     // Create from followee -> CacheOnly
                     if actor_is_followee {
+                        return PersistenceDecision::CacheOnly;
+                    }
+                }
+                PersistenceDecision::Ignore
+            }
+            Some(ActivityType::Update) => {
+                if let Some(object) = activity.get("object") {
+                    let object_type = object
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
+                    if matches!(object_type, "Note" | "Article") {
+                        if self.mentions_local_user(object) {
+                            return PersistenceDecision::Persist;
+                        }
+                        if let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str())
+                            && self.is_local_status(in_reply_to)
+                        {
+                            return PersistenceDecision::Persist;
+                        }
+                        if self
+                            .extract_quote_uri_from_object(object)
+                            .as_deref()
+                            .is_some_and(|quote_uri| self.is_local_status(quote_uri))
+                        {
+                            return PersistenceDecision::Persist;
+                        }
+                        if actor_is_followee {
+                            return PersistenceDecision::CacheOnly;
+                        }
+                    } else {
+                        // Profile-like updates should still refresh cache state.
                         return PersistenceDecision::CacheOnly;
                     }
                 }
@@ -509,8 +780,21 @@ impl ActivityProcessor {
                 // Accept of our Follow -> Persist
                 PersistenceDecision::Persist
             }
+            Some(ActivityType::Reject) => {
+                // Reject of our Follow -> Persist (removes pending follow row)
+                PersistenceDecision::Persist
+            }
             Some(ActivityType::Undo) => {
                 // Undo Follow -> Persist (removes follower)
+                PersistenceDecision::Persist
+            }
+            Some(ActivityType::Block) => {
+                // Remote blocks targeting the local account must always be processed
+                // so delivery suppression and follow teardown can be enforced.
+                PersistenceDecision::Persist
+            }
+            Some(ActivityType::Move) => {
+                // Move of an account we follow should update the local follow state.
                 PersistenceDecision::Persist
             }
             _ => {
@@ -546,15 +830,42 @@ impl ActivityProcessor {
         if object_type != "Note" && object_type != "Article" {
             return Ok(()); // Ignore other object types for now
         }
+        if !object_attributed_to_matches_actor(object, actor_uri) {
+            return Err(AppError::Unauthorized);
+        }
 
         // Extract actor address
         let actor_address = self.extract_actor_address(actor_uri);
+        let activity_uri = activity.get("id").and_then(|id| id.as_str());
         let should_persist_notification =
             matches!(persistence_decision, PersistenceDecision::Persist);
         let should_cache_status = matches!(persistence_decision, PersistenceDecision::CacheOnly);
+        let mentions_local = self.mentions_local_user(object);
+        let replies_to_local = object
+            .get("inReplyTo")
+            .and_then(|r| r.as_str())
+            .is_some_and(|in_reply_to| self.is_local_status(in_reply_to));
+        let quote_target_uri = self.extract_quote_uri_from_object(object);
+        let quotes_local = quote_target_uri
+            .as_deref()
+            .is_some_and(|quote_uri| self.is_local_status(quote_uri));
+
+        if should_persist_notification && (mentions_local || replies_to_local || quotes_local) {
+            if let Some(status) = self
+                .upsert_remote_status_from_object(
+                    object,
+                    actor_uri,
+                    PersistedReason::Mentioned,
+                    false,
+                )
+                .await?
+            {
+                self.publish_remote_status_update(&status, false).await;
+            }
+        }
 
         // 3. Check for mentions -> create notification
-        if should_persist_notification && self.mentions_local_user(object) {
+        if should_persist_notification && mentions_local {
             // Get the status URI
             let status_uri = object
                 .get("id")
@@ -571,14 +882,12 @@ impl ActivityProcessor {
                 created_at: chrono::Utc::now(),
             };
 
-            self.insert_notification_and_publish(&notification).await?;
+            self.insert_notification_and_publish(&notification, activity_uri)
+                .await?;
         }
 
         // 4. Check if reply to our post -> create notification
-        if should_persist_notification
-            && let Some(in_reply_to) = object.get("inReplyTo").and_then(|r| r.as_str())
-            && self.is_local_status(in_reply_to)
-        {
+        if should_persist_notification && replies_to_local {
             // Get the status URI
             let status_uri = object
                 .get("id")
@@ -586,7 +895,7 @@ impl ActivityProcessor {
                 .map(|s| s.to_string());
 
             // Create reply notification (if not already created as mention)
-            if !self.mentions_local_user(object) {
+            if !mentions_local {
                 let notification = crate::data::Notification {
                     id: crate::data::EntityId::new_string(),
                     notification_type: NotificationType::Mention, // Replies are also mentions
@@ -596,41 +905,35 @@ impl ActivityProcessor {
                     created_at: chrono::Utc::now(),
                 };
 
-                self.insert_notification_and_publish(&notification).await?;
+                self.insert_notification_and_publish(&notification, activity_uri)
+                    .await?;
             }
         }
 
-        // 5. Cache followee posts without persisting to DB.
-        if should_cache_status && let Some(status_uri) = object.get("id").and_then(|id| id.as_str())
-        {
-            let created_at = object
-                .get("published")
-                .and_then(|published| published.as_str())
-                .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now);
-            let sanitized_content = sanitize_remote_html(
-                object
-                    .get("content")
-                    .and_then(|content| content.as_str())
-                    .unwrap_or_default(),
-            );
-
-            let cached = CachedStatus {
-                id: status_uri.to_string(),
-                uri: status_uri.to_string(),
-                content: sanitized_content,
-                account_address: actor_address,
-                created_at,
-                visibility: self.extract_visibility(object),
-                attachments: self.extract_cached_attachments(object),
-                reply_to_uri: object
-                    .get("inReplyTo")
-                    .and_then(|reply| reply.as_str())
-                    .map(str::to_string),
-                boost_of_uri: None,
+        if should_persist_notification && quotes_local {
+            let status_uri = object
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string());
+            let notification = crate::data::Notification {
+                id: crate::data::EntityId::new_string(),
+                notification_type: NotificationType::Quote,
+                origin_account_address: actor_address.clone(),
+                status_uri,
+                read: false,
+                created_at: chrono::Utc::now(),
             };
-            self.timeline_cache.insert(cached).await;
+
+            self.insert_notification_and_publish(&notification, activity_uri)
+                .await?;
+        }
+
+        // 5. Cache followee posts without persisting to DB.
+        if should_cache_status
+            && let Some(cached_status) = self.cache_status_from_object(object, actor_uri).await
+        {
+            self.publish_cached_status_update(&cached_status, true)
+                .await;
         }
 
         Ok(())
@@ -641,11 +944,131 @@ impl ActivityProcessor {
         &self,
         activity: serde_json::Value,
         actor_uri: &str,
+        persistence_decision: PersistenceDecision,
+        actor_is_followee: bool,
     ) -> Result<(), AppError> {
-        self.profile_cache
-            .update_from_activity(actor_uri, activity)
-            .await;
+        let object = activity
+            .get("object")
+            .ok_or_else(|| AppError::Validation("Missing object in Update".to_string()))?;
+        let object_type = object
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default();
+
+        if matches!(object_type, "Note" | "Article") {
+            if !object_attributed_to_matches_actor(object, actor_uri) {
+                return Err(AppError::Unauthorized);
+            }
+            let mentions_local = self.mentions_local_user(object);
+            let replies_to_local = object
+                .get("inReplyTo")
+                .and_then(|r| r.as_str())
+                .is_some_and(|in_reply_to| self.is_local_status(in_reply_to));
+            let quote_target_uri = self.extract_quote_uri_from_object(object);
+            let status_uri = object.get("id").and_then(|id| id.as_str());
+            let existing_status = if let Some(status_uri) = status_uri {
+                self.db.get_status_by_uri(status_uri).await?
+            } else {
+                None
+            };
+            let is_newly_persisted = existing_status.is_none();
+            let known_in_db = existing_status.is_some();
+            let known_in_cache = if let Some(status_uri) = status_uri {
+                self.timeline_cache.get_by_uri(status_uri).await.is_some()
+            } else {
+                false
+            };
+
+            let should_persist_status =
+                matches!(persistence_decision, PersistenceDecision::Persist)
+                    || known_in_db
+                    || mentions_local
+                    || replies_to_local;
+            let should_cache_status =
+                matches!(persistence_decision, PersistenceDecision::CacheOnly)
+                    || actor_is_followee
+                    || known_in_cache;
+
+            if should_persist_status {
+                if let Some(status) = self
+                    .upsert_remote_status_from_object(
+                        object,
+                        actor_uri,
+                        PersistedReason::Mentioned,
+                        true,
+                    )
+                    .await?
+                {
+                    let activity_uri = activity.get("id").and_then(|id| id.as_str());
+                    if status_changed(existing_status.as_ref(), &status)
+                        && self.local_user_interacts_with_status(&status.id).await?
+                    {
+                        let notification = crate::data::Notification {
+                            id: crate::data::EntityId::new_string(),
+                            notification_type: NotificationType::Update,
+                            origin_account_address: status.account_address.clone(),
+                            status_uri: Some(status.uri.clone()),
+                            read: false,
+                            created_at: chrono::Utc::now(),
+                        };
+                        self.insert_notification_and_publish(&notification, activity_uri)
+                            .await?;
+                    }
+                    if status_changed(existing_status.as_ref(), &status) {
+                        for quote_status in self
+                            .db
+                            .get_local_statuses_by_quote_of_uri(&status.uri)
+                            .await?
+                        {
+                            let notification = crate::data::Notification {
+                                id: crate::data::EntityId::new_string(),
+                                notification_type: NotificationType::QuotedUpdate,
+                                origin_account_address: status.account_address.clone(),
+                                status_uri: Some(quote_status.uri.clone()),
+                                read: false,
+                                created_at: chrono::Utc::now(),
+                            };
+                            self.insert_notification_and_publish(&notification, activity_uri)
+                                .await?;
+                        }
+                    }
+                    if is_newly_persisted
+                        && quote_target_uri
+                            .as_deref()
+                            .is_some_and(|quote_uri| self.is_local_status(quote_uri))
+                    {
+                        let notification = crate::data::Notification {
+                            id: crate::data::EntityId::new_string(),
+                            notification_type: NotificationType::Quote,
+                            origin_account_address: status.account_address.clone(),
+                            status_uri: Some(status.uri.clone()),
+                            read: false,
+                            created_at: chrono::Utc::now(),
+                        };
+                        self.insert_notification_and_publish(&notification, activity_uri)
+                            .await?;
+                    }
+                    self.publish_remote_status_update(&status, actor_is_followee)
+                        .await;
+                }
+            } else if should_cache_status
+                && let Some(cached_status) = self.cache_status_from_object(object, actor_uri).await
+            {
+                self.publish_cached_status_update(&cached_status, actor_is_followee)
+                    .await;
+            }
+        } else {
+            self.profile_cache
+                .update_from_activity(actor_uri, activity)
+                .await;
+        }
         Ok(())
+    }
+
+    async fn local_user_interacts_with_status(&self, status_id: &str) -> Result<bool, AppError> {
+        Ok(self.db.is_reposted(status_id).await?
+            || self.db.is_favourited(status_id).await?
+            || self.db.is_bookmarked(status_id).await?)
     }
 
     /// Handle Delete activity
@@ -661,6 +1084,7 @@ impl ActivityProcessor {
             let actor_scheme = url::Url::parse(actor_uri)
                 .ok()
                 .map(|url| url.scheme().to_ascii_lowercase());
+            let actor_is_followee = self.is_followee(actor_uri).await;
 
             if let Some(cached_status) = self.timeline_cache.get_by_uri(&uri).await {
                 if follow_addresses_match(
@@ -668,6 +1092,8 @@ impl ActivityProcessor {
                     &cached_status.account_address,
                     actor_scheme.as_deref(),
                 ) {
+                    self.publish_cached_status_delete(&cached_status, actor_is_followee)
+                        .await;
                     self.timeline_cache.remove_by_uri(&uri).await;
                 } else {
                     tracing::debug!(
@@ -686,6 +1112,8 @@ impl ActivityProcessor {
                         actor_scheme.as_deref(),
                     )
                 {
+                    self.publish_remote_status_delete(&status, actor_is_followee)
+                        .await;
                     self.db.delete_status(&status.id).await?;
                 } else if !status.is_local {
                     tracing::debug!(
@@ -716,22 +1144,48 @@ impl ActivityProcessor {
             ));
         }
 
-        // 2. Get actor's inbox for later Accept delivery
-        let inbox_uri = activity
+        // 2. Resolve actor metadata for later Accept delivery.
+        let activity_actor = activity
             .get("actor")
-            .and_then(|a| {
-                if let Some(actor_str) = a.as_str() {
-                    Some(format!("{}/inbox", actor_str))
-                } else {
-                    a.get("inbox")
-                        .and_then(|i| i.as_str())
-                        .map(|s| s.to_string())
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(actor_uri.to_string()));
+        let mut canonical_actor_uri = actor_uri.to_string();
+        let inbox_uri = if let Some(inbox_uri) = activity_actor
+            .get("inbox")
+            .and_then(|i| i.as_str())
+            .map(|s| s.to_string())
+        {
+            if let Some(embedded_actor_uri) = activity_actor.get("id").and_then(|id| id.as_str()) {
+                canonical_actor_uri = embedded_actor_uri.to_string();
+            }
+            inbox_uri
+        } else if let Some(client) = &self.federation_fetch_client {
+            match crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.profile_cache.as_ref(),
+                client.as_ref(),
+                actor_uri,
+            )
+            .await
+            {
+                Ok((resolved_actor_uri, resolved_inbox_uri)) => {
+                    canonical_actor_uri = resolved_actor_uri;
+                    resolved_inbox_uri
                 }
-            })
-            .unwrap_or_else(|| format!("{}/inbox", actor_uri));
+                Err(error) => {
+                    tracing::warn!(
+                        actor_uri,
+                        %error,
+                        "failed to resolve canonical actor inbox; falling back to suffix-based inbox URI"
+                    );
+                    format!("{}/inbox", actor_uri)
+                }
+            }
+        } else {
+            format!("{}/inbox", actor_uri)
+        };
 
         // Extract actor address from URI
-        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_address = self.extract_actor_address(&canonical_actor_uri);
 
         // Get the Follow activity ID
         let follow_activity_uri = activity
@@ -744,7 +1198,7 @@ impl ActivityProcessor {
         let follower = crate::data::Follower {
             id: crate::data::EntityId::new_string(),
             follower_address: actor_address.clone(),
-            actor_uri: Some(actor_uri.to_string()),
+            actor_uri: Some(canonical_actor_uri),
             inbox_uri: inbox_uri.clone(),
             uri: follow_activity_uri.clone(),
             created_at: chrono::Utc::now(),
@@ -762,16 +1216,23 @@ impl ActivityProcessor {
             created_at: chrono::Utc::now(),
         };
 
-        self.insert_notification_and_publish(&notification).await?;
+        self.insert_notification_and_publish(
+            &notification,
+            activity.get("id").and_then(|id| id.as_str()),
+        )
+        .await?;
 
         // 5. Send Accept activity
         if let Some(ref delivery) = self.delivery {
-            match delivery.send_accept(&follow_activity_uri, &inbox_uri).await {
+            match delivery
+                .queue_accept(self.db.as_ref(), &follow_activity_uri, &inbox_uri)
+                .await
+            {
                 Ok(_) => {
-                    tracing::info!("Successfully sent Accept to {}", inbox_uri);
+                    tracing::info!("Queued Accept for {}", inbox_uri);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to send Accept to {}: {}", inbox_uri, e);
+                    tracing::error!("Failed to queue Accept for {}: {}", inbox_uri, e);
                     // Don't fail the whole operation if Accept sending fails
                     // The follower is already added to the database
                 }
@@ -783,23 +1244,126 @@ impl ActivityProcessor {
         Ok(())
     }
 
+    /// Handle Block activity targeting the local account.
+    async fn handle_block(
+        &self,
+        activity: serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<(), AppError> {
+        let object = activity
+            .get("object")
+            .ok_or_else(|| AppError::Validation("Missing object in Block".to_string()))?;
+        let Some(target) = object
+            .as_str()
+            .or_else(|| object.get("id").and_then(|id| id.as_str()))
+        else {
+            return Err(AppError::Validation("Missing block target".to_string()));
+        };
+
+        if !is_local_follow_target(&self.local_address, &self.local_protocol, target) {
+            return Ok(());
+        }
+
+        self.db.record_remote_block(actor_uri).await?;
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        let _ = self
+            .db
+            .delete_follow(&actor_address, actor_default_port)
+            .await;
+        tracing::info!(actor_uri, "Recorded remote block");
+        Ok(())
+    }
+
     /// Handle Accept activity (follow accepted)
     async fn handle_accept(
         &self,
         activity: serde_json::Value,
-        _actor_uri: &str,
+        actor_uri: &str,
     ) -> Result<(), AppError> {
-        // 1. Verify we sent the original Follow
-        let object = activity.get("object");
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        let Some(existing_follow) = self
+            .db
+            .get_follow(&actor_address, actor_default_port)
+            .await?
+        else {
+            tracing::debug!(
+                "Ignoring Accept from {} without a matching follow row",
+                actor_uri
+            );
+            return Ok(());
+        };
 
-        // The object should be our Follow activity
-        // For now, just log that we received an Accept
-        tracing::info!("Received Accept activity: {:?}", object);
+        if let Some(object_follow_uri) = extract_activity_object_id(activity.get("object"))
+            && existing_follow.uri != object_follow_uri
+        {
+            tracing::debug!(
+                "Ignoring Accept from {} because Follow URI {} does not match stored {}",
+                actor_uri,
+                object_follow_uri,
+                existing_follow.uri
+            );
+            return Ok(());
+        }
 
-        // In a full implementation:
-        // 2. Mark follow as accepted in DB
-        // 3. Fetch actor's recent posts to cache
+        self.db
+            .mark_follow_accepted(&actor_address, actor_uri, actor_default_port)
+            .await?;
 
+        if let Some(client) = &self.federation_fetch_client {
+            let _ = crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.profile_cache.as_ref(),
+                client.as_ref(),
+                actor_uri,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle Reject activity (follow rejected)
+    async fn handle_reject(
+        &self,
+        activity: serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<(), AppError> {
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        let Some(existing_follow) = self
+            .db
+            .get_follow(&actor_address, actor_default_port)
+            .await?
+        else {
+            tracing::debug!(
+                "Ignoring Reject from {} without a matching follow row",
+                actor_uri
+            );
+            return Ok(());
+        };
+
+        if let Some(object_follow_uri) = extract_activity_object_id(activity.get("object"))
+            && existing_follow.uri != object_follow_uri
+        {
+            tracing::debug!(
+                "Ignoring Reject from {} because Follow URI {} does not match stored {}",
+                actor_uri,
+                object_follow_uri,
+                existing_follow.uri
+            );
+            return Ok(());
+        }
+
+        self.db
+            .delete_follow(&actor_address, actor_default_port)
+            .await?;
         Ok(())
     }
 
@@ -867,13 +1431,39 @@ impl ActivityProcessor {
                         Ok(())
                     }
                     "Like" | "Announce" => {
-                        // Could remove notification, but for simplicity just ignore
+                        self.remove_notification_for_undo(obj, &actor_address)
+                            .await?;
+                        Ok(())
+                    }
+                    "Block" => {
+                        let target = obj
+                            .get("object")
+                            .and_then(|value| {
+                                value
+                                    .as_str()
+                                    .or_else(|| value.get("id").and_then(|id| id.as_str()))
+                            })
+                            .unwrap_or_default();
+                        if is_local_follow_target(&self.local_address, &self.local_protocol, target)
+                        {
+                            self.db.remove_remote_block(actor_uri).await?;
+                        }
                         Ok(())
                     }
                     _ => Ok(()),
                 }
             } else if let Some(follow_uri) = obj.as_str() {
-                // Compact Undo representation where object is the Follow activity URI.
+                // Compact Undo representation where object is the activity URI.
+                if self
+                    .db
+                    .delete_notifications_by_activity_uri(follow_uri)
+                    .await?
+                    > 0
+                {
+                    return Ok(());
+                }
+
+                // Fallback to Follow activity URI semantics for older implementations.
                 let removed = self
                     .db
                     .delete_follower_by_address_and_uri(
@@ -934,8 +1524,163 @@ impl ActivityProcessor {
             created_at: chrono::Utc::now(),
         };
 
-        self.insert_notification_and_publish(&notification).await?;
+        self.insert_notification_and_publish(
+            &notification,
+            activity.get("id").and_then(|id| id.as_str()),
+        )
+        .await?;
 
+        Ok(())
+    }
+
+    /// Handle Move activity.
+    async fn handle_move(
+        &self,
+        activity: serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<(), AppError> {
+        let Some(object_actor_uri) = extract_move_object_actor_uri(&activity) else {
+            return Err(AppError::Validation("Missing object in Move".to_string()));
+        };
+        if !normalize_identity_candidate(&object_actor_uri)
+            .eq_ignore_ascii_case(normalize_identity_candidate(actor_uri))
+        {
+            tracing::debug!(
+                actor_uri,
+                object_actor_uri,
+                "Ignoring Move because object does not match actor"
+            );
+            return Ok(());
+        }
+
+        let Some(target_uri) = extract_move_target_uri(&activity) else {
+            return Err(AppError::Validation("Missing target in Move".to_string()));
+        };
+        if normalize_identity_candidate(&target_uri)
+            .eq_ignore_ascii_case(normalize_identity_candidate(actor_uri))
+        {
+            tracing::debug!(actor_uri, "Ignoring Move because target equals actor");
+            return Ok(());
+        }
+
+        if let Some(also_known_as) = activity
+            .get("target")
+            .and_then(|target| target.get("alsoKnownAs"))
+            && !activity_value_contains_identity(also_known_as, actor_uri)
+        {
+            tracing::debug!(
+                actor_uri,
+                target_uri,
+                "Ignoring Move because embedded target alsoKnownAs does not reference actor"
+            );
+            return Ok(());
+        }
+
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        let Some(_existing_follow) = self
+            .db
+            .get_follow(&actor_address, actor_default_port)
+            .await?
+        else {
+            tracing::debug!(actor_uri, "Ignoring Move without an existing follow row");
+            return Ok(());
+        };
+
+        let target_default_port = url::Url::parse(&target_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        let target_address = self.extract_actor_address(&target_uri);
+
+        if self
+            .db
+            .get_follow(&target_address, target_default_port)
+            .await?
+            .is_some()
+        {
+            self.db
+                .delete_follow(&actor_address, actor_default_port)
+                .await?;
+            return Ok(());
+        }
+
+        let target_inbox_uri = if let Some(inbox_uri) = extract_move_target_inbox_uri(&activity) {
+            inbox_uri
+        } else if let Some(client) = &self.federation_fetch_client {
+            let (resolved_actor_uri, resolved_inbox_uri) = crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.profile_cache.as_ref(),
+                client.as_ref(),
+                &target_uri,
+            )
+            .await?;
+            if !normalize_identity_candidate(&resolved_actor_uri)
+                .eq_ignore_ascii_case(normalize_identity_candidate(&target_uri))
+            {
+                tracing::debug!(
+                    actor_uri,
+                    target_uri,
+                    resolved_actor_uri,
+                    "Ignoring Move because resolved target actor differs from activity target"
+                );
+                return Ok(());
+            }
+            resolved_inbox_uri
+        } else {
+            return Err(AppError::Federation(
+                "Cannot process Move without federation fetch client".to_string(),
+            ));
+        };
+
+        let Some(delivery) = &self.delivery else {
+            return Err(AppError::Federation(
+                "Cannot process Move without outbound delivery".to_string(),
+            ));
+        };
+
+        let local_actor_uri =
+            local_actor_uri_from_address(&self.local_protocol, &self.local_address);
+        let follow_activity_uri = format!(
+            "{}/follow/{}",
+            local_actor_uri,
+            crate::data::EntityId::new_string()
+        );
+        let inserted = self
+            .db
+            .insert_follow_if_absent(
+                &crate::data::Follow {
+                    id: crate::data::EntityId::new_string(),
+                    target_address: target_address.clone(),
+                    actor_uri: Some(target_uri.clone()),
+                    uri: follow_activity_uri.clone(),
+                    created_at: chrono::Utc::now(),
+                },
+                target_default_port,
+            )
+            .await?;
+
+        if inserted {
+            if let Err(error) = delivery
+                .queue_follow_with_id(
+                    self.db.as_ref(),
+                    &follow_activity_uri,
+                    &target_uri,
+                    &target_inbox_uri,
+                )
+                .await
+            {
+                let _ = self
+                    .db
+                    .delete_follow(&target_address, target_default_port)
+                    .await;
+                return Err(error);
+            }
+        }
+
+        self.db
+            .delete_follow(&actor_address, actor_default_port)
+            .await?;
         Ok(())
     }
 
@@ -955,25 +1700,59 @@ impl ActivityProcessor {
         // Check if it's a quote boost (embedded object) or regular boost (URI)
         if object.is_object() {
             // Quote boost: Announce with embedded Note/Article
-            // Check if the quote mentions us
-            if self.mentions_local_user(object) {
-                // Get the quote status URI
+            let mentions_local = self.mentions_local_user(object);
+            let quote_target_uri = self.extract_quote_uri_from_object(object);
+            let quotes_local = quote_target_uri
+                .as_deref()
+                .is_some_and(|quote_uri| self.is_local_status(quote_uri));
+
+            if mentions_local || quotes_local {
+                self.upsert_remote_status_from_object(
+                    object,
+                    actor_uri,
+                    PersistedReason::Mentioned,
+                    false,
+                )
+                .await?;
+
                 let status_uri = object
                     .get("id")
                     .and_then(|id| id.as_str())
                     .map(|s| s.to_string());
 
-                // Create mention notification for quote boost
-                let notification = crate::data::Notification {
-                    id: crate::data::EntityId::new_string(),
-                    notification_type: NotificationType::Mention,
-                    origin_account_address: actor_address,
-                    status_uri,
-                    read: false,
-                    created_at: chrono::Utc::now(),
-                };
+                if quotes_local {
+                    let notification = crate::data::Notification {
+                        id: crate::data::EntityId::new_string(),
+                        notification_type: NotificationType::Quote,
+                        origin_account_address: actor_address.clone(),
+                        status_uri: status_uri.clone(),
+                        read: false,
+                        created_at: chrono::Utc::now(),
+                    };
 
-                self.insert_notification_and_publish(&notification).await?;
+                    self.insert_notification_and_publish(
+                        &notification,
+                        activity.get("id").and_then(|id| id.as_str()),
+                    )
+                    .await?;
+                }
+
+                if mentions_local {
+                    let notification = crate::data::Notification {
+                        id: crate::data::EntityId::new_string(),
+                        notification_type: NotificationType::Mention,
+                        origin_account_address: actor_address,
+                        status_uri,
+                        read: false,
+                        created_at: chrono::Utc::now(),
+                    };
+
+                    self.insert_notification_and_publish(
+                        &notification,
+                        activity.get("id").and_then(|id| id.as_str()),
+                    )
+                    .await?;
+                }
             }
             // If quote doesn't mention us, ignore (future: could cache if from followee)
         } else if let Some(object_uri) = object.as_str() {
@@ -990,11 +1769,185 @@ impl ActivityProcessor {
                     created_at: chrono::Utc::now(),
                 };
 
-                self.insert_notification_and_publish(&notification).await?;
+                self.insert_notification_and_publish(
+                    &notification,
+                    activity.get("id").and_then(|id| id.as_str()),
+                )
+                .await?;
             }
             // If boosting someone else's status, ignore (future: could cache if from followee)
         }
 
+        Ok(())
+    }
+
+    async fn upsert_remote_status_from_object(
+        &self,
+        object: &serde_json::Value,
+        actor_uri: &str,
+        persisted_reason: PersistedReason,
+        capture_edit_snapshot: bool,
+    ) -> Result<Option<Status>, AppError> {
+        let Some(status_uri) = object.get("id").and_then(|id| id.as_str()) else {
+            return Ok(None);
+        };
+
+        let cached = self.cached_status_from_object(object, actor_uri)?;
+        self.timeline_cache.insert(cached.clone()).await;
+        let quote_of_uri = self.extract_quote_uri_from_object(object);
+
+        let mut status = Status {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: cached.content.clone(),
+            content_warning: object
+                .get("summary")
+                .and_then(|summary| summary.as_str())
+                .map(str::to_string)
+                .filter(|summary| !summary.trim().is_empty()),
+            visibility: StatusVisibility::parse(&cached.visibility)
+                .unwrap_or(StatusVisibility::Private),
+            language: object
+                .get("contentMap")
+                .and_then(|map| map.as_object())
+                .and_then(|map| map.keys().next().cloned())
+                .or_else(|| {
+                    object
+                        .get("language")
+                        .and_then(|language| language.as_str())
+                        .map(str::to_string)
+                }),
+            account_address: cached.account_address.clone(),
+            is_local: false,
+            in_reply_to_uri: cached.reply_to_uri.clone(),
+            boost_of_uri: cached.boost_of_uri.clone(),
+            quote_of_uri,
+            persisted_reason,
+            created_at: cached.created_at,
+            fetched_at: Some(Utc::now()),
+        };
+
+        if let Some(existing) = self.db.get_status_by_uri(status_uri).await? {
+            if existing.is_local {
+                return Ok(Some(existing));
+            }
+            status.id = existing.id.clone();
+            status.created_at = existing.created_at;
+            status.persisted_reason =
+                merge_persisted_reason(existing.persisted_reason, persisted_reason);
+            if capture_edit_snapshot
+                && (existing.content != status.content
+                    || existing.content_warning != status.content_warning
+                    || existing.visibility != status.visibility
+                    || existing.language != status.language
+                    || existing.in_reply_to_uri != status.in_reply_to_uri
+                    || existing.boost_of_uri != status.boost_of_uri
+                    || existing.quote_of_uri != status.quote_of_uri)
+            {
+                self.db
+                    .update_status_with_edit_snapshot(&existing, &status)
+                    .await?;
+            } else {
+                self.db.update_status(&status).await?;
+            }
+            return Ok(Some(status));
+        }
+
+        self.db.insert_status(&status).await?;
+        Ok(Some(status))
+    }
+
+    fn cached_status_from_object(
+        &self,
+        object: &serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<CachedStatus, AppError> {
+        let status_uri = object
+            .get("id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| AppError::Validation("Missing object id".to_string()))?;
+        let created_at = object
+            .get("published")
+            .and_then(|published| published.as_str())
+            .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let sanitized_content = sanitize_remote_html(
+            object
+                .get("content")
+                .and_then(|content| content.as_str())
+                .unwrap_or_default(),
+        );
+
+        Ok(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: sanitized_content,
+            account_address: self.extract_actor_address(actor_uri),
+            created_at,
+            visibility: self.extract_visibility(object),
+            attachments: self.extract_cached_attachments(object),
+            reply_to_uri: object
+                .get("inReplyTo")
+                .and_then(|reply| reply.as_str())
+                .map(str::to_string),
+            boost_of_uri: None,
+            quote_of_uri: self.extract_quote_uri_from_object(object),
+        })
+    }
+
+    async fn cache_status_from_object(
+        &self,
+        object: &serde_json::Value,
+        actor_uri: &str,
+    ) -> Option<CachedStatus> {
+        let cached_status = self.cached_status_from_object(object, actor_uri).ok()?;
+        self.timeline_cache.insert(cached_status.clone()).await;
+        Some(cached_status)
+    }
+
+    fn extract_quote_uri_from_object(&self, object: &serde_json::Value) -> Option<String> {
+        ["quoteUri", "quoteUrl", "_misskey_quote"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(extract_first_uri_reference))
+    }
+
+    async fn remove_notification_for_undo(
+        &self,
+        object: &serde_json::Value,
+        actor_address: &str,
+    ) -> Result<(), AppError> {
+        if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
+            let removed = self
+                .db
+                .delete_notifications_by_activity_uri(activity_uri)
+                .await?;
+            if removed > 0 {
+                return Ok(());
+            }
+        }
+
+        let Some(obj_type) = object.get("type").and_then(|t| t.as_str()) else {
+            return Ok(());
+        };
+
+        let notification_type = match obj_type {
+            "Like" => NotificationType::Favourite,
+            "Announce" => NotificationType::Reblog,
+            _ => return Ok(()),
+        };
+        let status_uri = object
+            .get("object")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                object
+                    .get("object")
+                    .and_then(|value| value.get("id"))
+                    .and_then(|id| id.as_str())
+            });
+        self.db
+            .delete_notifications_by_identity(notification_type, actor_address, status_uri)
+            .await?;
         Ok(())
     }
 
@@ -1008,9 +1961,16 @@ impl ActivityProcessor {
     async fn insert_notification_and_publish(
         &self,
         notification: &crate::data::Notification,
+        activity_uri: Option<&str>,
     ) -> Result<(), AppError> {
-        self.db.insert_notification(notification).await?;
-        self.publish_notification(notification).await;
+        let inserted = self
+            .db
+            .insert_notification_if_new(notification, activity_uri)
+            .await?;
+        if inserted {
+            self.publish_notification(notification).await;
+            self.send_web_push_notification(notification).await;
+        }
         Ok(())
     }
 
@@ -1038,12 +1998,252 @@ impl ActivityProcessor {
         }
     }
 
+    async fn send_web_push_notification(&self, notification: &crate::data::Notification) {
+        let Some(web_push_sender) = &self.web_push_sender else {
+            return;
+        };
+
+        let Ok(Some(subscription)) = self.db.get_push_subscription().await else {
+            return;
+        };
+        let alerts: PushAlerts = match serde_json::from_str(&subscription.alerts_json) {
+            Ok(alerts) => alerts,
+            Err(error) => {
+                tracing::warn!(%error, "invalid stored push alerts JSON");
+                return;
+            }
+        };
+        if !push_alert_enabled(&alerts, notification.notification_type) {
+            return;
+        }
+
+        let payload = PushPayload {
+            notification_id: notification.id.clone(),
+            notification_type: notification.notification_type.as_str().to_string(),
+            title: push_notification_title(notification.notification_type).to_string(),
+            body: push_notification_body(notification),
+            status_uri: notification.status_uri.clone(),
+        };
+        if let Err(error) = web_push_sender.send(&subscription, &payload).await {
+            tracing::warn!(%error, "failed to send web push notification");
+        }
+    }
+
+    fn local_default_port(&self) -> Option<u16> {
+        default_port_for_scheme(&self.local_protocol)
+    }
+
+    async fn stream_targets_for_remote_status(
+        &self,
+        account_address: &str,
+        visibility: StatusVisibility,
+        include_home_stream: bool,
+        content: &str,
+    ) -> Result<Vec<StreamTarget>, AppError> {
+        let mut targets = std::collections::HashSet::new();
+        let local_account_id = self.local_account_id().to_string();
+
+        if include_home_stream {
+            targets.insert(StreamTarget::User {
+                account_id: local_account_id.clone(),
+            });
+        }
+
+        match visibility {
+            StatusVisibility::Public => {
+                targets.insert(StreamTarget::Public);
+                for hashtag in crate::data::extract_hashtags_from_content(content) {
+                    targets.insert(StreamTarget::Hashtag { hashtag });
+                }
+            }
+            StatusVisibility::Direct => {
+                targets.insert(StreamTarget::Direct {
+                    account_id: local_account_id,
+                });
+            }
+            StatusVisibility::Unlisted | StatusVisibility::Private => {}
+        }
+
+        for list_id in self
+            .db
+            .get_list_ids_for_account(account_address, self.local_default_port())
+            .await?
+        {
+            targets.insert(StreamTarget::List { list_id });
+        }
+
+        Ok(targets.into_iter().collect())
+    }
+
+    async fn publish_remote_status_update(&self, status: &Status, include_home_stream: bool) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let Ok(targets) = self
+            .stream_targets_for_remote_status(
+                status.account_address.as_str(),
+                status.visibility,
+                include_home_stream,
+                status.content.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        let event = StreamEvent::Update {
+            payload: serde_json::json!({
+                "id": status.id.as_str(),
+                "uri": status.uri.as_str(),
+                "visibility": status.visibility.as_str(),
+                "created_at": status.created_at.to_rfc3339(),
+            }),
+            targets,
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish remote status update event");
+        }
+    }
+
+    async fn publish_remote_status_delete(&self, status: &Status, include_home_stream: bool) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let Ok(targets) = self
+            .stream_targets_for_remote_status(
+                status.account_address.as_str(),
+                status.visibility,
+                include_home_stream,
+                status.content.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        let event = StreamEvent::Delete {
+            payload: serde_json::json!({
+                "id": status.id.as_str(),
+                "uri": status.uri.as_str(),
+            }),
+            targets,
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish remote status delete event");
+        }
+    }
+
+    async fn publish_cached_status_update(
+        &self,
+        cached_status: &CachedStatus,
+        include_home_stream: bool,
+    ) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let visibility =
+            StatusVisibility::parse(&cached_status.visibility).unwrap_or(StatusVisibility::Private);
+        let Ok(targets) = self
+            .stream_targets_for_remote_status(
+                cached_status.account_address.as_str(),
+                visibility,
+                include_home_stream,
+                cached_status.content.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        let event = StreamEvent::Update {
+            payload: serde_json::json!({
+                "id": cached_status.id.as_str(),
+                "uri": cached_status.uri.as_str(),
+                "visibility": cached_status.visibility.as_str(),
+                "created_at": cached_status.created_at.to_rfc3339(),
+            }),
+            targets,
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish cached remote status update event");
+        }
+    }
+
+    async fn publish_cached_status_delete(
+        &self,
+        cached_status: &CachedStatus,
+        include_home_stream: bool,
+    ) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let visibility =
+            StatusVisibility::parse(&cached_status.visibility).unwrap_or(StatusVisibility::Private);
+        let Ok(targets) = self
+            .stream_targets_for_remote_status(
+                cached_status.account_address.as_str(),
+                visibility,
+                include_home_stream,
+                cached_status.content.as_str(),
+            )
+            .await
+        else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        let event = StreamEvent::Delete {
+            payload: serde_json::json!({
+                "id": cached_status.id.as_str(),
+                "uri": cached_status.uri.as_str(),
+            }),
+            targets,
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish cached remote status delete event");
+        }
+    }
+
     // =========================================================================
     // Helpers
     // =========================================================================
 
     fn extract_visibility(&self, object: &serde_json::Value) -> String {
         const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
+        let Some((local_username, local_domain)) = self.local_address.split_once('@') else {
+            return "private".to_string();
+        };
+        let local_actor_paths = [
+            format!(
+                "{}://{}/users/{}",
+                self.local_protocol, local_domain, local_username
+            ),
+            format!(
+                "{}://{}/@{}",
+                self.local_protocol, local_domain, local_username
+            ),
+            format!("acct:{}", self.local_address),
+            self.local_address.clone(),
+        ];
 
         let contains_public = |audience: &serde_json::Value| -> bool {
             if let Some(value) = audience.as_str() {
@@ -1059,11 +2259,37 @@ impl ActivityProcessor {
                 })
                 .unwrap_or(false)
         };
+        let contains_local_identity = |audience: &serde_json::Value| -> bool {
+            if let Some(value) = audience.as_str() {
+                let normalized = normalize_identity_candidate(value);
+                return local_actor_paths
+                    .iter()
+                    .any(|candidate| normalized.eq_ignore_ascii_case(candidate));
+            }
+            audience
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(normalize_identity_candidate)
+                        .any(|value| {
+                            local_actor_paths
+                                .iter()
+                                .any(|candidate| value.eq_ignore_ascii_case(candidate))
+                        })
+                })
+                .unwrap_or(false)
+        };
 
         if object.get("to").is_some_and(contains_public) {
             "public".to_string()
         } else if object.get("cc").is_some_and(contains_public) {
             "unlisted".to_string()
+        } else if object.get("to").is_some_and(contains_local_identity)
+            || object.get("cc").is_some_and(contains_local_identity)
+        {
+            "direct".to_string()
         } else {
             "private".to_string()
         }
@@ -1138,31 +2364,57 @@ impl ActivityProcessor {
 
     /// Check if activity mentions the local user
     fn mentions_local_user(&self, object: &serde_json::Value) -> bool {
-        // Check cc/to/tag for local user URI or address
-        let check_array = |arr: &serde_json::Value| -> bool {
-            if let Some(items) = arr.as_array() {
-                items.iter().any(|item| {
-                    if let Some(s) = item.as_str() {
-                        s.contains(&self.local_address)
-                    } else {
-                        false
-                    }
-                })
-            } else {
-                false
+        let Some((local_username, local_domain)) = self.local_address.split_once('@') else {
+            return false;
+        };
+        let local_actor_paths = [
+            format!(
+                "{}://{}/users/{}",
+                self.local_protocol, local_domain, local_username
+            ),
+            format!(
+                "{}://{}/@{}",
+                self.local_protocol, local_domain, local_username
+            ),
+            format!("acct:{}", self.local_address),
+            self.local_address.clone(),
+        ];
+
+        let matches_local_identity = |value: &str| -> bool {
+            let normalized = normalize_identity_candidate(value);
+            normalized.eq_ignore_ascii_case(&self.local_address)
+                || local_actor_paths
+                    .iter()
+                    .any(|candidate| normalized.eq_ignore_ascii_case(candidate))
+        };
+
+        // Check cc/to/tag for local user URI or address.
+        let check_audience = |audience: &serde_json::Value| -> bool {
+            if let Some(value) = audience.as_str() {
+                return matches_local_identity(value);
             }
+
+            audience
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(matches_local_identity)
+                })
+                .unwrap_or(false)
         };
 
         // Check 'to' field
         if let Some(to) = object.get("to")
-            && check_array(to)
+            && check_audience(to)
         {
             return true;
         }
 
         // Check 'cc' field
         if let Some(cc) = object.get("cc")
-            && check_array(cc)
+            && check_audience(cc)
         {
             return true;
         }
@@ -1174,7 +2426,7 @@ impl ActivityProcessor {
             for t in tags {
                 if t.get("type").and_then(|ty| ty.as_str()) == Some("Mention")
                     && let Some(href) = t.get("href").and_then(|h| h.as_str())
-                    && href.contains(&self.local_address)
+                    && matches_local_identity(href)
                 {
                     return true;
                 }
@@ -1202,6 +2454,22 @@ impl ActivityProcessor {
             .unwrap_or(false)
     }
 
+    async fn is_actor_locally_blocked(&self, actor_uri: &str) -> Result<bool, AppError> {
+        let actor_address = self.extract_actor_address(actor_uri);
+        let actor_default_port = url::Url::parse(actor_uri)
+            .ok()
+            .and_then(|url| default_port_for_scheme(url.scheme()));
+        if self
+            .db
+            .is_account_blocked(&actor_address, actor_default_port)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        self.db.is_actor_uri_blocked(actor_uri).await
+    }
+
     /// Check if status is by local user
     fn is_local_status(&self, status_uri: &str) -> bool {
         // Check if URI contains local domain/address
@@ -1217,15 +2485,17 @@ impl ActivityProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_follow_target, is_local_follow_target};
+    use super::{PersistenceDecision, extract_follow_target, is_local_follow_target};
     use crate::data::{
-        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, PersistedReason,
-        ProfileCache, TimelineCache,
+        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, NotificationType,
+        PersistedReason, ProfileCache, PushAlerts, PushPayload, PushSubscription, TimelineCache,
     };
     use crate::error::AppError;
+    use crate::service::WebPushSender;
+    use axum::async_trait;
     use chrono::Utc;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     const TEST_PRIVATE_KEY_PEM: &str = include_str!("../../tests/fixtures/test_private_key.pem");
@@ -1278,6 +2548,30 @@ mod tests {
         let (processor, db, _timeline_cache, temp_dir) =
             create_test_processor_with_timeline(local_address, local_protocol).await;
         (processor, db, temp_dir)
+    }
+
+    #[derive(Debug, Default)]
+    struct MockWebPushSender {
+        sent: Mutex<Vec<(PushSubscription, PushPayload)>>,
+    }
+
+    #[async_trait]
+    impl WebPushSender for MockWebPushSender {
+        async fn send(
+            &self,
+            subscription: &PushSubscription,
+            payload: &PushPayload,
+        ) -> Result<(), AppError> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((subscription.clone(), payload.clone()));
+            Ok(())
+        }
+
+        async fn server_key(&self) -> Result<String, AppError> {
+            Ok("mock-server-key".to_string())
+        }
     }
 
     #[test]
@@ -1463,31 +2757,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_follow_sends_accept_when_delivery_is_configured() {
-        use axum::{Router, routing::post};
-        use http::StatusCode;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::net::TcpListener;
-
-        let deliveries = Arc::new(AtomicUsize::new(0));
-        let deliveries_for_route = deliveries.clone();
-        let app = Router::new().route(
-            "/users/bob/inbox",
-            post(move || {
-                let deliveries = deliveries_for_route.clone();
-                async move {
-                    deliveries.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::ACCEPTED
-                }
-            }),
-        );
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
         let delivery = Arc::new(crate::federation::ActivityDelivery::new(
             Arc::new(reqwest::Client::new()),
             "https://example.com/users/alice".to_string(),
@@ -1496,7 +2766,7 @@ mod tests {
         ));
         let processor = processor.with_delivery(delivery);
 
-        let actor_uri = format!("http://{addr}/users/bob");
+        let actor_uri = "https://remote.example/users/bob".to_string();
         let activity = json!({
             "type": "Follow",
             "id": format!("{actor_uri}/follows/1"),
@@ -1506,7 +2776,53 @@ mod tests {
 
         processor.handle_follow(activity, &actor_uri).await.unwrap();
 
-        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        let jobs = db.claim_pending_delivery_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].inbox_url, "https://remote.example/users/bob/inbox");
+        assert!(jobs[0].activity_json.contains("\"type\":\"Accept\""));
+    }
+
+    #[tokio::test]
+    async fn handle_follow_sends_web_push_for_enabled_follow_alerts() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let sender = Arc::new(MockWebPushSender::default());
+        let processor = processor.with_web_push_sender(sender.clone());
+
+        db.upsert_push_subscription(
+            "https://push.example.test/subscription/1",
+            "p256dh-test",
+            "auth-test",
+            &PushAlerts {
+                follow: true,
+                ..PushAlerts::default()
+            },
+            "all",
+        )
+        .await
+        .unwrap();
+
+        let actor_uri = "https://remote.example/users/bob".to_string();
+        let activity = json!({
+            "type": "Follow",
+            "id": format!("{actor_uri}/follows/1"),
+            "actor": actor_uri,
+            "object": "https://example.com/users/alice"
+        });
+
+        processor
+            .handle_follow(activity, "https://remote.example/users/bob")
+            .await
+            .unwrap();
+
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].0.endpoint,
+            "https://push.example.test/subscription/1"
+        );
+        assert_eq!(sent[0].1.notification_type, "follow");
+        assert_eq!(sent[0].1.title, "New follower");
+        assert!(sent[0].1.body.contains("bob@remote.example followed you"));
     }
 
     #[tokio::test]
@@ -1564,7 +2880,10 @@ mod tests {
             }
         });
 
-        processor.handle_update(activity, actor_uri).await.unwrap();
+        processor
+            .handle_update(activity, actor_uri, PersistenceDecision::CacheOnly, false)
+            .await
+            .unwrap();
 
         let updated = profile_cache
             .get("bob@remote.example")
@@ -1589,6 +2908,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": "https://remote.example/statuses/blocked",
                 "content": "<p>blocked</p>",
                 "published": "2026-01-01T00:00:00Z"
@@ -1610,6 +2930,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": "https://remote.example:8443/statuses/blocked",
                 "content": "<p>blocked</p>",
                 "published": "2026-01-01T00:00:00Z"
@@ -1816,6 +3137,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from followee</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -1850,6 +3172,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from :443 actor URI</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -1885,6 +3208,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from explicit :443 follow row</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -1919,6 +3243,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from @bob</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -1953,6 +3278,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from /accounts/bob</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -1987,6 +3313,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello from IPv6 actor</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -2021,6 +3348,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>Hello</p><script>alert(1)</script><a href=\"javascript:alert(2)\">click</a>",
                 "published": "2026-01-01T00:00:00Z",
@@ -2061,6 +3389,7 @@ mod tests {
             "actor": actor_uri,
             "object": {
                 "type": "Note",
+                "attributedTo": actor_uri,
                 "id": status_uri,
                 "content": "<p>To be deleted</p>",
                 "published": "2026-01-01T00:00:00Z",
@@ -2098,6 +3427,7 @@ mod tests {
                 attachments: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
+                quote_of_uri: None,
             })
             .await;
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
@@ -2139,6 +3469,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2182,6 +3513,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2216,6 +3548,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Favourited,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2250,6 +3583,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2288,6 +3622,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2322,6 +3657,7 @@ mod tests {
                 attachments: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
+                quote_of_uri: None,
             })
             .await;
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
@@ -2354,6 +3690,7 @@ mod tests {
             is_local: false,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: PersistedReason::Bookmarked,
             created_at: Utc::now(),
             fetched_at: Some(Utc::now()),
@@ -2368,5 +3705,256 @@ mod tests {
         processor.process(delete_activity, actor_uri).await.unwrap();
 
         assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn process_create_mention_persists_remote_status_and_notification() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/mention";
+
+        let activity = json!({
+            "id": "https://remote.example/activities/create-mention",
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "id": status_uri,
+                "content": "<p>Hello @alice@example.com</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "tag": [{
+                    "type": "Mention",
+                    "href": "https://example.com/users/alice"
+                }]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        let persisted = db
+            .get_status_by_uri(status_uri)
+            .await
+            .unwrap()
+            .expect("mentioned status should be persisted");
+        assert_eq!(persisted.id, status_uri);
+        assert_eq!(persisted.persisted_reason, PersistedReason::Mentioned);
+
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].notification_type,
+            NotificationType::Mention
+        );
+        assert_eq!(notifications[0].status_uri.as_deref(), Some(status_uri));
+    }
+
+    #[tokio::test]
+    async fn process_update_note_updates_persisted_remote_status_and_snapshots_edit() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/editable";
+        let status = crate::data::Status {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>before</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Mentioned,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        db.insert_status(&status).await.unwrap();
+
+        let activity = json!({
+            "type": "Update",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "id": status_uri,
+                "content": "<p>after #edited</p>",
+                "summary": "cw",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        let updated = db
+            .get_status_by_uri(status_uri)
+            .await
+            .unwrap()
+            .expect("updated status should exist");
+        assert_eq!(updated.content, "<p>after #edited</p>");
+        assert_eq!(updated.content_warning.as_deref(), Some("cw"));
+        let edits = db.get_status_edits(&updated.id, 10).await.unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].1, "<p>before</p>");
+    }
+
+    #[tokio::test]
+    async fn process_follow_redelivery_upserts_existing_follower() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let first = json!({
+            "id": "https://remote.example/follows/1",
+            "type": "Follow",
+            "actor": actor_uri,
+            "object": "https://example.com/users/alice"
+        });
+        let second = json!({
+            "id": "https://remote.example/follows/1",
+            "type": "Follow",
+            "actor": actor_uri,
+            "object": "https://example.com/users/alice"
+        });
+
+        processor.process(first, actor_uri).await.unwrap();
+        processor.process(second, actor_uri).await.unwrap();
+
+        assert_eq!(db.count_follower_addresses().await.unwrap(), 1);
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_accept_marks_follow_as_accepted() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let follow = Follow {
+            id: EntityId::new_string(),
+            target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
+            uri: "https://example.com/users/alice/follow/accept".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Accept",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "id": follow.uri
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        assert!(
+            db.is_follow_accepted("bob@remote.example", Some(443))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_reject_removes_follow_row() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let follow = Follow {
+            id: EntityId::new_string(),
+            target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
+            uri: "https://example.com/users/alice/follow/reject".to_string(),
+            created_at: Utc::now(),
+        };
+        db.insert_follow(&follow).await.unwrap();
+
+        let activity = json!({
+            "type": "Reject",
+            "actor": actor_uri,
+            "object": {
+                "type": "Follow",
+                "id": follow.uri
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+        assert!(
+            db.get_follow("bob@remote.example", Some(443))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_undo_like_removes_notification_by_activity_uri() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://example.com/users/alice/statuses/local-1";
+
+        let like_activity = json!({
+            "id": "https://remote.example/likes/1",
+            "type": "Like",
+            "actor": actor_uri,
+            "object": status_uri
+        });
+        processor.process(like_activity, actor_uri).await.unwrap();
+        assert_eq!(
+            db.get_notifications(10, None, false).await.unwrap().len(),
+            1
+        );
+
+        let undo_activity = json!({
+            "type": "Undo",
+            "actor": actor_uri,
+            "object": {
+                "type": "Like",
+                "id": "https://remote.example/likes/1",
+                "object": status_uri
+            }
+        });
+        processor.process(undo_activity, actor_uri).await.unwrap();
+
+        assert!(
+            db.get_notifications(10, None, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_create_detects_mention_from_single_to_string_with_trailing_slash() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/single-to";
+
+        let activity = json!({
+            "id": "https://remote.example/activities/create-single-to",
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "id": status_uri,
+                "content": "<p>Hello</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": "https://example.com/users/alice/"
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].notification_type,
+            NotificationType::Mention
+        );
+        assert_eq!(notifications[0].status_uri.as_deref(), Some(status_uri));
     }
 }

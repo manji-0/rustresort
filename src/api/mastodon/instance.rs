@@ -11,6 +11,31 @@ const DEFAULT_INSTANCE_RULES: [&str; 3] = [
     "Content warnings are required for sensitive material.",
 ];
 
+const MASTODON_COMPAT_VERSION: &str = "4.2.0";
+
+fn instance_version_string() -> String {
+    format!(
+        "{MASTODON_COMPAT_VERSION} (compatible; RustResort/{})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn streaming_base_url(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return None,
+    }
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn streaming_endpoint_url(state: &InstanceApiState) -> String {
+    let base_url = state.config.server.base_url();
+    let streaming_base = streaming_base_url(&base_url)
+        .unwrap_or_else(|| format!("https://{}", state.config.server.domain));
+    format!("{streaming_base}/api/v1/streaming")
+}
+
 fn domain_from_account_address(address: &str) -> Option<String> {
     let trimmed = address.trim();
     if let Ok(parsed) = url::Url::parse(trimmed)
@@ -215,7 +240,7 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
         short_description: state.config.instance.description.clone(),
         description: state.config.instance.description.clone(),
         email: state.config.instance.contact_email.clone(),
-        version: format!("RustResort {}", env!("CARGO_PKG_VERSION")),
+        version: instance_version_string(),
         languages: vec!["en".to_string()],
         registrations: false, // Single-user instance
         approval_required: false,
@@ -248,7 +273,7 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
             },
         },
         urls: InstanceUrls {
-            streaming_api: format!("wss://{}", state.config.server.domain),
+            streaming_api: streaming_endpoint_url(&state),
         },
         stats: InstanceStats {
             user_count,
@@ -363,8 +388,8 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
     Json(serde_json::json!({
         "domain": state.config.server.domain,
         "title": state.config.instance.title,
-        "version": format!("RustResort {}", env!("CARGO_PKG_VERSION")),
-        "source_url": "https://github.com/yourusername/rustresort",
+        "version": instance_version_string(),
+        "source_url": env!("CARGO_PKG_REPOSITORY"),
         "description": state.config.instance.description,
         "usage": {
             "users": {
@@ -379,7 +404,7 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "languages": ["en"],
         "configuration": {
             "urls": {
-                "streaming": format!("wss://{}", state.config.server.domain)
+                "streaming": streaming_endpoint_url(&state)
             },
             "accounts": {
                 "max_featured_tags": 10

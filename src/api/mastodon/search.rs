@@ -220,7 +220,8 @@ pub async fn search_v2(
                             .get(status.account_address.trim())
                             .copied();
                         let status_response =
-                            crate::api::status_to_response_with_account_stats_and_remote_stats(
+                            crate::api::build_status_response_with_account_stats_and_remote_stats(
+                                state.db.as_ref(),
                                 &status,
                                 &account,
                                 &state.config,
@@ -233,7 +234,24 @@ pub async fn search_v2(
                                     Some(false),
                                     Some(false),
                                 ),
-                            );
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                crate::api::status_to_response_with_account_stats_and_remote_stats(
+                                    &status,
+                                    &account,
+                                    &state.config,
+                                    account_stats,
+                                    remote_stats,
+                                    crate::api::StatusInteractions::new(
+                                        Some(false),
+                                        Some(false),
+                                        Some(false),
+                                        Some(false),
+                                        Some(false),
+                                    ),
+                                )
+                            });
                         statuses.push(serde_json::to_value(status_response).unwrap_or_default());
                     }
                 }

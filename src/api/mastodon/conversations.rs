@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::accounts::resolve_account_response_for_identity;
 use crate::{ConversationsApiState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +24,94 @@ pub struct ConversationsParams {
     _min_id: Option<String>,
 }
 
+async fn build_conversation_response(
+    state: &ConversationsApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    conversation_id: String,
+    last_status_id: Option<String>,
+    unread: bool,
+) -> Result<serde_json::Value, AppError> {
+    let local_address = format!("{}@{}", account.username, state.config.server.domain);
+    let participant_addresses = state
+        .db
+        .get_conversation_participants(&conversation_id)
+        .await?;
+
+    let mut accounts = Vec::new();
+    for address in participant_addresses
+        .iter()
+        .filter(|address| !address.eq_ignore_ascii_case(local_address.as_str()))
+    {
+        if let Some(account_response) = resolve_account_response_for_identity(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            None,
+            address,
+        )
+        .await
+        {
+            accounts.push(serde_json::to_value(account_response).unwrap());
+        }
+    }
+
+    if accounts.is_empty() {
+        accounts.push(
+            serde_json::to_value(crate::api::account_to_response_with_stats(
+                account,
+                &state.config,
+                account_stats,
+            ))
+            .unwrap(),
+        );
+    }
+
+    let last_status = if let Some(status_id) = last_status_id {
+        if let Some(status) = state.db.get_status(&status_id).await? {
+            let remote_stats = if status.is_local {
+                None
+            } else {
+                crate::api::load_remote_account_stats_map(
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    &state.config.server.protocol,
+                    std::slice::from_ref(&status),
+                )
+                .await
+                .ok()
+                .and_then(|stats| stats.get(status.account_address.trim()).copied())
+            };
+            Some(
+                serde_json::to_value(
+                    crate::api::build_status_response_with_account_stats_and_remote_stats(
+                        state.db.as_ref(),
+                        &status,
+                        account,
+                        &state.config,
+                        account_stats,
+                        remote_stats,
+                        crate::api::StatusInteractions::default(),
+                    )
+                    .await?,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "id": conversation_id,
+        "unread": unread,
+        "accounts": accounts,
+        "last_status": last_status,
+    }))
+}
+
 /// GET /api/v1/conversations - Get conversations
 ///
 /// View all conversations (direct message threads).
@@ -32,59 +121,24 @@ pub async fn get_conversations(
     Query(params): Query<ConversationsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let limit = params.limit.unwrap_or(20).min(40);
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let conversations = state.db.get_conversations(limit).await?;
 
     let mut response = Vec::new();
     for (conversation_id, last_status_id, unread) in conversations {
-        // Get participants
-        let participant_addresses = state
-            .db
-            .get_conversation_participants(&conversation_id)
-            .await?;
-
-        // Create minimal account info for participants
-        let accounts: Vec<serde_json::Value> = participant_addresses
-            .iter()
-            .map(|address| {
-                serde_json::json!({
-                    "id": address.clone(),
-                    "username": address.split('@').next().unwrap_or(address),
-                    "acct": address,
-                    "display_name": "",
-                    "note": "",
-                    "url": format!("https://{}", address.split('@').nth(1).unwrap_or("")),
-                    "avatar": "",
-                    "header": "",
-                    "followers_count": 0,
-                    "following_count": 0,
-                    "statuses_count": 0,
-                    "created_at": chrono::Utc::now().to_rfc3339(),
-                })
-            })
-            .collect();
-
-        // Get last status if available
-        let last_status = if let Some(status_id) = last_status_id {
-            state.db.get_status(&status_id).await?.map(|status| {
-                // Create minimal status response
-                serde_json::json!({
-                    "id": status.id,
-                    "content": status.content,
-                    "created_at": status.created_at,
-                    "visibility": status.visibility,
-                })
-            })
-        } else {
-            None
-        };
-
-        response.push(serde_json::json!({
-            "id": conversation_id,
-            "unread": unread,
-            "accounts": accounts,
-            "last_status": last_status,
-        }));
+        response.push(
+            build_conversation_response(
+                &state,
+                &account,
+                account_stats,
+                conversation_id,
+                last_status_id,
+                unread,
+            )
+            .await?,
+        );
     }
 
     Ok(Json(serde_json::json!(response)))
@@ -121,10 +175,22 @@ pub async fn mark_conversation_read(
         return Err(AppError::NotFound);
     }
 
-    // Return the updated conversation
-    // For simplicity, just return success
-    Ok(Json(serde_json::json!({
-        "id": id,
-        "unread": false,
-    })))
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let (conversation_id, last_status_id, unread) = state
+        .db
+        .get_conversation(&id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let updated_conversation = build_conversation_response(
+        &state,
+        &account,
+        account_stats,
+        conversation_id,
+        last_status_id,
+        unread,
+    )
+    .await?;
+
+    Ok(Json(updated_conversation))
 }

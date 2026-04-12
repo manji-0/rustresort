@@ -48,10 +48,10 @@ r2_access_key_id = "your-access-key-id"
 r2_secret_access_key = "your-secret-access-key"
 
 [auth]
-github_client_id = "your-github-client-id"
-github_client_secret = "your-github-client-secret"
-github_allowed_username = "your-github-username"
-session_secret = "change-this-to-a-random-secret-key"
+username = "admin"
+password = "change-this-on-first-start"
+session_secret = "change-this-to-a-random-secret-key-with-at-least-32-bytes"
+session_max_age = 604800
 
 [instance]
 title = "RustResort"
@@ -59,13 +59,16 @@ description = "A lightweight, single-user ActivityPub server"
 contact_email = "admin@example.com"
 
 [admin]
-username = "admin"
 display_name = "Admin"
 # email defaults to instance.contact_email
 # note = "Instance administrator"
 
 [cache]
 timeline_max_items = 2000
+
+[ui]
+enabled = false
+# dev_dir = "crates/rustresort-ui/dist"
 
 [logging]
 level = "info"

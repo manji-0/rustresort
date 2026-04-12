@@ -28,10 +28,13 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.direnv/
 
 # Temporary files
 /tmp/
 *.tmp
+node_modules/
+output/playwright/
 
 # Backups
 *.bak

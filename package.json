@@ -1,0 +1,11 @@
+{
+  "name": "rustresort-ui-tests",
+  "private": true,
+  "scripts": {
+    "install:browsers": "playwright install chromium",
+    "test:settings-ui": "node tests/playwright/settings-ui.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.55.0"
+  }
+}

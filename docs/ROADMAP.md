@@ -82,11 +82,10 @@ Stable Release
 - [ ] マイグレーションスクリプト
 
 ### 1.3 認証システム
-- [ ] OAuth2アプリ登録 (`POST /api/v1/apps`)
-- [ ] 認可フロー (`GET /oauth/authorize`)
-- [ ] トークン発行 (`POST /oauth/token`)
-- [ ] トークン検証ミドルウェア
-- [ ] パスワードハッシュ（Argon2）
+- [x] ローカルログイン (`POST /auth/login`)
+- [x] ローカルセッション検証ミドルウェア
+- [x] パスワードハッシュ（Argon2）
+- [x] パスキー登録・認証
 
 ### 1.4 アカウントAPI
 - [ ] アカウント取得 (`GET /api/v1/accounts/:id`)

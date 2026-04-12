@@ -5,10 +5,15 @@ edition = "2024"
 authors = ["RustResort Contributors"]
 description = "A lightweight, single-user ActivityPub server"
 license = "AGPL-3.0"
-repository = "https://github.com/yourusername/rustresort"
+repository = "https://github.com/manji-0/rustresort"
 
 [workspace]
-members = [".", "crates/rustresort-models", "crates/rustresort-storage"]
+members = [
+    ".",
+    "crates/rustresort-models",
+    "crates/rustresort-storage",
+    "crates/rustresort-ui",
+]
 default-members = [".", "crates/rustresort-models", "crates/rustresort-storage"]
 
 [features]
@@ -30,6 +35,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip",
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7"
 
 # Database (SQLite only)
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "migrate", "macros"] }
@@ -52,6 +58,9 @@ hmac = "0.12"
 subtle = "2"
 aes-gcm = "0.10"
 rand = "0.8"
+argon2 = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+webauthn-rs = "0.5.4"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
@@ -71,6 +80,7 @@ time = "0.3"
 html-escape = "0.2"
 ammonia = "4"
 image = { version = "0.25", default-features = false, features = ["webp"] }
+web-push = "0.10"
 rustresort-models = { path = "crates/rustresort-models" }
 rustresort-storage = { path = "crates/rustresort-storage" }
 

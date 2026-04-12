@@ -43,10 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustresort::metrics::init_metrics();
 
     // 3. Load configuration
-    let config = config::AppConfig::load()?;
+    let mut config = config::AppConfig::load()?;
+    apply_startup_flags(&mut config)?;
     tracing::info!(
         domain = %config.server.domain,
         protocol = %config.server.protocol,
+        ui_enabled = config.ui.enabled,
         "Configuration loaded"
     );
 
@@ -64,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Public URL: {}", config.server.base_url());
 
     // 7. Start background tasks
+    rustresort::federation::spawn_delivery_worker(state.clone());
+    rustresort::service::spawn_scheduled_status_runner(state.clone());
     if config.storage.backup.enabled {
         spawn_backup_task(state.clone());
     }
@@ -79,6 +83,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     Ok(())
+}
+
+fn apply_startup_flags(config: &mut config::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    for argument in std::env::args().skip(1) {
+        match argument.as_str() {
+            "--enable-ui" => config.ui.enabled = true,
+            "--disable-ui" => config.ui.enabled = false,
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => {
+                return Err(format!("unknown startup flag: {other}").into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_help() {
+    println!("rustresort");
+    println!();
+    println!("Startup flags:");
+    println!("  --enable-ui   Enable the integrated Rust/WASM UI at /ui");
+    println!("  --disable-ui  Disable the integrated Rust/WASM UI at /ui");
 }
 
 /// Spawn background backup task

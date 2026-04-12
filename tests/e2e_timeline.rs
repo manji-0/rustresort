@@ -78,6 +78,221 @@ async fn test_local_timeline() {
 }
 
 #[tokio::test]
+async fn test_home_timeline_includes_cached_remote_followee_status() {
+    use chrono::Utc;
+    use rustresort::data::{CachedStatus, EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let actor_uri = "https://remote.example/users/alice";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: actor_uri.to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/alice".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/cached-home";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Cached followee post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/home"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(
+        entries.iter().any(|item| item["uri"] == status_uri),
+        "home timeline should include cached remote followee status"
+    );
+}
+
+#[tokio::test]
+async fn test_public_timeline_includes_cached_remote_public_status() {
+    use chrono::Utc;
+    use rustresort::data::CachedStatus;
+
+    let server = TestServer::new().await;
+    let status_uri = "https://remote.example/users/alice/statuses/cached-public";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(
+        entries.iter().any(|item| item["uri"] == status_uri),
+        "public timeline should include cached remote public status"
+    );
+}
+
+#[tokio::test]
+async fn test_public_timeline_preserves_cached_quote_relationship() {
+    use chrono::Utc;
+    use rustresort::data::{CachedStatus, EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let quoted_target = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/users/testuser/statuses/quoted-target".to_string(),
+        content: "<p>Quoted target</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&quoted_target).await.unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/cached-quote";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Cached public quote</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: Some(quoted_target.uri.clone()),
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    let cached_quote = entries
+        .iter()
+        .find(|item| item["uri"] == status_uri)
+        .expect("public timeline should include cached quoted status");
+    assert_eq!(cached_quote["quote"]["uri"], quoted_target.uri);
+}
+
+#[tokio::test]
+async fn test_local_public_timeline_excludes_cached_remote_public_status() {
+    use chrono::Utc;
+    use rustresort::data::{CachedStatus, EntityId, Status};
+
+    let server = TestServer::new().await;
+    let remote_status_uri = "https://remote.example/users/alice/statuses/local-only-excluded";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: remote_status_uri.to_string(),
+            uri: remote_status_uri.to_string(),
+            content: "<p>Remote cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let local_status = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/statuses/local-public".to_string(),
+        content: "<p>Local public post</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&local_status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public?local=true"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(entries.iter().any(|item| item["uri"] == local_status.uri));
+    assert!(!entries.iter().any(|item| item["uri"] == remote_status_uri));
+}
+
+#[tokio::test]
 async fn test_timeline_pagination() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -98,6 +313,7 @@ async fn test_timeline_pagination() {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: Utc::now(),
             fetched_at: None,
@@ -142,6 +358,7 @@ async fn test_hashtag_timeline() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -157,6 +374,7 @@ async fn test_hashtag_timeline() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -172,6 +390,7 @@ async fn test_hashtag_timeline() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -248,6 +467,7 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -263,6 +483,7 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
@@ -278,6 +499,7 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
         is_local: false,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Favourited,
         created_at: Utc::now(),
         fetched_at: None,
@@ -347,6 +569,7 @@ async fn test_list_timeline_matches_local_account_added_by_id() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -406,6 +629,7 @@ async fn test_list_timeline_respects_none_replies_policy() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -421,6 +645,7 @@ async fn test_list_timeline_respects_none_replies_policy() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -482,6 +707,7 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -497,6 +723,7 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -512,6 +739,7 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -606,6 +834,7 @@ async fn test_home_timeline_since_id_filters_older_statuses() {
                 is_local: true,
                 in_reply_to_uri: None,
                 boost_of_uri: None,
+                quote_of_uri: None,
                 persisted_reason: PersistedReason::Own,
                 created_at: now - Duration::seconds(seconds_ago),
                 fetched_at: None,
@@ -655,6 +884,7 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -670,6 +900,7 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
         is_local: true,
         in_reply_to_uri: Some(root.uri.clone()),
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -685,6 +916,7 @@ async fn test_muted_thread_is_hidden_from_public_timeline() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -745,6 +977,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time,
         fetched_at: None,
@@ -760,6 +993,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time + Duration::seconds(1),
         fetched_at: None,
@@ -775,6 +1009,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: base_time + Duration::seconds(2),
         fetched_at: None,
@@ -796,6 +1031,7 @@ async fn test_public_timeline_backfills_when_newest_statuses_are_muted() {
             is_local: true,
             in_reply_to_uri: Some(muted_root.uri.clone()),
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: base_time + Duration::seconds((index + 3) as i64),
             fetched_at: None,

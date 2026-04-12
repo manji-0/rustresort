@@ -26,6 +26,37 @@ impl Database {
         Ok(())
     }
 
+    /// Insert notification once for a specific ActivityPub activity URI.
+    ///
+    /// Re-delivery of the same remote activity should not create duplicate
+    /// notifications, so callers can provide the upstream activity URI and rely
+    /// on a unique partial index.
+    pub async fn insert_notification_if_new(
+        &self,
+        notification: &Notification,
+        activity_uri: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO notifications (
+                id, notification_type, origin_account_address, status_uri, read, created_at, activity_uri
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&notification.id)
+        .bind(notification.notification_type)
+        .bind(&notification.origin_account_address)
+        .bind(&notification.status_uri)
+        .bind(notification.read)
+        .bind(notification.created_at)
+        .bind(activity_uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(inserted.rows_affected() > 0)
+    }
+
     /// Get notifications (paginated)
     pub async fn get_notifications(
         &self,
@@ -127,5 +158,62 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+
+    /// Delete a single notification by ID.
+    pub async fn delete_notification(&self, id: &str) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM notifications WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete all notifications.
+    pub async fn clear_notifications(&self) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM notifications")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete notifications created for a specific upstream ActivityPub activity URI.
+    pub async fn delete_notifications_by_activity_uri(
+        &self,
+        activity_uri: &str,
+    ) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM notifications WHERE activity_uri = ?")
+            .bind(activity_uri)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete notifications by semantic identity when the upstream activity URI
+    /// is not available in compact Undo payloads.
+    pub async fn delete_notifications_by_identity(
+        &self,
+        notification_type: NotificationType,
+        origin_account_address: &str,
+        status_uri: Option<&str>,
+    ) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM notifications
+            WHERE notification_type = ?
+              AND origin_account_address = ?
+              AND (
+                    (status_uri IS NULL AND ? IS NULL)
+                 OR status_uri = ?
+              )
+            "#,
+        )
+        .bind(notification_type)
+        .bind(origin_account_address)
+        .bind(status_uri)
+        .bind(status_uri)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

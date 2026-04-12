@@ -4,16 +4,15 @@
 //! See: https://docs.joinmastodon.org/api/
 
 use axum::{
-    Extension, Router,
+    Router,
     extract::FromRef,
     middleware,
     routing::{MethodRouter, delete, get, post, put},
 };
 
-use crate::auth::{OAuthScopeAllRequirement, OAuthScopeRequirement};
 use crate::{
     AccountApiState, AdminApiState, AppsApiState, AuthState, ConversationsApiState,
-    FiltersApiState, InstanceApiState, ListsApiState, MediaApiState, PollsApiState,
+    FiltersApiState, InstanceApiState, ListsApiState, MediaApiState, PollsApiState, PushApiState,
     ScheduledStatusesApiState, SearchApiState, StatusApiState, StreamingApiState, TimelineApiState,
 };
 
@@ -22,7 +21,7 @@ pub mod admin;
 pub mod apps;
 pub mod bookmarks;
 pub mod conversations;
-mod federation_delivery;
+pub(crate) mod federation_delivery;
 pub mod filters;
 pub mod instance;
 pub mod lists;
@@ -30,6 +29,7 @@ pub mod markers;
 pub mod media;
 pub mod notifications;
 pub mod polls;
+pub mod push;
 pub mod scheduled_statuses;
 pub mod search;
 pub mod statuses;
@@ -68,6 +68,7 @@ where
     ListsApiState: FromRef<S>,
     MediaApiState: FromRef<S>,
     PollsApiState: FromRef<S>,
+    PushApiState: FromRef<S>,
     ScheduledStatusesApiState: FromRef<S>,
     SearchApiState: FromRef<S>,
     StatusApiState: FromRef<S>,
@@ -75,22 +76,44 @@ where
     TimelineApiState: FromRef<S>,
 {
     let scoped = |router: MethodRouter<S>, scopes: &'static [&'static str]| {
-        router
-            .route_layer(middleware::from_fn_with_state(
-                auth_state.clone(),
-                crate::auth::require_auth,
-            ))
-            // Route-level scope metadata must be attached before require_auth executes.
-            .layer(Extension(OAuthScopeRequirement(scopes)))
+        let auth_state = auth_state.clone();
+        router.route_layer(middleware::from_fn(
+            move |jar: axum_extra::extract::CookieJar,
+                  request: axum::http::Request<axum::body::Body>,
+                  next: axum::middleware::Next| {
+                let auth_state = auth_state.clone();
+                async move {
+                    crate::auth::require_auth_scopes_with_policy(
+                        auth_state,
+                        crate::auth::ScopePolicy::Any(scopes),
+                        jar,
+                        request,
+                        next,
+                    )
+                    .await
+                }
+            },
+        ))
     };
     let scoped_all = |router: MethodRouter<S>, scopes: &'static [&'static str]| {
-        router
-            .route_layer(middleware::from_fn_with_state(
-                auth_state.clone(),
-                crate::auth::require_auth,
-            ))
-            // Route-level scope metadata must be attached before require_auth executes.
-            .layer(Extension(OAuthScopeAllRequirement(scopes)))
+        let auth_state = auth_state.clone();
+        router.route_layer(middleware::from_fn(
+            move |jar: axum_extra::extract::CookieJar,
+                  request: axum::http::Request<axum::body::Body>,
+                  next: axum::middleware::Next| {
+                let auth_state = auth_state.clone();
+                async move {
+                    crate::auth::require_auth_scopes_with_policy(
+                        auth_state,
+                        crate::auth::ScopePolicy::All(scopes),
+                        jar,
+                        request,
+                        next,
+                    )
+                    .await
+                }
+            },
+        ))
     };
 
     // Public endpoints (no authentication required)
@@ -101,14 +124,12 @@ where
         .route("/v1/instance/activity", get(instance::instance_activity))
         .route("/v1/instance/rules", get(instance::instance_rules))
         .route("/v2/instance", get(instance::instance_v2))
-        // App registration is public
         .route("/v1/apps", post(apps::create_app))
-        // Account creation is public
-        .route("/v1/accounts", post(accounts::create_account))
         // Public timelines
         .route("/v1/timelines/public", get(timelines::public_timeline))
         // Public account and status views
         .route("/v1/accounts/:id", get(accounts::get_account))
+        .route("/v1/accounts/:id/statuses", get(accounts::account_statuses))
         .route("/v1/statuses/:id", get(statuses::get_status))
         .route(
             "/v1/statuses/:id/context",
@@ -125,12 +146,11 @@ where
 
     // Authenticated endpoints (require valid token)
     let authenticated_routes = Router::new()
-        // Apps - verify credentials requires auth
+        // Accounts - authenticated operations
         .route(
             "/v1/apps/verify_credentials",
             scoped(get(apps::verify_app_credentials), READ_ACCOUNTS),
         )
-        // Accounts - authenticated operations
         .route(
             "/v1/accounts/verify_credentials",
             scoped(get(accounts::verify_credentials), READ_ACCOUNTS),
@@ -141,10 +161,6 @@ where
                 axum::routing::patch(accounts::update_credentials),
                 WRITE_ACCOUNTS,
             ),
-        )
-        .route(
-            "/v1/accounts/:id/statuses",
-            scoped(get(accounts::account_statuses), READ_STATUSES),
         )
         .route(
             "/v1/accounts/:id/followers",
@@ -317,6 +333,16 @@ where
         .route(
             "/v1/notifications/unread_count",
             scoped(get(notifications::get_unread_count), READ_NOTIFICATIONS),
+        )
+        .route(
+            "/v1/push/subscription",
+            scoped_all(
+                get(push::get_subscription)
+                    .post(push::create_subscription)
+                    .put(push::update_subscription)
+                    .delete(push::delete_subscription),
+                READ_NOTIFICATIONS,
+            ),
         )
         .route(
             "/v1/markers",

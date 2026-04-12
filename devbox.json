@@ -1,0 +1,61 @@
+{
+  "packages": [
+    "rustup@latest",
+    "nodejs@22",
+    "sqlite@latest",
+    "pkg-config@latest",
+    "openssl@latest",
+    "gcc@latest",
+    "python3@latest",
+    "curl@latest",
+    "git@latest",
+    "jq@latest",
+    "jj@latest",
+    "watchexec@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "export PATH=\"$HOME/.cargo/bin:$PWD/node_modules/.bin:$PATH\"",
+      "echo 'RustResort devbox shell ready. Run `devbox run bootstrap` on first use.'"
+    ],
+    "scripts": {
+      "bootstrap": [
+        "rustup toolchain install stable --profile minimal --component rustfmt --component clippy",
+        "rustup default stable",
+        "rustup target add wasm32-unknown-unknown",
+        "command -v wasm-bindgen >/dev/null || cargo install wasm-bindgen-cli --version 0.2.118 --locked",
+        "cargo --version",
+        "node --version",
+        "npm install",
+        "npm run install:browsers"
+      ],
+      "dev": [
+        "scripts/run-dev-ui.sh"
+      ],
+      "dev:watch": [
+        "scripts/run-dev-watch.sh"
+      ],
+      "dev:legacy": [
+        "scripts/run-dev-legacy.sh"
+      ],
+      "dev:ui:build": [
+        "scripts/build-wasm-ui.sh"
+      ],
+      "dev:server:build": [
+        "scripts/build-dev-server.sh"
+      ],
+      "test": [
+        "cargo test"
+      ],
+      "test:ui": [
+        "scripts/run-settings-ui-e2e.sh"
+      ],
+      "fmt": [
+        "cargo fmt --all"
+      ],
+      "clippy": [
+        "cargo clippy --all-targets --all-features -- -D warnings"
+      ]
+    }
+  }
+}

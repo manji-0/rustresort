@@ -13,7 +13,7 @@ RustResort provides two types of APIs:
 https://example.com/
 ├── api/v1/          # Mastodon-compatible API
 ├── api/v2/          # Mastodon v2 API
-├── oauth/           # OAuth authentication
+├── auth/            # Built-in local auth + passkeys
 ├── users/{username} # ActivityPub actor
 ├── statuses/{id}    # ActivityPub object
 ├── .well-known/     # Well-known endpoints
@@ -22,14 +22,21 @@ https://example.com/
 
 ## Authentication
 
-### OAuth 2.0 Flow
+### Built-in Local Auth Flow
 
 ```
-1. Register app:    POST /api/v1/apps
-2. Authorization:   GET /oauth/authorize
-3. Get token:       POST /oauth/token
-4. API access:      Authorization: Bearer <token>
+1. Bootstrap login: POST /auth/login
+2. Register passkey: POST /auth/passkeys/register/*
+3. Inspect session:  GET /auth/session
+4. API access:       Authorization: Bearer <signed-session-token>
+5. Routine login:    POST /auth/passkeys/auth/*
 ```
+
+Operational guidance:
+
+- the configured password is intended for first startup and recovery
+- after passkeys are registered, routine access should use passkeys
+- OAuth authorization flows are intentionally not part of the supported auth model
 
 ### Scopes
 
@@ -44,7 +51,7 @@ https://example.com/
 | `write:media` | Upload media |
 | `write:favourites` | Favourite operations |
 | `follow` | Manage follow relationships |
-| `push` | Manage Web Push |
+| `push` | Manage Web Push subscriptions |
 
 ## Mastodon-Compatible API
 

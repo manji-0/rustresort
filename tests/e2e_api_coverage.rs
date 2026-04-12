@@ -134,7 +134,7 @@ async fn test_instance_rules() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_create_app() {
+async fn test_create_app_endpoint_works() {
     let server = TestServer::new().await;
     let app_data = json!({
         "client_name": "Test App",
@@ -151,13 +151,18 @@ async fn test_create_app() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["name"], "Test App");
+    assert_eq!(body["redirect_uris"], "urn:ietf:wg:oauth:2.0:oob");
 }
 
 #[tokio::test]
-async fn test_verify_app_credentials() {
+async fn test_verify_app_credentials_endpoint_works() {
     let server = TestServer::new().await;
     server.create_test_account().await;
-    let token = server.create_test_token().await;
+    let token = server
+        .create_oauth_authorization_code_token("read:accounts")
+        .await;
 
     let response = server
         .client
@@ -168,11 +173,8 @@ async fn test_verify_app_credentials() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert!(
-        body.get("client_id").is_none(),
-        "session fallback must not leak unrelated app credentials"
-    );
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["name"], "RustResort E2E Client");
 }
 
 // ============================================================================
@@ -180,7 +182,7 @@ async fn test_verify_app_credentials() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_create_account() {
+async fn test_create_account_endpoint_is_disabled() {
     let server = TestServer::new().await;
     let account_data = json!({
         "username": "newuser",
@@ -197,7 +199,7 @@ async fn test_create_account() {
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 422);
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]
@@ -256,6 +258,25 @@ async fn test_get_account() {
 }
 
 #[tokio::test]
+async fn test_get_account_supports_remote_account_ids() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@remote.example"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["id"], "alice@remote.example");
+    assert_eq!(body["acct"], "alice@remote.example");
+}
+
+#[tokio::test]
 async fn test_account_statuses() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;
@@ -270,6 +291,48 @@ async fn test_account_statuses() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_account_statuses_support_remote_account_ids() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/1".to_string(),
+        content: "<p>Remote status</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@remote.example/statuses"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let statuses = body.as_array().expect("account statuses should be array");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["id"], status.id);
+    assert_eq!(statuses[0]["account"]["acct"], "alice@remote.example");
 }
 
 #[tokio::test]
@@ -1807,6 +1870,96 @@ async fn test_get_status() {
 }
 
 #[tokio::test]
+async fn test_get_status_returns_current_metadata() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let root = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Original @alice #rust",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .expect("create root status");
+    assert_eq!(root.status(), 200);
+    let root_body: serde_json::Value = root.json().await.expect("root json");
+    let root_id = root_body["id"].as_str().expect("root id").to_string();
+
+    let reply = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Replying to root",
+            "visibility": "public",
+            "in_reply_to_id": root_id
+        }))
+        .send()
+        .await
+        .expect("create reply");
+    assert_eq!(reply.status(), 200);
+
+    let favourite = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{}/favourite", root_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("favourite root");
+    assert_eq!(favourite.status(), 200);
+
+    let reblog = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{}/reblog", root_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("reblog root");
+    assert_eq!(reblog.status(), 200);
+
+    let update = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{}", root_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Updated @alice #rust"
+        }))
+        .send()
+        .await
+        .expect("update root");
+    assert_eq!(update.status(), 200);
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", root_id)))
+        .send()
+        .await
+        .expect("get status");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.expect("status json");
+
+    assert_eq!(body["replies_count"], 1);
+    assert_eq!(body["reblogs_count"], 1);
+    assert_eq!(body["favourites_count"], 1);
+    assert_eq!(body["quotes_count"], 0);
+    assert_eq!(body["text"], "Updated @alice #rust");
+    assert!(body["edited_at"].as_str().is_some());
+    assert_eq!(body["application"], serde_json::Value::Null);
+    assert_eq!(body["filtered"], json!([]));
+
+    let tags = body["tags"].as_array().expect("tags array");
+    assert!(tags.iter().any(|tag| tag["name"] == "rust"));
+
+    let mentions = body["mentions"].as_array().expect("mentions array");
+    assert!(mentions.iter().any(|mention| mention["acct"] == "alice"));
+}
+
+#[tokio::test]
 async fn test_delete_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2226,6 +2379,122 @@ async fn test_get_notifications() {
 }
 
 #[tokio::test]
+async fn test_notifications_return_origin_account() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: EntityId::new_string(),
+            notification_type: NotificationType::Mention,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let notifications = body.as_array().expect("notifications should be array");
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["account"]["id"], "alice@remote.example");
+    assert_eq!(notifications[0]["account"]["acct"], "alice@remote.example");
+}
+
+#[tokio::test]
+async fn test_notifications_embed_status_with_current_interactions() {
+    use chrono::Utc;
+    use rustresort::data::{
+        EntityId, Notification, NotificationType, PersistedReason, Status, StatusVisibility,
+    };
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/notif-status-1"),
+        content: "<p>status embedded in notification</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server.state.db.insert_bookmark(&status.id).await.unwrap();
+    server.state.db.insert_status_pin(&status.id).await.unwrap();
+
+    let notification = Notification {
+        id: EntityId::new_string(),
+        notification_type: NotificationType::Favourite,
+        origin_account_address: "alice@remote.example".to_string(),
+        status_uri: Some(status.uri.clone()),
+        read: false,
+        created_at: Utc::now(),
+    };
+    server
+        .state
+        .db
+        .insert_notification(&notification)
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let notifications = body.as_array().expect("notifications should be array");
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["status"]["id"], status.id);
+    assert_eq!(notifications[0]["status"]["bookmarked"], true);
+    assert_eq!(notifications[0]["status"]["pinned"], true);
+
+    let single_response = server
+        .client
+        .get(server.url(&format!("/api/v1/notifications/{}", notification.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(single_response.status(), 200);
+    let single: serde_json::Value = single_response.json().await.unwrap();
+    assert_eq!(single["status"]["bookmarked"], true);
+    assert_eq!(single["status"]["pinned"], true);
+}
+
+#[tokio::test]
 async fn test_get_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2244,26 +2513,90 @@ async fn test_get_notification() {
 
 #[tokio::test]
 async fn test_dismiss_notification() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    let notification = Notification {
+        id: EntityId::new_string(),
+        notification_type: NotificationType::Mention,
+        origin_account_address: "alice@remote.example".to_string(),
+        status_uri: None,
+        read: false,
+        created_at: Utc::now(),
+    };
+    server
+        .state
+        .db
+        .insert_notification(&notification)
+        .await
+        .unwrap();
 
     let response = server
         .client
-        .post(server.url("/api/v1/notifications/test_id/dismiss"))
+        .post(server.url(&format!(
+            "/api/v1/notifications/{}/dismiss",
+            notification.id
+        )))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+
+    let list_response = server
+        .client
+        .get(server.url("/api/v1/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), 200);
+    let notifications: serde_json::Value = list_response.json().await.unwrap();
+    assert!(
+        notifications
+            .as_array()
+            .expect("notifications should be array")
+            .iter()
+            .all(|item| item["id"] != notification.id)
+    );
+
+    let single_response = server
+        .client
+        .get(server.url(&format!("/api/v1/notifications/{}", notification.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(single_response.status(), 404);
 }
 
 #[tokio::test]
 async fn test_clear_notifications() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    for notification_type in [NotificationType::Mention, NotificationType::Favourite] {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: EntityId::new_string(),
+                notification_type,
+                origin_account_address: "alice@remote.example".to_string(),
+                status_uri: None,
+                read: false,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
 
     let response = server
         .client
@@ -2274,6 +2607,75 @@ async fn test_clear_notifications() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+
+    let list_response = server
+        .client
+        .get(server.url("/api/v1/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list_response.status(), 200);
+    let notifications: serde_json::Value = list_response.json().await.unwrap();
+    assert!(
+        notifications
+            .as_array()
+            .expect("notifications should be array")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_get_notifications_applies_type_filter_before_pagination() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: EntityId::new_string(),
+            notification_type: NotificationType::Follow,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: EntityId::new_string(),
+            notification_type: NotificationType::Mention,
+            origin_account_address: "bob@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: now - Duration::seconds(1),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/notifications"))
+        .query(&[("limit", "1"), ("types[]", "mention")])
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let notifications = body.as_array().expect("notifications should be array");
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["type"], "mention");
 }
 
 #[tokio::test]
@@ -2977,6 +3379,7 @@ async fn test_search_v2_accounts_following_keeps_followed_accounts() {
         is_local: true,
         in_reply_to_uri: None,
         boost_of_uri: None,
+        quote_of_uri: None,
         persisted_reason: rustresort::data::PersistedReason::Own,
         created_at: Utc::now(),
         fetched_at: None,
@@ -3143,6 +3546,106 @@ async fn test_get_conversations() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_conversations_returns_full_accounts_and_last_status() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let conversation_id = server
+        .state
+        .db
+        .get_or_create_conversation(&[
+            "testuser@test.example.com".to_string(),
+            "alice@remote.example".to_string(),
+        ])
+        .await
+        .unwrap();
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/users/testuser/statuses/conversation-1".to_string(),
+        content: "<p>hello</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Direct,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server
+        .state
+        .db
+        .add_status_to_conversation(&conversation_id, &status.id)
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/conversations"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let conversations = body.as_array().expect("conversations should be array");
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(
+        conversations[0]["accounts"][0]["acct"],
+        "alice@remote.example"
+    );
+    assert_eq!(conversations[0]["last_status"]["id"], status.id);
+    assert!(conversations[0]["last_status"]["account"].is_object());
+}
+
+#[tokio::test]
+async fn test_mark_conversation_read_returns_target_even_when_older_than_first_page() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let mut target_id = None;
+    for index in 0..45 {
+        let conversation_id = server
+            .state
+            .db
+            .get_or_create_conversation(&[
+                format!("testuser{}@test.example.com", index),
+                format!("remote{}@remote.example", index),
+            ])
+            .await
+            .unwrap();
+        if index == 0 {
+            target_id = Some(conversation_id);
+        }
+    }
+    let target_id = target_id.expect("target conversation should be created");
+
+    let response = server
+        .client
+        .post(server.url(&format!("/api/v1/conversations/{}/read", target_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["id"], target_id);
+    assert_eq!(body["unread"], false);
 }
 
 #[tokio::test]

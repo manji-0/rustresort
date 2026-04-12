@@ -39,6 +39,8 @@ async fn test_verify_credentials_with_auth() {
         let json: Value = response.json().await.unwrap();
         assert!(json.get("id").is_some());
         assert!(json.get("username").is_some());
+        assert!(json.get("uri").is_some());
+        assert!(json.get("source").is_some());
     }
 }
 
@@ -86,6 +88,127 @@ async fn test_update_credentials() {
         let json: Value = response.json().await.unwrap();
         assert_eq!(json["display_name"], "Updated Name");
     }
+}
+
+#[tokio::test]
+async fn test_update_credentials_sets_moved_to_and_delivers_move() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use rustresort::data::{EntityId, Follower};
+    use std::sync::Arc;
+    use tokio::{
+        net::TcpListener,
+        sync::Mutex,
+        time::{Duration, sleep},
+    };
+
+    async fn record_move(
+        State(received): State<Arc<Mutex<Vec<Value>>>>,
+        body: String,
+    ) -> StatusCode {
+        if let Ok(activity) = serde_json::from_str::<Value>(&body) {
+            received.lock().await.push(activity);
+        }
+        StatusCode::ACCEPTED
+    }
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let remote_router = axum::Router::new()
+        .route("/users/remote/inbox", post(record_move))
+        .with_state(received.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "remote@followers.example".to_string(),
+            actor_uri: Some("https://followers.example/users/remote".to_string()),
+            inbox_uri: format!("http://{remote_addr}/users/remote/inbox"),
+            uri: "https://followers.example/follows/1".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let moved_to_uri = "https://new.example/users/testuser";
+    let response = server
+        .client
+        .patch(server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "display_name": "Updated Name",
+            "moved_to_account_id": moved_to_uri
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["moved"]["uri"], moved_to_uri);
+
+    let updated = server.state.db.get_account().await.unwrap().unwrap();
+    assert_eq!(updated.id, account.id);
+    assert_eq!(updated.display_name.as_deref(), Some("Updated Name"));
+    assert_eq!(updated.moved_to_uri.as_deref(), Some(moved_to_uri));
+
+    let mut delivered = None;
+    for _ in 0..200 {
+        {
+            let events = received.lock().await;
+            if let Some(first) = events.first() {
+                delivered = Some(first.clone());
+                break;
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let delivered = delivered.expect("expected Move delivery to follower inbox");
+    assert_eq!(delivered["type"], "Move");
+    assert_eq!(delivered["target"], moved_to_uri);
+    assert_eq!(delivered["object"], server.public_url("/users/testuser"));
+}
+
+#[tokio::test]
+async fn test_verify_credentials_includes_moved_account() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let moved_to_uri = "https://new.example/users/testuser";
+    server
+        .state
+        .db
+        .patch_account_migration(
+            &server.state.db.get_account().await.unwrap().unwrap().id,
+            None,
+            Some(Some(moved_to_uri)),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/verify_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["moved"]["uri"], moved_to_uri);
 }
 
 #[tokio::test]
@@ -237,6 +360,7 @@ async fn test_account_statuses_only_media_pages_until_limit() {
             is_local: true,
             in_reply_to_uri: None,
             boost_of_uri: None,
+            quote_of_uri: None,
             persisted_reason: rustresort::data::PersistedReason::Own,
             created_at: now - Duration::seconds(idx as i64),
             fetched_at: None,

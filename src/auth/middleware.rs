@@ -5,107 +5,140 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, State},
-    http::{Request, request::Parts},
+    http::{HeaderMap, Request, request::Parts},
     middleware::Next,
     response::Response,
 };
 use axum_extra::extract::CookieJar;
 use chrono::{Duration, Utc};
-use std::collections::HashSet;
+use rustresort_models::OAuthToken;
 use std::sync::Arc;
 
 use super::session::{Session, verify_session_token};
 use crate::AuthState;
 use crate::error::AppError;
 
-/// OAuth scope requirement attached to a route definition.
-#[derive(Debug, Clone, Copy)]
-pub struct OAuthScopeRequirement(pub &'static [&'static str]);
+#[derive(Debug, Clone)]
+pub struct OAuthAccess {
+    pub token_id: String,
+    pub app_id: String,
+    pub scopes: Vec<String>,
+    pub grant_type: String,
+}
 
-/// OAuth scope requirement that enforces all declared scopes.
 #[derive(Debug, Clone, Copy)]
-pub struct OAuthScopeAllRequirement(pub &'static [&'static str]);
-
-#[derive(Debug, Clone, Copy)]
-enum OAuthScopeMatch {
+pub enum ScopePolicy {
     Any(&'static [&'static str]),
     All(&'static [&'static str]),
 }
 
-impl OAuthScopeMatch {
-    fn scopes(self) -> &'static [&'static str] {
-        match self {
-            Self::Any(scopes) | Self::All(scopes) => scopes,
-        }
-    }
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(ToOwned::to_owned)
 }
 
-fn normalize_mastodon_path(path: &str) -> &str {
-    path.strip_prefix("/api").unwrap_or(path)
-}
-
-fn required_oauth_scopes(request: &Request<axum::body::Body>) -> Option<OAuthScopeMatch> {
-    if let Some(requirement) = request.extensions().get::<OAuthScopeAllRequirement>() {
-        return Some(OAuthScopeMatch::All(requirement.0));
-    }
-
-    request
-        .extensions()
-        .get::<OAuthScopeRequirement>()
-        .map(|requirement| OAuthScopeMatch::Any(requirement.0))
-}
-
-fn scope_grants(scope_set: &HashSet<String>, required: &str) -> bool {
-    if scope_set.contains(required) {
-        return true;
-    }
-
-    if required.starts_with("read:") && scope_set.contains("read") {
-        return true;
-    }
-    if required.starts_with("write:") && scope_set.contains("write") {
-        return true;
-    }
-
-    false
-}
-
-fn has_any_required_scope(scope_set: &HashSet<String>, required_scopes: &[&str]) -> bool {
-    required_scopes
-        .iter()
-        .any(|required| scope_grants(scope_set, required))
-}
-
-fn has_all_required_scopes(scope_set: &HashSet<String>, required_scopes: &[&str]) -> bool {
-    required_scopes
-        .iter()
-        .all(|required| scope_grants(scope_set, required))
-}
-
-fn parse_scope_set(scopes: &str) -> HashSet<String> {
-    scopes
-        .split_whitespace()
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn build_oauth_session(state: &AuthState) -> Session {
+fn session_from_oauth_token(
+    account: crate::data::Account,
+    token: &OAuthToken,
+    session_max_age: i64,
+) -> Session {
     let now = Utc::now();
+    let expires_at = token
+        .expires_at
+        .min(now + Duration::seconds(session_max_age.max(60)));
     Session {
-        github_username: state.config.auth.github_username.clone(),
-        github_id: 0,
-        avatar_url: String::new(),
-        name: Some(state.config.admin.display_name.clone()),
-        created_at: now,
-        expires_at: now + Duration::seconds(state.config.auth.session_max_age),
+        username: account.username,
+        display_name: account.display_name,
+        auth_method: "oauth".to_string(),
+        created_at: token.created_at,
+        expires_at,
+    }
+}
+
+async fn authenticate_bearer_token(
+    state: &AuthState,
+    token: &str,
+) -> Result<(Session, Option<OAuthAccess>), AppError> {
+    if let Ok(session) = verify_session_token(token, &state.config.auth.session_secret) {
+        return Ok((session, None));
+    }
+
+    let oauth_token = state
+        .db
+        .get_oauth_token(token)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let account = state
+        .db
+        .get_account()
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let scopes = oauth_token
+        .scopes
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let oauth_access = OAuthAccess {
+        token_id: oauth_token.id.clone(),
+        app_id: oauth_token.app_id.clone(),
+        scopes,
+        grant_type: oauth_token.grant_type.clone(),
+    };
+    let session = session_from_oauth_token(
+        account,
+        &oauth_token,
+        state.config.auth.session_max_age as i64,
+    );
+    Ok((session, Some(oauth_access)))
+}
+
+async fn authenticate_request(
+    state: &AuthState,
+    bearer_token: Option<String>,
+    cookie_token: Option<String>,
+) -> Result<(Session, Option<OAuthAccess>), AppError> {
+    if let Some(token) = bearer_token.as_deref() {
+        return authenticate_bearer_token(state, token).await;
+    }
+
+    if let Some(cookie_token) = cookie_token.as_deref() {
+        let session = verify_session_token(cookie_token, &state.config.auth.session_secret)?;
+        return Ok((session, None));
+    }
+
+    Err(AppError::Unauthorized)
+}
+
+fn scope_matches(granted: &str, required: &str) -> bool {
+    granted == required
+        || required
+            .split_once(':')
+            .map(|(prefix, _)| granted == prefix)
+            .unwrap_or(false)
+}
+
+fn oauth_scopes_satisfy(granted: &[String], required: &[&str], require_all: bool) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let matches_required = |required_scope: &&str| {
+        granted
+            .iter()
+            .any(|granted_scope| scope_matches(granted_scope, required_scope))
+    };
+    if require_all {
+        required.iter().all(matches_required)
+    } else {
+        required.iter().any(matches_required)
     }
 }
 
 /// Middleware to require session authentication only.
 ///
 /// Accepts signed session tokens from Authorization bearer or session cookie.
-/// OAuth bearer tokens are rejected by this middleware.
 pub async fn require_session_auth(
     State(config): State<Arc<crate::config::AppConfig>>,
     jar: CookieJar,
@@ -181,56 +214,51 @@ pub async fn require_auth(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Try to get token from Authorization header first.
-    let bearer_token = request
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    if let Some(token) = bearer_token {
-        if let Ok(session) = verify_session_token(token, &state.config.auth.session_secret) {
-            request.extensions_mut().insert(session);
-        } else if let Some(oauth_token) = state.db.get_oauth_token(token).await? {
-            if oauth_token.grant_type != "authorization_code" {
-                return Err(AppError::Unauthorized);
-            }
-
-            let scope_set = parse_scope_set(&oauth_token.scopes);
-            if let Some(scope_requirement) = required_oauth_scopes(&request) {
-                let required_scopes = scope_requirement.scopes();
-                // Empty required scope list means session-only endpoint.
-                if required_scopes.is_empty() {
-                    return Err(AppError::Forbidden);
-                }
-                let has_scope = match scope_requirement {
-                    OAuthScopeMatch::Any(scopes) => has_any_required_scope(&scope_set, scopes),
-                    OAuthScopeMatch::All(scopes) => has_all_required_scopes(&scope_set, scopes),
-                };
-                if !has_scope {
-                    return Err(AppError::Forbidden);
-                }
-            } else {
-                // Fail closed for OAuth-protected Mastodon API endpoints that
-                // forgot to declare route-level scope metadata.
-                let normalized_path = normalize_mastodon_path(request.uri().path());
-                if normalized_path.starts_with("/v1/") || normalized_path.starts_with("/v2/") {
-                    return Err(AppError::Forbidden);
-                }
-            }
-
-            request.extensions_mut().insert(build_oauth_session(&state));
-        } else {
-            return Err(AppError::Unauthorized);
-        }
-    } else if let Some(cookie_token) = jar.get("session").map(|cookie| cookie.value()) {
-        let session = verify_session_token(cookie_token, &state.config.auth.session_secret)?;
-        request.extensions_mut().insert(session);
-    } else {
-        return Err(AppError::Unauthorized);
+    let bearer_token = bearer_token(request.headers());
+    let cookie_token = jar.get("session").map(|cookie| cookie.value().to_string());
+    let (session, oauth_access) = authenticate_request(&state, bearer_token, cookie_token).await?;
+    request.extensions_mut().insert(session);
+    if let Some(oauth_access) = oauth_access {
+        request.extensions_mut().insert(oauth_access);
     }
 
-    // Continue to next handler
+    Ok(next.run(request).await)
+}
+
+/// Middleware to require authentication and enforce OAuth scopes when an OAuth
+/// bearer token is used. Local signed sessions retain full access.
+pub async fn require_auth_scopes(
+    State((state, policy)): State<(AuthState, ScopePolicy)>,
+    jar: CookieJar,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    require_auth_scopes_with_policy(state, policy, jar, request, next).await
+}
+
+pub async fn require_auth_scopes_with_policy(
+    state: AuthState,
+    policy: ScopePolicy,
+    jar: CookieJar,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let bearer_token = bearer_token(request.headers());
+    let cookie_token = jar.get("session").map(|cookie| cookie.value().to_string());
+    let (session, oauth_access) = authenticate_request(&state, bearer_token, cookie_token).await?;
+    request.extensions_mut().insert(session);
+
+    if let Some(oauth_access) = oauth_access {
+        let (required, require_all) = match policy {
+            ScopePolicy::Any(required) => (required, false),
+            ScopePolicy::All(required) => (required, true),
+        };
+        if !oauth_scopes_satisfy(&oauth_access.scopes, required, require_all) {
+            return Err(AppError::Forbidden);
+        }
+        request.extensions_mut().insert(oauth_access);
+    }
+
     Ok(next.run(request).await)
 }
 
@@ -243,7 +271,7 @@ pub async fn require_auth(
 /// async fn handler(
 ///     CurrentUser(session): CurrentUser,
 /// ) -> impl IntoResponse {
-///     format!("Hello, {}", session.github_username)
+///     format!("Hello, {}", session.username)
 /// }
 /// ```
 #[derive(Debug, Clone)]

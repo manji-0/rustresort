@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::data::Database;
 use crate::error::AppError;
 
 /// Cached public key entry
@@ -36,6 +37,8 @@ pub struct PublicKeyCache {
     cache: Arc<RwLock<HashMap<String, CachedKey>>>,
     /// HTTP client for fetching keys
     http_client: Arc<reqwest::Client>,
+    /// Optional persistent backing store.
+    db: Option<Arc<Database>>,
     /// Default TTL for cached keys
     default_ttl: Duration,
 }
@@ -46,10 +49,15 @@ impl PublicKeyCache {
     /// # Arguments
     /// * `http_client` - HTTP client for fetching keys
     /// * `default_ttl` - Default TTL for cached keys (default: 1 hour)
-    pub fn new(http_client: Arc<reqwest::Client>, default_ttl: Option<Duration>) -> Self {
+    pub fn new(
+        http_client: Arc<reqwest::Client>,
+        db: Option<Arc<Database>>,
+        default_ttl: Option<Duration>,
+    ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             http_client,
+            db,
             default_ttl: default_ttl.unwrap_or(Duration::from_secs(3600)), // 1 hour
         }
     }
@@ -76,11 +84,34 @@ impl PublicKeyCache {
             }
         }
 
-        // 2. Cache miss or expired - fetch from remote
+        // 2. Check persistent cache.
+        if let Some(db) = &self.db
+            && let Some(entry) = db.get_cached_public_key(key_id).await?
+        {
+            let pem = entry.pem;
+            let ttl = entry
+                .expires_at
+                .signed_duration_since(chrono::Utc::now())
+                .to_std()
+                .unwrap_or(self.default_ttl);
+            let mut cache = self.cache.write().await;
+            cache.insert(
+                key_id.to_string(),
+                CachedKey {
+                    pem: pem.clone(),
+                    cached_at: Instant::now(),
+                    ttl,
+                },
+            );
+            tracing::debug!("Public key persistent cache hit for {}", key_id);
+            return Ok(pem);
+        }
+
+        // 3. Cache miss or expired - fetch from remote
         tracing::debug!("Public key cache miss for {}, fetching...", key_id);
         let pem = super::signature::fetch_public_key(key_id, &self.http_client).await?;
 
-        // 3. Update cache (write lock)
+        // 4. Update cache (write lock)
         {
             let mut cache = self.cache.write().await;
             cache.insert(
@@ -91,6 +122,14 @@ impl PublicKeyCache {
                     ttl: self.default_ttl,
                 },
             );
+        }
+
+        if let Some(db) = &self.db {
+            let expires_at = chrono::Utc::now()
+                + chrono::Duration::from_std(self.default_ttl)
+                    .unwrap_or_else(|_| chrono::Duration::hours(1));
+            db.upsert_cached_public_key(key_id, &pem, expires_at)
+                .await?;
         }
 
         Ok(pem)
@@ -139,6 +178,16 @@ impl PublicKeyCache {
         if removed > 0 {
             tracing::info!("Pruned {} expired public key cache entries", removed);
         }
+
+        if let Some(db) = &self.db
+            && let Ok(pruned) = db.prune_expired_public_keys().await
+            && pruned > 0
+        {
+            tracing::info!(
+                "Pruned {} expired persistent public key cache entries",
+                pruned
+            );
+        }
     }
 }
 
@@ -160,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_expiry() {
         let client = Arc::new(reqwest::Client::new());
-        let cache = PublicKeyCache::new(client, Some(Duration::from_millis(100)));
+        let cache = PublicKeyCache::new(client, None, Some(Duration::from_millis(100)));
 
         // Manually insert a key
         {

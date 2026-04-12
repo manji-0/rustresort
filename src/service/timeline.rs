@@ -4,13 +4,16 @@
 
 use std::{collections::HashSet, future::Future, sync::Arc};
 
-use crate::data::{ListTimelineQuery, ProfileCache, Status, TimelineCache, TimelineRepository};
+use crate::data::{
+    CachedStatus, Follow, ListTimelineQuery, PersistedReason, ProfileCache, Status,
+    StatusVisibility, TimelineCache, TimelineRepository,
+};
 use crate::error::AppError;
 
 /// Timeline service
 pub struct TimelineService {
     db: Arc<dyn TimelineRepository>,
-    _timeline_cache: Arc<TimelineCache>,
+    timeline_cache: Arc<TimelineCache>,
     _profile_cache: Arc<ProfileCache>,
 }
 
@@ -29,14 +32,14 @@ impl TimelineService {
     {
         Self {
             db,
-            _timeline_cache: timeline_cache,
+            timeline_cache,
             _profile_cache: profile_cache,
         }
     }
 
     /// Get home timeline
     ///
-    /// Returns local statuses for the single-user instance.
+    /// Returns local statuses plus cached followee statuses.
     ///
     /// # Arguments
     /// * `limit` - Maximum results (default 20, max 40)
@@ -51,27 +54,30 @@ impl TimelineService {
         max_id: Option<&str>,
         min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        let min_id = min_id.map(str::to_string);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fetch_limit = Self::overfetch_limit(limit);
+        let local_statuses = self
+            .db
+            .get_local_statuses_in_window(fetch_limit, max_id, min_id)
+            .await?;
+        let follows = self.db.get_all_follows().await?;
+        let followee_identities = Self::followee_cache_identities(&follows);
+        let cached_statuses = self
+            .timeline_cache
+            .get_home_timeline(&followee_identities, fetch_limit, max_id)
+            .await;
         let statuses = self
-            .collect_visible_statuses(limit, max_id.map(str::to_string), |fetch_limit, cursor| {
-                let min_id = min_id.clone();
-                async move {
-                    self.db
-                        .get_local_statuses_in_window(
-                            fetch_limit,
-                            cursor.as_deref(),
-                            min_id.as_deref(),
-                        )
-                        .await
-                }
-            })
+            .merge_statuses(local_statuses, cached_statuses, limit, min_id)
             .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
 
     /// Get public timeline
     ///
-    /// Returns local public statuses for the single-user instance.
+    /// Returns local public statuses and, unless `local_only`, cached remote public statuses.
     ///
     /// # Arguments
     /// * `local_only` - If true, only return local statuses
@@ -83,19 +89,24 @@ impl TimelineService {
         limit: usize,
         max_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        // Single-user instance currently stores local statuses only,
-        // so local_only doesn't change query behavior yet.
-        let _ = local_only;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fetch_limit = Self::overfetch_limit(limit);
+        let local_statuses = self
+            .db
+            .get_local_public_statuses(fetch_limit, max_id)
+            .await?;
+        let cached_statuses = if local_only {
+            Vec::new()
+        } else {
+            self.timeline_cache
+                .get_public_timeline(fetch_limit, max_id)
+                .await
+        };
         let statuses = self
-            .collect_visible_statuses(
-                limit,
-                max_id.map(str::to_string),
-                |fetch_limit, cursor| async move {
-                    self.db
-                        .get_local_public_statuses(fetch_limit, cursor.as_deref())
-                        .await
-                },
-            )
+            .merge_statuses(local_statuses, cached_statuses, limit, None)
             .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
@@ -175,15 +186,107 @@ impl TimelineService {
     /// * `exclude_replies` - If true, exclude replies
     pub async fn account_timeline(
         &self,
-        _account_address: &str,
-        _limit: usize,
-        _max_id: Option<&str>,
-        _only_media: bool,
-        _exclude_replies: bool,
+        account_address: Option<&str>,
+        default_port: Option<u16>,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+        only_media: bool,
+        exclude_replies: bool,
+        exclude_reblogs: bool,
+        only_pinned: bool,
     ) -> Result<Vec<TimelineItem>, AppError> {
-        Err(AppError::NotImplemented(
-            "account timeline is not implemented yet".to_string(),
-        ))
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let muted_thread_uris = self.db.get_muted_thread_uris().await?;
+        let has_filters = only_media || exclude_replies || exclude_reblogs || only_pinned;
+        let fetch_limit = if has_filters {
+            limit
+                .saturating_mul(5)
+                .min(TIMELINE_MUTE_OVERFETCH_MAX_LIMIT)
+        } else {
+            Self::overfetch_limit(limit)
+        };
+
+        let mut filtered = Vec::with_capacity(limit);
+        let mut page_max_id = max_id.map(str::to_string);
+
+        loop {
+            let statuses = match account_address {
+                Some(account_address) => {
+                    self.db
+                        .get_statuses_by_account_address_in_window(
+                            account_address,
+                            default_port,
+                            fetch_limit,
+                            page_max_id.as_deref(),
+                            min_id,
+                        )
+                        .await?
+                }
+                None => {
+                    self.db
+                        .get_local_statuses_in_window(fetch_limit, page_max_id.as_deref(), min_id)
+                        .await?
+                }
+            };
+            if statuses.is_empty() {
+                break;
+            }
+
+            let batch_len = statuses.len();
+            let last_status_id = statuses.last().map(|status| status.id.clone());
+            let statuses = self
+                .filter_muted_threads_with_uris(statuses, &muted_thread_uris)
+                .await?;
+
+            for status in statuses {
+                if !matches!(
+                    status.visibility,
+                    StatusVisibility::Public | StatusVisibility::Unlisted
+                ) {
+                    continue;
+                }
+                if exclude_reblogs && status.boost_of_uri.is_some() {
+                    continue;
+                }
+                if exclude_replies && status.in_reply_to_uri.is_some() {
+                    continue;
+                }
+
+                let is_pinned = self.db.is_status_pinned(&status.id).await?;
+                if only_pinned && !is_pinned {
+                    continue;
+                }
+                if only_media && self.db.get_media_by_status(&status.id).await?.is_empty() {
+                    continue;
+                }
+
+                filtered.push(status);
+                if filtered.len() >= limit {
+                    break;
+                }
+            }
+
+            if filtered.len() >= limit {
+                break;
+            }
+            if last_status_id.is_none() || batch_len < fetch_limit {
+                break;
+            }
+
+            let Some(next_max_id) = last_status_id else {
+                break;
+            };
+            if page_max_id.as_deref() == Some(next_max_id.as_str()) {
+                break;
+            }
+            page_max_id = Some(next_max_id);
+        }
+
+        self.build_timeline_items_with_interactions(filtered).await
     }
 
     /// Get favourites timeline
@@ -301,6 +404,135 @@ impl TimelineService {
                 reblogged: false,
             })
             .collect())
+    }
+
+    fn cached_status_to_status(cached: &CachedStatus) -> Status {
+        Status {
+            id: cached.id.clone(),
+            uri: cached.uri.clone(),
+            content: cached.content.clone(),
+            content_warning: None,
+            visibility: StatusVisibility::parse(&cached.visibility)
+                .unwrap_or(StatusVisibility::Public),
+            language: None,
+            account_address: cached.account_address.clone(),
+            is_local: false,
+            in_reply_to_uri: cached.reply_to_uri.clone(),
+            boost_of_uri: cached.boost_of_uri.clone(),
+            quote_of_uri: cached.quote_of_uri.clone(),
+            persisted_reason: PersistedReason::CacheOnly,
+            created_at: cached.created_at,
+            fetched_at: Some(cached.created_at),
+        }
+    }
+
+    fn overfetch_limit(limit: usize) -> usize {
+        limit
+            .saturating_mul(TIMELINE_MUTE_OVERFETCH_MULTIPLIER)
+            .max(limit)
+            .min(TIMELINE_MUTE_OVERFETCH_MAX_LIMIT)
+    }
+
+    fn extract_username_from_actor_path(path: &str) -> Option<&str> {
+        let mut parts = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty());
+        let first_segment = parts.next()?;
+
+        if let Some(username) = first_segment.strip_prefix('@') {
+            return (!username.is_empty()).then_some(username);
+        }
+
+        if first_segment.eq_ignore_ascii_case("users")
+            || first_segment.eq_ignore_ascii_case("accounts")
+            || first_segment.eq_ignore_ascii_case("u")
+            || first_segment.eq_ignore_ascii_case("profile")
+        {
+            let username = parts.next()?;
+            return (!username.is_empty()).then_some(username);
+        }
+
+        None
+    }
+
+    fn format_authority_host(host: &str) -> String {
+        if host.contains(':') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        }
+    }
+
+    fn cache_identity_from_actor_uri(actor_uri: &str) -> Option<String> {
+        let parsed = url::Url::parse(actor_uri).ok()?;
+        let host = parsed.host_str()?;
+        let username = Self::extract_username_from_actor_path(parsed.path())?;
+        let authority_host = Self::format_authority_host(&host.to_ascii_lowercase());
+        let authority = match parsed.port() {
+            Some(port) => format!("{}:{}", authority_host, port),
+            None => authority_host,
+        };
+        Some(format!("{}@{}", username.to_ascii_lowercase(), authority))
+    }
+
+    fn followee_cache_identities(follows: &[Follow]) -> HashSet<String> {
+        let mut identities = HashSet::new();
+
+        for follow in follows {
+            identities.insert(follow.target_address.clone());
+            if let Some(actor_uri) = &follow.actor_uri {
+                identities.insert(actor_uri.clone());
+                if let Some(actor_address) = Self::cache_identity_from_actor_uri(actor_uri) {
+                    identities.insert(actor_address);
+                }
+            }
+        }
+
+        identities
+    }
+
+    async fn merge_statuses(
+        &self,
+        db_statuses: Vec<Status>,
+        cached_statuses: Vec<Arc<CachedStatus>>,
+        limit: usize,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let mut merged = Vec::with_capacity(db_statuses.len() + cached_statuses.len());
+        let mut seen_uris = HashSet::new();
+        let mut seen_ids = HashSet::new();
+
+        for status in db_statuses {
+            seen_uris.insert(status.uri.clone());
+            seen_ids.insert(status.id.clone());
+            merged.push(status);
+        }
+
+        for cached in cached_statuses {
+            let status = Self::cached_status_to_status(&cached);
+            if min_id.is_some_and(|cursor| status.id.as_str() <= cursor) {
+                continue;
+            }
+            if seen_uris.contains(&status.uri) || seen_ids.contains(&status.id) {
+                continue;
+            }
+            seen_uris.insert(status.uri.clone());
+            seen_ids.insert(status.id.clone());
+            merged.push(status);
+        }
+
+        merged.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+
+        let visible = self
+            .filter_muted_threads_with_uris(merged, &self.db.get_muted_thread_uris().await?)
+            .await?;
+        Ok(visible.into_iter().take(limit).collect())
     }
 
     async fn collect_visible_statuses<F, Fut>(
