@@ -2,7 +2,8 @@
 
 use axum::{
     extract::{Multipart, Path, State},
-    response::Json,
+    http::StatusCode,
+    response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 
@@ -99,22 +100,19 @@ fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
     Ok((x, y))
 }
 
-/// POST /api/v1/media
-pub async fn upload_media(
-    State(state): State<MediaApiState>,
-    CurrentUser(_session): CurrentUser,
-    mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // Start timing the request
-    let _timer = HTTP_REQUEST_DURATION_SECONDS
-        .with_label_values(&["POST", "/api/v1/media"])
-        .start_timer();
+struct ParsedMediaUpload {
+    file_data: Vec<u8>,
+    content_type: String,
+    description: Option<String>,
+    focus: Option<(f64, f64)>,
+}
 
+async fn parse_media_upload(mut multipart: Multipart) -> Result<ParsedMediaUpload, AppError> {
     let mut file_data: Option<Vec<u8>> = None;
     let mut content_type: Option<String> = None;
     let mut description: Option<String> = None;
+    let mut focus: Option<(f64, f64)> = None;
 
-    // Parse multipart form data
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -162,6 +160,16 @@ pub async fn upload_media(
                     AppError::Validation(format!("Failed to read description: {}", e))
                 })?);
             }
+            "focus" => {
+                let raw_focus = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::Validation(format!("Failed to read focus: {}", e)))?;
+                let trimmed = raw_focus.trim();
+                if !trimmed.is_empty() {
+                    focus = Some(parse_media_focus(trimmed)?);
+                }
+            }
             _ => {}
         }
     }
@@ -171,46 +179,25 @@ pub async fn upload_media(
         "Missing content type for uploaded file".to_string(),
     ))?;
 
-    // Validate MIME type
-    let supported_types = [
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "video/mp4",
-    ];
+    Ok(ParsedMediaUpload {
+        file_data,
+        content_type,
+        description,
+        focus,
+    })
+}
 
-    if !supported_types.contains(&content_type.as_str()) {
-        return Err(AppError::Validation(format!(
-            "Unsupported MIME type: {}",
-            content_type
-        )));
-    }
-
-    let status_service = StatusService::new(
-        state.db.clone(),
-        state.timeline_cache.clone(),
-        state.storage.clone(),
-        state.streaming_event_bus.clone(),
-        state.config.server.base_url().to_string(),
-        state.config.admin.username.clone(),
-    );
-    let media = status_service
-        .upload_media(file_data, content_type, description)
-        .await?;
-
+fn media_response_value(
+    state: &MediaApiState,
+    media: crate::data::MediaAttachment,
+) -> serde_json::Value {
     let url = state.storage.get_public_url(&media.s3_key);
-    let thumbnail_url = media
+    let preview_url = media
         .thumbnail_s3_key
         .as_ref()
         .map(|thumb_key| state.storage.get_public_url(thumb_key))
         .unwrap_or_else(|| url.clone());
 
-    // Update media metrics
-    MEDIA_UPLOADS_TOTAL.inc();
-    MEDIA_BYTES_UPLOADED.inc_by(media.file_size as f64);
-
-    // Determine media type
     let media_type = if media.content_type.starts_with("image/") {
         "image"
     } else if media.content_type.starts_with("video/") {
@@ -219,74 +206,6 @@ pub async fn upload_media(
         "unknown"
     };
 
-    // Return response
-    let response = MediaAttachmentResponse {
-        id: media.id,
-        media_type: media_type.to_string(),
-        url,
-        preview_url: thumbnail_url,
-        remote_url: None,
-        text_url: None,
-        meta: MediaMeta {
-            original: build_original_media_meta(
-                media.width,
-                media.height,
-                media.focus_x,
-                media.focus_y,
-            ),
-            small: None,
-        },
-        description: media.description,
-        blurhash: media.blurhash,
-    };
-
-    // Record successful request
-    HTTP_REQUESTS_TOTAL
-        .with_label_values(&["POST", "/api/v1/media", "200"])
-        .inc();
-
-    Ok(Json(serde_json::to_value(response).unwrap()))
-}
-
-/// POST /api/v2/media (async upload)
-pub async fn upload_media_v2(
-    State(state): State<MediaApiState>,
-    CurrentUser(_session): CurrentUser,
-    multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // For now, v2 is the same as v1 (synchronous upload)
-    // In a full implementation, v2 would return immediately with a processing status
-    // and the client would poll for completion
-    upload_media(State(state), CurrentUser(_session), multipart).await
-}
-
-/// GET /api/v1/media/:id
-pub async fn get_media(
-    State(state): State<MediaApiState>,
-    CurrentUser(_session): CurrentUser,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    // Get media from database
-    let media = state.db.get_media(&id).await?.ok_or(AppError::NotFound)?;
-
-    // Generate URLs
-    let url = state.storage.get_public_url(&media.s3_key);
-    let preview_url = if let Some(ref thumb_key) = media.thumbnail_s3_key {
-        state.storage.get_public_url(thumb_key)
-    } else {
-        url.clone()
-    };
-
-    // Determine media type from content type
-    let media_type = if media.content_type.starts_with("image/") {
-        "image"
-    } else if media.content_type.starts_with("video/") {
-        "video"
-    } else {
-        "unknown"
-    };
-
-    // Build response
     let response = MediaAttachmentResponse {
         id: media.id,
         media_type: media_type.to_string(),
@@ -307,7 +226,102 @@ pub async fn get_media(
         blurhash: media.blurhash,
     };
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    serde_json::to_value(response).expect("media attachment response should serialize")
+}
+
+async fn upload_media_response_value(
+    state: &MediaApiState,
+    multipart: Multipart,
+) -> Result<serde_json::Value, AppError> {
+    let parsed = parse_media_upload(multipart).await?;
+
+    let supported_types = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "video/mp4",
+    ];
+
+    if !supported_types.contains(&parsed.content_type.as_str()) {
+        return Err(AppError::Validation(format!(
+            "Unsupported MIME type: {}",
+            parsed.content_type
+        )));
+    }
+
+    let status_service = StatusService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.storage.clone(),
+        state.streaming_event_bus.clone(),
+        state.config.server.base_url().to_string(),
+        state.config.admin.username.clone(),
+    );
+    let mut media = status_service
+        .upload_media(parsed.file_data, parsed.content_type, parsed.description)
+        .await?;
+
+    if let Some((focus_x, focus_y)) = parsed.focus {
+        media.focus_x = Some(focus_x);
+        media.focus_y = Some(focus_y);
+        state.db.update_media(&media).await?;
+    }
+
+    MEDIA_UPLOADS_TOTAL.inc();
+    MEDIA_BYTES_UPLOADED.inc_by(media.file_size as f64);
+
+    Ok(media_response_value(state, media))
+}
+
+/// POST /api/v1/media
+pub async fn upload_media(
+    State(state): State<MediaApiState>,
+    CurrentUser(_session): CurrentUser,
+    multipart: Multipart,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _timer = HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&["POST", "/api/v1/media"])
+        .start_timer();
+
+    let response = upload_media_response_value(&state, multipart).await?;
+
+    HTTP_REQUESTS_TOTAL
+        .with_label_values(&["POST", "/api/v1/media", "200"])
+        .inc();
+
+    Ok(Json(response))
+}
+
+/// POST /api/v2/media (async upload)
+pub async fn upload_media_v2(
+    State(state): State<MediaApiState>,
+    CurrentUser(_session): CurrentUser,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, AppError> {
+    let _timer = HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&["POST", "/api/v2/media"])
+        .start_timer();
+
+    let response = upload_media_response_value(&state, multipart).await?;
+
+    HTTP_REQUESTS_TOTAL
+        .with_label_values(&["POST", "/api/v2/media", "202"])
+        .inc();
+
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// GET /api/v1/media/:id
+pub async fn get_media(
+    State(state): State<MediaApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Get media from database
+    let media = state.db.get_media(&id).await?.ok_or(AppError::NotFound)?;
+
+    Ok(Json(media_response_value(&state, media)))
 }
 
 /// PUT /api/v1/media/:id
@@ -340,48 +354,7 @@ pub async fn update_media(
     // Update in database
     state.db.update_media(&media).await?;
 
-    // Generate URLs
-    let url = state.storage.get_public_url(&media.s3_key);
-    let preview_url = if let Some(ref thumb_key) = media.thumbnail_s3_key {
-        state.storage.get_public_url(thumb_key)
-    } else {
-        url.clone()
-    };
-
-    // Determine media type from content type
-    let media_type = if media.content_type.starts_with("image/") {
-        "image"
-    } else if media.content_type.starts_with("video/") {
-        "video"
-    } else {
-        "unknown"
-    };
-
-    // Build response
-    let response = MediaAttachmentResponse {
-        id: media.id,
-        media_type: media_type.to_string(),
-        url,
-        preview_url,
-        remote_url: None,
-        text_url: None,
-        meta: MediaMeta {
-            original: media.width.and_then(|w| {
-                media.height.map(|h| MediaMetaInfo {
-                    width: Some(w),
-                    height: Some(h),
-                    size: Some(format!("{}x{}", w, h)),
-                    aspect: Some(w as f64 / h as f64),
-                    focus: format_media_focus(media.focus_x, media.focus_y),
-                })
-            }),
-            small: None,
-        },
-        description: media.description,
-        blurhash: media.blurhash,
-    };
-
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    Ok(Json(media_response_value(&state, media)))
 }
 
 #[derive(Debug, Deserialize)]

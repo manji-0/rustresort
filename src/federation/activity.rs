@@ -744,6 +744,7 @@ impl ActivityProcessor {
         let follower = crate::data::Follower {
             id: crate::data::EntityId::new_string(),
             follower_address: actor_address.clone(),
+            actor_uri: Some(actor_uri.to_string()),
             inbox_uri: inbox_uri.clone(),
             uri: follow_activity_uri.clone(),
             created_at: chrono::Utc::now(),
@@ -1627,6 +1628,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/1".to_string(),
             created_at: Utc::now(),
@@ -1655,6 +1657,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/no-id-port-variant".to_string(),
             created_at: Utc::now(),
@@ -1683,6 +1686,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "Bob@Remote.Example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/mixed-case".to_string(),
             created_at: Utc::now(),
@@ -1713,6 +1717,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: follow_uri.to_string(),
             created_at: Utc::now(),
@@ -1738,6 +1743,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/current".to_string(),
             created_at: Utc::now(),
@@ -1767,6 +1773,7 @@ mod tests {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
             uri: "https://remote.example/follows/2".to_string(),
             created_at: Utc::now(),
@@ -1798,6 +1805,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "Bob@Remote.Example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/1".to_string(),
             created_at: Utc::now(),
         };
@@ -1831,6 +1839,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/port-normalized".to_string(),
             created_at: Utc::now(),
         };
@@ -1865,6 +1874,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example:443".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/port-follow-row".to_string(),
             created_at: Utc::now(),
         };
@@ -1898,6 +1908,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/2".to_string(),
             created_at: Utc::now(),
         };
@@ -1931,6 +1942,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/3".to_string(),
             created_at: Utc::now(),
         };
@@ -1964,6 +1976,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@[2001:db8::1]".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/ipv6".to_string(),
             created_at: Utc::now(),
         };
@@ -1997,6 +2010,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/sanitized".to_string(),
             created_at: Utc::now(),
         };
@@ -2036,6 +2050,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/3".to_string(),
             created_at: Utc::now(),
         };
@@ -2107,6 +2122,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/4".to_string(),
             created_at: Utc::now(),
         };
@@ -2149,6 +2165,7 @@ mod tests {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "bob@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/users/alice/follow/5".to_string(),
             created_at: Utc::now(),
         };

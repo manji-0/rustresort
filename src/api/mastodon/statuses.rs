@@ -57,7 +57,7 @@ pub struct CreateStatusRequest {
     pub poll: Option<CreateStatusPollRequest>,
     pub scheduled_at: Option<String>,
     #[serde(rename = "sensitive")]
-    pub _sensitive: Option<bool>,
+    pub sensitive: Option<bool>,
     pub spoiler_text: Option<String>,
     pub visibility: Option<String>,
     pub language: Option<String>,
@@ -195,6 +195,23 @@ fn normalize_scheduled_at(raw_scheduled_at: Option<String>) -> Result<Option<Str
     }
 
     Ok(Some(scheduled_at.to_rfc3339()))
+}
+
+fn normalize_content_warning(
+    spoiler_text: Option<String>,
+    sensitive: Option<bool>,
+    current: Option<&str>,
+) -> Option<String> {
+    match (spoiler_text, sensitive) {
+        (Some(text), _) if !text.is_empty() => Some(text),
+        (Some(_), Some(true)) => Some(String::new()),
+        (Some(_), _) => None,
+        (None, Some(true)) => current
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(String::new())),
+        (None, Some(false)) => None,
+        (None, None) => current.map(ToOwned::to_owned),
+    }
 }
 
 fn extract_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, AppError> {
@@ -405,7 +422,7 @@ pub async fn create_status(
             quoted_status_id,
             poll,
             scheduled_at,
-            _sensitive: _,
+            sensitive,
             spoiler_text,
             visibility,
             language,
@@ -415,6 +432,7 @@ pub async fn create_status(
         let poll = normalize_poll_input(poll)?;
         let scheduled_at = normalize_scheduled_at(scheduled_at)?;
         let media_ids = media_ids.unwrap_or_default();
+        let content_warning = normalize_content_warning(spoiler_text, sensitive, None);
 
         if poll.is_some() && !media_ids.is_empty() {
             return Err(AppError::Unprocessable(
@@ -492,7 +510,7 @@ pub async fn create_status(
                     scheduled_at,
                     status_text: content.clone(),
                     visibility: visibility.to_string(),
-                    content_warning: spoiler_text.clone(),
+                    content_warning: content_warning.clone(),
                     in_reply_to_id: in_reply_to_id.clone(),
                     media_ids: media_ids_json,
                     poll_options: poll_options_json,
@@ -518,7 +536,7 @@ pub async fn create_status(
             id: status_id.clone(),
             uri: uri.clone(),
             content: format!("<p>{}</p>", html_escape::encode_text(&content)),
-            content_warning: spoiler_text.clone(),
+            content_warning: content_warning.clone(),
             visibility,
             language: language.or(Some("en".to_string())),
             account_address: String::new(),
@@ -1413,7 +1431,7 @@ pub struct UpdateStatusRequest {
     pub status: Option<String>,
     pub spoiler_text: Option<String>,
     #[serde(rename = "sensitive")]
-    pub _sensitive: Option<bool>,
+    pub sensitive: Option<bool>,
     pub media_ids: Option<Vec<String>>,
 }
 
@@ -1455,10 +1473,13 @@ pub async fn update_status(
         }
     }
 
-    if let Some(spoiler_text) = req.spoiler_text
-        && status.content_warning.as_deref() != Some(spoiler_text.as_str())
-    {
-        status.content_warning = Some(spoiler_text);
+    let next_content_warning = normalize_content_warning(
+        req.spoiler_text,
+        req.sensitive,
+        status.content_warning.as_deref(),
+    );
+    if status.content_warning != next_content_warning {
+        status.content_warning = next_content_warning;
         changed = true;
     }
 

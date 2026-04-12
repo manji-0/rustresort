@@ -211,6 +211,8 @@ pub struct Follow {
     pub id: String,
     /// Target address (user@domain format)
     pub target_address: String,
+    /// Canonical ActivityPub actor URI when known
+    pub actor_uri: Option<String>,
     /// ActivityPub Follow activity URI
     pub uri: String,
     pub created_at: DateTime<Utc>,
@@ -224,6 +226,8 @@ pub struct Follower {
     pub id: String,
     /// Follower address (user@domain format)
     pub follower_address: String,
+    /// Canonical ActivityPub actor URI when known
+    pub actor_uri: Option<String>,
     /// Follower's inbox URI for delivery
     pub inbox_uri: String,
     /// ActivityPub Follow activity URI

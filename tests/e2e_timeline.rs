@@ -582,6 +582,60 @@ async fn test_timeline_with_since_id() {
 }
 
 #[tokio::test]
+async fn test_home_timeline_since_id_filters_older_statuses() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let now = Utc::now();
+    for (id, seconds_ago) in [("100", 30), ("200", 20), ("300", 10)] {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/status/{}", id),
+                content: format!("<p>Status {}</p>", id),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: "testuser@test.example.com".to_string(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds(seconds_ago),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/home?since_id=150"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let json: Value = response.json().await.unwrap();
+    let ids: Vec<&str> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"200"));
+    assert!(ids.contains(&"300"));
+    assert!(!ids.contains(&"100"));
+}
+
+#[tokio::test]
 async fn test_muted_thread_is_hidden_from_public_timeline() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Status};

@@ -26,6 +26,7 @@ use crate::metrics::{
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
     pub max_id: Option<String>,
+    pub since_id: Option<String>,
     pub min_id: Option<String>,
     pub limit: Option<usize>,
 }
@@ -64,8 +65,7 @@ pub struct SearchParams {
     pub q: String,
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
-    #[serde(rename = "following")]
-    pub _following: Option<bool>,
+    pub following: Option<bool>,
 }
 
 fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
@@ -790,6 +790,33 @@ async fn resolve_remote_account_response_for_list(
     build_remote_account_placeholder_response(raw_address, state.config.as_ref(), statuses_count)
 }
 
+fn list_entry_identity(actor_uri: Option<&str>, address: &str) -> Option<String> {
+    let actor_uri = actor_uri
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if actor_uri.is_some() {
+        return actor_uri;
+    }
+
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn list_entry_dedup_key(identity: &str) -> Option<String> {
+    normalize_remote_lookup_account_address(identity).or_else(|| {
+        let trimmed = identity.trim();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            Some(trimmed.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
 fn contains_equivalent_address(
     seen_addresses: &[String],
     candidate: &str,
@@ -867,6 +894,52 @@ async fn resolve_remote_actor_and_inbox(
         address,
     )
     .await
+}
+
+async fn resolve_remote_actor_and_inbox_with_hint(
+    state: &AccountApiState,
+    address: &str,
+    actor_uri_hint: Option<&str>,
+) -> Result<(String, String), AppError> {
+    if let Some(actor_uri) = actor_uri_hint.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(profile) = state.profile_cache.get_by_uri(actor_uri).await {
+            if !profile.address.eq_ignore_ascii_case(address) {
+                let mut aliased = (*profile).clone();
+                aliased.address = address.to_string();
+                aliased.uri = actor_uri.to_string();
+                state.profile_cache.insert(aliased).await;
+            }
+            return Ok((actor_uri.to_string(), profile.inbox_uri.clone()));
+        }
+    }
+
+    if let Some(profile) = state.profile_cache.get(address).await {
+        return Ok((profile.uri.clone(), profile.inbox_uri.clone()));
+    }
+
+    resolve_remote_actor_and_inbox(state, address).await
+}
+
+async fn resolve_remote_actor_and_inbox_with_stored_hints(
+    state: &AccountApiState,
+    address: &str,
+    actor_uri_hint: Option<&str>,
+    inbox_uri_hint: Option<&str>,
+) -> Result<(String, String), AppError> {
+    let actor_uri_hint = actor_uri_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let inbox_uri_hint = inbox_uri_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let (Some(actor_uri), Some(inbox_uri)) = (actor_uri_hint.clone(), inbox_uri_hint.clone()) {
+        return Ok((actor_uri, inbox_uri));
+    }
+
+    resolve_remote_actor_and_inbox_with_hint(state, address, actor_uri_hint.as_deref()).await
 }
 
 async fn resolve_target_address(state: &AccountApiState, id: &str) -> Result<String, AppError> {
@@ -1206,40 +1279,38 @@ pub async fn get_account_followers(
         return Err(AppError::NotFound);
     }
 
-    let follower_addresses = state.db.get_all_follower_addresses().await?;
+    let follower_entries = state.db.get_all_followers().await?;
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    let mut unique_addresses: Vec<String> = Vec::new();
+    let mut unique_keys: Vec<String> = Vec::new();
+    let mut identities: Vec<String> = Vec::new();
     let mut followers = Vec::new();
 
-    for address in follower_addresses {
-        let normalized_address = normalize_account_address(&address);
-        let candidate = match normalized_address.as_ref() {
-            Ok(normalized) => normalized.to_string(),
-            Err(_) => {
-                let trimmed = address.trim();
-                if trimmed.is_empty()
-                    || !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
-                {
-                    continue;
-                }
-                trimmed.to_string()
-            }
+    for follower in follower_entries {
+        let Some(candidate) =
+            list_entry_identity(follower.actor_uri.as_deref(), &follower.follower_address)
+        else {
+            continue;
+        };
+        let Some(dedup_key) = list_entry_dedup_key(&candidate) else {
+            continue;
         };
 
-        let is_duplicate = match normalized_address {
-            Ok(_) => contains_equivalent_address(&unique_addresses, &candidate, default_port),
-            Err(_) => unique_addresses
+        let is_duplicate = if normalize_account_address(&dedup_key).is_ok() {
+            contains_equivalent_address(&unique_keys, &dedup_key, default_port)
+        } else {
+            unique_keys
                 .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(&candidate)),
+                .any(|seen| seen.eq_ignore_ascii_case(&dedup_key))
         };
         if is_duplicate {
             continue;
         }
-        unique_addresses.push(candidate);
+        unique_keys.push(dedup_key);
+        identities.push(candidate);
     }
 
-    let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
+    let paged_addresses = apply_account_address_pagination(identities, &params);
     for address in paged_addresses.into_iter().take(limit) {
         let Some(response) =
             resolve_remote_account_response_for_list(&state, &address, default_port).await
@@ -1265,40 +1336,37 @@ pub async fn get_account_following(
         return Err(AppError::NotFound);
     }
 
-    let following_addresses = state.db.get_all_follow_addresses().await?;
+    let following_entries = state.db.get_all_follows().await?;
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    let mut unique_addresses: Vec<String> = Vec::new();
+    let mut unique_keys: Vec<String> = Vec::new();
+    let mut identities: Vec<String> = Vec::new();
     let mut following = Vec::new();
 
-    for address in following_addresses {
-        let normalized_address = normalize_account_address(&address);
-        let candidate = match normalized_address.as_ref() {
-            Ok(normalized) => normalized.to_string(),
-            Err(_) => {
-                let trimmed = address.trim();
-                if trimmed.is_empty()
-                    || !trimmed.starts_with("http://") && !trimmed.starts_with("https://")
-                {
-                    continue;
-                }
-                trimmed.to_string()
-            }
+    for follow in following_entries {
+        let Some(candidate) = list_entry_identity(follow.actor_uri.as_deref(), &follow.target_address)
+        else {
+            continue;
+        };
+        let Some(dedup_key) = list_entry_dedup_key(&candidate) else {
+            continue;
         };
 
-        let is_duplicate = match normalized_address {
-            Ok(_) => contains_equivalent_address(&unique_addresses, &candidate, default_port),
-            Err(_) => unique_addresses
+        let is_duplicate = if normalize_account_address(&dedup_key).is_ok() {
+            contains_equivalent_address(&unique_keys, &dedup_key, default_port)
+        } else {
+            unique_keys
                 .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(&candidate)),
+                .any(|seen| seen.eq_ignore_ascii_case(&dedup_key))
         };
         if is_duplicate {
             continue;
         }
-        unique_addresses.push(candidate);
+        unique_keys.push(dedup_key);
+        identities.push(candidate);
     }
 
-    let paged_addresses = apply_account_address_pagination(unique_addresses, &params);
+    let paged_addresses = apply_account_address_pagination(identities, &params);
     for address in paged_addresses.into_iter().take(limit) {
         let Some(response) =
             resolve_remote_account_response_for_list(&state, &address, default_port).await
@@ -1344,6 +1412,7 @@ pub async fn follow_account(
     let follow = Follow {
         id: follow_id.clone(),
         target_address: target_address.clone(),
+        actor_uri: None,
         uri: format!(
             "{}/users/{}/follow/{}",
             state.config.server.base_url(),
@@ -1367,6 +1436,21 @@ pub async fn follow_account(
             let (target_actor_uri, target_inbox_uri) =
                 resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
                     .await?;
+            if let Err(error) = state_for_delivery
+                .db
+                .update_follow_actor_uri(
+                    &target_address_for_delivery,
+                    &target_actor_uri,
+                    default_port_for_protocol(&state_for_delivery.config.server.protocol),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to persist actor URI for follow target {}: {}",
+                    target_address_for_delivery,
+                    error
+                );
+            }
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
                 .send_follow_with_id(&follow_uri, &target_actor_uri, &target_inbox_uri)
@@ -1431,6 +1515,7 @@ pub async fn unfollow_account(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
     let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let follow = state.db.get_follow(&target_address, default_port).await?;
     let follow_uri = state
         .db
         .get_follow_uri(&target_address, default_port)
@@ -1446,10 +1531,15 @@ pub async fn unfollow_account(
         let state_for_delivery = state.clone();
         let account_for_delivery = account.clone();
         let target_address_for_delivery = target_address.clone();
+        let target_actor_uri_hint = follow.and_then(|follow| follow.actor_uri);
         spawn_best_effort_delivery("unfollow", async move {
             let (target_actor_uri, target_inbox_uri) =
-                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
-                    .await?;
+                resolve_remote_actor_and_inbox_with_hint(
+                    &state_for_delivery,
+                    &target_address_for_delivery,
+                    target_actor_uri_hint.as_deref(),
+                )
+                .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
                 .send_undo_to_inbox_with_type_and_object(
@@ -1490,19 +1580,37 @@ pub async fn get_relationships(
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    let following_set: HashSet<String> = state
-        .db
-        .get_all_follow_addresses()
-        .await?
-        .into_iter()
-        .filter_map(|address| canonical_remote_account_address(&address))
+    let follows = state.db.get_all_follows().await?;
+    let followers = state.db.get_all_followers().await?;
+    let following_set: HashSet<String> = follows
+        .iter()
+        .filter_map(|follow| canonical_remote_account_address(&follow.target_address))
         .collect();
-    let follower_set: HashSet<String> = state
-        .db
-        .get_all_follower_addresses()
-        .await?
-        .into_iter()
-        .filter_map(|address| canonical_remote_account_address(&address))
+    let follower_set: HashSet<String> = followers
+        .iter()
+        .filter_map(|follower| canonical_remote_account_address(&follower.follower_address))
+        .collect();
+    let following_actor_uri_set: HashSet<String> = follows
+        .iter()
+        .filter_map(|follow| {
+            follow
+                .actor_uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    let follower_actor_uri_set: HashSet<String> = followers
+        .iter()
+        .filter_map(|follower| {
+            follower
+                .actor_uri
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .collect();
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
@@ -1548,7 +1656,8 @@ pub async fn get_relationships(
         };
         let normalized_target = normalize_account_address(&target_address)
             .unwrap_or_else(|_| target_address.to_ascii_lowercase());
-        let following = following_set.contains(&normalized_target)
+        let following = following_actor_uri_set.contains(&id)
+            || following_set.contains(&normalized_target)
             || following_set.iter().any(|candidate| {
                 account_addresses_match_with_default_port(
                     candidate,
@@ -1556,7 +1665,8 @@ pub async fn get_relationships(
                     default_port,
                 )
             });
-        let followed_by = follower_set.contains(&normalized_target)
+        let followed_by = follower_actor_uri_set.contains(&id)
+            || follower_set.contains(&normalized_target)
             || follower_set.iter().any(|candidate| {
                 account_addresses_match_with_default_port(
                     candidate,
@@ -1682,6 +1792,46 @@ pub async fn search_accounts(
         }
     }
 
+    if params.following.unwrap_or(false) {
+        let following_addresses: HashSet<String> = state
+            .db
+            .get_all_follow_addresses()
+            .await?
+            .into_iter()
+            .filter_map(|address| canonical_remote_account_address(&address))
+            .collect();
+        let following_actor_uris: HashSet<String> = state
+            .db
+            .get_all_follows()
+            .await?
+            .into_iter()
+            .filter_map(|follow| follow.actor_uri)
+            .collect();
+
+        results.retain(|entry| {
+            let acct_match = entry
+                .get("acct")
+                .and_then(|value| value.as_str())
+                .map(|acct| canonical_account_identity(acct, &local_domain))
+                .is_some_and(|acct| {
+                    following_addresses.contains(&acct)
+                        || following_addresses.iter().any(|candidate| {
+                            account_addresses_match_with_default_port(
+                                candidate,
+                                &acct,
+                                default_port_for_protocol(&state.config.server.protocol),
+                            )
+                        })
+                });
+            let url_match = entry
+                .get("url")
+                .and_then(|value| value.as_str())
+                .is_some_and(|url| following_actor_uris.contains(url));
+
+            acct_match || url_match
+        });
+    }
+
     // Apply limit
     let limit = params.limit.unwrap_or(40).min(80);
     results.truncate(limit);
@@ -1794,21 +1944,49 @@ pub async fn block_account(
     let target_address = resolve_target_address(&state, &id).await?;
     let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
 
-    // Store block in database
     let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let follow_actor_uri_hint = state
+        .db
+        .get_follow(&target_address, default_port)
+        .await?
+        .and_then(|follow| follow.actor_uri);
+    let resolved_remote = resolve_remote_actor_and_inbox_with_hint(
+        &state,
+        &target_address,
+        follow_actor_uri_hint.as_deref(),
+    )
+    .await
+    .ok();
+    let resolved_actor_uri = resolved_remote.as_ref().map(|(actor_uri, _)| actor_uri.as_str());
+    let resolved_inbox_uri = resolved_remote.as_ref().map(|(_, inbox_uri)| inbox_uri.as_str());
+
+    // Store block in database
     let newly_blocked = state
         .db
-        .block_account(&target_address, default_port)
+        .block_account_with_remote_metadata(
+            &target_address,
+            resolved_actor_uri,
+            resolved_inbox_uri,
+            default_port,
+        )
         .await?;
 
     if newly_blocked {
         let state_for_delivery = state.clone();
         let account_for_delivery = account_for_delivery.clone();
         let target_address_for_delivery = target_address.clone();
+        let resolved_remote_for_delivery = resolved_remote.clone();
         spawn_best_effort_delivery("block", async move {
-            let (target_actor_uri, target_inbox_uri) =
-                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
-                    .await?;
+            let (target_actor_uri, target_inbox_uri) = if let Some(resolved) = resolved_remote_for_delivery {
+                resolved
+            } else {
+                resolve_remote_actor_and_inbox_with_hint(
+                    &state_for_delivery,
+                    &target_address_for_delivery,
+                    follow_actor_uri_hint.as_deref(),
+                )
+                .await?
+            };
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             delivery
                 .send_block(&target_actor_uri, &target_inbox_uri)
@@ -1852,6 +2030,7 @@ pub async fn unblock_account(
 
     // Remove block from database
     let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let block_target = state.db.get_block_target(&target_address, default_port).await?;
     let unblocked = state
         .db
         .unblock_account(&target_address, default_port)
@@ -1861,10 +2040,17 @@ pub async fn unblock_account(
         let state_for_delivery = state.clone();
         let account_for_delivery = account_for_delivery.clone();
         let target_address_for_delivery = target_address.clone();
+        let target_actor_uri_hint = block_target.as_ref().and_then(|(_, actor_uri, _)| actor_uri.clone());
+        let target_inbox_uri_hint = block_target.as_ref().and_then(|(_, _, inbox_uri)| inbox_uri.clone());
         spawn_best_effort_delivery("unblock", async move {
             let (target_actor_uri, target_inbox_uri) =
-                resolve_remote_actor_and_inbox(&state_for_delivery, &target_address_for_delivery)
-                    .await?;
+                resolve_remote_actor_and_inbox_with_stored_hints(
+                    &state_for_delivery,
+                    &target_address_for_delivery,
+                    target_actor_uri_hint.as_deref(),
+                    target_inbox_uri_hint.as_deref(),
+                )
+                .await?;
             let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
             let block_activity_uri = delivery.block_activity_uri_for_target(&target_actor_uri);
             delivery
@@ -1920,15 +2106,27 @@ pub async fn mute_account(
 
     let mute_notifications = req.notifications.unwrap_or(true);
     let duration = req.duration;
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let actor_uri_hint: Option<String> = if id.starts_with("http://") || id.starts_with("https://")
+    {
+        Some(id.clone())
+    } else {
+        state
+            .db
+            .get_follow(&target_address, default_port)
+            .await?
+            .and_then(|follow| follow.actor_uri)
+    };
 
     // Store mute in database
     state
         .db
-        .mute_account(
+        .mute_account_with_actor_uri(
             &target_address,
             mute_notifications,
             duration,
-            default_port_for_protocol(&state.config.server.protocol),
+            actor_uri_hint.as_deref(),
+            default_port,
         )
         .await?;
 
@@ -2002,11 +2200,14 @@ pub async fn get_blocks(
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let addresses = state.db.get_blocked_accounts(limit).await?;
-    let accounts = stream::iter(addresses.into_iter().take(limit))
-        .map(|address| {
+    let blocked_accounts = state.db.get_blocked_account_details(limit).await?;
+    let accounts = stream::iter(blocked_accounts.into_iter().take(limit))
+        .map(|(address, actor_uri, _inbox_uri)| {
             let state = state.clone();
-            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+            async move {
+                let identity = actor_uri.unwrap_or(address);
+                resolve_remote_account_or_stub(state, identity, default_port).await
+            }
         })
         .buffered(10)
         .collect::<Vec<_>>()
@@ -2025,11 +2226,14 @@ pub async fn get_mutes(
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let addresses = state.db.get_muted_accounts(limit).await?;
-    let accounts = stream::iter(addresses.into_iter().take(limit))
-        .map(|address| {
+    let muted_accounts = state.db.get_muted_account_details(limit).await?;
+    let accounts = stream::iter(muted_accounts.into_iter().take(limit))
+        .map(|(address, actor_uri)| {
             let state = state.clone();
-            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+            async move {
+                let identity = actor_uri.unwrap_or(address);
+                resolve_remote_account_or_stub(state, identity, default_port).await
+            }
         })
         .buffered(10)
         .collect::<Vec<_>>()
@@ -2048,11 +2252,14 @@ pub async fn get_follow_requests(
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let addresses = state.db.get_follow_request_addresses(limit).await?;
-    let accounts = stream::iter(addresses.into_iter().take(limit))
-        .map(|address| {
+    let requests = state.db.get_follow_request_details(limit).await?;
+    let accounts = stream::iter(requests.into_iter().take(limit))
+        .map(|(address, actor_uri)| {
             let state = state.clone();
-            async move { resolve_remote_account_or_stub(state, address, default_port).await }
+            async move {
+                let identity = actor_uri.unwrap_or(address);
+                resolve_remote_account_or_stub(state, identity, default_port).await
+            }
         })
         .buffered(10)
         .collect::<Vec<_>>()
@@ -2075,13 +2282,19 @@ pub async fn get_follow_request(
     }
 
     let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let actor_identity = state
+        .db
+        .get_follow_request_with_actor_uri(&requester_address)
+        .await?
+        .and_then(|(_, _, actor_uri)| actor_uri)
+        .unwrap_or_else(|| requester_address.clone());
     let account = if let Some(response) =
-        resolve_remote_account_response_for_list(&state, &requester_address, default_port).await
+        resolve_remote_account_response_for_list(&state, &actor_identity, default_port).await
     {
         serde_json::to_value(response)
-            .unwrap_or_else(|_| build_remote_account_stub(&requester_address))
+            .unwrap_or_else(|_| build_remote_account_stub(&actor_identity))
     } else {
-        build_remote_account_stub(&requester_address)
+        build_remote_account_stub(&actor_identity)
     };
 
     Ok(Json(account))

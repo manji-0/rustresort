@@ -501,6 +501,7 @@ async fn test_follow_operations() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "user@example.com".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/123".to_string(),
         created_at: Utc::now(),
     };
@@ -605,12 +606,14 @@ async fn test_insert_follow_if_absent_deduplicates_default_port_variants() {
     let first = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/default-port-first".to_string(),
         created_at: Utc::now(),
     };
     let second = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/default-port-second".to_string(),
         created_at: Utc::now(),
     };
@@ -639,6 +642,7 @@ async fn test_insert_follow_if_absent_is_atomic_for_equivalent_targets() {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "alice@remote.example:443".to_string(),
+            actor_uri: None,
             uri: "https://example.com/follows/atomic-1".to_string(),
             created_at: Utc::now(),
         };
@@ -654,6 +658,7 @@ async fn test_insert_follow_if_absent_is_atomic_for_equivalent_targets() {
         let follow = Follow {
             id: EntityId::new_string(),
             target_address: "alice@remote.example".to_string(),
+            actor_uri: None,
             uri: "https://example.com/follows/atomic-2".to_string(),
             created_at: Utc::now(),
         };
@@ -678,6 +683,7 @@ async fn test_follower_operations() {
     let follower = Follower {
         id: EntityId::new_string(),
         follower_address: "follower@example.com".to_string(),
+        actor_uri: None,
         inbox_uri: "https://example.com/inbox".to_string(),
         uri: "https://example.com/follows/456".to_string(),
         created_at: Utc::now(),
@@ -711,6 +717,7 @@ async fn test_delete_follower_matches_missing_default_https_port() {
     let follower = Follower {
         id: EntityId::new_string(),
         follower_address: "bob@remote.example:443".to_string(),
+        actor_uri: None,
         inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
         uri: "https://remote.example/follows/default-port".to_string(),
         created_at: Utc::now(),
@@ -731,6 +738,7 @@ async fn test_delete_follower_by_address_and_uri_matches_default_https_port_vari
     let follower = Follower {
         id: EntityId::new_string(),
         follower_address: "bob@remote.example".to_string(),
+        actor_uri: None,
         inbox_uri: "https://remote.example/users/bob/inbox".to_string(),
         uri: "https://remote.example/follows/default-port-uri".to_string(),
         created_at: Utc::now(),
@@ -758,6 +766,7 @@ async fn test_delete_follow_matches_missing_default_https_port() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/default-port".to_string(),
         created_at: Utc::now(),
     };
@@ -777,6 +786,7 @@ async fn test_delete_follow_matches_explicit_default_https_port() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/no-port".to_string(),
         created_at: Utc::now(),
     };
@@ -796,6 +806,7 @@ async fn test_delete_follow_does_not_match_non_default_port() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:80".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/non-default-port".to_string(),
         created_at: Utc::now(),
     };
@@ -815,6 +826,7 @@ async fn test_get_follow_uri_matches_case_insensitively() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "Alice@Remote.EXAMPLE".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/case-insensitive".to_string(),
         created_at: Utc::now(),
     };
@@ -837,6 +849,7 @@ async fn test_get_follow_uri_matches_default_https_port_variants() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/default-port-uri".to_string(),
         created_at: Utc::now(),
     };
@@ -859,6 +872,7 @@ async fn test_get_follow_uri_does_not_match_non_default_port_variant() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/no-port-uri".to_string(),
         created_at: Utc::now(),
     };
@@ -872,12 +886,42 @@ async fn test_get_follow_uri_does_not_match_non_default_port_variant() {
 }
 
 #[tokio::test]
+async fn test_update_follow_actor_uri_matches_default_https_port_variant() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let follow = Follow {
+        id: EntityId::new_string(),
+        target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
+        uri: "https://example.com/follows/actor-uri-update".to_string(),
+        created_at: Utc::now(),
+    };
+    db.insert_follow(&follow).await.unwrap();
+
+    db.update_follow_actor_uri(
+        "alice@remote.example",
+        "https://remote.example/@alice",
+        Some(443),
+    )
+    .await
+    .unwrap();
+
+    let follows = db.get_all_follows().await.unwrap();
+    assert_eq!(follows.len(), 1);
+    assert_eq!(
+        follows[0].actor_uri.as_deref(),
+        Some("https://remote.example/@alice")
+    );
+}
+
+#[tokio::test]
 async fn test_block_account_removes_follow_for_default_port_variant() {
     let (db, _temp_dir) = create_test_db().await;
 
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://example.com/follows/block-match".to_string(),
         created_at: Utc::now(),
     };
@@ -941,6 +985,29 @@ async fn test_mute_unmute_matches_default_port_variant() {
 }
 
 #[tokio::test]
+async fn test_get_muted_account_details_preserves_actor_uri() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.mute_account_with_actor_uri(
+        "alice@remote.example",
+        true,
+        None,
+        Some("https://remote.example/users/alice"),
+        Some(443),
+    )
+    .await
+    .unwrap();
+
+    let muted = db.get_muted_account_details(10).await.unwrap();
+    assert_eq!(muted.len(), 1);
+    assert_eq!(muted[0].0, "alice@remote.example");
+    assert_eq!(
+        muted[0].1.as_deref(),
+        Some("https://remote.example/users/alice")
+    );
+}
+
+#[tokio::test]
 async fn test_notification_operations() {
     let (db, _temp_dir) = create_test_db().await;
 
@@ -968,6 +1035,52 @@ async fn test_notification_operations() {
     db.mark_notification_read(&notification.id).await.unwrap();
     let notifications = db.get_notifications(10, None, true).await.unwrap();
     assert_eq!(notifications.len(), 0);
+}
+
+#[tokio::test]
+async fn test_get_notifications_paginates_by_created_at_then_id() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let shared_time = Utc::now();
+    let oldest = Notification {
+        id: "notif-001".to_string(),
+        notification_type: NotificationType::Mention,
+        origin_account_address: "user1@example.com".to_string(),
+        status_uri: None,
+        read: false,
+        created_at: shared_time - chrono::Duration::seconds(1),
+    };
+    let middle = Notification {
+        id: "notif-002".to_string(),
+        notification_type: NotificationType::Reblog,
+        origin_account_address: "user2@example.com".to_string(),
+        status_uri: None,
+        read: false,
+        created_at: shared_time,
+    };
+    let newest_same_time = Notification {
+        id: "notif-003".to_string(),
+        notification_type: NotificationType::Favourite,
+        origin_account_address: "user3@example.com".to_string(),
+        status_uri: None,
+        read: false,
+        created_at: shared_time,
+    };
+
+    db.insert_notification(&oldest).await.unwrap();
+    db.insert_notification(&middle).await.unwrap();
+    db.insert_notification(&newest_same_time).await.unwrap();
+
+    let first_page = db.get_notifications(2, None, false).await.unwrap();
+    let first_page_ids: Vec<&str> = first_page.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(first_page_ids, vec!["notif-003", "notif-002"]);
+
+    let second_page = db
+        .get_notifications(2, Some("notif-002"), false)
+        .await
+        .unwrap();
+    let second_page_ids: Vec<&str> = second_page.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(second_page_ids, vec!["notif-001"]);
 }
 
 #[tokio::test]
@@ -2575,10 +2688,11 @@ async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_s
 async fn test_accept_follow_request_moves_to_followers() {
     let (db, _temp_dir) = create_test_db().await;
 
-    db.insert_follow_request(
+    db.insert_follow_request_with_actor_uri(
         "alice@remote.example",
         "https://remote.example/inbox",
         "https://remote.example/follows/1",
+        Some("https://remote.example/users/alice"),
     )
     .await
     .unwrap();
@@ -2595,6 +2709,12 @@ async fn test_accept_follow_request_moves_to_followers() {
 
     let inboxes = db.get_follower_inboxes().await.unwrap();
     assert_eq!(inboxes, vec!["https://remote.example/inbox".to_string()]);
+
+    let followers = db.get_all_followers().await.unwrap();
+    assert_eq!(
+        followers[0].actor_uri.as_deref(),
+        Some("https://remote.example/users/alice")
+    );
 }
 
 #[tokio::test]
@@ -2615,6 +2735,7 @@ async fn test_accept_follow_request_rolls_back_on_follower_insert_failure() {
     db.insert_follower(&Follower {
         id: EntityId::new_string(),
         follower_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         inbox_uri: "https://existing.example/inbox".to_string(),
         uri: "https://existing.example/follows/1".to_string(),
         created_at: Utc::now(),

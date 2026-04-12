@@ -26,6 +26,7 @@ mod federation_delivery;
 pub mod filters;
 pub mod instance;
 pub mod lists;
+pub mod markers;
 pub mod media;
 pub mod notifications;
 pub mod polls;
@@ -316,6 +317,14 @@ where
         .route(
             "/v1/notifications/unread_count",
             scoped(get(notifications::get_unread_count), READ_NOTIFICATIONS),
+        )
+        .route(
+            "/v1/markers",
+            scoped(get(markers::get_markers), READ_STATUSES),
+        )
+        .route(
+            "/v1/markers",
+            scoped(post(markers::save_markers), WRITE_STATUSES),
         )
         // Media
         .route("/v1/media", scoped(post(media::upload_media), WRITE_MEDIA))

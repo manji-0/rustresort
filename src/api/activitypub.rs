@@ -56,6 +56,22 @@ fn build_activity_processor(
     .with_streaming_event_bus(state.streaming_event_bus.clone())
 }
 
+fn fallback_actor_uri_from_address(protocol: &str, address: &str) -> String {
+    let Some((username, domain)) = address.split_once('@') else {
+        return address.to_string();
+    };
+    format!(
+        "{}://{}/users/{}",
+        if protocol.eq_ignore_ascii_case("http") {
+            "http"
+        } else {
+            "https"
+        },
+        domain,
+        username
+    )
+}
+
 /// Create ActivityPub router
 ///
 /// Routes:
@@ -469,23 +485,20 @@ async fn followers(
 
     match account {
         Some(acc) if acc.username == username => {
-            // Get follower addresses from database
-            let follower_addresses = state.db.get_all_follower_addresses().await?;
+            let followers = state.db.get_all_followers().await?;
 
             let base_url = state.config.server.base_url();
             let followers_url = format!("{}/users/{}/followers", base_url, username);
 
-            // Build OrderedCollection of follower URIs
-            // Note: In a real implementation, these should be actor URIs, not addresses
-            // For now, we'll use placeholder URIs
-            let items: Vec<String> = follower_addresses
+            let items: Vec<String> = followers
                 .iter()
-                .map(|addr| {
-                    format!(
-                        "https://{}/users/{}",
-                        addr.split('@').nth(1).unwrap_or("unknown.example"),
-                        addr.split('@').next().unwrap_or("unknown")
-                    )
+                .map(|follower| {
+                    follower.actor_uri.clone().unwrap_or_else(|| {
+                        fallback_actor_uri_from_address(
+                            &state.config.server.protocol,
+                            &follower.follower_address,
+                        )
+                    })
                 })
                 .collect();
 
@@ -513,21 +526,20 @@ async fn following(
 
     match account {
         Some(acc) if acc.username == username => {
-            // Get follow addresses from database
-            let follow_addresses = state.db.get_all_follow_addresses().await?;
+            let follows = state.db.get_all_follows().await?;
 
             let base_url = state.config.server.base_url();
             let following_url = format!("{}/users/{}/following", base_url, username);
 
-            // Build OrderedCollection of following URIs
-            let items: Vec<String> = follow_addresses
+            let items: Vec<String> = follows
                 .iter()
-                .map(|addr| {
-                    format!(
-                        "https://{}/users/{}",
-                        addr.split('@').nth(1).unwrap_or("unknown.example"),
-                        addr.split('@').next().unwrap_or("unknown")
-                    )
+                .map(|follow| {
+                    follow.actor_uri.clone().unwrap_or_else(|| {
+                        fallback_actor_uri_from_address(
+                            &state.config.server.protocol,
+                            &follow.target_address,
+                        )
+                    })
                 })
                 .collect();
 

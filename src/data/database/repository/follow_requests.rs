@@ -20,6 +20,21 @@ impl Database {
         Ok(addresses)
     }
 
+    /// Get follow request identities with actor URIs when available.
+    pub async fn get_follow_request_details(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>, AppError> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT requester_address, actor_uri FROM follow_requests ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Check if follow request exists
     pub async fn has_follow_request(&self, requester_address: &str) -> Result<bool, AppError> {
         let count: i64 =
@@ -75,6 +90,21 @@ impl Database {
         Ok(result)
     }
 
+    /// Get follow request details including canonical actor URI.
+    pub async fn get_follow_request_with_actor_uri(
+        &self,
+        requester_address: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, AppError> {
+        let result = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT inbox_uri, uri, actor_uri FROM follow_requests WHERE requester_address = ?",
+        )
+        .bind(requester_address)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result)
+    }
+
     /// Insert follow request
     pub async fn insert_follow_request(
         &self,
@@ -82,14 +112,27 @@ impl Database {
         inbox_uri: &str,
         uri: &str,
     ) -> Result<(), AppError> {
+        self.insert_follow_request_with_actor_uri(requester_address, inbox_uri, uri, None)
+            .await
+    }
+
+    /// Insert follow request with optional canonical actor URI.
+    pub async fn insert_follow_request_with_actor_uri(
+        &self,
+        requester_address: &str,
+        inbox_uri: &str,
+        uri: &str,
+        actor_uri: Option<&str>,
+    ) -> Result<(), AppError> {
         let id = EntityId::new_string();
         sqlx::query(
-            "INSERT OR REPLACE INTO follow_requests (id, requester_address, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+            "INSERT OR REPLACE INTO follow_requests (id, requester_address, inbox_uri, uri, actor_uri, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(&id)
         .bind(requester_address)
         .bind(inbox_uri)
         .bind(uri)
+        .bind(actor_uri)
         .execute(&self.pool)
         .await?;
 
@@ -102,23 +145,24 @@ impl Database {
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         let result: Result<bool, AppError> = async {
-            let follow_request = sqlx::query_as::<_, (String, String)>(
-                "SELECT inbox_uri, uri FROM follow_requests WHERE requester_address = ?",
+            let follow_request = sqlx::query_as::<_, (String, String, Option<String>)>(
+                "SELECT inbox_uri, uri, actor_uri FROM follow_requests WHERE requester_address = ?",
             )
             .bind(requester_address)
             .fetch_optional(&mut *conn)
             .await?;
 
-            let Some((inbox_uri, uri)) = follow_request else {
+            let Some((inbox_uri, uri, actor_uri)) = follow_request else {
                 return Ok(false);
             };
 
             let follower_id = EntityId::new_string();
             sqlx::query(
-                "INSERT INTO followers (id, follower_address, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+                "INSERT INTO followers (id, follower_address, actor_uri, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
             )
             .bind(&follower_id)
             .bind(requester_address)
+            .bind(actor_uri)
             .bind(&inbox_uri)
             .bind(&uri)
             .execute(&mut *conn)

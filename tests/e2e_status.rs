@@ -1801,3 +1801,82 @@ async fn test_notifications_fallback_to_cached_status() {
         "<p>Cached notification status</p>"
     );
 }
+
+#[tokio::test]
+async fn test_create_status_marks_sensitive_without_spoiler_text() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let payload = serde_json::json!({
+        "status": "nsfw post",
+        "sensitive": true,
+        "visibility": "public"
+    });
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let created: Value = response.json().await.unwrap();
+    assert_eq!(created["sensitive"], true);
+    assert_eq!(created["spoiler_text"], "");
+
+    let status_id = created["id"].as_str().unwrap();
+    let source_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/source", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source_response.status(), 200);
+    let source: Value = source_response.json().await.unwrap();
+    assert_eq!(source["spoiler_text"], "");
+}
+
+#[tokio::test]
+async fn test_update_status_can_clear_sensitive_flag_without_spoiler_text() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_payload = serde_json::json!({
+        "status": "needs warning",
+        "sensitive": true
+    });
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&create_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let update_payload = serde_json::json!({
+        "sensitive": false
+    });
+    let update_response = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{}", status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&update_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+
+    let updated: Value = update_response.json().await.unwrap();
+    assert_eq!(updated["sensitive"], false);
+    assert_eq!(updated["spoiler_text"], "");
+}

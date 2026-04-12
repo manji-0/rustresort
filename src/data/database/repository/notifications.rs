@@ -33,20 +33,46 @@ impl Database {
         max_id: Option<&str>,
         unread_only: bool,
     ) -> Result<Vec<Notification>, AppError> {
-        let notifications = match (max_id, unread_only) {
-            (Some(max_id), true) => {
+        let cursor = match max_id {
+            Some(id) => sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT created_at FROM notifications WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|created_at| (id, created_at)),
+            None => None,
+        };
+
+        let notifications = match (cursor, unread_only) {
+            (Some((max_id, created_at)), true) => {
                 sqlx::query_as::<_, Notification>(
-                    "SELECT * FROM notifications WHERE id < ? AND read = 0 ORDER BY created_at DESC LIMIT ?"
+                    r#"
+                    SELECT * FROM notifications
+                    WHERE read = 0
+                      AND (created_at < ? OR (created_at = ? AND id < ?))
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
                 )
+                .bind(created_at)
+                .bind(created_at)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
             }
-            (Some(max_id), false) => {
+            (Some((max_id, created_at)), false) => {
                 sqlx::query_as::<_, Notification>(
-                    "SELECT * FROM notifications WHERE id < ? ORDER BY created_at DESC LIMIT ?"
+                    r#"
+                    SELECT * FROM notifications
+                    WHERE created_at < ? OR (created_at = ? AND id < ?)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
                 )
+                .bind(created_at)
+                .bind(created_at)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -54,7 +80,7 @@ impl Database {
             }
             (None, true) => {
                 sqlx::query_as::<_, Notification>(
-                    "SELECT * FROM notifications WHERE read = 0 ORDER BY created_at DESC LIMIT ?"
+                    "SELECT * FROM notifications WHERE read = 0 ORDER BY created_at DESC, id DESC LIMIT ?"
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -62,7 +88,7 @@ impl Database {
             }
             (None, false) => {
                 sqlx::query_as::<_, Notification>(
-                    "SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?"
+                    "SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ?"
                 )
                 .bind(limit as i64)
                 .fetch_all(&self.pool)

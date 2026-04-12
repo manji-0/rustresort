@@ -1,15 +1,63 @@
 //! Notification endpoints
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     response::Json,
 };
+use serde::Deserialize;
 
 use super::accounts::PaginationParams;
 use crate::TimelineApiState;
 use crate::auth::CurrentUser;
-use crate::data::{PersistedReason, Status, StatusVisibility};
+use crate::data::{NotificationType, PersistedReason, Status, StatusVisibility};
 use crate::error::AppError;
+
+#[derive(Debug, Deserialize)]
+pub struct NotificationQueryParams {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+}
+
+fn parse_notification_type_query(raw_query: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let Some(raw_query) = raw_query else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        match key.as_ref() {
+            "types[]" => include.push(value.into_owned()),
+            "exclude_types[]" => exclude.push(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    (include, exclude)
+}
+
+fn parse_notification_type_filter(raw: &str) -> Option<NotificationType> {
+    match raw.trim() {
+        "mention" => Some(NotificationType::Mention),
+        "favourite" => Some(NotificationType::Favourite),
+        "reblog" => Some(NotificationType::Reblog),
+        "follow" => Some(NotificationType::Follow),
+        "follow_request" => Some(NotificationType::FollowRequest),
+        _ => None,
+    }
+}
+
+fn notification_is_included(
+    notification_type: NotificationType,
+    include_types: &[NotificationType],
+    exclude_types: &[NotificationType],
+) -> bool {
+    if !include_types.is_empty() && !include_types.iter().any(|ty| *ty == notification_type) {
+        return false;
+    }
+
+    !exclude_types.iter().any(|ty| *ty == notification_type)
+}
 
 async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> Option<Status> {
     if let Ok(status) = state.db.get_status_by_uri(status_uri).await
@@ -41,7 +89,8 @@ async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> 
 pub async fn get_notifications(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
-    Query(params): Query<PaginationParams>,
+    raw_query: RawQuery,
+    Query(params): Query<NotificationQueryParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     use crate::api::dto::NotificationResponse;
 
@@ -50,12 +99,22 @@ pub async fn get_notifications(
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     // Get notifications
-    let limit = params.limit.unwrap_or(20).min(40);
+    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let (raw_include_types, raw_exclude_types) =
+        parse_notification_type_query(raw_query.0.as_deref());
+    let include_types = raw_include_types
+        .iter()
+        .filter_map(|value| parse_notification_type_filter(value))
+        .collect::<Vec<_>>();
+    let exclude_types = raw_exclude_types
+        .iter()
+        .filter_map(|value| parse_notification_type_filter(value))
+        .collect::<Vec<_>>();
     let notifications = state
         .db
         .get_notifications(
             limit,
-            params.max_id.as_deref(),
+            params.pagination.max_id.as_deref(),
             false, // Get all notifications, not just unread
         )
         .await?;
@@ -63,6 +122,14 @@ pub async fn get_notifications(
     // Convert to API responses
     let mut responses = vec![];
     for notification in notifications {
+        if !notification_is_included(
+            notification.notification_type,
+            &include_types,
+            &exclude_types,
+        ) {
+            continue;
+        }
+
         // Get status if present
         let status = if let Some(status_uri) = &notification.status_uri {
             get_notification_status(&state, status_uri).await

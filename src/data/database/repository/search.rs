@@ -20,13 +20,17 @@ impl Database {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Status>, AppError> {
-        // Use FTS5 for full-text search
-        let statuses = sqlx::query_as::<_, Status>(
+        // Prefer FTS5 when available, but keep a LIKE fallback for environments
+        // where the virtual table schema differs from expectations.
+        let fts_result = sqlx::query_as::<_, Status>(
             r#"
             SELECT s.*
             FROM statuses s
-            INNER JOIN statuses_fts fts ON s.id = fts.status_id
-            WHERE statuses_fts MATCH ?
+            WHERE s.id IN (
+                SELECT status_id
+                FROM statuses_fts
+                WHERE statuses_fts MATCH ?
+            )
             ORDER BY s.created_at DESC
             LIMIT ? OFFSET ?
             "#,
@@ -35,9 +39,30 @@ impl Database {
         .bind(limit as i64)
         .bind(offset as i64)
         .fetch_all(&self.pool)
-        .await?;
+        .await;
 
-        Ok(statuses)
+        match fts_result {
+            Ok(statuses) => Ok(statuses),
+            Err(_) => {
+                let like_query = format!("%{}%", query);
+                let statuses = sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT *
+                    FROM statuses
+                    WHERE content LIKE ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    "#,
+                )
+                .bind(like_query)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await?;
+
+                Ok(statuses)
+            }
+        }
     }
 
     /// Search hashtags by name

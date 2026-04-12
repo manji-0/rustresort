@@ -2,7 +2,9 @@
 
 mod common;
 
+use chrono::Utc;
 use common::TestServer;
+use rustresort::data::{Notification, NotificationType};
 use serde_json::Value;
 
 #[tokio::test]
@@ -205,6 +207,105 @@ async fn test_account_statuses_empty() {
         let statuses = json.as_array().unwrap();
         assert_eq!(statuses.len(), 0);
     }
+}
+
+#[tokio::test]
+async fn test_markers_round_trip() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let save_payload = serde_json::json!({
+        "home": { "last_read_id": "status-123" },
+        "notifications": { "last_read_id": "notif-456" }
+    });
+
+    let save_response = server
+        .client
+        .post(server.url("/api/v1/markers"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(save_response.status(), 200);
+    let saved: Value = save_response.json().await.unwrap();
+    assert_eq!(saved["home"]["last_read_id"], "status-123");
+    assert_eq!(saved["notifications"]["last_read_id"], "notif-456");
+
+    let get_response = server
+        .client
+        .get(server.url("/api/v1/markers"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), 200);
+    let loaded: Value = get_response.json().await.unwrap();
+    assert_eq!(loaded["home"]["last_read_id"], "status-123");
+    assert_eq!(loaded["notifications"]["last_read_id"], "notif-456");
+}
+
+#[tokio::test]
+async fn test_notifications_respect_types_filters() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for (id, notification_type) in [
+        ("notif-mention", NotificationType::Mention),
+        ("notif-follow", NotificationType::Follow),
+    ] {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: id.to_string(),
+                notification_type,
+                origin_account_address: "alice@remote.example".to_string(),
+                status_uri: None,
+                read: false,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let only_mentions = server
+        .client
+        .get(server.url("/api/v1/notifications?types[]=mention"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(only_mentions.status(), 200);
+    let only_mentions: Value = only_mentions.json().await.unwrap();
+    let ids: Vec<&str> = only_mentions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"notif-mention"));
+    assert!(!ids.contains(&"notif-follow"));
+
+    let excluded_mentions = server
+        .client
+        .get(server.url("/api/v1/notifications?exclude_types[]=mention"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(excluded_mentions.status(), 200);
+    let excluded_mentions: Value = excluded_mentions.json().await.unwrap();
+    let ids: Vec<&str> = excluded_mentions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&"notif-mention"));
+    assert!(ids.contains(&"notif-follow"));
 }
 
 #[tokio::test]

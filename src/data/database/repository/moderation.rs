@@ -11,29 +11,68 @@ impl Database {
         target_address: &str,
         default_port: Option<u16>,
     ) -> Result<bool, AppError> {
-        let existing_blocks =
-            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
-                .fetch_all(&self.pool)
-                .await?;
-        let existing_match =
-            find_matching_addresses(&existing_blocks, target_address, default_port)
+        self.block_account_with_remote_metadata(target_address, None, None, default_port)
+            .await
+    }
+
+    /// Block an account and persist resolved remote metadata when available.
+    pub async fn block_account_with_remote_metadata(
+        &self,
+        target_address: &str,
+        actor_uri: Option<&str>,
+        inbox_uri: Option<&str>,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<bool, AppError> = async {
+            let existing_blocks =
+                sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
+                    .fetch_all(&mut *conn)
+                    .await?;
+            let existing_match = find_matching_addresses(&existing_blocks, target_address, default_port)
                 .into_iter()
                 .next();
-        if existing_match.is_none() {
-            let id = EntityId::new_string();
-            sqlx::query(
-                "INSERT INTO account_blocks (id, target_address, created_at) VALUES (?, ?, datetime('now'))",
-            )
-            .bind(&id)
-            .bind(target_address)
-            .execute(&self.pool)
-            .await?;
+
+            if existing_match.is_none() {
+                let id = EntityId::new_string();
+                sqlx::query(
+                    "INSERT INTO account_blocks (id, target_address, actor_uri, inbox_uri, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+                )
+                .bind(&id)
+                .bind(target_address)
+                .bind(actor_uri)
+                .bind(inbox_uri)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            let existing_follows = sqlx::query_scalar::<_, String>("SELECT target_address FROM follows")
+                .fetch_all(&mut *conn)
+                .await?;
+            let follow_matches = find_matching_addresses(&existing_follows, target_address, default_port);
+            for existing in follow_matches {
+                sqlx::query("DELETE FROM follows WHERE target_address COLLATE NOCASE = ?")
+                    .bind(existing)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+
+            Ok(existing_match.is_none())
         }
+        .await;
 
-        // Also remove any existing equivalent follow relationship.
-        self.delete_follow(target_address, default_port).await?;
-
-        Ok(existing_match.is_none())
+        match result {
+            Ok(inserted) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(inserted)
+            }
+            Err(error) => {
+                super::rollback_with_log(&mut conn, "block_account").await;
+                Err(error)
+            }
+        }
     }
 
     /// Unblock an account
@@ -75,6 +114,34 @@ impl Database {
             .any(|existing| account_addresses_match(existing, target_address, default_port)))
     }
 
+    /// Get stored block metadata for an account when present.
+    pub async fn get_block_target(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<(String, Option<String>, Option<String>)>, AppError> {
+        let existing_blocks =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_blocks")
+                .fetch_all(&self.pool)
+                .await?;
+        let Some(stored_target_address) =
+            find_matching_addresses(&existing_blocks, target_address, default_port)
+                .into_iter()
+                .next()
+        else {
+            return Ok(None);
+        };
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT target_address, actor_uri, inbox_uri FROM account_blocks WHERE target_address COLLATE NOCASE = ? LIMIT 1",
+        )
+        .bind(stored_target_address)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     /// Get blocked account addresses
     pub async fn get_blocked_accounts(&self, limit: usize) -> Result<Vec<String>, AppError> {
         let addresses = sqlx::query_scalar::<_, String>(
@@ -87,12 +154,46 @@ impl Database {
         Ok(addresses)
     }
 
+    /// Get blocked account details with optional remote metadata.
+    pub async fn get_blocked_account_details(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, AppError> {
+        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT target_address, actor_uri, inbox_uri FROM account_blocks ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Mute an account
     pub async fn mute_account(
         &self,
         target_address: &str,
         mute_notifications: bool,
         duration: Option<i64>,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        self.mute_account_with_actor_uri(
+            target_address,
+            mute_notifications,
+            duration,
+            None,
+            default_port,
+        )
+        .await
+    }
+
+    /// Mute an account and persist canonical actor URI when available.
+    pub async fn mute_account_with_actor_uri(
+        &self,
+        target_address: &str,
+        mute_notifications: bool,
+        duration: Option<i64>,
+        actor_uri: Option<&str>,
         default_port: Option<u16>,
     ) -> Result<(), AppError> {
         let existing_mutes =
@@ -107,12 +208,13 @@ impl Database {
 
         let id = EntityId::new_string();
         sqlx::query(
-            "INSERT OR REPLACE INTO account_mutes (id, target_address, notifications, duration, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+            "INSERT OR REPLACE INTO account_mutes (id, target_address, notifications, duration, actor_uri, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(&id)
         .bind(&stored_target_address)
         .bind(mute_notifications as i64)
         .bind(duration)
+        .bind(actor_uri)
         .execute(&self.pool)
         .await?;
 
@@ -183,5 +285,20 @@ impl Database {
         .await?;
 
         Ok(addresses)
+    }
+
+    /// Get muted account details with optional remote metadata.
+    pub async fn get_muted_account_details(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>, AppError> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT target_address, actor_uri FROM account_mutes ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 }

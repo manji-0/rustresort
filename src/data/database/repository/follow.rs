@@ -19,6 +19,15 @@ impl Database {
         Ok(addresses)
     }
 
+    /// Get all follows with canonical actor URIs when available.
+    pub async fn get_all_follows(&self) -> Result<Vec<Follow>, AppError> {
+        let follows = sqlx::query_as::<_, Follow>("SELECT * FROM follows ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(follows)
+    }
+
     /// Count follows.
     pub async fn count_follow_addresses(&self) -> Result<i64, AppError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM follows")
@@ -39,6 +48,16 @@ impl Database {
         .await?;
 
         Ok(addresses)
+    }
+
+    /// Get all followers with canonical actor URIs when available.
+    pub async fn get_all_followers(&self) -> Result<Vec<Follower>, AppError> {
+        let followers =
+            sqlx::query_as::<_, Follower>("SELECT * FROM followers ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(followers)
     }
 
     /// Count followers.
@@ -102,10 +121,11 @@ impl Database {
     /// Insert new follow relationship
     pub async fn insert_follow(&self, follow: &Follow) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO follows (id, target_address, uri, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO follows (id, target_address, actor_uri, uri, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&follow.id)
         .bind(&follow.target_address)
+        .bind(&follow.actor_uri)
         .bind(&follow.uri)
         .bind(follow.created_at)
         .execute(&self.pool)
@@ -138,10 +158,11 @@ impl Database {
             }
 
             let inserted = sqlx::query(
-                "INSERT OR IGNORE INTO follows (id, target_address, uri, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO follows (id, target_address, actor_uri, uri, created_at) VALUES (?, ?, ?, ?, ?)",
             )
             .bind(&follow.id)
             .bind(&follow.target_address)
+            .bind(&follow.actor_uri)
             .bind(&follow.uri)
             .bind(follow.created_at)
             .execute(&mut *conn)
@@ -193,6 +214,56 @@ impl Database {
         Ok(uri)
     }
 
+    /// Get the most recent follow row for a target address.
+    pub async fn get_follow(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<Follow>, AppError> {
+        let candidates = equivalent_account_address_candidates(target_address, default_port);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT * FROM follows WHERE target_address COLLATE NOCASE IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in &candidates {
+                separated.push_bind(candidate);
+            }
+        }
+        query_builder.push(") ORDER BY created_at DESC LIMIT 1");
+
+        let follow = query_builder
+            .build_query_as::<Follow>()
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(follow)
+    }
+
+    /// Update canonical actor URI for an existing follow relationship.
+    pub async fn update_follow_actor_uri(
+        &self,
+        target_address: &str,
+        actor_uri: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing_addresses = self.get_all_follow_addresses().await?;
+        let matches = find_matching_addresses(&existing_addresses, target_address, default_port);
+        for existing in matches {
+            sqlx::query("UPDATE follows SET actor_uri = ? WHERE target_address COLLATE NOCASE = ?")
+                .bind(actor_uri)
+                .bind(existing)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Delete follow relationship
     pub async fn delete_follow(
         &self,
@@ -214,10 +285,11 @@ impl Database {
     /// Insert new follower
     pub async fn insert_follower(&self, follower: &Follower) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO followers (id, follower_address, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO followers (id, follower_address, actor_uri, inbox_uri, uri, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         )
         .bind(&follower.id)
         .bind(&follower.follower_address)
+        .bind(&follower.actor_uri)
         .bind(&follower.inbox_uri)
         .bind(&follower.uri)
         .bind(follower.created_at)

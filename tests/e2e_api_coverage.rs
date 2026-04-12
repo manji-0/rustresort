@@ -326,6 +326,7 @@ async fn test_account_followers_applies_max_id_cursor() {
             .insert_follower(&Follower {
                 id: EntityId::new_string(),
                 follower_address: address.to_string(),
+                actor_uri: None,
                 inbox_uri: format!("https://remote.example/inbox/{}", address),
                 uri: format!("https://remote.example/follows/{}", address),
                 created_at: Utc::now(),
@@ -388,6 +389,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
             .insert_follower(&Follower {
                 id: EntityId::new_string(),
                 follower_address: address.to_string(),
+                actor_uri: None,
                 inbox_uri: format!("https://remote.example/inbox/{}", address),
                 uri: format!("https://remote.example/follows/{}", address),
                 created_at: Utc::now(),
@@ -451,6 +453,7 @@ async fn test_account_following_applies_max_id_cursor() {
             .insert_follow(&Follow {
                 id: EntityId::new_string(),
                 target_address: address.to_string(),
+                actor_uri: None,
                 uri: format!("https://remote.example/follows/{}", address),
                 created_at: Utc::now(),
             })
@@ -509,6 +512,7 @@ async fn test_account_followers_returns_remote_account_data_from_cache() {
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: remote_address.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/1".to_string(),
             created_at: Utc::now(),
@@ -550,6 +554,7 @@ async fn test_account_following_returns_remote_account_data_from_cache() {
         .insert_follow(&Follow {
             id: EntityId::new_string(),
             target_address: remote_address.to_string(),
+            actor_uri: None,
             uri: "https://remote.example/follows/2".to_string(),
             created_at: Utc::now(),
         })
@@ -590,6 +595,7 @@ async fn test_account_followers_actor_uri_uses_cached_profile_by_uri_alias() {
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri-cached".to_string(),
             created_at: Utc::now(),
@@ -618,6 +624,48 @@ async fn test_account_followers_actor_uri_uses_cached_profile_by_uri_alias() {
 }
 
 #[tokio::test]
+async fn test_account_followers_prefers_stored_actor_uri_over_address_lookup() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/@alice";
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "alice@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/stored-actor-uri".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let followers = body.as_array().expect("followers should be array");
+    assert_eq!(followers.len(), 1);
+    assert_eq!(followers[0]["id"], "alice@remote.example");
+    assert_eq!(followers[0]["acct"], "alice@remote.example");
+    assert_eq!(followers[0]["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
 async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_accounts() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follower};
@@ -633,6 +681,7 @@ async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_account
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri".to_string(),
             created_at: Utc::now(),
@@ -673,6 +722,7 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
         .insert_follow(&Follow {
             id: EntityId::new_string(),
             target_address: actor_uri_address.to_string(),
+            actor_uri: None,
             uri: "https://remote.example/follows/actor-uri".to_string(),
             created_at: Utc::now(),
         })
@@ -697,6 +747,47 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
 }
 
 #[tokio::test]
+async fn test_account_following_prefers_stored_actor_uri_over_address_lookup() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "alice@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://remote.example/follows/stored-actor-uri".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let following = body.as_array().expect("following should be array");
+    assert_eq!(following.len(), 1);
+    assert_eq!(following[0]["id"], "alice@remote.example");
+    assert_eq!(following[0]["acct"], "alice@remote.example");
+    assert_eq!(following[0]["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
 async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_url() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follower};
@@ -712,6 +803,7 @@ async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: actor_uri_address.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follows/actor-uri-at".to_string(),
             created_at: Utc::now(),
@@ -857,6 +949,44 @@ async fn test_get_blocks() {
 }
 
 #[tokio::test]
+async fn test_get_blocks_prefers_stored_actor_uri_profile_alias() {
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .block_account_with_remote_metadata(
+            "alice@remote.example",
+            Some(actor_uri),
+            Some("https://remote.example/inbox"),
+            Some(443),
+        )
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let blocks = body.as_array().expect("blocks should be array");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["id"], "alice@remote.example");
+    assert_eq!(blocks[0]["acct"], "alice@remote.example");
+    assert_eq!(blocks[0]["display_name"], "Alice Alias");
+    assert_ne!(blocks[0]["id"], account.id);
+}
+
+#[tokio::test]
 async fn test_get_mutes() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -871,6 +1001,44 @@ async fn test_get_mutes() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_mutes_prefers_stored_actor_uri_profile_alias() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .mute_account_with_actor_uri(
+            "alice@remote.example",
+            true,
+            None,
+            Some(actor_uri),
+            Some(443),
+        )
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/mutes"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let mutes = body.as_array().expect("mutes should be array");
+    assert_eq!(mutes.len(), 1);
+    assert_eq!(mutes[0]["id"], "alice@remote.example");
+    assert_eq!(mutes[0]["acct"], "alice@remote.example");
+    assert_eq!(mutes[0]["display_name"], "Alice Alias");
 }
 
 #[tokio::test]
@@ -928,6 +1096,7 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
         .insert_follow(&Follow {
             id: EntityId::new_string(),
             target_address: target_with_port.to_string(),
+            actor_uri: None,
             uri: "https://remote.example/follow/1".to_string(),
             created_at: Utc::now(),
         })
@@ -939,6 +1108,7 @@ async fn test_get_relationships_matches_default_port_equivalent_ids() {
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: target_with_port.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follow/2".to_string(),
             created_at: Utc::now(),
@@ -977,6 +1147,7 @@ async fn test_get_relationships_matches_actor_uri_ids() {
         .insert_follow(&Follow {
             id: EntityId::new_string(),
             target_address: actor_uri.to_string(),
+            actor_uri: None,
             uri: "https://remote.example/follow/uri-1".to_string(),
             created_at: Utc::now(),
         })
@@ -988,8 +1159,61 @@ async fn test_get_relationships_matches_actor_uri_ids() {
         .insert_follower(&Follower {
             id: EntityId::new_string(),
             follower_address: actor_uri.to_string(),
+            actor_uri: None,
             inbox_uri: "https://remote.example/inbox".to_string(),
             uri: "https://remote.example/follow/uri-2".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/relationships"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("id[]", actor_uri)])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body[0]["id"], actor_uri);
+    assert_eq!(body[0]["following"], true);
+    assert_eq!(body[0]["followed_by"], true);
+}
+
+#[tokio::test]
+async fn test_get_relationships_matches_stored_actor_uri_fields() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow, Follower};
+
+    let actor_uri = "https://remote.example/users/alice";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "alice@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://remote.example/follow/stored-actor-1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "alice@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follow/stored-actor-2".to_string(),
             created_at: Utc::now(),
         })
         .await
@@ -1243,6 +1467,72 @@ async fn test_search_accounts_resolve_local_address_with_leading_at_skips_remote
 }
 
 #[tokio::test]
+async fn test_search_accounts_following_filters_out_unfollowed_accounts() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/accounts/search?q={}&resolve=true&following=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("search accounts should be array");
+    assert!(accounts.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_accounts_following_keeps_followed_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: remote_address.to_string(),
+            actor_uri: Some("https://remote.example/users/alice".to_string()),
+            uri: "https://test.example.com/follows/alice-v1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/accounts/search?q={}&resolve=true&following=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("search accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], remote_address);
+}
+
+#[tokio::test]
 async fn test_get_account_lists() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;
@@ -1332,6 +1622,78 @@ async fn test_get_follow_requests() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_follow_requests_prefers_stored_actor_uri_profile_alias() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follow_request_with_actor_uri(
+            "alice@remote.example",
+            "https://remote.example/inbox",
+            "https://remote.example/follows/1",
+            Some(actor_uri),
+        )
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/follow_requests"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let requests = body.as_array().expect("follow_requests should be array");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["id"], "alice@remote.example");
+    assert_eq!(requests[0]["acct"], "alice@remote.example");
+    assert_eq!(requests[0]["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
+async fn test_get_follow_request_prefers_stored_actor_uri_profile_alias() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follow_request_with_actor_uri(
+            "alice@remote.example",
+            "https://remote.example/inbox",
+            "https://remote.example/follows/1",
+            Some(actor_uri),
+        )
+        .await
+        .unwrap();
+    cache_remote_profile_alias_by_actor_uri(&server, actor_uri, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/follow_requests/alice@remote.example"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["id"], "alice@remote.example");
+    assert_eq!(body["acct"], "alice@remote.example");
+    assert_eq!(body["display_name"], "Alice Alias");
 }
 
 #[tokio::test]
@@ -2533,6 +2895,112 @@ async fn test_search_v2_resolve_local_address_with_leading_at_skips_remote_looku
         .expect("search v2 accounts should be array");
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["acct"], "testuser");
+}
+
+#[tokio::test]
+async fn test_search_v2_accounts_following_filters_out_unfollowed_accounts() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true&following=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert!(accounts.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_v2_accounts_following_keeps_followed_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "alice@remote.example";
+    cache_remote_profile(&server, remote_address).await;
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: remote_address.to_string(),
+            actor_uri: None,
+            uri: "https://test.example.com/follows/alice".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v2/search?q={}&type=accounts&resolve=true&following=true",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], remote_address);
+
+    let status = rustresort::data::Status {
+        id: "local-status-search".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/local-status-search".to_string(),
+        content: "<p>followed search content</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: format!("{}@{}", account.username, server.state.config.server.domain),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v2/search?q=followed&account_id={}",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let statuses = body["statuses"]
+        .as_array()
+        .expect("search v2 statuses should be array");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["id"], status.id);
 }
 
 // ============================================================================

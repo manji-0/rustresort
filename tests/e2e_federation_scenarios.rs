@@ -200,6 +200,7 @@ async fn test_follow_notification_database() {
     let follower = Follower {
         id: EntityId::new_string(),
         follower_address: "bob@remote.example.com".to_string(),
+        actor_uri: None,
         inbox_uri: "https://remote.example.com/users/bob/inbox".to_string(),
         uri: "https://remote.example.com/users/bob/follow/123".to_string(),
         created_at: Utc::now(),
@@ -318,6 +319,7 @@ async fn test_follow_lifecycle_with_accept() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example.com".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/456".to_string(),
         created_at: Utc::now(),
     };
@@ -368,6 +370,7 @@ async fn test_followers_collection_updates() {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: addr.to_string(),
+            actor_uri: None,
             inbox_uri: inbox.to_string(),
             uri: format!("https://example.com/follow/{}", i),
             created_at: Utc::now(),
@@ -909,6 +912,7 @@ async fn test_delivery_target_collection() {
         let follower = Follower {
             id: EntityId::new_string(),
             follower_address: addr.to_string(),
+            actor_uri: None,
             inbox_uri: inbox.to_string(),
             uri: format!("https://example.com/follow/{}", addr),
             created_at: Utc::now(),

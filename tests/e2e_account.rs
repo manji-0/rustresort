@@ -417,12 +417,14 @@ async fn test_insert_follow_is_idempotent_for_duplicate_target_address() {
     let first = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/dup-1".to_string(),
         created_at: Utc::now(),
     };
     let second = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/dup-2".to_string(),
         created_at: Utc::now(),
     };
@@ -447,6 +449,7 @@ async fn test_unfollow_account_removes_follow_relationship() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: target.to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/seed".to_string(),
         created_at: Utc::now(),
     };
@@ -482,6 +485,7 @@ async fn test_unfollow_account_matches_case_insensitively() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "Alice@Remote.EXAMPLE".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/mixed".to_string(),
         created_at: Utc::now(),
     };
@@ -512,6 +516,7 @@ async fn test_unfollow_account_matches_default_https_port_variants() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/default-port".to_string(),
         created_at: Utc::now(),
     };
@@ -528,6 +533,103 @@ async fn test_unfollow_account_matches_default_https_port_variants() {
     assert!(response.status().is_success());
     let follow_addresses = server.state.db.get_all_follow_addresses().await.unwrap();
     assert!(follow_addresses.is_empty());
+}
+
+#[tokio::test]
+async fn test_unfollow_account_uses_stored_actor_uri_alias_for_delivery() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, EntityId, Follow};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    async fn record_inbox_delivery(
+        State(counter): State<Arc<AtomicUsize>>,
+        body: String,
+    ) -> StatusCode {
+        if let Ok(activity) = serde_json::from_str::<Value>(&body)
+            && activity.get("type").and_then(|value| value.as_str()) == Some("Undo")
+        {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        StatusCode::ACCEPTED
+    }
+
+    let undo_delivery_count = Arc::new(AtomicUsize::new(0));
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(undo_delivery_count.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let target_address = "alice@remote.example";
+    let actor_uri = format!("{}/users/alice", remote_base_url);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: target_address.to_string(),
+            actor_uri: Some(actor_uri.clone()),
+            uri: "https://test.example.com/users/testuser/follow/seed".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    // Only cache the canonical actor URI alias, not the account address.
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: actor_uri.clone(),
+            uri: actor_uri.clone(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let response = server
+        .client
+        .post(server.url(&format!("/api/v1/accounts/{}/unfollow", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+
+    let mut undo_delivered = false;
+    for _ in 0..600 {
+        if undo_delivery_count.load(Ordering::SeqCst) > 0 {
+            undo_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(undo_delivered, "expected outbound Undo(Follow) delivery");
 }
 
 #[tokio::test]
@@ -643,6 +745,7 @@ async fn test_block_account_matches_default_https_port_variants() {
     let follow = Follow {
         id: EntityId::new_string(),
         target_address: "alice@remote.example:443".to_string(),
+        actor_uri: None,
         uri: "https://test.example.com/users/testuser/follow/block-default-port".to_string(),
         created_at: Utc::now(),
     };
@@ -754,6 +857,142 @@ async fn test_block_and_unblock_account_deliver_outbound_activities() {
         .insert(CachedProfile {
             address: target_address.to_string(),
             uri: format!("{}/users/alice", remote_base_url),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: format!("{}/users/alice/inbox", remote_base_url),
+            outbox_uri: None,
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let block_response = server
+        .client
+        .post(server.url(&format!("/api/v1/accounts/{}/block", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(block_response.status().is_success());
+
+    let mut block_delivered = false;
+    for _ in 0..600 {
+        if counters.blocks.load(Ordering::SeqCst) > 0 {
+            block_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(block_delivered, "expected outbound Block delivery");
+
+    let unblock_response = server
+        .client
+        .post(server.url(&format!("/api/v1/accounts/{}/unblock", target_address)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert!(unblock_response.status().is_success());
+
+    let mut undo_delivered = false;
+    for _ in 0..600 {
+        if counters.undo_blocks.load(Ordering::SeqCst) > 0 {
+            undo_delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(undo_delivered, "expected outbound Undo(Block) delivery");
+}
+
+#[tokio::test]
+async fn test_block_and_unblock_use_stored_actor_uri_alias_for_delivery() {
+    use axum::{extract::State, http::StatusCode, routing::post};
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, EntityId, Follow};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    #[derive(Clone)]
+    struct InboxCounters {
+        blocks: Arc<AtomicUsize>,
+        undo_blocks: Arc<AtomicUsize>,
+    }
+
+    async fn record_inbox_delivery(
+        State(counters): State<InboxCounters>,
+        body: String,
+    ) -> StatusCode {
+        if let Ok(activity) = serde_json::from_str::<Value>(&body) {
+            match activity.get("type").and_then(|value| value.as_str()) {
+                Some("Block") => {
+                    counters.blocks.fetch_add(1, Ordering::SeqCst);
+                }
+                Some("Undo")
+                    if activity
+                        .get("object")
+                        .and_then(|value| value.get("type"))
+                        .and_then(|value| value.as_str())
+                        == Some("Block") =>
+                {
+                    counters.undo_blocks.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+        StatusCode::ACCEPTED
+    }
+
+    let counters = InboxCounters {
+        blocks: Arc::new(AtomicUsize::new(0)),
+        undo_blocks: Arc::new(AtomicUsize::new(0)),
+    };
+    let remote_router = axum::Router::new()
+        .route("/users/alice/inbox", post(record_inbox_delivery))
+        .with_state(counters.clone());
+    let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_base_url = format!("http://{}", remote_addr);
+    let actor_uri = format!("{}/users/alice", remote_base_url);
+
+    tokio::spawn(async move {
+        axum::serve(remote_listener, remote_router).await.unwrap();
+    });
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let target_address = "alice@remote.example";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: target_address.to_string(),
+            actor_uri: Some(actor_uri.clone()),
+            uri: "https://test.example.com/users/testuser/follow/block-alias".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    // Only cache the actor URI alias, not the account address.
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: actor_uri.clone(),
+            uri: actor_uri.clone(),
             display_name: Some("Alice".to_string()),
             note: None,
             avatar_url: None,

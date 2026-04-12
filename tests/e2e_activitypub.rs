@@ -227,6 +227,83 @@ async fn test_following_collection() {
 }
 
 #[tokio::test]
+async fn test_followers_collection_prefers_stored_actor_uri() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follower};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "alice@remote.example".to_string(),
+            actor_uri: Some("https://remote.example/@alice".to_string()),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser/followers"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ordered_items = json["orderedItems"]
+        .as_array()
+        .expect("followers should expose orderedItems");
+    assert_eq!(ordered_items.len(), 1);
+    assert_eq!(ordered_items[0], "https://remote.example/@alice");
+}
+
+#[tokio::test]
+async fn test_following_collection_prefers_stored_actor_uri() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "alice@remote.example".to_string(),
+            actor_uri: Some("https://remote.example/users/alice".to_string()),
+            uri: "https://test.example.com/users/testuser/follow/1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser/following"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ordered_items = json["orderedItems"]
+        .as_array()
+        .expect("following should expose orderedItems");
+    assert_eq!(ordered_items.len(), 1);
+    assert_eq!(ordered_items[0], "https://remote.example/users/alice");
+}
+
+#[tokio::test]
 async fn test_status_as_activity() {
     let server = TestServer::new().await;
     server.create_test_account().await;

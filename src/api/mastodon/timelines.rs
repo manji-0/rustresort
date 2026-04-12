@@ -46,6 +46,7 @@ pub async fn home_timeline(
     db_timer.observe_duration();
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -55,7 +56,7 @@ pub async fn home_timeline(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let timeline_items = timeline_service
-        .home_timeline(limit, params.max_id.as_deref(), params.min_id.as_deref())
+        .home_timeline(limit, params.max_id.as_deref(), effective_min_id)
         .await?;
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
@@ -200,18 +201,14 @@ pub async fn tag_timeline(
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
     let timeline_items = timeline_service
-        .tag_timeline(
-            &hashtag,
-            limit,
-            params.max_id.as_deref(),
-            params.min_id.as_deref(),
-        )
+        .tag_timeline(&hashtag, limit, params.max_id.as_deref(), effective_min_id)
         .await?;
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
@@ -276,6 +273,7 @@ pub async fn list_timeline(
     };
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let effective_min_id = params.min_id.clone().or(params.since_id.clone());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -284,7 +282,7 @@ pub async fn list_timeline(
     let timeline_items = if list.2 == "none" {
         let mut collected = Vec::with_capacity(limit);
         let mut cursor = params.max_id.clone();
-        let min_id = params.min_id.clone();
+        let min_id = effective_min_id.clone();
 
         while collected.len() < limit {
             let query = ListTimelineQuery {
@@ -326,7 +324,7 @@ pub async fn list_timeline(
             default_port,
             limit,
             max_id: params.max_id.clone(),
-            min_id: params.min_id.clone(),
+            min_id: effective_min_id,
         };
         timeline_service.list_timeline(&query).await?
     };

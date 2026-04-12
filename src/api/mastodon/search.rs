@@ -22,10 +22,10 @@ pub struct SearchParams {
     /// Only include accounts that the user is following
     #[serde(default)]
     #[serde(rename = "following")]
-    _following: bool,
+    following: bool,
     /// If provided, will only return statuses authored by this account
     #[serde(rename = "account_id")]
-    _account_id: Option<String>,
+    account_id: Option<String>,
     /// Filter out unreviewed tags
     #[serde(default)]
     #[serde(rename = "exclude_unreviewed")]
@@ -71,6 +71,18 @@ pub async fn search_v2(
     let mut statuses: Vec<serde_json::Value> = Vec::new();
     let mut hashtags = Vec::new();
     let account_limit = params.limit.unwrap_or(40).min(80);
+    let following_identities = if params.following {
+        state
+            .db
+            .get_all_follow_addresses()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|address| canonical_account_identity(&address, &local_domain))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     // Determine what to search based on type parameter
     let search_accounts =
@@ -160,6 +172,14 @@ pub async fn search_v2(
                 }
             }
         }
+        if params.following {
+            accounts.retain(|account| {
+                let identity = canonical_account_identity(&account.acct, &local_domain);
+                following_identities
+                    .iter()
+                    .any(|candidate| candidate == &identity)
+            });
+        }
         accounts.truncate(account_limit);
     }
 
@@ -172,6 +192,18 @@ pub async fn search_v2(
             Ok(found_statuses) => {
                 // Get account for status responses
                 if let Ok(Some(account)) = state.db.get_account().await {
+                    let filtered_statuses = if let Some(account_id) = params.account_id.as_deref() {
+                        if account.id == account_id {
+                            found_statuses
+                                .into_iter()
+                                .filter(|status| status.is_local)
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        found_statuses
+                    };
                     let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
                         .await
                         .unwrap_or_default();
@@ -179,11 +211,11 @@ pub async fn search_v2(
                         state.db.as_ref(),
                         state.profile_cache.as_ref(),
                         &state.config.server.protocol,
-                        &found_statuses,
+                        &filtered_statuses,
                     )
                     .await
                     .unwrap_or_default();
-                    for status in found_statuses {
+                    for status in filtered_statuses {
                         let remote_stats = remote_account_stats
                             .get(status.account_address.trim())
                             .copied();
