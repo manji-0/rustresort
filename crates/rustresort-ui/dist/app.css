@@ -242,6 +242,17 @@ code {
   background: rgba(255, 255, 255, 0.04);
 }
 
+.avatar-fallback {
+  display: grid;
+  place-items: center;
+  color: #f5fbff;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background:
+    radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.18), transparent 48%),
+    linear-gradient(135deg, rgba(29, 155, 240, 0.92), rgba(4, 56, 92, 0.92));
+}
+
 .bio {
   margin: 0;
   line-height: 1.45;

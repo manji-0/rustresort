@@ -1366,7 +1366,7 @@ fn render_profile_panel(model: &Model) -> String {
     {header}
   </div>
   <div class="profile-body">
-    <img class="profile-avatar" src="{avatar}" alt="{name}" />
+    {avatar}
     <div class="profile-text">
       <h3>{name}</h3>
       <p class="handle">@{acct}</p>
@@ -1392,7 +1392,7 @@ fn render_profile_panel(model: &Model) -> String {
                 encode_attribute(&display_name(account))
             )
         },
-        avatar = encode_attribute(&account.avatar),
+        avatar = avatar_markup("profile-avatar", &account.avatar, &display_name(account)),
         name = encode_text(&display_name(account)),
         acct = encode_text(&account.acct),
         note = encode_text(note),
@@ -1594,7 +1594,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
         r#"<article class="status-card {compact}">
   {boost_banner}
   <div class="status-head">
-    <img class="status-avatar" src="{avatar}" alt="{display_name}" />
+    {avatar}
     <div class="status-meta">
       <div class="status-line">
         <strong>{display_name}</strong>
@@ -1625,7 +1625,11 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
 </article>"#,
         compact = if compact { "compact" } else { "" },
         boost_banner = boost_banner.unwrap_or_default(),
-        avatar = encode_attribute(&primary.account.avatar),
+        avatar = avatar_markup(
+            "status-avatar",
+            &primary.account.avatar,
+            &display_name_from_status(&primary.account)
+        ),
         display_name = encode_text(&display_name_from_status(&primary.account)),
         acct = encode_text(&primary.account.acct),
         created_at = encode_text(&short_timestamp(&primary.created_at)),
@@ -1706,13 +1710,16 @@ fn render_media_attachments(media: &[MediaAttachment]) -> String {
 
     let items = media
         .iter()
-        .map(|attachment| {
+        .filter_map(|attachment| {
             let preview = if attachment.preview_url.trim().is_empty() {
                 &attachment.url
             } else {
                 &attachment.preview_url
             };
-            format!(
+            if preview.trim().is_empty() {
+                return None;
+            }
+            Some(format!(
                 r#"<figure class="media-tile">
   <img src="{preview}" alt="{alt}" />
   <figcaption>{kind}</figcaption>
@@ -1729,10 +1736,14 @@ fn render_media_attachments(media: &[MediaAttachment]) -> String {
                 } else {
                     &attachment.media_type
                 }),
-            )
+            ))
         })
         .collect::<Vec<_>>()
         .join("");
+
+    if items.is_empty() {
+        return String::new();
+    }
 
     format!(r#"<div class="media-grid">{items}</div>"#)
 }
@@ -1794,7 +1805,7 @@ fn render_notifications(model: &Model) -> String {
     <span>{created_at}</span>
   </div>
   <div class="notification-user">
-    <img class="status-avatar small" src="{avatar}" alt="{display_name}" />
+    {avatar}
     <div>
       <strong>{display_name}</strong>
       <span>@{acct}</span>
@@ -1808,7 +1819,11 @@ fn render_notifications(model: &Model) -> String {
 </div>"#,
                 kind = encode_text(&notification.notification_type),
                 created_at = encode_text(&short_timestamp(&notification.created_at)),
-                avatar = encode_attribute(&notification.account.avatar),
+                avatar = avatar_markup(
+                    "status-avatar small",
+                    &notification.account.avatar,
+                    &display_name_from_status(&notification.account)
+                ),
                 display_name = encode_text(&display_name_from_status(&notification.account)),
                 acct = encode_text(&notification.account.acct),
                 preview = encode_text(&preview),
@@ -1818,6 +1833,31 @@ fn render_notifications(model: &Model) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn avatar_markup(class_name: &str, url: &str, label: &str) -> String {
+    if !url.trim().is_empty() {
+        return format!(
+            r#"<img class="{class_name}" src="{src}" alt="{label}" />"#,
+            class_name = class_name,
+            src = encode_attribute(url),
+            label = encode_attribute(label),
+        );
+    }
+
+    let initial = label
+        .trim()
+        .chars()
+        .next()
+        .map(|ch| ch.to_ascii_uppercase())
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .unwrap_or('R');
+    format!(
+        r#"<div class="{class_name} avatar-fallback" aria-label="{label}">{initial}</div>"#,
+        class_name = class_name,
+        label = encode_attribute(label),
+        initial = initial,
+    )
 }
 
 fn render_backups(model: &Model) -> String {
