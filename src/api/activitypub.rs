@@ -242,6 +242,26 @@ async fn build_status_tags(
             })
         })
         .collect::<Vec<_>>();
+    tags.extend(
+        crate::api::mastodon::federation_delivery::extract_mentions_from_content(content)
+            .into_iter()
+            .filter(|mention| {
+                mention.split_once('@').is_some_and(|(_, domain)| {
+                    domain.eq_ignore_ascii_case(&state.config.server.domain)
+                })
+            })
+            .map(|mention| {
+                let username = mention
+                    .split_once('@')
+                    .map(|(username, _)| username)
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "type": "Mention",
+                    "href": format!("{}/users/{}", state.config.server.base_url(), username),
+                    "name": format!("@{}", mention),
+                })
+            }),
+    );
     let recipients =
         crate::api::mastodon::federation_delivery::resolve_remote_recipients_with_dependencies(
             state.db.as_ref(),

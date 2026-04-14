@@ -2018,11 +2018,17 @@ fn render_app(model: &Model) -> String {
       <div>
         <p class="micro-label">Timeline</p>
         <h2>{feed_label}</h2>
-        <div class="timeline-meta">
+          <div class="timeline-meta">
           <p class="subtle-line">{feed_subtitle}</p>
           <div class="shortcut-row">
-            <span class="shortcut-hint"><kbd>g</kbd> top</span>
+            <span class="shortcut-hint"><kbd>j</kbd>/<kbd>k</kbd> move</span>
+            <span class="shortcut-hint"><kbd>n</kbd> compose</span>
+            <span class="shortcut-hint"><kbd>N</kbd> mention</span>
             <span class="shortcut-hint"><kbd>d</kbd> detail</span>
+            <span class="shortcut-hint"><kbd>f</kbd> like</span>
+            <span class="shortcut-hint"><kbd>r</kbd> boost</span>
+            <span class="shortcut-hint"><kbd>q</kbd> quote</span>
+            <span class="shortcut-hint"><kbd>g</kbd> top</span>
             <span class="shortcut-hint"><kbd>Tab</kbd> notifications</span>
             <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
           </div>
@@ -2359,6 +2365,14 @@ fn render_detail_modal(model: &Model) -> String {
         return String::new();
     }
 
+    let ancestor_count = model.thread.ancestors.len();
+    let descendant_count = model.thread.descendants.len();
+    let thread_summary = if model.thread.focus.is_some() {
+        format!("{} earlier · {} replies", ancestor_count, descendant_count)
+    } else {
+        "Conversation unavailable".to_string()
+    };
+
     let content = if model.thread.loading && model.thread.focus.is_none() {
         r#"<div class="thread-empty">Loading conversation…</div>"#.to_string()
     } else if let Some(focus) = model.thread.focus.as_ref() {
@@ -2366,7 +2380,10 @@ fn render_detail_modal(model: &Model) -> String {
             String::new()
         } else {
             format!(
-                r#"<div class="thread-stack">{}</div>"#,
+                r#"<section class="thread-section thread-section-ancestors">
+  <p class="thread-section-label">Earlier in thread</p>
+  <div class="thread-stack">{}</div>
+</section>"#,
                 model
                     .thread
                     .ancestors
@@ -2380,7 +2397,10 @@ fn render_detail_modal(model: &Model) -> String {
             String::new()
         } else {
             format!(
-                r#"<div class="thread-stack">{}</div>"#,
+                r#"<section class="thread-section thread-section-descendants">
+  <p class="thread-section-label">Replies</p>
+  <div class="thread-stack">{}</div>
+</section>"#,
                 model
                     .thread
                     .descendants
@@ -2394,6 +2414,7 @@ fn render_detail_modal(model: &Model) -> String {
         format!(
             r#"{ancestors}
 <div class="thread-focus">
+  <p class="thread-section-label">Selected post</p>
   {focus}
 </div>
 {descendants}"#,
@@ -2428,6 +2449,7 @@ fn render_detail_modal(model: &Model) -> String {
         </div>
         <h3 id="detail-modal-title">Selected thread</h3>
         <p class="detail-caption">Focused thread inspector. Use <code>j</code>/<code>k</code> to move within the conversation.</p>
+        <p class="detail-summary">{thread_summary}</p>
       </div>
       <div class="detail-actions">
         <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
@@ -2440,6 +2462,7 @@ fn render_detail_modal(model: &Model) -> String {
   </div>
 </section>"#,
         thread_badge = thread_badge,
+        thread_summary = encode_text(&thread_summary),
         content = content,
     )
 }
@@ -2766,6 +2789,7 @@ fn render_notifications(model: &Model) -> String {
         .iter()
         .map(|group| {
             let group_key = notification_group_selection_key(group);
+            let kind_class = notification_kind_class(&group.notification_type);
             let preview = group
                 .status
                 .as_ref()
@@ -2800,20 +2824,20 @@ fn render_notifications(model: &Model) -> String {
             let dismiss_ids = encode_attribute(&group.ids.join("|"));
 
             format!(
-                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}" tabindex="{tabindex}" role="option" aria-selected="{aria_selected}">
+                r#"<div class="notification-card {selected} {kind_class}" data-focus-notification="{group_key}" tabindex="{tabindex}" role="option" aria-selected="{aria_selected}">
   <div class="notification-head">
-    <strong>{kind}</strong>
+    <strong class="notification-kind-pill {kind_class}">{kind}</strong>
     <span>{created_at}</span>
   </div>
   <div class="notification-user">
     {avatar}
-    <div>
+    <div class="notification-actor-meta">
       <strong>{display_name}</strong>
       {handle}
     </div>
     {count_badge}
   </div>
-  <p>{preview}</p>
+  <p class="notification-preview">{preview}</p>
   <div class="notification-actions">
     {thread_button}
     <button class="ghost-button small" data-dismiss-notification="{notification_id}">Dismiss</button>
@@ -3185,6 +3209,17 @@ fn notification_kind_label(kind: &str) -> &'static str {
         "follow" => "Follows",
         "status" => "Posts",
         _ => "Activity",
+    }
+}
+
+fn notification_kind_class(kind: &str) -> &'static str {
+    match kind {
+        "mention" => "kind-mention",
+        "favourite" => "kind-favourite",
+        "reblog" => "kind-reblog",
+        "follow" => "kind-follow",
+        "status" => "kind-status",
+        _ => "kind-generic",
     }
 }
 

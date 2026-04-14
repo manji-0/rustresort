@@ -1378,6 +1378,28 @@ impl ActivityDelivery {
         Ok(())
     }
 
+    pub async fn send_poll_vote(
+        &self,
+        poll_uri: &str,
+        option_titles: &[String],
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        for option_title in option_titles {
+            let vote_object_uri = format!("{}/votes/{}", self.actor_uri, EntityId::new_string());
+            let vote_activity_uri = format!("{vote_object_uri}/activity");
+            let activity = self.build_poll_vote_activity(
+                &vote_activity_uri,
+                &vote_object_uri,
+                poll_uri,
+                option_title,
+                target_actor_uri,
+            );
+            self.deliver_to_inbox(target_inbox_uri, activity).await?;
+        }
+        Ok(())
+    }
+
     /// Send Undo activity
     pub async fn send_undo(
         &self,

@@ -1098,6 +1098,14 @@ impl ActivityProcessor {
             return Ok(false);
         }
 
+        let voter_address = self.extract_actor_address(actor_uri);
+        if !self
+            .can_actor_vote_on_local_status(&status, &voter_address)
+            .await?
+        {
+            return Err(AppError::Unauthorized);
+        }
+
         let Some((poll_id, _expires_at, _expired, _multiple, _votes_count, _voters_count)) =
             self.db.get_poll_by_status_id(&status.id).await?
         else {
@@ -1116,7 +1124,6 @@ impl ActivityProcessor {
             return Ok(false);
         }
 
-        let voter_address = self.extract_actor_address(actor_uri);
         if self
             .db
             .record_remote_poll_vote(&poll_id, &voter_address, &option_ids)
@@ -1126,6 +1133,35 @@ impl ActivityProcessor {
         }
 
         Ok(true)
+    }
+
+    async fn can_actor_vote_on_local_status(
+        &self,
+        status: &Status,
+        actor_address: &str,
+    ) -> Result<bool, AppError> {
+        match status.visibility {
+            StatusVisibility::Public | StatusVisibility::Unlisted => Ok(true),
+            StatusVisibility::Private => {
+                let default_port = default_port_for_scheme(&self.local_protocol);
+                Ok(self
+                    .db
+                    .get_follower(actor_address, default_port)
+                    .await?
+                    .is_some())
+            }
+            StatusVisibility::Direct => {
+                let Some((_, local_domain)) = self.local_address.split_once('@') else {
+                    return Ok(false);
+                };
+                Ok(crate::api::mastodon::federation_delivery::extract_remote_mentions_from_content(
+                    &status.content,
+                    local_domain,
+                )
+                .into_iter()
+                .any(|mention| mention.eq_ignore_ascii_case(actor_address)))
+            }
+        }
     }
 
     /// Handle Update activity (profile update)

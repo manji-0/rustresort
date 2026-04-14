@@ -303,7 +303,7 @@ fn extract_mentions_from_text(text: &str) -> Vec<String> {
     mentions
 }
 
-pub fn extract_remote_mentions_from_content(content: &str, local_domain: &str) -> Vec<String> {
+pub fn extract_mentions_from_content(content: &str) -> Vec<String> {
     let normalized = content
         .replace("<br />", "\n")
         .replace("<br/>", "\n")
@@ -323,6 +323,10 @@ pub fn extract_remote_mentions_from_content(content: &str, local_domain: &str) -
     }
 
     extract_mentions_from_text(&html_escape::decode_html_entities(without_tags.trim()))
+}
+
+pub fn extract_remote_mentions_from_content(content: &str, local_domain: &str) -> Vec<String> {
+    extract_mentions_from_content(content)
         .into_iter()
         .filter(|mention| {
             mention

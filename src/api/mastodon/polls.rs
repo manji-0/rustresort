@@ -9,11 +9,8 @@ use std::collections::HashSet;
 
 use crate::{
     PollsApiState,
-    api::mastodon::federation_delivery::{
-        resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_delivery,
-    },
-    auth::CurrentUser,
-    error::AppError,
+    api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies,
+    auth::CurrentUser, error::AppError,
 };
 
 fn build_delivery(
@@ -143,43 +140,37 @@ pub async fn vote_in_poll(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_address = format!("{}@{}", account.username, state.config.server.domain);
 
-    // Record vote
-    state
-        .db
-        .vote_in_poll(&id, &account_address, &option_ids)
-        .await?;
-
     if let Some(status_id) = state.db.get_status_id_by_poll_id(&id).await?
         && let Some(status) = state.db.get_status(&status_id).await?
         && !status.is_local
         && !status.account_address.is_empty()
     {
-        let state_for_delivery = state.clone();
-        let account_for_delivery = account.clone();
         let poll_uri = status.uri.clone();
         let remote_account_address = status.account_address.clone();
-        let selected_titles_for_delivery = selected_titles.clone();
-        spawn_best_effort_delivery("vote_poll", async move {
-            let (target_actor_uri, target_inbox_uri) =
-                resolve_remote_actor_and_inbox_with_dependencies(
-                    state_for_delivery.db.as_ref(),
-                    state_for_delivery.profile_cache.as_ref(),
-                    state_for_delivery.federation_fetch_client.as_ref(),
-                    &remote_account_address,
-                )
-                .await?;
-            let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
-            delivery
-                .queue_poll_vote(
-                    state_for_delivery.db.as_ref(),
-                    &poll_uri,
-                    &selected_titles_for_delivery,
-                    &target_actor_uri,
-                    &target_inbox_uri,
-                )
-                .await
-        });
+        let (target_actor_uri, target_inbox_uri) =
+            resolve_remote_actor_and_inbox_with_dependencies(
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                state.federation_fetch_client.as_ref(),
+                &remote_account_address,
+            )
+            .await?;
+        let delivery = build_delivery(&state, &account);
+        delivery
+            .send_poll_vote(
+                &poll_uri,
+                &selected_titles,
+                &target_actor_uri,
+                &target_inbox_uri,
+            )
+            .await?;
     }
+
+    // Record vote after remote delivery succeeds, or immediately for local polls.
+    state
+        .db
+        .vote_in_poll(&id, &account_address, &option_ids)
+        .await?;
 
     // Return updated poll
     get_poll(State(state), CurrentUser(session), Path(id)).await

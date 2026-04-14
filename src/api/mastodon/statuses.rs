@@ -11,7 +11,7 @@ use std::collections::{HashSet, VecDeque};
 
 use super::accounts::PaginationParams;
 use super::federation_delivery::{
-    ResolvedRemoteRecipient, extract_remote_mentions_from_content,
+    ResolvedRemoteRecipient, extract_mentions_from_content, extract_remote_mentions_from_content,
     resolve_remote_actor_and_inbox_with_dependencies, resolve_remote_recipients_with_dependencies,
     spawn_best_effort_batch_delivery, spawn_best_effort_delivery,
 };
@@ -424,6 +424,7 @@ async fn resolve_explicit_remote_recipients(
     content: &str,
     extra_addresses: impl IntoIterator<Item = String>,
 ) -> (Vec<ResolvedRemoteRecipient>, Vec<serde_json::Value>) {
+    let mention_addresses_all = extract_mentions_from_content(content);
     let mut addresses = extract_remote_mentions_from_content(content, &state.config.server.domain);
     let mention_addresses = addresses
         .iter()
@@ -439,7 +440,7 @@ async fn resolve_explicit_remote_recipients(
     )
     .await;
 
-    let mention_tags = recipients
+    let mut mention_tags = recipients
         .iter()
         .filter(|recipient| mention_addresses.contains(&recipient.address))
         .map(|recipient| {
@@ -449,7 +450,28 @@ async fn resolve_explicit_remote_recipients(
                 "name": format!("@{}", recipient.address),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    mention_tags.extend(
+        mention_addresses_all
+            .into_iter()
+            .filter(|mention| {
+                mention.split_once('@').is_some_and(|(_, domain)| {
+                    domain.eq_ignore_ascii_case(&state.config.server.domain)
+                })
+            })
+            .map(|mention| {
+                let username = mention
+                    .split_once('@')
+                    .map(|(username, _)| username)
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "type": "Mention",
+                    "href": format!("{}/users/{}", state.config.server.base_url(), username),
+                    "name": format!("@{}", mention),
+                })
+            }),
+    );
 
     (recipients, mention_tags)
 }
