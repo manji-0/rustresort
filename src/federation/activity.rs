@@ -170,6 +170,18 @@ fn sanitize_remote_html(content: &str) -> String {
     ammonia::clean(content)
 }
 
+fn extract_attachment_dimensions(value: &serde_json::Value) -> (Option<i32>, Option<i32>) {
+    let width = value
+        .get("width")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|raw| i32::try_from(raw).ok());
+    let height = value
+        .get("height")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|raw| i32::try_from(raw).ok());
+    (width, height)
+}
+
 fn push_alert_enabled(alerts: &PushAlerts, notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Mention => alerts.mention,
@@ -638,9 +650,14 @@ impl ActivityProcessor {
             .and_then(|t| t.as_str())
             .ok_or_else(|| AppError::Validation("Missing activity type".to_string()))?;
 
-        let activity_type = ActivityType::parse(activity_type_str).ok_or_else(|| {
-            AppError::Validation(format!("Unknown activity type: {}", activity_type_str))
-        })?;
+        let Some(activity_type) = ActivityType::parse(activity_type_str) else {
+            tracing::debug!(
+                activity_type = activity_type_str,
+                actor_uri,
+                "Ignoring unsupported inbound ActivityPub activity type"
+            );
+            return Ok(());
+        };
 
         // 2. Check if domain is blocked
         let mut actor_is_blocked = false;
@@ -658,12 +675,14 @@ impl ActivityProcessor {
             return Err(AppError::Forbidden);
         }
 
-        let actor_is_followee =
-            if matches!(activity_type, ActivityType::Create | ActivityType::Update) {
-                self.is_followee(actor_uri).await
-            } else {
-                false
-            };
+        let actor_is_followee = if matches!(
+            activity_type,
+            ActivityType::Create | ActivityType::Update | ActivityType::Announce
+        ) {
+            self.is_followee(actor_uri).await
+        } else {
+            false
+        };
 
         // 3. Decide whether this activity should be handled at all.
         let persistence_decision = self.decide_persistence(&activity, actor_is_followee);
@@ -689,7 +708,10 @@ impl ActivityProcessor {
             ActivityType::Reject => self.handle_reject(activity, actor_uri).await,
             ActivityType::Undo => self.handle_undo(activity, actor_uri).await,
             ActivityType::Like => self.handle_like(activity, actor_uri).await,
-            ActivityType::Announce => self.handle_announce(activity, actor_uri).await,
+            ActivityType::Announce => {
+                self.handle_announce(activity, actor_uri, persistence_decision, actor_is_followee)
+                    .await
+            }
             ActivityType::Block => self.handle_block(activity, actor_uri).await,
             ActivityType::Move => self.handle_move(activity, actor_uri).await,
         }
@@ -742,6 +764,9 @@ impl ActivityProcessor {
                             return PersistenceDecision::Persist;
                         }
                     }
+                }
+                if actor_is_followee {
+                    return PersistenceDecision::Persist;
                 }
                 // Boost of someone else's status -> Ignore
                 PersistenceDecision::Ignore
@@ -1210,6 +1235,11 @@ impl ActivityProcessor {
             if let Some(embedded_actor_uri) = activity_actor.get("id").and_then(|id| id.as_str()) {
                 canonical_actor_uri = embedded_actor_uri.to_string();
             }
+            crate::api::mastodon::federation_delivery::validate_actor_and_inbox_urls(
+                &canonical_actor_uri,
+                &inbox_uri,
+            )
+            .await?;
             inbox_uri
         } else if let Some(client) = &self.federation_fetch_client {
             match crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
@@ -1819,6 +1849,8 @@ impl ActivityProcessor {
         &self,
         activity: serde_json::Value,
         actor_uri: &str,
+        persistence_decision: PersistenceDecision,
+        actor_is_followee: bool,
     ) -> Result<(), AppError> {
         let object = activity
             .get("object")
@@ -1839,17 +1871,18 @@ impl ActivityProcessor {
                 .as_deref()
                 .is_some_and(|quote_uri| self.is_local_status(quote_uri));
 
-            if mentions_local || quotes_local {
+            if mentions_local || quotes_local || actor_is_followee {
+                let persisted_reason = if mentions_local || quotes_local {
+                    PersistedReason::Mentioned
+                } else {
+                    PersistedReason::Timeline
+                };
                 if let Some(status) = self
-                    .upsert_remote_status_from_object(
-                        object,
-                        actor_uri,
-                        PersistedReason::Mentioned,
-                        false,
-                    )
+                    .upsert_remote_status_from_object(object, actor_uri, persisted_reason, false)
                     .await?
                 {
-                    self.publish_remote_status_update(&status, false).await;
+                    self.publish_remote_status_update(&status, actor_is_followee)
+                        .await;
                 }
 
                 let status_uri = object
@@ -1891,7 +1924,7 @@ impl ActivityProcessor {
                     .await?;
                 }
             }
-            // If quote doesn't mention us, ignore (future: could cache if from followee)
+            // Otherwise ignore non-relevant quote Announce objects.
         } else if let Some(object_uri) = object.as_str() {
             // Regular boost: just a URI reference
             // Check if it's our status being boosted
@@ -1930,11 +1963,90 @@ impl ActivityProcessor {
                 if let Some(status) = boosted_status.as_ref() {
                     self.publish_local_status_update(status).await;
                 }
+            } else if matches!(persistence_decision, PersistenceDecision::Persist)
+                && actor_is_followee
+                && let Some(status) = self
+                    .upsert_remote_announce_status(
+                        &activity,
+                        actor_uri,
+                        object_uri,
+                        PersistedReason::Timeline,
+                    )
+                    .await?
+            {
+                self.publish_remote_status_update(&status, true).await;
             }
-            // If boosting someone else's status, ignore (future: could cache if from followee)
         }
 
         Ok(())
+    }
+
+    async fn upsert_remote_announce_status(
+        &self,
+        activity: &serde_json::Value,
+        actor_uri: &str,
+        object_uri: &str,
+        persisted_reason: PersistedReason,
+    ) -> Result<Option<Status>, AppError> {
+        let Some(activity_uri) = activity.get("id").and_then(|id| id.as_str()) else {
+            return Ok(None);
+        };
+
+        let created_at = activity
+            .get("published")
+            .and_then(|published| published.as_str())
+            .and_then(|published| DateTime::parse_from_rfc3339(published).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let visibility = StatusVisibility::parse(&self.extract_visibility(activity))
+            .unwrap_or(StatusVisibility::Private);
+        let account_address = self.extract_actor_address(actor_uri);
+
+        let cached = CachedStatus {
+            id: activity_uri.to_string(),
+            uri: activity_uri.to_string(),
+            content: String::new(),
+            account_address: account_address.clone(),
+            created_at,
+            visibility: visibility.as_str().to_string(),
+            attachments: Vec::new(),
+            reply_to_uri: None,
+            boost_of_uri: Some(object_uri.to_string()),
+            quote_of_uri: None,
+        };
+        self.timeline_cache.insert(cached).await;
+
+        let mut status = Status {
+            id: activity_uri.to_string(),
+            uri: activity_uri.to_string(),
+            content: String::new(),
+            content_warning: None,
+            visibility,
+            language: None,
+            account_address,
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: Some(object_uri.to_string()),
+            quote_of_uri: None,
+            persisted_reason,
+            created_at,
+            fetched_at: Some(Utc::now()),
+        };
+
+        if let Some(existing) = self.db.get_status_by_uri(activity_uri).await? {
+            if existing.is_local {
+                return Ok(Some(existing));
+            }
+            status.id = existing.id.clone();
+            status.created_at = existing.created_at;
+            status.persisted_reason =
+                merge_persisted_reason(existing.persisted_reason, persisted_reason);
+            self.db.update_status(&status).await?;
+            return Ok(Some(status));
+        }
+
+        self.db.insert_status(&status).await?;
+        Ok(Some(status))
     }
 
     async fn upsert_remote_status_from_object(
@@ -2006,10 +2118,18 @@ impl ActivityProcessor {
             } else {
                 self.db.update_status(&status).await?;
             }
+            let attachments = self.remote_status_attachments_from_object(&status.id, object);
+            self.db
+                .replace_remote_status_attachments(&status.id, &attachments)
+                .await?;
             return Ok(Some(status));
         }
 
         self.db.insert_status(&status).await?;
+        let attachments = self.remote_status_attachments_from_object(&status.id, object);
+        self.db
+            .replace_remote_status_attachments(&status.id, &attachments)
+            .await?;
         Ok(Some(status))
     }
 
@@ -2066,6 +2186,61 @@ impl ActivityProcessor {
         ["quoteUri", "quoteUrl", "_misskey_quote"]
             .into_iter()
             .find_map(|key| object.get(key).and_then(extract_first_uri_reference))
+    }
+
+    fn remote_status_attachments_from_object(
+        &self,
+        status_id: &str,
+        object: &serde_json::Value,
+    ) -> Vec<crate::data::RemoteStatusAttachment> {
+        let Some(values) = object
+            .get("attachment")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let remote_url = if let Some(url) = value.as_str() {
+                    url.to_string()
+                } else {
+                    value
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string()
+                };
+                let (width, height) = extract_attachment_dimensions(value);
+                Some(crate::data::RemoteStatusAttachment {
+                    id: format!("{status_id}:remote:{index}"),
+                    status_id: status_id.to_string(),
+                    remote_url: remote_url.clone(),
+                    preview_url: value
+                        .get("icon")
+                        .and_then(|icon| icon.get("url"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    content_type: value
+                        .get("mediaType")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("application/octet-stream")
+                        .to_string(),
+                    description: value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    blurhash: value
+                        .get("blurhash")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    width,
+                    height,
+                    created_at: Utc::now(),
+                })
+            })
+            .collect()
     }
 
     async fn remove_notification_for_undo(
@@ -2179,6 +2354,12 @@ impl ActivityProcessor {
             }
             "Announce" => {
                 if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
+                    if self
+                        .remove_remote_announce_status_by_activity_uri(activity_uri, actor_address)
+                        .await?
+                    {
+                        return Ok(true);
+                    }
                     if let Some((stored_actor, stored_status_id)) = self
                         .db
                         .get_remote_repost_actor_and_status_by_activity_uri(activity_uri)
@@ -2262,7 +2443,46 @@ impl ActivityProcessor {
             }
         }
 
+        if self
+            .remove_remote_announce_status_by_activity_uri(activity_uri, actor_address)
+            .await?
+        {
+            removed_any = true;
+        }
+
         Ok(removed_any)
+    }
+
+    async fn remove_remote_announce_status_by_activity_uri(
+        &self,
+        activity_uri: &str,
+        actor_address: &str,
+    ) -> Result<bool, AppError> {
+        let Some(status) = self.db.get_status_by_uri(activity_uri).await? else {
+            return Ok(false);
+        };
+        if status.is_local || status.boost_of_uri.is_none() {
+            return Ok(false);
+        }
+        if !status.account_address.eq_ignore_ascii_case(actor_address) {
+            return Ok(false);
+        }
+
+        let include_home_stream = self
+            .db
+            .get_all_follow_addresses()
+            .await
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .any(|address| address.eq_ignore_ascii_case(&status.account_address))
+            })
+            .unwrap_or(false);
+        self.publish_remote_status_delete(&status, include_home_stream)
+            .await;
+        self.timeline_cache.remove_by_uri(activity_uri).await;
+        self.db.delete_status(&status.id).await?;
+        Ok(true)
     }
 
     fn local_account_id(&self) -> &str {
@@ -3210,6 +3430,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_follow_rejects_embedded_loopback_inbox() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let activity = json!({
+            "type": "Follow",
+            "id": "https://remote.example/follows/loopback-inbox",
+            "actor": {
+                "id": actor_uri,
+                "inbox": "http://127.0.0.1/inbox"
+            },
+            "object": "https://example.com/users/alice"
+        });
+
+        let result = processor.handle_follow(activity, actor_uri).await;
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn process_ignores_unknown_activity_type() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let activity = json!({
+            "type": "Flag",
+            "id": "https://remote.example/activities/flag-1",
+            "actor": "https://remote.example/users/bob",
+            "object": "https://example.com/users/alice"
+        });
+
+        processor
+            .process(activity, "https://remote.example/users/bob")
+            .await
+            .unwrap();
+
+        assert!(db.get_all_follower_addresses().await.unwrap().is_empty());
+        assert!(
+            db.get_notifications(10, None, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_update_applies_profile_cache_updates() {
         let (processor, db, _timeline_cache, profile_cache, _temp_dir) =
             create_test_processor_with_timeline_and_profile("alice@example.com", "https").await;
@@ -3532,6 +3794,54 @@ mod tests {
             .unwrap()
             .expect("followee status should be persisted");
         assert_eq!(persisted.persisted_reason, PersistedReason::Timeline);
+    }
+
+    #[tokio::test]
+    async fn process_announce_from_followee_persists_remote_reblog_wrapper() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let announce_activity_uri = "https://remote.example/activities/announce-1";
+        let announced_status_uri = "https://remote.example/users/carol/statuses/target-1";
+
+        db.insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "bob@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://example.com/follows/bob".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let activity = json!({
+            "type": "Announce",
+            "id": announce_activity_uri,
+            "actor": actor_uri,
+            "published": "2026-01-07T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "object": announced_status_uri
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        let persisted = db
+            .get_status_by_uri(announce_activity_uri)
+            .await
+            .unwrap()
+            .expect("followee announce should be persisted");
+        assert_eq!(
+            persisted.boost_of_uri.as_deref(),
+            Some(announced_status_uri)
+        );
+        assert_eq!(persisted.persisted_reason, PersistedReason::Timeline);
+        assert_eq!(
+            timeline_cache
+                .get_by_uri(announce_activity_uri)
+                .await
+                .and_then(|status| status.boost_of_uri.clone()),
+            Some(announced_status_uri.to_string())
+        );
     }
 
     #[tokio::test]

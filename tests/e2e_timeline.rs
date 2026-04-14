@@ -515,6 +515,83 @@ async fn test_home_timeline_includes_persisted_remote_followee_status_after_cach
 }
 
 #[tokio::test]
+async fn test_home_timeline_includes_persisted_remote_followee_announce_after_cache_eviction() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/home-announce-persisted"
+                .to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let announced_status_uri = "https://remote.example/users/bob/statuses/boost-target";
+    let announce_activity_uri = "https://remote.example/activities/home-announce-followee";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": announce_activity_uri,
+        "type": "Announce",
+        "actor": REMOTE_ACTOR_ID,
+        "object": announced_status_uri,
+        "published": "2026-01-06T00:00:00Z",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"]
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let persisted = server
+        .state
+        .db
+        .get_status_by_uri(announce_activity_uri)
+        .await
+        .unwrap()
+        .expect("followee Announce should be persisted for restart-safe timelines");
+    assert_eq!(
+        persisted.boost_of_uri.as_deref(),
+        Some(announced_status_uri)
+    );
+
+    server
+        .state
+        .timeline_cache
+        .remove_by_uri(announce_activity_uri)
+        .await;
+
+    let timeline_response = server
+        .client
+        .get(server.url("/api/v1/timelines/home"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeline_response.status(), 200);
+    let body: Value = timeline_response.json().await.unwrap();
+    let entry = body
+        .as_array()
+        .expect("timeline should be array")
+        .iter()
+        .find(|item| item["uri"] == announce_activity_uri)
+        .expect("home timeline should materialize persisted followee Announce rows");
+    assert_eq!(entry["reblog"]["uri"], announced_status_uri);
+}
+
+#[tokio::test]
 async fn test_public_timeline_includes_persisted_remote_status_after_cache_eviction() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow};

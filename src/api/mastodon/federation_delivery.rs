@@ -49,6 +49,32 @@ fn is_blocked_ip_address(ip: IpAddr) -> bool {
 async fn resolve_allowed_remote_addrs(
     url: &url::Url,
 ) -> Result<(String, u16, Vec<SocketAddr>), AppError> {
+    let (host, port) = validate_remote_url_host(url)?;
+    let mut resolved_addrs = Vec::new();
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Failed to resolve remote host {}: {}", host, error))
+        })?;
+    for address in resolved {
+        if is_blocked_ip_address(address.ip()) {
+            return Err(AppError::Validation(
+                "Remote URL host is not allowed".to_string(),
+            ));
+        }
+        resolved_addrs.push(address);
+    }
+    if resolved_addrs.is_empty() {
+        return Err(AppError::Federation(format!(
+            "Remote host did not resolve to any IP addresses: {}",
+            host
+        )));
+    }
+
+    Ok((host, port, resolved_addrs))
+}
+
+fn validate_remote_url_host(url: &url::Url) -> Result<(String, u16), AppError> {
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(AppError::Validation(
             "Remote URL must use http or https".to_string(),
@@ -88,30 +114,10 @@ async fn resolve_allowed_remote_addrs(
     let port = url.port_or_known_default().ok_or_else(|| {
         AppError::Validation("Remote URL must include a known default port".to_string())
     })?;
-    let mut resolved_addrs = Vec::new();
-    let resolved = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|error| {
-            AppError::Federation(format!("Failed to resolve remote host {}: {}", host, error))
-        })?;
-    for address in resolved {
-        if is_blocked_ip_address(address.ip()) {
-            return Err(AppError::Validation(
-                "Remote URL host is not allowed".to_string(),
-            ));
-        }
-        resolved_addrs.push(address);
-    }
-    if resolved_addrs.is_empty() {
-        return Err(AppError::Federation(format!(
-            "Remote host did not resolve to any IP addresses: {}",
-            host
-        )));
-    }
-
-    Ok((host, port, resolved_addrs))
+    Ok((host, port))
 }
 
+#[allow(dead_code)]
 async fn validate_remote_fetch_url(url: &url::Url) -> Result<(), AppError> {
     let _ = resolve_allowed_remote_addrs(url).await?;
     Ok(())
@@ -166,16 +172,19 @@ async fn send_validated_get(
     )))
 }
 
-async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Result<(), AppError> {
+pub(crate) async fn validate_actor_and_inbox_urls(
+    actor_uri: &str,
+    inbox_uri: &str,
+) -> Result<(), AppError> {
     let actor_url = url::Url::parse(actor_uri).map_err(|error| {
         AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
     })?;
-    validate_remote_fetch_url(&actor_url).await?;
+    validate_remote_url_host(&actor_url)?;
 
     let inbox_url = url::Url::parse(inbox_uri).map_err(|error| {
         AppError::Federation(format!("Invalid inbox URI {} ({})", inbox_uri, error))
     })?;
-    validate_remote_fetch_url(&inbox_url).await?;
+    validate_remote_url_host(&inbox_url)?;
     Ok(())
 }
 

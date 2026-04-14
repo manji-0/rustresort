@@ -1038,6 +1038,7 @@ fn build_delivery(
         &state.config.server.base_url(),
         account,
     )
+    .with_media_storage(state.storage.clone())
 }
 
 async fn resolve_remote_actor_and_inbox(

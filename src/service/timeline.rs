@@ -285,7 +285,7 @@ impl TimelineService {
                 if only_pinned && !is_pinned {
                     continue;
                 }
-                if only_media && self.db.get_media_by_status(&status.id).await?.is_empty() {
+                if only_media && !self.db.status_has_any_media(&status.id).await? {
                     continue;
                 }
 

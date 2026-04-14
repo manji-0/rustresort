@@ -55,11 +55,14 @@ fn build_activity_processor(
     account: &Account,
 ) -> crate::federation::ActivityProcessor {
     let local_address = format!("{}@{}", account.username, state.config.server.domain);
-    let delivery = Arc::new(crate::federation::build_local_delivery(
-        state.http_client.clone(),
-        &state.config.server.base_url(),
-        account,
-    ));
+    let delivery = Arc::new(
+        crate::federation::build_local_delivery(
+            state.http_client.clone(),
+            &state.config.server.base_url(),
+            account,
+        )
+        .with_media_storage(state.storage.clone()),
+    );
 
     crate::federation::ActivityProcessor::new(
         state.db.clone(),
@@ -213,7 +216,24 @@ fn activitypub_audience(
     }
 }
 
-fn build_note_object(actor_url: &str, followers_url: &str, status: &Status) -> serde_json::Value {
+fn activitypub_attachment_type(content_type: &str) -> &'static str {
+    if content_type.starts_with("image/") {
+        "Image"
+    } else if content_type.starts_with("video/") {
+        "Video"
+    } else if content_type.starts_with("audio/") {
+        "Audio"
+    } else {
+        "Document"
+    }
+}
+
+async fn build_note_object(
+    state: &ActivityPubState,
+    actor_url: &str,
+    followers_url: &str,
+    status: &Status,
+) -> Result<serde_json::Value, AppError> {
     let (to_audience, cc_audience) = activitypub_audience(followers_url, status.visibility);
     let mut note = serde_json::json!({
         "type": "Note",
@@ -237,7 +257,56 @@ fn build_note_object(actor_url: &str, followers_url: &str, status: &Status) -> s
         note["quoteUrl"] = serde_json::json!(quote_of_uri);
     }
 
-    note
+    if let Some(language) = &status.language {
+        let mut content_map = serde_json::Map::new();
+        content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
+        note["contentMap"] = serde_json::Value::Object(content_map);
+    }
+
+    let attachments = state
+        .db
+        .get_media_by_status(&status.id)
+        .await?
+        .into_iter()
+        .map(|attachment| {
+            let url = state.storage.get_public_url(&attachment.s3_key);
+            let preview_url = attachment
+                .thumbnail_s3_key
+                .as_ref()
+                .map(|key| state.storage.get_public_url(key));
+            let content_type = attachment.content_type.clone();
+            let mut object = serde_json::json!({
+                "type": activitypub_attachment_type(&content_type),
+                "mediaType": content_type,
+                "url": url,
+            });
+            if let Some(description) = attachment.description {
+                object["name"] = serde_json::json!(description);
+            }
+            if let Some(blurhash) = attachment.blurhash {
+                object["blurhash"] = serde_json::json!(blurhash);
+            }
+            if let Some(width) = attachment.width {
+                object["width"] = serde_json::json!(width);
+            }
+            if let Some(height) = attachment.height {
+                object["height"] = serde_json::json!(height);
+            }
+            if let Some(preview_url) = preview_url {
+                object["icon"] = serde_json::json!({
+                    "type": "Image",
+                    "mediaType": attachment.content_type,
+                    "url": preview_url,
+                });
+            }
+            object
+        })
+        .collect::<Vec<_>>();
+    if !attachments.is_empty() {
+        note["attachment"] = serde_json::json!(attachments);
+    }
+
+    Ok(note)
 }
 
 pub(crate) fn build_local_actor_document(
@@ -291,13 +360,14 @@ pub(crate) fn build_local_actor_document(
     actor
 }
 
-fn build_create_activity(
+async fn build_create_activity(
+    state: &ActivityPubState,
     actor_url: &str,
     followers_url: &str,
     status: &Status,
-) -> serde_json::Value {
-    let object = build_note_object(actor_url, followers_url, status);
-    serde_json::json!({
+) -> Result<serde_json::Value, AppError> {
+    let object = build_note_object(state, actor_url, followers_url, status).await?;
+    Ok(serde_json::json!({
         "type": "Create",
         "id": format!("{}/activity", status.uri),
         "actor": actor_url,
@@ -305,7 +375,7 @@ fn build_create_activity(
         "to": object["to"].clone(),
         "cc": object["cc"].clone(),
         "object": object
-    })
+    }))
 }
 
 fn build_announce_activity(
@@ -552,19 +622,18 @@ async fn outbox(
             let outbox_url = format!("{}/users/{}/outbox", base_url, username);
             let actor_url = format!("{}/users/{}", base_url, username);
             let followers_url = format!("{}/users/{}/followers", base_url, username);
-            let ordered_items: Vec<serde_json::Value> = items
-                .iter()
-                .skip(offset)
-                .take(page_size)
-                .map(|item| match item {
+            let mut ordered_items = Vec::new();
+            for item in items.iter().skip(offset).take(page_size) {
+                let value = match item {
                     OutboxItem::Create(status) => {
-                        build_create_activity(&actor_url, &followers_url, status)
+                        build_create_activity(&state, &actor_url, &followers_url, status).await?
                     }
                     OutboxItem::Announce { repost, status } => {
                         build_announce_activity(&actor_url, &followers_url, repost, status)
                     }
-                })
-                .collect();
+                };
+                ordered_items.push(value);
+            }
 
             if query.page.unwrap_or(false) {
                 let next_offset = offset.saturating_add(page_size);
@@ -618,7 +687,7 @@ async fn status_object(
                 .await?
                 .ok_or(AppError::NotFound)?;
             ensure_public_activity_visibility(status.visibility)?;
-            let mut note = build_note_object(&actor_url, &followers_url, &status);
+            let mut note = build_note_object(&state, &actor_url, &followers_url, &status).await?;
             note["@context"] = serde_json::json!("https://www.w3.org/ns/activitystreams");
 
             HTTP_REQUESTS_TOTAL
@@ -665,11 +734,9 @@ async fn status_activity(
                 .await?
                 .ok_or(AppError::NotFound)?;
             ensure_public_activity_visibility(status.visibility)?;
-            Ok(activitypub_json_response(build_create_activity(
-                &actor_url,
-                &followers_url,
-                &status,
-            )))
+            Ok(activitypub_json_response(
+                build_create_activity(&state, &actor_url, &followers_url, &status).await?,
+            ))
         }
         _ => Err(AppError::NotFound),
     }

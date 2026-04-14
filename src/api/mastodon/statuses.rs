@@ -336,6 +336,7 @@ fn build_delivery(
         &state.config.server.base_url(),
         account,
     )
+    .with_media_storage(state.storage.clone())
 }
 
 async fn status_response_without_interaction_state(

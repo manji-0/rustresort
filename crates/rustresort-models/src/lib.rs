@@ -148,6 +148,21 @@ pub struct RemoteProfile {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Metadata for a remote status attachment referenced by URL.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RemoteStatusAttachment {
+    pub id: String,
+    pub status_id: String,
+    pub remote_url: String,
+    pub preview_url: Option<String>,
+    pub content_type: String,
+    pub description: Option<String>,
+    pub blurhash: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Notification categories enabled for Web Push.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

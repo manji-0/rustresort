@@ -6,7 +6,7 @@ use axum::{
 use chrono::Utc;
 use common::TestServer;
 use reqwest::StatusCode;
-use rustresort::data::{CachedProfile, EntityId, Follower};
+use rustresort::data::{CachedProfile, EntityId, Follower, MediaAttachment};
 use tokio::{
     net::TcpListener,
     sync::mpsc,
@@ -252,6 +252,77 @@ async fn test_status_edit_and_delete_deliver_update_and_delete_to_explicit_recip
     assert_eq!(
         delivered_delete.body["object"]["id"],
         serde_json::json!(server.public_url(&format!("/users/testuser/statuses/{status_id}")))
+    );
+}
+
+#[tokio::test]
+async fn test_create_with_media_delivers_activitypub_attachment_metadata() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let mut capture = ActivityCaptureServer::new().await;
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "bob@followers.example".to_string(),
+            actor_uri: Some("https://followers.example/users/bob".to_string()),
+            inbox_uri: capture.inbox_url(),
+            uri: "https://followers.example/follows/media-1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let media = MediaAttachment {
+        id: EntityId::new_string(),
+        status_id: None,
+        s3_key: "attachments/test-image.webp".to_string(),
+        thumbnail_s3_key: Some("attachments/test-image-thumb.webp".to_string()),
+        content_type: "image/webp".to_string(),
+        file_size: 1234,
+        description: Some("cover image".to_string()),
+        blurhash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string()),
+        width: Some(64),
+        height: Some(32),
+        focus_x: None,
+        focus_y: None,
+        created_at: Utc::now(),
+    };
+    server.state.db.insert_media(&media).await.unwrap();
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "status": "Media delivery",
+            "visibility": "public",
+            "spoiler_text": "cw",
+            "media_ids": [media.id]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let delivered = capture.recv().await;
+    assert_eq!(delivered.body["type"], "Create");
+    assert_eq!(delivered.body["object"]["summary"], "cw");
+    assert_eq!(delivered.body["object"]["attachment"][0]["type"], "Image");
+    assert_eq!(
+        delivered.body["object"]["attachment"][0]["url"],
+        "https://media.test.example.com/attachments/test-image.webp"
+    );
+    assert_eq!(
+        delivered.body["object"]["attachment"][0]["icon"]["url"],
+        "https://media.test.example.com/attachments/test-image-thumb.webp"
+    );
+    assert_eq!(
+        delivered.body["object"]["attachment"][0]["name"],
+        "cover image"
     );
 }
 

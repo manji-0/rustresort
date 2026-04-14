@@ -813,7 +813,7 @@ async fn test_signed_personal_inbox_follow_persists_and_delivers_accept() {
         .with_state(received.clone());
     let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote_addr = remote_listener.local_addr().unwrap();
-    let remote_base_url = format!("http://{}", remote_addr);
+    let remote_base_url = format!("http://localtest.me:{}", remote_addr.port());
     tokio::spawn(async move {
         axum::serve(remote_listener, remote_router).await.unwrap();
     });

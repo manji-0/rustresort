@@ -39,6 +39,7 @@ fn build_delivery(state: &AppState, account: &Account) -> crate::federation::Act
         &state.config.server.base_url(),
         account,
     )
+    .with_media_storage(state.storage.clone())
 }
 
 fn parse_optional_string_array(

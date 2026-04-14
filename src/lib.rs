@@ -541,7 +541,7 @@ impl AppState {
             .get_recent_remote_statuses(config.cache.timeline_max_items)
             .await?;
         for status in recent_remote_statuses {
-            let attachments = db
+            let mut attachments = db
                 .get_media_by_status(&status.id)
                 .await
                 .unwrap_or_default()
@@ -563,7 +563,20 @@ impl AppState {
                     description: media.description,
                     blurhash: media.blurhash,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            attachments.extend(
+                db.get_remote_status_attachments(&status.id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|attachment| data::CachedAttachment {
+                        url: attachment.remote_url.clone(),
+                        thumbnail_url: attachment.preview_url,
+                        content_type: attachment.content_type,
+                        description: attachment.description,
+                        blurhash: attachment.blurhash,
+                    }),
+            );
             timeline_cache
                 .insert(data::CachedStatus {
                     id: status.id.clone(),

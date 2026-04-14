@@ -2,7 +2,7 @@
 
 use crate::api::dto::*;
 use crate::config::AppConfig;
-use crate::data::{Account, Database, MediaAttachment, Status};
+use crate::data::{Account, Database, MediaAttachment, RemoteStatusAttachment, Status};
 use crate::error::AppError;
 use std::collections::HashMap;
 
@@ -246,6 +246,9 @@ async fn build_quote_response_value(
     let remote_account_stats =
         load_remote_account_stats_for_status(db, &config.server.protocol, quote_status).await?;
     let media_attachments = db.get_media_by_status(&quote_status.id).await?;
+    let media_attachment_responses =
+        load_status_media_attachment_responses(db, &quote_status.id, config, &media_attachments)
+            .await?;
     let mut response = status_to_response_with_media(
         quote_status,
         account,
@@ -253,7 +256,7 @@ async fn build_quote_response_value(
         account_stats,
         remote_account_stats,
         StatusInteractions::default(),
-        &media_attachments,
+        &media_attachment_responses,
     );
     enrich_status_response(db, quote_status, &mut response).await?;
     response.quote = None;
@@ -272,6 +275,8 @@ pub async fn build_status_response_with_media(
     interactions: StatusInteractions,
     media_attachments: &[MediaAttachment],
 ) -> Result<StatusResponse, AppError> {
+    let media_attachment_responses =
+        load_status_media_attachment_responses(db, &status.id, config, media_attachments).await?;
     let mut response = status_to_response_with_media(
         status,
         account,
@@ -279,7 +284,7 @@ pub async fn build_status_response_with_media(
         account_stats,
         remote_account_stats,
         interactions,
-        media_attachments,
+        &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
     if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
@@ -628,6 +633,62 @@ fn media_attachment_to_response(
     }
 }
 
+fn remote_media_attachment_to_response(
+    attachment: &RemoteStatusAttachment,
+) -> MediaAttachmentResponse {
+    let url = attachment.remote_url.clone();
+    let preview_url = attachment
+        .preview_url
+        .clone()
+        .unwrap_or_else(|| url.clone());
+
+    let meta = if attachment.width.is_some() || attachment.height.is_some() {
+        Some(serde_json::json!({
+            "original": {
+                "width": attachment.width,
+                "height": attachment.height,
+                "size": attachment.width.zip(attachment.height).map(|(w, h)| format!("{w}x{h}")),
+                "aspect": attachment.width.zip(attachment.height).and_then(|(w, h)| (h != 0).then_some(w as f64 / h as f64)),
+            }
+        }))
+    } else {
+        None
+    };
+
+    MediaAttachmentResponse {
+        id: attachment.id.clone(),
+        media_type: media_type_from_content_type(&attachment.content_type).to_string(),
+        url: url.clone(),
+        preview_url,
+        remote_url: Some(url),
+        text_url: None,
+        meta,
+        description: attachment.description.clone(),
+        blurhash: attachment.blurhash.clone(),
+    }
+}
+
+async fn load_status_media_attachment_responses(
+    db: &Database,
+    status_id: &str,
+    config: &AppConfig,
+    local_media_attachments: &[MediaAttachment],
+) -> Result<Vec<MediaAttachmentResponse>, AppError> {
+    let mut responses = local_media_attachments
+        .iter()
+        .map(|attachment| media_attachment_to_response(attachment, config))
+        .collect::<Vec<_>>();
+
+    responses.extend(
+        db.get_remote_status_attachments(status_id)
+            .await?
+            .into_iter()
+            .map(|attachment| remote_media_attachment_to_response(&attachment)),
+    );
+
+    Ok(responses)
+}
+
 fn boost_stub_status(
     boost_of_uri: &str,
     status: &Status,
@@ -909,7 +970,7 @@ pub fn status_to_response_with_media(
     account_stats: AccountStats,
     remote_account_stats: Option<RemoteAccountStats>,
     interactions: StatusInteractions,
-    media_attachments: &[MediaAttachment],
+    media_attachments: &[MediaAttachmentResponse],
 ) -> StatusResponse {
     let base_url = config.server.base_url();
     let account_response = if status.is_local || status.account_address.trim().is_empty() {
@@ -961,10 +1022,7 @@ pub fn status_to_response_with_media(
         }),
         application: None,
         account: account_response,
-        media_attachments: media_attachments
-            .iter()
-            .map(|attachment| media_attachment_to_response(attachment, config))
-            .collect(),
+        media_attachments: media_attachments.to_vec(),
         mentions,
         tags,
         emojis: vec![],
@@ -985,8 +1043,11 @@ pub fn status_to_response_with_media(
 mod tests {
     use super::*;
     use crate::config::*;
-    use crate::data::{Account, PersistedReason, Status};
+    use crate::data::{
+        Account, Database, EntityId, PersistedReason, RemoteStatusAttachment, Status,
+    };
     use chrono::Utc;
+    use tempfile::TempDir;
 
     fn create_test_config() -> AppConfig {
         AppConfig {
@@ -1608,7 +1669,7 @@ mod tests {
             AccountStats::default(),
             None,
             StatusInteractions::default(),
-            &[media],
+            &[media_attachment_to_response(&media, &config)],
         );
 
         assert_eq!(response.media_attachments.len(), 1);
@@ -1617,6 +1678,92 @@ mod tests {
         assert_eq!(
             response.media_attachments[0].url,
             "https://media.test.example.com/uploads/media-1.webp"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_status_response_with_media_uses_remote_attachment_urls() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Database::connect(&temp_dir.path().join("test.db"))
+            .await
+            .unwrap();
+        let config = create_test_config();
+        let now = Utc::now();
+        let account = Account {
+            id: "testuser".to_string(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: Some("Test account".to_string()),
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private-key".to_string(),
+            public_key_pem: "public-key".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let status = Status {
+            id: "https://remote.example/statuses/1".to_string(),
+            uri: "https://remote.example/statuses/1".to_string(),
+            content: "<p>hello</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Timeline,
+            created_at: now,
+            fetched_at: Some(now),
+        };
+
+        db.insert_status(&status).await.unwrap();
+        db.replace_remote_status_attachments(
+            &status.id,
+            &[RemoteStatusAttachment {
+                id: EntityId::new_string(),
+                status_id: status.id.clone(),
+                remote_url: "https://cdn.remote.example/media/original.jpg".to_string(),
+                preview_url: Some("https://cdn.remote.example/media/preview.jpg".to_string()),
+                content_type: "image/jpeg".to_string(),
+                description: Some("remote alt".to_string()),
+                blurhash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string()),
+                width: Some(1200),
+                height: Some(800),
+                created_at: now,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let response = build_status_response_with_media(
+            &db,
+            &status,
+            &account,
+            &config,
+            AccountStats::default(),
+            Some(RemoteAccountStats::default()),
+            StatusInteractions::default(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.media_attachments.len(), 1);
+        assert_eq!(
+            response.media_attachments[0].url,
+            "https://cdn.remote.example/media/original.jpg"
+        );
+        assert_eq!(
+            response.media_attachments[0].preview_url,
+            "https://cdn.remote.example/media/preview.jpg"
+        );
+        assert_eq!(
+            response.media_attachments[0].remote_url.as_deref(),
+            Some("https://cdn.remote.example/media/original.jpg")
         );
     }
 }

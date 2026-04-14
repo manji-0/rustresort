@@ -8,8 +8,9 @@ use axum::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
-use crate::data::{Account, EntityId, Status};
+use crate::data::{Account, EntityId, MediaAttachment, Status};
 use crate::error::AppError;
+use crate::storage::MediaStorageRepository;
 
 const DELIVERY_WORKER_BATCH_SIZE: usize = 32;
 const DELIVERY_WORKER_IDLE_MILLIS: u64 = 250;
@@ -29,6 +30,7 @@ pub trait DeliveryQueue: Send + Sync {
     async fn mark_failed(&self, job_id: &str, error: &str) -> Result<(), AppError>;
     async fn reap_dead_jobs(&self, max_attempts: u32) -> Result<u64, AppError>;
     async fn is_blocked_by_remote(&self, actor_uri: &str) -> Result<bool, AppError>;
+    async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
 }
 
 #[async_trait]
@@ -62,6 +64,10 @@ impl DeliveryQueue for crate::data::Database {
     async fn is_blocked_by_remote(&self, actor_uri: &str) -> Result<bool, AppError> {
         crate::data::Database::is_blocked_by_remote(self, actor_uri).await
     }
+
+    async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
+        crate::data::Database::get_media_by_status(self, status_id).await
+    }
 }
 
 /// Activity delivery service
@@ -76,6 +82,8 @@ pub struct ActivityDelivery {
     key_id: String,
     /// Private key for signing
     private_key_pem: String,
+    /// Optional storage handle for building public media URLs in ActivityPub objects.
+    media_storage: Option<Arc<dyn MediaStorageRepository>>,
 }
 
 pub fn local_actor_uri(base_url: &str, username: &str) -> String {
@@ -192,7 +200,97 @@ impl ActivityDelivery {
             actor_uri,
             key_id,
             private_key_pem,
+            media_storage: None,
         }
+    }
+
+    pub fn with_media_storage(mut self, media_storage: Arc<dyn MediaStorageRepository>) -> Self {
+        self.media_storage = Some(media_storage);
+        self
+    }
+
+    fn note_attachment_type(content_type: &str) -> &'static str {
+        if content_type.starts_with("image/") {
+            "Image"
+        } else if content_type.starts_with("video/") {
+            "Video"
+        } else if content_type.starts_with("audio/") {
+            "Audio"
+        } else {
+            "Document"
+        }
+    }
+
+    fn local_media_attachment_object(
+        &self,
+        attachment: &MediaAttachment,
+    ) -> Option<serde_json::Value> {
+        let storage = self.media_storage.as_ref()?;
+        let url = storage.get_public_url(&attachment.s3_key);
+        let preview_url = attachment
+            .thumbnail_s3_key
+            .as_ref()
+            .map(|key| storage.get_public_url(key));
+        let content_type = attachment.content_type.clone();
+
+        let mut object = serde_json::json!({
+            "type": Self::note_attachment_type(&content_type),
+            "mediaType": content_type,
+            "url": url,
+        });
+        if let Some(name) = &attachment.description {
+            object["name"] = serde_json::json!(name);
+        }
+        if let Some(blurhash) = &attachment.blurhash {
+            object["blurhash"] = serde_json::json!(blurhash);
+        }
+        if let Some(width) = attachment.width {
+            object["width"] = serde_json::json!(width);
+        }
+        if let Some(height) = attachment.height {
+            object["height"] = serde_json::json!(height);
+        }
+        if let Some(preview_url) = preview_url {
+            object["icon"] = serde_json::json!({
+                "type": "Image",
+                "mediaType": attachment.content_type,
+                "url": preview_url,
+            });
+        }
+        Some(object)
+    }
+
+    async fn enrich_note_object(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+        note: &mut serde_json::Value,
+        mention_tags: &[serde_json::Value],
+    ) -> Result<(), AppError> {
+        if let Some(summary) = &status.content_warning {
+            note["summary"] = serde_json::json!(summary);
+            note["sensitive"] = serde_json::json!(true);
+        }
+        if let Some(language) = &status.language {
+            let mut content_map = serde_json::Map::new();
+            content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
+            note["contentMap"] = serde_json::Value::Object(content_map);
+        }
+        if !mention_tags.is_empty() {
+            note["tag"] = serde_json::json!(mention_tags);
+        }
+
+        let attachments = queue
+            .get_media_by_status(&status.id)
+            .await?
+            .into_iter()
+            .filter_map(|attachment| self.local_media_attachment_object(&attachment))
+            .collect::<Vec<_>>();
+        if !attachments.is_empty() {
+            note["attachment"] = serde_json::json!(attachments);
+        }
+
+        Ok(())
     }
 
     fn serialize_activity(activity: &serde_json::Value) -> Result<String, AppError> {
@@ -320,16 +418,78 @@ impl ActivityDelivery {
         )
     }
 
-    fn build_create_activity(&self, status: &Status) -> serde_json::Value {
-        self.build_create_activity_with_audience(status, &[], &[])
+    async fn build_create_activity(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+    ) -> Result<serde_json::Value, AppError> {
+        self.build_create_activity_with_audience(queue, status, &[], &[])
+            .await
     }
 
-    fn build_create_activity_with_audience(
+    fn build_create_activity_legacy(&self, status: &Status) -> serde_json::Value {
+        let (to_audience, cc_audience) =
+            merge_explicit_recipient_audience(&self.actor_uri, status.visibility.as_str(), &[]);
+        let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
+        let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
+        let mut note = if let Some(ref in_reply_to) = status.in_reply_to_uri {
+            builder::note_reply(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                in_reply_to,
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        } else {
+            builder::note(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                note_to.clone(),
+                note_cc.clone(),
+            )
+        };
+        if let Some(summary) = &status.content_warning {
+            note["summary"] = serde_json::json!(summary);
+            note["sensitive"] = serde_json::json!(true);
+        }
+        if let Some(language) = &status.language {
+            let mut content_map = serde_json::Map::new();
+            content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
+            note["contentMap"] = serde_json::Value::Object(content_map);
+        }
+        if let Some(ref quote_of_uri) = status.quote_of_uri
+            && let Some(note_object) = note.as_object_mut()
+        {
+            note_object.insert(
+                "quoteUri".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            note_object.insert(
+                "quoteUrl".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+        }
+
+        builder::create(
+            &format!("{}/activity", status.uri),
+            &self.actor_uri,
+            note,
+            note_to,
+            note_cc,
+        )
+    }
+
+    async fn build_create_activity_with_audience(
         &self,
+        queue: &(impl DeliveryQueue + ?Sized),
         status: &Status,
         explicit_recipient_actor_uris: &[String],
         mention_tags: &[serde_json::Value],
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, AppError> {
         let (to_audience, cc_audience) = merge_explicit_recipient_audience(
             &self.actor_uri,
             status.visibility.as_str(),
@@ -357,6 +517,8 @@ impl ActivityDelivery {
                 note_cc.clone(),
             )
         };
+        self.enrich_note_object(queue, status, &mut note, mention_tags)
+            .await?;
         if let Some(ref quote_of_uri) = status.quote_of_uri
             && let Some(note_object) = note.as_object_mut()
         {
@@ -368,30 +530,24 @@ impl ActivityDelivery {
                 "quoteUrl".to_string(),
                 serde_json::Value::String(quote_of_uri.clone()),
             );
-            if !mention_tags.is_empty() {
-                note_object.insert(
-                    "tag".to_string(),
-                    serde_json::Value::Array(mention_tags.to_vec()),
-                );
-            }
-        } else if let Some(note_object) = note.as_object_mut()
-            && !mention_tags.is_empty()
-        {
-            note_object.insert(
-                "tag".to_string(),
-                serde_json::Value::Array(mention_tags.to_vec()),
-            );
         }
         let create_id = format!("{}/activity", status.uri);
-        builder::create(&create_id, &self.actor_uri, note, note_to, note_cc)
+        Ok(builder::create(
+            &create_id,
+            &self.actor_uri,
+            note,
+            note_to,
+            note_cc,
+        ))
     }
 
-    fn build_update_status_activity(
+    async fn build_update_status_activity(
         &self,
+        queue: &(impl DeliveryQueue + ?Sized),
         status: &Status,
         explicit_recipient_actor_uris: &[String],
         mention_tags: &[serde_json::Value],
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, AppError> {
         let (to_audience, cc_audience) = merge_explicit_recipient_audience(
             &self.actor_uri,
             status.visibility.as_str(),
@@ -419,6 +575,8 @@ impl ActivityDelivery {
                 note_cc.clone(),
             )
         };
+        self.enrich_note_object(queue, status, &mut object, mention_tags)
+            .await?;
         if let Some(ref quote_of_uri) = status.quote_of_uri
             && let Some(object_map) = object.as_object_mut()
         {
@@ -430,28 +588,15 @@ impl ActivityDelivery {
                 "quoteUrl".to_string(),
                 serde_json::Value::String(quote_of_uri.clone()),
             );
-            if !mention_tags.is_empty() {
-                object_map.insert(
-                    "tag".to_string(),
-                    serde_json::Value::Array(mention_tags.to_vec()),
-                );
-            }
-        } else if let Some(object_map) = object.as_object_mut()
-            && !mention_tags.is_empty()
-        {
-            object_map.insert(
-                "tag".to_string(),
-                serde_json::Value::Array(mention_tags.to_vec()),
-            );
         }
 
-        builder::update(
+        Ok(builder::update(
             &format!("{}/activity/update/{}", status.uri, EntityId::new_string()),
             &self.actor_uri,
             object,
             note_to,
             note_cc,
-        )
+        ))
     }
 
     fn build_delete_activity(
@@ -867,7 +1012,7 @@ impl ActivityDelivery {
         status: &crate::data::Status,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
-        let activity = self.build_create_activity(status);
+        let activity = self.build_create_activity_legacy(status);
 
         // 3. Deliver to inboxes
         self.deliver_to_followers(activity, inbox_uris).await
@@ -879,7 +1024,20 @@ impl ActivityDelivery {
         status: &Status,
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
-        let activity = self.build_create_activity(status);
+        let activity = match self.build_create_activity(queue, status).await {
+            Ok(activity) => activity,
+            Err(error) => {
+                return unique_inbox_targets(inbox_uris)
+                    .into_iter()
+                    .map(|inbox_uri| DeliveryResult {
+                        inbox_uri,
+                        success: false,
+                        error: Some(error.to_string()),
+                        status_code: None,
+                    })
+                    .collect();
+            }
+        };
         self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
             .await
     }
@@ -892,11 +1050,28 @@ impl ActivityDelivery {
         explicit_recipient_actor_uris: &[String],
         mention_tags: &[serde_json::Value],
     ) -> Vec<DeliveryResult> {
-        let activity = self.build_create_activity_with_audience(
-            status,
-            explicit_recipient_actor_uris,
-            mention_tags,
-        );
+        let activity = match self
+            .build_create_activity_with_audience(
+                queue,
+                status,
+                explicit_recipient_actor_uris,
+                mention_tags,
+            )
+            .await
+        {
+            Ok(activity) => activity,
+            Err(error) => {
+                return unique_inbox_targets(inbox_uris)
+                    .into_iter()
+                    .map(|inbox_uri| DeliveryResult {
+                        inbox_uri,
+                        success: false,
+                        error: Some(error.to_string()),
+                        status_code: None,
+                    })
+                    .collect();
+            }
+        };
         self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
             .await
     }
@@ -972,8 +1147,28 @@ impl ActivityDelivery {
         explicit_recipient_actor_uris: &[String],
         mention_tags: &[serde_json::Value],
     ) -> Vec<DeliveryResult> {
-        let activity =
-            self.build_update_status_activity(status, explicit_recipient_actor_uris, mention_tags);
+        let activity = match self
+            .build_update_status_activity(
+                queue,
+                status,
+                explicit_recipient_actor_uris,
+                mention_tags,
+            )
+            .await
+        {
+            Ok(activity) => activity,
+            Err(error) => {
+                return unique_inbox_targets(inbox_uris)
+                    .into_iter()
+                    .map(|inbox_uri| DeliveryResult {
+                        inbox_uri,
+                        success: false,
+                        error: Some(error.to_string()),
+                        status_code: None,
+                    })
+                    .collect();
+            }
+        };
         self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
             .await
     }
@@ -1685,7 +1880,7 @@ mod tests {
             fetched_at: None,
         };
 
-        let activity = delivery.build_create_activity(&status);
+        let activity = delivery.build_create_activity_legacy(&status);
         assert_eq!(
             activity["object"]["quoteUri"],
             "https://remote.example/users/bob/statuses/quoted"

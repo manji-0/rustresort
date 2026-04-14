@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Document, Element, Event, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement,
-    KeyboardEvent, Storage, Window,
+    Document, Element, Event, HtmlElement, HtmlInputElement, HtmlSelectElement,
+    HtmlTextAreaElement, KeyboardEvent, Storage, Window,
 };
 
 const APP_TITLE: &str = "RustResort";
@@ -70,6 +70,31 @@ impl NotificationFilter {
                 "/api/v1/notifications?limit=8&types[]=favourite&types[]=reblog&types[]=follow&types[]=status"
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Timeline,
+    Notifications,
+}
+
+impl Default for Pane {
+    fn default() -> Self {
+        Self::Timeline
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivePane {
+    Timeline,
+    Notifications,
+    DetailModal,
+}
+
+impl Default for ActivePane {
+    fn default() -> Self {
+        Self::Timeline
     }
 }
 
@@ -137,7 +162,11 @@ struct Model {
     composer: ComposerDraft,
     composer_popout: bool,
     hashtag_query: String,
+    active_pane: ActivePane,
+    last_non_modal_pane: Pane,
     selected_status_id: Option<String>,
+    selected_notification_key: Option<String>,
+    detail_return_status_id: Option<String>,
     thread_history: Vec<String>,
     backups: Vec<BackupInfo>,
     domain_blocks: Vec<String>,
@@ -274,6 +303,7 @@ struct NotificationGroup {
 }
 
 #[derive(Clone, Deserialize)]
+#[allow(dead_code)]
 struct BackupInfo {
     key: String,
     size: u64,
@@ -406,6 +436,12 @@ impl App {
                 app.toggle_composer_popout();
             }
         });
+        self.attach_click("composer-close-popout", {
+            let app = self.clone();
+            move || {
+                app.toggle_composer_popout();
+            }
+        });
         self.attach_click("logout-action", {
             let app = self.clone();
             move || {
@@ -456,7 +492,7 @@ impl App {
         self.attach_click("thread-close", {
             let app = self.clone();
             move || {
-                app.clear_thread();
+                app.close_detail_modal();
             }
         });
 
@@ -507,7 +543,7 @@ impl App {
                 return;
             };
             spawn_local(async move {
-                app.load_thread(status_id).await;
+                app.open_detail_modal(status_id).await;
             });
         });
         self.attach_dynamic_action("[data-focus-status]", move |app, element| {
@@ -515,6 +551,12 @@ impl App {
                 return;
             };
             app.set_selected_status(status_id);
+        });
+        self.attach_dynamic_action("[data-focus-notification]", move |app, element| {
+            let Some(group_key) = element.get_attribute("data-focus-notification") else {
+                return;
+            };
+            app.set_selected_notification(group_key);
         });
         self.attach_dynamic_action("[data-reply-status]", move |app, element| {
             let Some(status_id) = element.get_attribute("data-reply-status") else {
@@ -677,12 +719,25 @@ impl App {
 
                 let key = event.key().to_ascii_lowercase();
                 let raw_key = event.key();
+                let shift_tab = event.shift_key() && raw_key == "Tab";
                 let handled = match raw_key.as_str() {
                     "N" => {
                         app.activate_mention_shortcut();
                         true
                     }
+                    "Escape" => {
+                        app.close_detail_modal();
+                        true
+                    }
                     _ => match key.as_str() {
+                        "tab" if shift_tab => {
+                            app.cycle_pane_focus(-1);
+                            true
+                        }
+                        "tab" => {
+                            app.cycle_pane_focus(1);
+                            true
+                        }
                         "j" => {
                             app.move_selection(-1);
                             true
@@ -696,12 +751,8 @@ impl App {
                             app.select_first_status();
                             true
                         }
-                        "l" => {
-                            app.open_selected_status();
-                            true
-                        }
-                        "h" => {
-                            app.go_back_from_thread();
+                        "d" => {
+                            app.open_selected_detail();
                             true
                         }
                         "n" => {
@@ -769,6 +820,8 @@ impl App {
             let mut model = self.model.borrow_mut();
             model.feed_mode = feed_mode;
             model.feed_loading = true;
+            model.active_pane = ActivePane::Timeline;
+            model.last_non_modal_pane = Pane::Timeline;
         }
         self.render();
         spawn_local({
@@ -783,6 +836,8 @@ impl App {
         {
             let mut model = self.model.borrow_mut();
             model.notification_filter = filter;
+            model.active_pane = ActivePane::Notifications;
+            model.last_non_modal_pane = Pane::Notifications;
         }
         self.render();
         spawn_local({
@@ -863,9 +918,23 @@ impl App {
         }
     }
 
+    fn blur_active_element(&self) {
+        let Some(element) = self.document.active_element() else {
+            return;
+        };
+        if let Ok(html_element) = element.dyn_into::<HtmlElement>() {
+            let _ = html_element.blur();
+        }
+    }
+
     fn set_selected_status(self: &Rc<Self>, status_id: String) {
+        self.blur_active_element();
         let should_render = {
             let mut model = self.model.borrow_mut();
+            if model.active_pane != ActivePane::DetailModal {
+                model.active_pane = ActivePane::Timeline;
+                model.last_non_modal_pane = Pane::Timeline;
+            }
             if model.selected_status_id.as_deref() == Some(status_id.as_str()) {
                 false
             } else {
@@ -879,13 +948,37 @@ impl App {
         self.scroll_selected_into_view();
     }
 
-    fn current_selection_order(&self) -> Vec<String> {
-        let model = self.model.borrow();
-        selection_order(&model)
+    fn set_selected_notification(self: &Rc<Self>, group_key: String) {
+        self.blur_active_element();
+        let should_render = {
+            let mut model = self.model.borrow_mut();
+            if model.active_pane != ActivePane::DetailModal {
+                model.active_pane = ActivePane::Notifications;
+                model.last_non_modal_pane = Pane::Notifications;
+            }
+            if model.selected_notification_key.as_deref() == Some(group_key.as_str()) {
+                false
+            } else {
+                model.selected_notification_key = Some(group_key.clone());
+                true
+            }
+        };
+        if should_render {
+            self.render();
+        }
+        self.scroll_selected_into_view();
     }
 
     fn move_selection(self: &Rc<Self>, delta: isize) {
-        let order = self.current_selection_order();
+        match self.model.borrow().active_pane {
+            ActivePane::Timeline => self.move_timeline_selection(delta),
+            ActivePane::Notifications => self.move_notification_selection(delta),
+            ActivePane::DetailModal => self.move_detail_selection(delta),
+        }
+    }
+
+    fn move_timeline_selection(self: &Rc<Self>, delta: isize) {
+        let order = timeline_selection_order(&self.model.borrow());
         if order.is_empty() {
             return;
         }
@@ -896,53 +989,170 @@ impl App {
             .and_then(|status_id| order.iter().position(|candidate| candidate == status_id))
             .unwrap_or(0);
 
-        let target_index = if delta.is_negative() {
-            current_index.saturating_sub(delta.unsigned_abs())
-        } else {
-            (current_index + delta as usize).min(order.len().saturating_sub(1))
-        };
+        let target_index = next_selection_index(current_index, order.len(), delta);
+        self.set_selected_status(order[target_index].clone());
+    }
 
+    fn move_notification_selection(self: &Rc<Self>, delta: isize) {
+        let order = notification_selection_order(&self.model.borrow());
+        if order.is_empty() {
+            return;
+        }
+
+        let current_id = self.model.borrow().selected_notification_key.clone();
+        let current_index = current_id
+            .as_deref()
+            .and_then(|status_id| order.iter().position(|candidate| candidate == status_id))
+            .unwrap_or(0);
+
+        let target_index = next_selection_index(current_index, order.len(), delta);
+        self.set_selected_notification(order[target_index].clone());
+    }
+
+    fn move_detail_selection(self: &Rc<Self>, delta: isize) {
+        let order = detail_selection_order(&self.model.borrow());
+        if order.is_empty() {
+            return;
+        }
+
+        let current_id = self.model.borrow().selected_status_id.clone();
+        let current_index = current_id
+            .as_deref()
+            .and_then(|status_id| order.iter().position(|candidate| candidate == status_id))
+            .unwrap_or(0);
+
+        let target_index = next_selection_index(current_index, order.len(), delta);
         self.set_selected_status(order[target_index].clone());
     }
 
     fn select_first_status(self: &Rc<Self>) {
-        let order = self.current_selection_order();
-        let Some(status_id) = order.first() else {
-            return;
-        };
-        self.set_selected_status(status_id.clone());
+        match self.model.borrow().active_pane {
+            ActivePane::Timeline => {
+                let order = timeline_selection_order(&self.model.borrow());
+                let Some(status_id) = order.first() else {
+                    return;
+                };
+                self.set_selected_status(status_id.clone());
+            }
+            ActivePane::Notifications => {
+                let order = notification_selection_order(&self.model.borrow());
+                let Some(group_key) = order.first() else {
+                    return;
+                };
+                self.set_selected_notification(group_key.clone());
+            }
+            ActivePane::DetailModal => {
+                let order = detail_selection_order(&self.model.borrow());
+                let Some(status_id) = order.first() else {
+                    return;
+                };
+                self.set_selected_status(status_id.clone());
+            }
+        }
     }
 
-    fn open_selected_status(self: &Rc<Self>) {
-        let Some(status_id) = self.shortcut_status_id() else {
+    fn open_selected_detail(self: &Rc<Self>) {
+        let Some(status_id) = self.detail_target_status_id() else {
             return;
         };
         spawn_local({
             let app = self.clone();
             async move {
-                app.load_thread(status_id).await;
+                app.open_detail_modal(status_id).await;
             }
         });
     }
 
-    fn go_back_from_thread(self: &Rc<Self>) {
-        let previous_status_id = {
-            let mut model = self.model.borrow_mut();
-            if model.thread.status_id.is_none() {
-                return;
-            }
-            model.thread_history.pop()
-        };
+    fn cycle_pane_focus(self: &Rc<Self>, direction: isize) {
+        if self.model.borrow().active_pane == ActivePane::DetailModal {
+            return;
+        }
+        self.blur_active_element();
 
-        if let Some(status_id) = previous_status_id {
-            spawn_local({
-                let app = self.clone();
-                async move {
-                    app.load_thread_internal(status_id, false).await;
+        let next_pane = {
+            let model = self.model.borrow();
+            match (model.last_non_modal_pane, direction.is_negative()) {
+                (Pane::Timeline, false) => Pane::Notifications,
+                (Pane::Notifications, false) => Pane::Timeline,
+                (Pane::Timeline, true) => Pane::Notifications,
+                (Pane::Notifications, true) => Pane::Timeline,
+            }
+        };
+        {
+            let mut model = self.model.borrow_mut();
+            model.last_non_modal_pane = next_pane;
+            model.active_pane = match next_pane {
+                Pane::Timeline => ActivePane::Timeline,
+                Pane::Notifications => ActivePane::Notifications,
+            };
+        }
+        self.render();
+        self.scroll_selected_into_view();
+    }
+
+    async fn open_detail_modal(self: Rc<Self>, status_id: String) {
+        let origin_pane = {
+            let mut model = self.model.borrow_mut();
+            let origin = model.last_non_modal_pane;
+            model.active_pane = ActivePane::DetailModal;
+            model.detail_return_status_id = if origin == Pane::Notifications {
+                model.selected_status_id.clone()
+            } else {
+                None
+            };
+            origin
+        };
+        self.clone()
+            .load_thread_internal(status_id, origin_pane == Pane::Timeline)
+            .await;
+        {
+            let mut model = self.model.borrow_mut();
+            model.active_pane = ActivePane::DetailModal;
+        }
+        self.render();
+        self.scroll_selected_into_view();
+    }
+
+    fn close_detail_modal(self: &Rc<Self>) {
+        let should_render = {
+            let mut model = self.model.borrow_mut();
+            if model.active_pane != ActivePane::DetailModal {
+                if model.composer_popout {
+                    model.composer_popout = false;
+                    true
+                } else {
+                    false
                 }
-            });
-        } else {
-            self.clear_thread();
+            } else {
+                if model.last_non_modal_pane == Pane::Notifications
+                    && let Some(status_id) = model.detail_return_status_id.take()
+                {
+                    model.selected_status_id = Some(status_id);
+                }
+                model.active_pane = match model.last_non_modal_pane {
+                    Pane::Timeline => ActivePane::Timeline,
+                    Pane::Notifications => ActivePane::Notifications,
+                };
+                model.thread = ThreadView::default();
+                model.thread_history.clear();
+                true
+            }
+        };
+        if should_render {
+            self.render();
+            self.scroll_selected_into_view();
+        }
+    }
+
+    fn detail_target_status_id(&self) -> Option<String> {
+        match self.model.borrow().active_pane {
+            ActivePane::Timeline | ActivePane::DetailModal => self.shortcut_status_id(),
+            ActivePane::Notifications => self.selected_notification_group().and_then(|group| {
+                group
+                    .status
+                    .as_ref()
+                    .map(|status| display_status(status).id.clone())
+            }),
         }
     }
 
@@ -979,27 +1189,59 @@ impl App {
     }
 
     fn scroll_selected_into_view(&self) {
-        let Some(status_id) = self.model.borrow().selected_status_id.clone() else {
+        let selector = match self.model.borrow().active_pane {
+            ActivePane::Timeline => self
+                .model
+                .borrow()
+                .selected_status_id
+                .clone()
+                .map(|status_id| format!(r#".timeline-list [data-focus-status="{}"]"#, status_id)),
+            ActivePane::Notifications => {
+                self.model
+                    .borrow()
+                    .selected_notification_key
+                    .clone()
+                    .map(|group_key| {
+                        format!(
+                            r#".activity-column [data-focus-notification="{}"]"#,
+                            group_key
+                        )
+                    })
+            }
+            ActivePane::DetailModal => self
+                .model
+                .borrow()
+                .selected_status_id
+                .clone()
+                .map(|status_id| format!(r#".detail-modal [data-focus-status="{}"]"#, status_id)),
+        };
+        let Some(selector) = selector else {
             return;
         };
-        let Ok(Some(element)) = self
-            .document
-            .query_selector(&format!(r#"[data-focus-status="{}"]"#, status_id))
-        else {
+        let Ok(Some(element)) = self.document.query_selector(&selector) else {
             return;
         };
         element.scroll_into_view();
     }
 
     fn shortcut_status(&self) -> Option<Status> {
-        if let Some(status_id) = self.model.borrow().selected_status_id.clone() {
-            return self
-                .find_status(&status_id)
-                .or_else(|| self.find_notification_status(&status_id));
+        match self.model.borrow().active_pane {
+            ActivePane::Timeline => self
+                .model
+                .borrow()
+                .selected_status_id
+                .clone()
+                .and_then(|status_id| self.find_status(&status_id)),
+            ActivePane::Notifications => self
+                .selected_notification_group()
+                .and_then(|group| group.status.clone()),
+            ActivePane::DetailModal => self
+                .model
+                .borrow()
+                .selected_status_id
+                .clone()
+                .and_then(|status_id| self.find_thread_status(&status_id)),
         }
-        self.current_selection_order()
-            .first()
-            .and_then(|status_id| self.find_status(status_id))
     }
 
     fn shortcut_status_id(&self) -> Option<String> {
@@ -1034,16 +1276,6 @@ impl App {
             update(&mut model.composer);
         }
         self.save_composer_draft();
-    }
-
-    fn clear_thread(self: &Rc<Self>) {
-        {
-            let mut model = self.model.borrow_mut();
-            model.thread = ThreadView::default();
-            model.thread_history.clear();
-            normalize_selected_status(&mut model);
-        }
-        self.render();
     }
 
     async fn load_dashboard(self: Rc<Self>) {
@@ -1115,7 +1347,13 @@ impl App {
         let notifications_url = self.notifications_url();
         let selected_thread = {
             let model = self.model.borrow();
-            focus_status.or_else(|| model.thread.status_id.clone())
+            if model.active_pane == ActivePane::DetailModal {
+                focus_status
+                    .clone()
+                    .or_else(|| model.thread.status_id.clone())
+            } else {
+                None
+            }
         };
 
         let statuses_future = self.fetch_active_feed();
@@ -1138,7 +1376,17 @@ impl App {
                 Err(error) => flash_error = Some(error),
             }
             match statuses {
-                Ok(statuses) => model.statuses = statuses,
+                Ok(statuses) => {
+                    model.statuses = statuses;
+                    if let Some(status_id) = focus_status.as_ref()
+                        && model
+                            .statuses
+                            .iter()
+                            .any(|status| display_status(status).id == *status_id)
+                    {
+                        model.selected_status_id = Some(status_id.clone());
+                    }
+                }
                 Err(error) => flash_error = Some(error),
             }
             if let Ok(notifications) = notifications {
@@ -1182,6 +1430,7 @@ impl App {
         if let Ok(unread) = unread {
             model.notifications_unread = unread.count;
         }
+        normalize_selected_status(&mut model);
         drop(model);
         self.render();
     }
@@ -1601,6 +1850,17 @@ impl App {
             .find_map(|status| status_with_id(status, id))
     }
 
+    fn find_thread_status(&self, id: &str) -> Option<Status> {
+        let model = self.model.borrow();
+        model
+            .thread
+            .ancestors
+            .iter()
+            .chain(model.thread.focus.iter())
+            .chain(model.thread.descendants.iter())
+            .find_map(|status| status_with_id(status, id))
+    }
+
     fn find_notification_status(&self, id: &str) -> Option<Status> {
         self.model
             .borrow()
@@ -1608,6 +1868,14 @@ impl App {
             .iter()
             .filter_map(|notification| notification.status.as_ref())
             .find_map(|status| status_with_id(status, id))
+    }
+
+    fn selected_notification_group(&self) -> Option<NotificationGroup> {
+        let model = self.model.borrow();
+        let selected_key = model.selected_notification_key.as_deref()?;
+        group_notifications(&model.notifications)
+            .into_iter()
+            .find(|group| notification_group_selection_key(group) == selected_key)
     }
 }
 
@@ -1692,6 +1960,7 @@ fn render_app(model: &Model) -> String {
     } else {
         String::new()
     };
+    let detail_modal = render_detail_modal(model);
     let hashtag_query = encode_attribute(&model.hashtag_query);
 
     format!(
@@ -1726,12 +1995,20 @@ fn render_app(model: &Model) -> String {
     </section>
   </aside>
 
-  <main class="timeline-column">
+  <main class="timeline-column {timeline_active}">
     <header class="timeline-header">
       <div>
         <p class="micro-label">Timeline</p>
         <h2>{feed_label}</h2>
-        <p class="subtle-line">{feed_subtitle}</p>
+        <div class="timeline-meta">
+          <p class="subtle-line">{feed_subtitle}</p>
+          <div class="shortcut-row">
+            <span class="shortcut-hint"><kbd>g</kbd> top</span>
+            <span class="shortcut-hint"><kbd>d</kbd> detail</span>
+            <span class="shortcut-hint"><kbd>Tab</kbd> notifications</span>
+            <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
+          </div>
+        </div>
       </div>
       <div class="timeline-actions">
         <button id="composer-toggle-popout" class="ghost-button">Compose</button>
@@ -1742,14 +2019,13 @@ fn render_app(model: &Model) -> String {
     {composer_panel}
 
     {flash_banner}
-    {thread_panel}
 
     <section class="timeline-list">
       {timeline_cards}
     </section>
   </main>
 
-  <aside class="activity-column">
+  <aside class="activity-column {notifications_active}">
     <section class="rail-card">
       <div class="rail-card-head">
         <div>
@@ -1772,37 +2048,31 @@ fn render_app(model: &Model) -> String {
     <section class="rail-card">
       <div class="rail-card-head">
         <div>
-          <p class="micro-label">Operations</p>
+          <p class="micro-label">Workspace</p>
           <h3>Admin</h3>
         </div>
-        <button id="backup-action" class="ghost-button">Run backup</button>
       </div>
-      <label class="field">
-        <span>Block domain</span>
-        <div class="inline-form">
-          <input id="domain-block-input" type="text" placeholder="bad.example" />
-          <button id="domain-block-action" class="primary-button">Block</button>
-        </div>
-      </label>
-      <div class="admin-grid">
-        <div>
-          <h4>Recent backups</h4>
-          <div class="rail-list">{backups}</div>
-        </div>
-        <div>
-          <h4>Blocked domains</h4>
-          <div class="rail-list">{domain_blocks}</div>
-        </div>
-      </div>
+      <p class="muted-copy">Administrative controls stay on their own page so the social client remains focused on Mastodon-compatible workflows.</p>
       <div class="rail-links">
-        <a href="/settings">Open legacy admin/settings</a>
+        <a href="/settings">Open standalone admin/settings</a>
       </div>
     </section>
   </aside>
 </div>
+{detail_modal}
 {composer_popout}
 "#,
         brand_title = encode_text(brand_title),
+        timeline_active = if matches!(model.active_pane, ActivePane::Timeline) {
+            "active-pane"
+        } else {
+            ""
+        },
+        notifications_active = if matches!(model.active_pane, ActivePane::Notifications) {
+            "active-pane"
+        } else {
+            ""
+        },
         home_active = if model.feed_mode == FeedMode::Home {
             "active"
         } else {
@@ -1829,14 +2099,12 @@ fn render_app(model: &Model) -> String {
         feed_subtitle = encode_text(&feed_subtitle(model)),
         composer_panel = composer_panel,
         composer_popout = composer_popout,
+        detail_modal = detail_modal,
         flash_banner = render_flash(model),
-        thread_panel = render_thread_panel(model),
         timeline_cards = render_timeline(model),
         notifications_unread = model.notifications_unread,
         notification_filters = render_notification_filters(model),
         notifications = render_notifications(model),
-        backups = render_backups(model),
-        domain_blocks = render_domain_blocks(model),
     )
 }
 
@@ -1850,7 +2118,7 @@ fn render_composer(model: &Model, popout: bool) -> String {
         "composer-panel"
     };
     let dismiss = if popout {
-        r#"<button id="composer-toggle-popout" class="ghost-button">Close</button>"#.to_string()
+        r#"<button id="composer-close-popout" class="ghost-button">Close</button>"#.to_string()
     } else {
         String::new()
     };
@@ -2036,8 +2304,10 @@ fn render_flash(model: &Model) -> String {
     )
 }
 
-fn render_thread_panel(model: &Model) -> String {
-    if model.thread.status_id.is_none() && !model.thread.loading {
+fn render_detail_modal(model: &Model) -> String {
+    if model.active_pane != ActivePane::DetailModal
+        || (model.thread.status_id.is_none() && !model.thread.loading)
+    {
         return String::new();
     }
 
@@ -2100,16 +2370,23 @@ fn render_thread_panel(model: &Model) -> String {
     };
 
     format!(
-        r#"<section class="thread-panel">
-  <div class="thread-head">
-    <div>
-      <p class="micro-label">Conversation</p>
-      <h3>Selected thread</h3>
-      {thread_badge}
+        r#"<section class="detail-modal-shell">
+  <div class="detail-modal">
+    <div class="thread-head">
+      <div>
+        <p class="micro-label">Detail</p>
+        <h3>Selected thread</h3>
+        {thread_badge}
+      </div>
+      <div class="mini-row">
+        <small>Use <code>j</code>/<code>k</code> in this window, <code>Esc</code> to close.</small>
+        <button id="thread-close" class="ghost-button small">Close</button>
+      </div>
     </div>
-    <button id="thread-close" class="ghost-button small">Close</button>
+    <div class="thread-panel">
+      {content}
+    </div>
   </div>
-  {content}
 </section>"#,
         thread_badge = thread_badge,
         content = content,
@@ -2428,6 +2705,7 @@ fn render_notifications(model: &Model) -> String {
     groups
         .iter()
         .map(|group| {
+            let group_key = notification_group_selection_key(group);
             let preview = group
                 .status
                 .as_ref()
@@ -2462,7 +2740,7 @@ fn render_notifications(model: &Model) -> String {
             let dismiss_ids = encode_attribute(&group.ids.join("|"));
 
             format!(
-                r#"<div class="notification-card">
+                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}">
   <div class="notification-head">
     <strong>{kind}</strong>
     <span>{created_at}</span>
@@ -2481,6 +2759,14 @@ fn render_notifications(model: &Model) -> String {
     <button class="ghost-button small" data-dismiss-notification="{notification_id}">Dismiss</button>
   </div>
 </div>"#,
+                selected = if model.active_pane == ActivePane::Notifications
+                    && model.selected_notification_key.as_deref() == Some(group_key.as_str())
+                {
+                    "selected"
+                } else {
+                    ""
+                },
+                group_key = encode_attribute(&group_key),
                 kind = encode_text(notification_kind_label(&group.notification_type)),
                 created_at = encode_text(&short_timestamp(&group.created_at)),
                 avatar = avatar_markup(
@@ -2525,54 +2811,6 @@ fn avatar_markup(class_name: &str, url: &str, label: &str) -> String {
     )
 }
 
-fn render_backups(model: &Model) -> String {
-    if model.backups.is_empty() {
-        return r#"<div class="mini-row"><span class="muted-copy">No backups listed.</span></div>"#
-            .to_string();
-    }
-
-    model
-        .backups
-        .iter()
-        .take(5)
-        .map(|backup| {
-            format!(
-                r#"<div class="mini-row">
-  <span>{key}</span>
-  <small>{size} bytes · {created_at}</small>
-</div>"#,
-                key = encode_text(&backup.key),
-                size = backup.size,
-                created_at = encode_text(&short_timestamp(&backup.created_at)),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn render_domain_blocks(model: &Model) -> String {
-    if model.domain_blocks.is_empty() {
-        return r#"<div class="mini-row"><span class="muted-copy">No blocked domains.</span></div>"#
-            .to_string();
-    }
-
-    model
-        .domain_blocks
-        .iter()
-        .map(|domain| {
-            format!(
-                r#"<div class="mini-row removable">
-  <span>{domain}</span>
-  <button class="ghost-button small" data-domain-remove="{encoded_domain}">Remove</button>
-</div>"#,
-                domain = encode_text(domain),
-                encoded_domain = encode_attribute(domain),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn render_avatar_monogram(model: &Model) -> String {
     model
         .account
@@ -2588,27 +2826,7 @@ fn render_avatar_monogram(model: &Model) -> String {
         .unwrap_or_else(|| "R".to_string())
 }
 
-fn selection_order(model: &Model) -> Vec<String> {
-    if model.thread.status_id.is_some() {
-        let mut ids = model
-            .thread
-            .ancestors
-            .iter()
-            .map(|status| display_status(status).id.clone())
-            .collect::<Vec<_>>();
-        if let Some(focus) = model.thread.focus.as_ref() {
-            ids.push(display_status(focus).id.clone());
-        }
-        ids.extend(
-            model
-                .thread
-                .descendants
-                .iter()
-                .map(|status| display_status(status).id.clone()),
-        );
-        return ids;
-    }
-
+fn timeline_selection_order(model: &Model) -> Vec<String> {
     model
         .statuses
         .iter()
@@ -2616,22 +2834,71 @@ fn selection_order(model: &Model) -> Vec<String> {
         .collect()
 }
 
-fn normalize_selected_status(model: &mut Model) {
-    let order = selection_order(model);
-    if order.is_empty() {
-        model.selected_status_id = None;
-        return;
+fn detail_selection_order(model: &Model) -> Vec<String> {
+    let mut ids = model
+        .thread
+        .ancestors
+        .iter()
+        .map(|status| display_status(status).id.clone())
+        .collect::<Vec<_>>();
+    if let Some(focus) = model.thread.focus.as_ref() {
+        ids.push(display_status(focus).id.clone());
     }
+    ids.extend(
+        model
+            .thread
+            .descendants
+            .iter()
+            .map(|status| display_status(status).id.clone()),
+    );
+    ids
+}
 
-    if model
+fn notification_selection_order(model: &Model) -> Vec<String> {
+    group_notifications(&model.notifications)
+        .into_iter()
+        .map(|group| notification_group_selection_key(&group))
+        .collect()
+}
+
+fn next_selection_index(current_index: usize, len: usize, delta: isize) -> usize {
+    if delta.is_negative() {
+        current_index.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current_index + delta as usize).min(len.saturating_sub(1))
+    }
+}
+
+fn normalize_selected_status(model: &mut Model) {
+    let timeline_order = timeline_selection_order(model);
+    if timeline_order.is_empty() {
+        model.selected_status_id = None;
+    } else if !model
         .selected_status_id
         .as_deref()
-        .is_some_and(|status_id| order.iter().any(|candidate| candidate == status_id))
+        .is_some_and(|status_id| {
+            timeline_order
+                .iter()
+                .any(|candidate| candidate == status_id)
+        })
     {
-        return;
+        model.selected_status_id = timeline_order.first().cloned();
     }
 
-    model.selected_status_id = order.first().cloned();
+    let notification_order = notification_selection_order(model);
+    if notification_order.is_empty() {
+        model.selected_notification_key = None;
+    } else if !model
+        .selected_notification_key
+        .as_deref()
+        .is_some_and(|group_key| {
+            notification_order
+                .iter()
+                .any(|candidate| candidate == group_key)
+        })
+    {
+        model.selected_notification_key = notification_order.first().cloned();
+    }
 }
 
 fn feed_subtitle(model: &Model) -> String {
@@ -2820,6 +3087,13 @@ fn group_notifications(notifications: &[Notification]) -> Vec<NotificationGroup>
         });
     }
     groups
+}
+
+fn notification_group_selection_key(group: &NotificationGroup) -> String {
+    if !group.group_key.trim().is_empty() {
+        return group.group_key.clone();
+    }
+    group.ids.join("|")
 }
 
 fn grouped_actor_label(accounts: &[StatusAccount]) -> String {

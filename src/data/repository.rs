@@ -9,7 +9,9 @@ use std::collections::HashSet;
 
 use crate::error::AppError;
 
-use super::{Account, Database, Follow, MediaAttachment, Status, TimelineCursorKey};
+use super::{
+    Account, Database, Follow, MediaAttachment, RemoteStatusAttachment, Status, TimelineCursorKey,
+};
 
 #[derive(Debug, Clone)]
 pub struct AccountCredentialsPatch {
@@ -253,6 +255,11 @@ pub trait TimelineRepository: Send + Sync {
         status_ids: &[String],
     ) -> Result<HashSet<String>, AppError>;
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
+    async fn get_remote_status_attachments(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusAttachment>, AppError>;
+    async fn status_has_any_media(&self, status_id: &str) -> Result<bool, AppError>;
     async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError>;
     async fn get_favourited_status_ids_batch(
         &self,
@@ -680,6 +687,17 @@ impl TimelineRepository for Database {
 
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
         Database::get_media_by_status(self, status_id).await
+    }
+
+    async fn get_remote_status_attachments(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusAttachment>, AppError> {
+        Database::get_remote_status_attachments(self, status_id).await
+    }
+
+    async fn status_has_any_media(&self, status_id: &str) -> Result<bool, AppError> {
+        Database::status_has_any_media(self, status_id).await
     }
 
     async fn is_status_pinned(&self, status_id: &str) -> Result<bool, AppError> {
