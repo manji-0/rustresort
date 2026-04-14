@@ -283,7 +283,7 @@ impl TestServer {
     }
 
     /// Create a test local session token
-    pub async fn create_test_token(&self) -> String {
+    pub async fn create_test_session_token(&self) -> String {
         use chrono::{Duration, Utc};
         use rustresort::auth::session::{Session, create_session_token};
 
@@ -299,6 +299,65 @@ impl TestServer {
         // Generate token using the session secret from config
         create_session_token(&session, &self.state.config.auth.session_secret)
             .expect("Failed to create test token")
+    }
+
+    /// Create a broad-scope OAuth token for API compatibility tests.
+    pub async fn create_test_token(&self) -> String {
+        use chrono::{Duration, Utc};
+        use rustresort::data::EntityId;
+        use rustresort_models::{OAuthApp, OAuthToken};
+
+        self.create_test_account().await;
+
+        let now = Utc::now();
+        let app = OAuthApp {
+            id: EntityId::new_string(),
+            name: "RustResort Test Client".to_string(),
+            website: Some("https://client.example".to_string()),
+            redirect_uri: "urn:ietf:wg:oauth:2.0:oob".to_string(),
+            client_id: EntityId::new_string(),
+            client_secret: EntityId::new_string(),
+            vapid_key: None,
+            scopes: concat!(
+                "read ",
+                "write ",
+                "follow ",
+                "push ",
+                "admin:read ",
+                "admin:write ",
+                "read:accounts ",
+                "write:accounts ",
+                "read:statuses ",
+                "write:statuses ",
+                "write:favourites ",
+                "read:notifications ",
+                "write:notifications ",
+                "write:media ",
+                "read:lists ",
+                "write:lists ",
+                "read:filters ",
+                "write:filters ",
+                "read:search"
+            )
+            .to_string(),
+            created_at: now,
+        };
+        self.state.db.insert_oauth_app(&app).await.unwrap();
+
+        let access_token = EntityId::new_string();
+        let token = OAuthToken {
+            id: EntityId::new_string(),
+            app_id: app.id.clone(),
+            access_token: access_token.clone(),
+            grant_type: "authorization_code".to_string(),
+            scopes: app.scopes.clone(),
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            revoked: false,
+        };
+        self.state.db.insert_oauth_token(&token).await.unwrap();
+
+        access_token
     }
 
     /// Log in with the built-in password and return `(access_token, session_cookie)`.

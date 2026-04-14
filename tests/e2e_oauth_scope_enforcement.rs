@@ -5,7 +5,7 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 #[tokio::test]
-async fn test_local_session_bearer_can_post_status_and_follow() {
+async fn test_broad_oauth_bearer_can_post_status_and_follow() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
@@ -14,7 +14,7 @@ async fn test_local_session_bearer_can_post_status_and_follow() {
         .client
         .post(server.url("/api/v1/statuses"))
         .bearer_auth(&token)
-        .json(&json!({ "status": "local session write is allowed" }))
+        .json(&json!({ "status": "broad oauth write is allowed" }))
         .send()
         .await
         .unwrap();
@@ -31,7 +31,7 @@ async fn test_local_session_bearer_can_post_status_and_follow() {
 }
 
 #[tokio::test]
-async fn test_local_session_bearer_can_access_streaming_routes_without_oauth_scopes() {
+async fn test_broad_oauth_bearer_can_access_streaming_routes_with_required_scopes() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
@@ -140,7 +140,7 @@ async fn test_invalid_bearer_token_is_rejected() {
 }
 
 #[tokio::test]
-async fn test_password_login_and_cookie_session_both_authenticate() {
+async fn test_cookie_session_authenticates_browser_api_requests() {
     let server = TestServer::new().await;
     server.create_test_account().await;
 
@@ -161,7 +161,7 @@ async fn test_password_login_and_cookie_session_both_authenticate() {
 async fn test_passkey_registration_listing_starts_empty() {
     let server = TestServer::new().await;
     server.create_test_account().await;
-    let token = server.create_test_token().await;
+    let token = server.create_test_session_token().await;
 
     let response = server
         .client

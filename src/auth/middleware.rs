@@ -58,14 +58,10 @@ fn session_from_oauth_token(
     }
 }
 
-async fn authenticate_bearer_token(
+async fn authenticate_oauth_bearer_token(
     state: &AuthState,
     token: &str,
 ) -> Result<(Session, Option<OAuthAccess>), AppError> {
-    if let Ok(session) = verify_session_token(token, &state.config.auth.session_secret) {
-        return Ok((session, None));
-    }
-
     let oauth_token = state
         .db
         .get_oauth_token(token)
@@ -101,7 +97,7 @@ async fn authenticate_request(
     cookie_token: Option<String>,
 ) -> Result<(Session, Option<OAuthAccess>), AppError> {
     if let Some(token) = bearer_token.as_deref() {
-        return authenticate_bearer_token(state, token).await;
+        return authenticate_oauth_bearer_token(state, token).await;
     }
 
     if let Some(cookie_token) = cookie_token.as_deref() {
@@ -199,7 +195,7 @@ pub async fn require_metrics_auth(
 
 /// Middleware to require authentication
 ///
-/// Extracts and verifies session from cookie or Authorization header.
+/// Extracts and verifies OAuth bearer tokens or local session cookies.
 /// Adds Session to request extensions if valid.
 ///
 /// # Usage
@@ -225,8 +221,10 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-/// Middleware to require authentication and enforce OAuth scopes when an OAuth
-/// bearer token is used. Local signed sessions retain full access.
+/// Middleware to require authentication and enforce OAuth scopes.
+///
+/// API bearer authentication is OAuth-only. Local signed sessions are accepted
+/// via the `session` cookie for built-in browser flows.
 pub async fn require_auth_scopes(
     State((state, policy)): State<(AuthState, ScopePolicy)>,
     jar: CookieJar,

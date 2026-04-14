@@ -105,7 +105,7 @@ async fn test_password_login_rejects_bad_password() {
 async fn test_authenticated_session_endpoint_returns_local_session() {
     let server = TestServer::new().await;
     server.create_test_account().await;
-    let token = server.create_test_token().await;
+    let token = server.create_test_session_token().await;
 
     let response = server
         .client
@@ -219,7 +219,7 @@ async fn test_passkey_registration_start_requires_authenticated_session() {
         .expect("request succeeds");
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-    let token = server.create_test_token().await;
+    let token = server.create_test_session_token().await;
     let authorized = server
         .client
         .post(server.url("/auth/passkeys/register/start"))
@@ -238,7 +238,7 @@ async fn test_passkey_registration_start_requires_authenticated_session() {
 async fn test_password_change_updates_login_secret() {
     let server = TestServer::new().await;
     server.create_test_account().await;
-    let token = server.create_test_token().await;
+    let token = server.create_test_session_token().await;
 
     let change = server
         .client
@@ -281,7 +281,7 @@ async fn test_password_change_updates_login_secret() {
 #[tokio::test]
 async fn test_passkey_name_can_be_updated() {
     let server = TestServer::new().await;
-    let token = server.create_test_token().await;
+    let token = server.create_test_session_token().await;
     let now = Utc::now();
     let passkey = PasskeyCredential {
         id: EntityId::new_string(),

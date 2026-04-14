@@ -149,7 +149,7 @@ where
         // Accounts - authenticated operations
         .route(
             "/v1/apps/verify_credentials",
-            scoped(get(apps::verify_app_credentials), READ_ACCOUNTS),
+            scoped(get(apps::verify_app_credentials), SESSION_ONLY),
         )
         .route(
             "/v1/accounts/verify_credentials",

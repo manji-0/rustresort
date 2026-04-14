@@ -120,7 +120,7 @@ async fn test_public_account_creation_endpoint_is_not_exposed() {
 }
 
 #[tokio::test]
-async fn test_password_login_token_can_access_mastodon_api() {
+async fn test_password_login_token_cannot_access_mastodon_api_as_bearer() {
     let server = TestServer::new().await;
     server.create_test_account().await;
 
@@ -132,5 +132,5 @@ async fn test_password_login_token_can_access_mastodon_api() {
         .send()
         .await
         .unwrap();
-    assert_eq!(verify.status(), StatusCode::OK);
+    assert_eq!(verify.status(), StatusCode::UNAUTHORIZED);
 }
