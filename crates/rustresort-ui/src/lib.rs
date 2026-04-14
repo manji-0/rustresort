@@ -2013,12 +2013,17 @@ fn render_app(model: &Model) -> String {
     </section>
   </aside>
 
-  <main class="timeline-column {timeline_active}" aria-label="Timeline pane">
+  <main class="timeline-column {timeline_active} {feed_mode_class}" aria-label="Timeline pane">
     <header class="timeline-header" aria-current="{timeline_current}">
       <div>
         <p class="micro-label">Timeline</p>
+        <div class="timeline-identity">
+          <span class="timeline-feed-pill">{feed_label}</span>
+          <span class="timeline-feed-context">{feed_context}</span>
+          <span class="timeline-feed-contract">Mastodon API</span>
+        </div>
         <h2>{feed_label}</h2>
-          <div class="timeline-meta">
+        <div class="timeline-meta">
           <p class="subtle-line">{feed_subtitle}</p>
           <div class="shortcut-row">
             <span class="shortcut-hint"><kbd>j</kbd>/<kbd>k</kbd> move</span>
@@ -2069,7 +2074,7 @@ fn render_app(model: &Model) -> String {
       </div>
     </section>
 
-    <section class="rail-card">
+    <section class="rail-card admin-quiet">
       <div class="rail-card-head">
         <div>
           <p class="micro-label">Workspace</p>
@@ -2150,6 +2155,8 @@ fn render_app(model: &Model) -> String {
         hashtag_query = hashtag_query,
         profile_panel = render_profile_panel(model),
         feed_label = encode_text(model.feed_mode.label()),
+        feed_context = encode_text(feed_context_label(model)),
+        feed_mode_class = feed_mode_class(model),
         feed_subtitle = encode_text(&feed_subtitle(model)),
         composer_panel = composer_panel,
         composer_popout = composer_popout,
@@ -2186,12 +2193,19 @@ fn render_composer(model: &Model, popout: bool) -> String {
         <div>
           <p class="micro-label">Compose</p>
           <h3>New post</h3>
+          <p class="composer-note">Start with the body, then refine visibility, spoiler text, or language if needed.</p>
         </div>
         {dismiss}
       </div>
       {reply_banner}
       {quote_banner}
-      <textarea id="composer-input" placeholder="What do you want to post?">{composer_text}</textarea>
+      <div class="composer-main-field">
+        <div class="composer-main-head">
+          <span class="composer-main-label">Post body</span>
+          <span class="composer-shortcut-note"><kbd>n</kbd> compose <kbd>N</kbd> mention</span>
+        </div>
+        <textarea id="composer-input" placeholder="What do you want to post?">{composer_text}</textarea>
+      </div>
       <div class="composer-grid">
         <label class="field">
           <span>Visibility</span>
@@ -3019,6 +3033,24 @@ fn feed_subtitle(model: &Model) -> String {
                 format!("Merged hashtag timeline for #{}.", hashtags.join(", #"))
             }
         }
+    }
+}
+
+fn feed_context_label(model: &Model) -> &'static str {
+    match model.feed_mode {
+        FeedMode::Home => "followed + recent",
+        FeedMode::Public => "local public",
+        FeedMode::Profile => "account archive",
+        FeedMode::Hashtags => "merged hashtags",
+    }
+}
+
+fn feed_mode_class(model: &Model) -> &'static str {
+    match model.feed_mode {
+        FeedMode::Home => "feed-home",
+        FeedMode::Public => "feed-public",
+        FeedMode::Profile => "feed-profile",
+        FeedMode::Hashtags => "feed-hashtags",
     }
 }
 

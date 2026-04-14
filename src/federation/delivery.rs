@@ -206,7 +206,7 @@ fn hashtag_tag_objects(base_url: &str, content: &str) -> Vec<serde_json::Value> 
         .map(|name| {
             serde_json::json!({
                 "type": "Hashtag",
-                "href": format!("{}/tags/{}", base_url, name),
+                "href": format!("{}/tagged/{}", base_url, name),
                 "name": format!("#{}", name),
             })
         })

@@ -80,6 +80,16 @@ async fn test_actor_endpoint() {
     assert!(json.get("outbox").is_some());
     assert!(json.get("publicKey").is_some());
     assert_eq!(
+        json["featured"],
+        "https://test.example.com/users/testuser/collections/featured"
+    );
+    assert_eq!(
+        json["featuredTags"],
+        "https://test.example.com/users/testuser/collections/tags"
+    );
+    assert_eq!(json["discoverable"], true);
+    assert_eq!(json["indexable"], true);
+    assert_eq!(
         json["endpoints"]["sharedInbox"],
         "https://test.example.com/inbox"
     );
@@ -403,6 +413,116 @@ async fn test_following_collection() {
 }
 
 #[tokio::test]
+async fn test_featured_collection_returns_pinned_statuses() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let pinned_uri = insert_local_status(&server, "featured-pinned").await;
+    let unpinned_uri = insert_local_status(&server, "featured-unpinned").await;
+
+    let pinned_status = server
+        .state
+        .db
+        .get_status_by_uri(&pinned_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_status_pin(&pinned_status.id)
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser/collections/featured"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["type"], "OrderedCollection");
+    let ordered_items = json["orderedItems"].as_array().unwrap();
+    assert!(ordered_items.iter().any(|item| item["id"] == pinned_uri));
+    assert!(!ordered_items.iter().any(|item| item["id"] == unpinned_uri));
+}
+
+#[tokio::test]
+async fn test_featured_tags_collection_is_empty_ordered_collection() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser/collections/tags"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["type"], "OrderedCollection");
+    assert_eq!(json["totalItems"], 0);
+    assert_eq!(json["orderedItems"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn test_tag_collection_resolves_both_tagged_and_tags_routes() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let status_uri = server.public_url("/users/testuser/statuses/hashtag-collection");
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: EntityId::new_string(),
+            uri: status_uri.clone(),
+            content: "<p>#breakfast timeline item</p>".to_string(),
+            content_warning: None,
+            visibility: StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        })
+        .await
+        .unwrap();
+
+    for path in ["/tagged/breakfast", "/tags/breakfast"] {
+        let response = server
+            .client
+            .get(server.url(path))
+            .header("Accept", "application/activity+json")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200, "{path} should resolve");
+        let json: Value = response.json().await.unwrap();
+        assert_eq!(json["type"], "OrderedCollection");
+        let ordered_items = json["orderedItems"].as_array().unwrap();
+        assert!(
+            ordered_items
+                .iter()
+                .any(|item| item == &serde_json::json!(status_uri))
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_followers_collection_prefers_stored_actor_uri() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follower};
@@ -550,6 +670,7 @@ async fn test_status_activity_endpoint_returns_create_activity() {
     );
     let json: Value = response.json().await.unwrap();
     assert_eq!(json["type"], "Create");
+    assert!(json.get("@context").is_some());
     assert_eq!(json["object"]["id"], status_uri);
 }
 
@@ -606,6 +727,7 @@ async fn test_status_note_and_create_include_quote_fields() {
     assert_eq!(activity_response.status(), 200);
     let activity_json: Value = activity_response.json().await.unwrap();
     assert_eq!(activity_json["type"], "Create");
+    assert!(activity_json.get("@context").is_some());
     assert_eq!(activity_json["object"]["quoteUri"], quote_target_uri);
     assert_eq!(activity_json["object"]["quoteUrl"], quote_target_uri);
 }
@@ -674,6 +796,7 @@ async fn test_outbox_page_and_status_activity_include_local_announce() {
     assert_eq!(announce_response.status(), 200);
     let announce_json: Value = announce_response.json().await.unwrap();
     assert_eq!(announce_json["type"], "Announce");
+    assert!(announce_json.get("@context").is_some());
     assert_eq!(announce_json["object"], remote_status.uri);
 }
 

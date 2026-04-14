@@ -177,6 +177,35 @@ fn activitypub_content_type() -> HeaderValue {
     HeaderValue::from_static("application/activity+json")
 }
 
+fn activitypub_status_context() -> serde_json::Value {
+    serde_json::json!([
+        "https://www.w3.org/ns/activitystreams",
+        {
+            "Hashtag": "https://www.w3.org/ns/activitystreams#Hashtag",
+            "votersCount": "http://joinmastodon.org/ns#votersCount"
+        }
+    ])
+}
+
+fn activitypub_actor_context() -> serde_json::Value {
+    serde_json::json!([
+        "https://www.w3.org/ns/activitystreams",
+        "https://w3id.org/security/v1",
+        {
+            "featured": {
+                "@id": "http://joinmastodon.org/ns#featured",
+                "@type": "@id"
+            },
+            "featuredTags": {
+                "@id": "http://joinmastodon.org/ns#featuredTags",
+                "@type": "@id"
+            },
+            "discoverable": "http://joinmastodon.org/ns#discoverable",
+            "indexable": "http://joinmastodon.org/ns#indexable"
+        }
+    ])
+}
+
 fn activitypub_json_response(value: serde_json::Value) -> Response {
     (
         [(
@@ -237,7 +266,7 @@ async fn build_status_tags(
         .map(|name| {
             serde_json::json!({
                 "type": "Hashtag",
-                "href": format!("{}/tags/{}", state.config.server.base_url(), name),
+                "href": format!("{}/tagged/{}", state.config.server.base_url(), name),
                 "name": format!("#{}", name),
             })
         })
@@ -416,10 +445,7 @@ pub(crate) fn build_local_actor_document(
 ) -> serde_json::Value {
     let actor_url = format!("{}/users/{}", base_url, account.username);
     let mut actor = serde_json::json!({
-        "@context": [
-            "https://www.w3.org/ns/activitystreams",
-            "https://w3id.org/security/v1"
-        ],
+        "@context": activitypub_actor_context(),
         "type": "Person",
         "id": actor_url.clone(),
         "preferredUsername": account.username.clone(),
@@ -429,9 +455,13 @@ pub(crate) fn build_local_actor_document(
         "outbox": format!("{}/outbox", actor_url),
         "followers": format!("{}/followers", actor_url),
         "following": format!("{}/following", actor_url),
+        "featured": format!("{}/collections/featured", actor_url),
+        "featuredTags": format!("{}/collections/tags", actor_url),
         "endpoints": {
             "sharedInbox": format!("{}/inbox", base_url)
         },
+        "discoverable": true,
+        "indexable": true,
         "url": actor_url.clone(),
         "publicKey": {
             "id": format!("{}#main-key", actor_url),
@@ -468,6 +498,7 @@ async fn build_create_activity(
 ) -> Result<serde_json::Value, AppError> {
     let object = build_note_object(state, actor_url, followers_url, status).await?;
     Ok(serde_json::json!({
+        "@context": activitypub_status_context(),
         "type": "Create",
         "id": format!("{}/activity", status.uri),
         "actor": actor_url,
@@ -486,6 +517,7 @@ fn build_announce_activity(
 ) -> serde_json::Value {
     let (to_audience, cc_audience) = activitypub_audience(followers_url, status.visibility);
     serde_json::json!({
+        "@context": activitypub_status_context(),
         "type": "Announce",
         "id": repost.uri,
         "actor": actor_url,
@@ -570,8 +602,12 @@ where
             "/users/:username/statuses/:id/activity",
             get(status_activity),
         )
+        .route("/users/:username/collections/featured", get(featured))
+        .route("/users/:username/collections/tags", get(featured_tags))
         .route("/users/:username/followers", get(followers))
         .route("/users/:username/following", get(following))
+        .route("/tags/:hashtag", get(tag_collection))
+        .route("/tagged/:hashtag", get(tag_collection))
 }
 
 /// GET /users/:username
@@ -788,7 +824,7 @@ async fn status_object(
                 .ok_or(AppError::NotFound)?;
             ensure_public_activity_visibility(status.visibility)?;
             let mut note = build_note_object(&state, &actor_url, &followers_url, &status).await?;
-            note["@context"] = serde_json::json!("https://www.w3.org/ns/activitystreams");
+            note["@context"] = activitypub_status_context();
 
             HTTP_REQUESTS_TOTAL
                 .with_label_values(&["GET", "/users/:username/statuses/:id", "200"])
@@ -840,6 +876,89 @@ async fn status_activity(
         }
         _ => Err(AppError::NotFound),
     }
+}
+
+async fn featured(
+    State(state): State<ActivityPubState>,
+    Path(username): Path<String>,
+) -> Result<Response, AppError> {
+    let account = state.db.get_account().await?;
+    match account {
+        Some(acc) if acc.username == username => {
+            let actor_url = format!("{}/users/{}", state.config.server.base_url(), username);
+            let followers_url = format!("{}/followers", actor_url);
+            let timeline_service = crate::service::TimelineService::new(
+                state.db.clone(),
+                state.timeline_cache.clone(),
+                state.profile_cache.clone(),
+            );
+            let pinned_statuses = timeline_service
+                .account_timeline(None, None, 40, None, None, false, false, false, true)
+                .await?
+                .into_iter()
+                .map(|item| item.status)
+                .collect::<Vec<_>>();
+
+            let mut ordered_items = Vec::with_capacity(pinned_statuses.len());
+            for status in pinned_statuses {
+                ordered_items
+                    .push(build_note_object(&state, &actor_url, &followers_url, &status).await?);
+            }
+
+            Ok(activitypub_json_response(serde_json::json!({
+                "@context": activitypub_status_context(),
+                "type": "OrderedCollection",
+                "id": format!("{}/collections/featured", actor_url),
+                "totalItems": ordered_items.len(),
+                "orderedItems": ordered_items
+            })))
+        }
+        _ => Err(AppError::NotFound),
+    }
+}
+
+async fn featured_tags(
+    State(state): State<ActivityPubState>,
+    Path(username): Path<String>,
+) -> Result<Response, AppError> {
+    let account = state.db.get_account().await?;
+    match account {
+        Some(acc) if acc.username == username => {
+            let actor_url = format!("{}/users/{}", state.config.server.base_url(), username);
+            Ok(activitypub_json_response(serde_json::json!({
+                "@context": activitypub_status_context(),
+                "type": "OrderedCollection",
+                "id": format!("{}/collections/tags", actor_url),
+                "totalItems": 0,
+                "orderedItems": Vec::<serde_json::Value>::new()
+            })))
+        }
+        _ => Err(AppError::NotFound),
+    }
+}
+
+async fn tag_collection(
+    State(state): State<ActivityPubState>,
+    Path(hashtag): Path<String>,
+) -> Result<Response, AppError> {
+    let normalized = hashtag.trim().trim_start_matches('#');
+    let statuses = state
+        .db
+        .get_statuses_by_hashtag_in_window(normalized, 40, None, None)
+        .await?;
+    let ordered_items = statuses
+        .into_iter()
+        .map(|status| serde_json::json!(status.uri))
+        .collect::<Vec<_>>();
+    let base_url = state.config.server.base_url();
+
+    Ok(activitypub_json_response(serde_json::json!({
+        "@context": activitypub_status_context(),
+        "type": "OrderedCollection",
+        "id": format!("{}/tagged/{}", base_url, normalized),
+        "totalItems": ordered_items.len(),
+        "orderedItems": ordered_items
+    })))
 }
 
 /// GET /users/:username/followers
