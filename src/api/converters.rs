@@ -287,6 +287,7 @@ pub async fn build_status_response_with_media(
         &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
+    response.poll = load_status_poll_response(db, &status.id, account, config).await?;
     if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
         && let Some(quote_status) = db.get_status_by_uri(quote_of_uri).await?
     {
@@ -687,6 +688,53 @@ async fn load_status_media_attachment_responses(
     );
 
     Ok(responses)
+}
+
+async fn load_status_poll_response(
+    db: &Database,
+    status_id: &str,
+    account: &Account,
+    config: &AppConfig,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
+        db.get_poll_by_status_id(status_id).await?
+    else {
+        return Ok(None);
+    };
+
+    let options = db.get_poll_options(&poll_id).await?;
+    let account_address = format!("{}@{}", account.username, config.server.domain);
+    let user_votes = db.get_user_poll_votes(&poll_id, &account_address).await?;
+    let own_votes = user_votes
+        .iter()
+        .filter_map(|vote_option_id| {
+            options
+                .iter()
+                .position(|(option_id, _, _)| option_id == vote_option_id)
+        })
+        .collect::<Vec<_>>();
+    let options_response = options
+        .into_iter()
+        .map(|(_, title, option_votes_count)| {
+            serde_json::json!({
+                "title": title,
+                "votes_count": option_votes_count,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(serde_json::json!({
+        "id": poll_id,
+        "expires_at": expires_at,
+        "expired": expired,
+        "multiple": multiple,
+        "votes_count": votes_count,
+        "voters_count": voters_count,
+        "voted": !own_votes.is_empty(),
+        "own_votes": own_votes,
+        "options": options_response,
+        "emojis": [],
+    })))
 }
 
 fn boost_stub_status(

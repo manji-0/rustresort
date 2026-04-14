@@ -31,6 +31,12 @@ pub trait DeliveryQueue: Send + Sync {
     async fn reap_dead_jobs(&self, max_attempts: u32) -> Result<u64, AppError>;
     async fn is_blocked_by_remote(&self, actor_uri: &str) -> Result<bool, AppError>;
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
+    async fn get_poll_by_status_id(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError>;
+    async fn get_poll_options(&self, poll_id: &str)
+    -> Result<Vec<(String, String, i64)>, AppError>;
 }
 
 #[async_trait]
@@ -67,6 +73,20 @@ impl DeliveryQueue for crate::data::Database {
 
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
         crate::data::Database::get_media_by_status(self, status_id).await
+    }
+
+    async fn get_poll_by_status_id(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+        crate::data::Database::get_poll_by_status_id(self, status_id).await
+    }
+
+    async fn get_poll_options(
+        &self,
+        poll_id: &str,
+    ) -> Result<Vec<(String, String, i64)>, AppError> {
+        crate::data::Database::get_poll_options(self, poll_id).await
     }
 }
 
@@ -260,24 +280,24 @@ impl ActivityDelivery {
         Some(object)
     }
 
-    async fn enrich_note_object(
+    async fn enrich_status_object(
         &self,
         queue: &(impl DeliveryQueue + ?Sized),
         status: &Status,
-        note: &mut serde_json::Value,
+        object: &mut serde_json::Value,
         mention_tags: &[serde_json::Value],
     ) -> Result<(), AppError> {
         if let Some(summary) = &status.content_warning {
-            note["summary"] = serde_json::json!(summary);
-            note["sensitive"] = serde_json::json!(true);
+            object["summary"] = serde_json::json!(summary);
+            object["sensitive"] = serde_json::json!(true);
         }
         if let Some(language) = &status.language {
             let mut content_map = serde_json::Map::new();
             content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
-            note["contentMap"] = serde_json::Value::Object(content_map);
+            object["contentMap"] = serde_json::Value::Object(content_map);
         }
         if !mention_tags.is_empty() {
-            note["tag"] = serde_json::json!(mention_tags);
+            object["tag"] = serde_json::json!(mention_tags);
         }
 
         let attachments = queue
@@ -287,10 +307,100 @@ impl ActivityDelivery {
             .filter_map(|attachment| self.local_media_attachment_object(&attachment))
             .collect::<Vec<_>>();
         if !attachments.is_empty() {
-            note["attachment"] = serde_json::json!(attachments);
+            object["attachment"] = serde_json::json!(attachments);
         }
 
         Ok(())
+    }
+
+    async fn build_status_object_with_audience(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status: &Status,
+        note_to: &[&str],
+        note_cc: &[&str],
+        mention_tags: &[serde_json::Value],
+    ) -> Result<serde_json::Value, AppError> {
+        let poll = queue.get_poll_by_status_id(&status.id).await?;
+        let mut object = if let Some((
+            poll_id,
+            expires_at,
+            expired,
+            multiple,
+            _votes_count,
+            voters_count,
+        )) = poll
+        {
+            let options = queue
+                .get_poll_options(&poll_id)
+                .await?
+                .into_iter()
+                .map(|(_, title, votes_count)| {
+                    serde_json::json!({
+                        "type": "Note",
+                        "name": title,
+                        "replies": {
+                            "type": "Collection",
+                            "totalItems": votes_count,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut object = serde_json::json!({
+                "type": "Question",
+                "id": status.uri,
+                "attributedTo": self.actor_uri,
+                "content": status.content,
+                "published": status.created_at.to_rfc3339(),
+                "to": note_to,
+                "cc": note_cc,
+                "endTime": expires_at,
+                "votersCount": voters_count,
+            });
+            if expired {
+                object["closed"] = serde_json::json!(expires_at);
+            }
+            if multiple {
+                object["anyOf"] = serde_json::json!(options);
+            } else {
+                object["oneOf"] = serde_json::json!(options);
+            }
+            object
+        } else if let Some(ref in_reply_to) = status.in_reply_to_uri {
+            builder::note_reply(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                in_reply_to,
+                note_to.to_vec(),
+                note_cc.to_vec(),
+            )
+        } else {
+            builder::note(
+                &status.uri,
+                &self.actor_uri,
+                &status.content,
+                &status.created_at.to_rfc3339(),
+                note_to.to_vec(),
+                note_cc.to_vec(),
+            )
+        };
+        self.enrich_status_object(queue, status, &mut object, mention_tags)
+            .await?;
+        if let Some(ref quote_of_uri) = status.quote_of_uri
+            && let Some(object_map) = object.as_object_mut()
+        {
+            object_map.insert(
+                "quoteUri".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            object_map.insert(
+                "quoteUrl".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+        }
+        Ok(object)
     }
 
     fn serialize_activity(activity: &serde_json::Value) -> Result<String, AppError> {
@@ -497,40 +607,9 @@ impl ActivityDelivery {
         );
         let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
         let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
-        let mut note = if let Some(ref in_reply_to) = status.in_reply_to_uri {
-            builder::note_reply(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                in_reply_to,
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        } else {
-            builder::note(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        };
-        self.enrich_note_object(queue, status, &mut note, mention_tags)
+        let note = self
+            .build_status_object_with_audience(queue, status, &note_to, &note_cc, mention_tags)
             .await?;
-        if let Some(ref quote_of_uri) = status.quote_of_uri
-            && let Some(note_object) = note.as_object_mut()
-        {
-            note_object.insert(
-                "quoteUri".to_string(),
-                serde_json::Value::String(quote_of_uri.clone()),
-            );
-            note_object.insert(
-                "quoteUrl".to_string(),
-                serde_json::Value::String(quote_of_uri.clone()),
-            );
-        }
         let create_id = format!("{}/activity", status.uri);
         Ok(builder::create(
             &create_id,
@@ -555,40 +634,9 @@ impl ActivityDelivery {
         );
         let note_to: Vec<&str> = to_audience.iter().map(String::as_str).collect();
         let note_cc: Vec<&str> = cc_audience.iter().map(String::as_str).collect();
-        let mut object = if let Some(ref in_reply_to) = status.in_reply_to_uri {
-            builder::note_reply(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                in_reply_to,
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        } else {
-            builder::note(
-                &status.uri,
-                &self.actor_uri,
-                &status.content,
-                &status.created_at.to_rfc3339(),
-                note_to.clone(),
-                note_cc.clone(),
-            )
-        };
-        self.enrich_note_object(queue, status, &mut object, mention_tags)
+        let object = self
+            .build_status_object_with_audience(queue, status, &note_to, &note_cc, mention_tags)
             .await?;
-        if let Some(ref quote_of_uri) = status.quote_of_uri
-            && let Some(object_map) = object.as_object_mut()
-        {
-            object_map.insert(
-                "quoteUri".to_string(),
-                serde_json::Value::String(quote_of_uri.clone()),
-            );
-            object_map.insert(
-                "quoteUrl".to_string(),
-                serde_json::Value::String(quote_of_uri.clone()),
-            );
-        }
 
         Ok(builder::update(
             &format!("{}/activity/update/{}", status.uri, EntityId::new_string()),

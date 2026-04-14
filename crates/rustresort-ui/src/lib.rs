@@ -1965,7 +1965,7 @@ fn render_app(model: &Model) -> String {
 
     format!(
         r#"
-<div class="app-shell">
+<div class="app-shell" data-active-pane="{active_pane}">
   <aside class="sidebar">
     <div class="brand-lockup">
       <div class="brand-orb">rr</div>
@@ -1975,11 +1975,11 @@ fn render_app(model: &Model) -> String {
         <p class="lede">Integrated client tuned to Mastodon-compatible APIs first, with RustResort admin controls layered beside it.</p>
       </div>
     </div>
-    <nav class="sidebar-nav">
-      <button id="nav-home" class="sidebar-link {home_active}">Home timeline</button>
-      <button id="nav-public" class="sidebar-link {public_active}">Local timeline</button>
-      <button id="nav-profile" class="sidebar-link {profile_active}">My posts</button>
-      <button id="nav-hashtags" class="sidebar-link {hashtags_active}">Hashtag timeline</button>
+    <nav class="sidebar-nav" aria-label="Primary feeds">
+      <button id="nav-home" class="sidebar-link {home_active}" aria-pressed="{home_pressed}">Home timeline</button>
+      <button id="nav-public" class="sidebar-link {public_active}" aria-pressed="{public_pressed}">Local timeline</button>
+      <button id="nav-profile" class="sidebar-link {profile_active}" aria-pressed="{profile_pressed}">My posts</button>
+      <button id="nav-hashtags" class="sidebar-link {hashtags_active}" aria-pressed="{hashtags_pressed}">Hashtag timeline</button>
       <label class="field sidebar-field">
         <span>Hashtags</span>
         <input id="hashtag-query" type="text" value="{hashtag_query}" placeholder="rust, wasm, activitypub" />
@@ -1995,8 +1995,8 @@ fn render_app(model: &Model) -> String {
     </section>
   </aside>
 
-  <main class="timeline-column {timeline_active}">
-    <header class="timeline-header">
+  <main class="timeline-column {timeline_active}" aria-label="Timeline pane">
+    <header class="timeline-header" aria-current="{timeline_current}">
       <div>
         <p class="micro-label">Timeline</p>
         <h2>{feed_label}</h2>
@@ -2020,24 +2020,24 @@ fn render_app(model: &Model) -> String {
 
     {flash_banner}
 
-    <section class="timeline-list">
+    <section class="timeline-list" aria-label="Timeline posts">
       {timeline_cards}
     </section>
   </main>
 
-  <aside class="activity-column {notifications_active}">
-    <section class="rail-card">
+  <aside class="activity-column {notifications_active}" aria-label="Notifications pane">
+    <section class="rail-card" aria-labelledby="notifications-title">
       <div class="rail-card-head">
         <div>
           <p class="micro-label">Notifications</p>
-          <h3>Signals</h3>
+          <h3 id="notifications-title">Signals</h3>
         </div>
         <div class="notification-count">{notifications_unread} unread</div>
       </div>
-      <div class="filter-row">
+      <div class="filter-row" aria-label="Notification filters">
         {notification_filters}
       </div>
-      <div class="rail-list">
+      <div class="rail-list" aria-label="Notification groups">
         {notifications}
       </div>
       <div class="rail-actions">
@@ -2062,11 +2062,21 @@ fn render_app(model: &Model) -> String {
 {detail_modal}
 {composer_popout}
 "#,
+        active_pane = match model.active_pane {
+            ActivePane::Timeline => "timeline",
+            ActivePane::Notifications => "notifications",
+            ActivePane::DetailModal => "detail",
+        },
         brand_title = encode_text(brand_title),
         timeline_active = if matches!(model.active_pane, ActivePane::Timeline) {
             "active-pane"
         } else {
             ""
+        },
+        timeline_current = if matches!(model.active_pane, ActivePane::Timeline) {
+            "true"
+        } else {
+            "false"
         },
         notifications_active = if matches!(model.active_pane, ActivePane::Notifications) {
             "active-pane"
@@ -2078,20 +2088,40 @@ fn render_app(model: &Model) -> String {
         } else {
             ""
         },
+        home_pressed = if model.feed_mode == FeedMode::Home {
+            "true"
+        } else {
+            "false"
+        },
         public_active = if model.feed_mode == FeedMode::Public {
             "active"
         } else {
             ""
+        },
+        public_pressed = if model.feed_mode == FeedMode::Public {
+            "true"
+        } else {
+            "false"
         },
         profile_active = if model.feed_mode == FeedMode::Profile {
             "active"
         } else {
             ""
         },
+        profile_pressed = if model.feed_mode == FeedMode::Profile {
+            "true"
+        } else {
+            "false"
+        },
         hashtags_active = if model.feed_mode == FeedMode::Hashtags {
             "active"
         } else {
             ""
+        },
+        hashtags_pressed = if model.feed_mode == FeedMode::Hashtags {
+            "true"
+        } else {
+            "false"
         },
         hashtag_query = hashtag_query,
         profile_panel = render_profile_panel(model),
@@ -2298,7 +2328,7 @@ fn render_flash(model: &Model) -> String {
     };
 
     format!(
-        r#"<div class="flash-banner {tone}">{text}</div>"#,
+        r#"<div class="flash-banner {tone}" role="status" aria-live="polite">{text}</div>"#,
         tone = tone,
         text = encode_text(&flash.text),
     )
@@ -2371,16 +2401,19 @@ fn render_detail_modal(model: &Model) -> String {
 
     format!(
         r#"<section class="detail-modal-shell">
-  <div class="detail-modal">
+  <div class="detail-modal" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
     <div class="thread-head">
-      <div>
-        <p class="micro-label">Detail</p>
-        <h3>Selected thread</h3>
-        {thread_badge}
+      <div class="detail-title-group">
+        <div class="detail-title-row">
+          <p class="micro-label">Detail</p>
+          {thread_badge}
+        </div>
+        <h3 id="detail-modal-title">Selected thread</h3>
+        <p class="detail-caption">Focused thread inspector. Use <code>j</code>/<code>k</code> to move within the conversation.</p>
       </div>
-      <div class="mini-row">
-        <small>Use <code>j</code>/<code>k</code> in this window, <code>Esc</code> to close.</small>
-        <button id="thread-close" class="ghost-button small">Close</button>
+      <div class="detail-actions">
+        <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
+        <button id="thread-close" class="ghost-button small detail-close">Close</button>
       </div>
     </div>
     <div class="thread-panel">
@@ -2480,8 +2513,10 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
     );
     let content_markup = render_status_content(primary, expanded);
 
+    let is_selected = model.selected_status_id.as_deref() == Some(primary.id.as_str());
+
     format!(
-        r#"<article class="{card_classes}" data-focus-status="{select_target}">
+        r#"<article class="{card_classes}" data-focus-status="{select_target}" tabindex="{tabindex}" aria-selected="{aria_selected}">
   {boost_banner}
   <div class="status-head">
     {avatar}
@@ -2515,6 +2550,8 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
 </article>"#,
         card_classes = card_classes.join(" "),
         boost_banner = boost_banner.unwrap_or_default(),
+        tabindex = if is_selected { "0" } else { "-1" },
+        aria_selected = if is_selected { "true" } else { "false" },
         avatar = avatar_markup(
             "status-avatar",
             &primary.account.avatar,
@@ -2681,11 +2718,16 @@ fn render_notification_filters(model: &Model) -> String {
     .into_iter()
     .map(|(filter, value)| {
         format!(
-            r#"<button class="filter-pill {active}" data-notification-filter="{value}">{label}</button>"#,
+            r#"<button class="filter-pill {active}" data-notification-filter="{value}" aria-pressed="{pressed}">{label}</button>"#,
             active = if model.notification_filter == filter {
                 "active"
             } else {
                 ""
+            },
+            pressed = if model.notification_filter == filter {
+                "true"
+            } else {
+                "false"
             },
             value = value,
             label = filter.label(),
@@ -2740,7 +2782,7 @@ fn render_notifications(model: &Model) -> String {
             let dismiss_ids = encode_attribute(&group.ids.join("|"));
 
             format!(
-                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}">
+                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}" tabindex="{tabindex}" aria-selected="{aria_selected}">
   <div class="notification-head">
     <strong>{kind}</strong>
     <span>{created_at}</span>
@@ -2765,6 +2807,16 @@ fn render_notifications(model: &Model) -> String {
                     "selected"
                 } else {
                     ""
+                },
+                tabindex = if model.selected_notification_key.as_deref() == Some(group_key.as_str()) {
+                    "0"
+                } else {
+                    "-1"
+                },
+                aria_selected = if model.selected_notification_key.as_deref() == Some(group_key.as_str()) {
+                    "true"
+                } else {
+                    "false"
                 },
                 group_key = encode_attribute(&group_key),
                 kind = encode_text(notification_kind_label(&group.notification_type)),

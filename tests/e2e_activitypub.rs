@@ -1232,6 +1232,169 @@ async fn test_signed_shared_inbox_create_from_followee_persists_and_caches_for_t
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_create_question_from_followee_persists_poll_for_api() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+    use url::form_urlencoded::byte_serialize;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let status_uri = "https://remote.example/users/alice/statuses/followee-question";
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: server.public_url("/users/testuser/follows/remote-alice-question"),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/create-followee-question",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Question",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>tea or coffee?</p>",
+            "published": "2026-01-02T00:00:00Z",
+            "endTime": "2026-01-12T00:00:00Z",
+            "oneOf": [
+                { "name": "tea", "replies": { "totalItems": 2 } },
+                { "name": "coffee", "replies": { "totalItems": 1 } }
+            ],
+            "votersCount": 3,
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let persisted = server
+        .state
+        .db
+        .get_status_by_uri(status_uri)
+        .await
+        .unwrap()
+        .expect("remote question should be persisted");
+    let encoded_id: String = byte_serialize(persisted.id.as_bytes()).collect();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", encoded_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["poll"]["multiple"], false);
+    assert_eq!(body["poll"]["voters_count"], 3);
+    assert_eq!(body["poll"]["options"][0]["title"], "tea");
+    assert_eq!(body["poll"]["options"][0]["votes_count"], 2);
+}
+
+#[tokio::test]
+async fn test_activitypub_status_object_for_local_poll_includes_question_and_mention_tag() {
+    use chrono::Utc;
+    use rustresort::data::CachedProfile;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: REMOTE_ACTOR_ADDRESS.to_string(),
+            uri: REMOTE_ACTOR_ID.to_string(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: common::test_public_key_pem().to_string(),
+            inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
+            followers_count: None,
+            following_count: None,
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let status_id = "local-poll-activitypub";
+    let status_uri = server.public_url(&format!("/users/testuser/statuses/{status_id}"));
+    server
+        .state
+        .db
+        .insert_status(&rustresort::data::Status {
+            id: status_id.to_string(),
+            uri: status_uri.clone(),
+            content: "<p>@alice@remote.example tea or coffee?</p>".to_string(),
+            content_warning: None,
+            visibility: rustresort::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: rustresort::data::PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .create_poll(
+            status_id,
+            &["tea".to_string(), "coffee".to_string()],
+            600,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!("/users/testuser/statuses/{status_id}")))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["type"], "Question");
+    assert_eq!(body["oneOf"][0]["name"], "tea");
+    assert_eq!(body["tag"][0]["type"], "Mention");
+    assert_eq!(body["tag"][0]["href"], REMOTE_ACTOR_ID);
+
+    let activity_response = server
+        .client
+        .get(server.url(&format!("/users/testuser/statuses/{status_id}/activity")))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(activity_response.status(), reqwest::StatusCode::OK);
+    let activity_body = activity_response.json::<Value>().await.unwrap();
+    assert_eq!(activity_body["type"], "Create");
+    assert_eq!(activity_body["object"]["type"], "Question");
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_update_note_persists_edit_snapshot() {
     use chrono::Utc;
     use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};

@@ -182,6 +182,69 @@ fn extract_attachment_dimensions(value: &serde_json::Value) -> (Option<i32>, Opt
     (width, height)
 }
 
+#[derive(Debug, Clone)]
+struct ParsedQuestionPoll {
+    expires_at: String,
+    expired: bool,
+    multiple: bool,
+    votes_count: i64,
+    voters_count: i64,
+    options: Vec<(String, i64)>,
+}
+
+fn parse_question_poll(object: &serde_json::Value) -> Option<ParsedQuestionPoll> {
+    let raw_options = object
+        .get("oneOf")
+        .or_else(|| object.get("anyOf"))
+        .and_then(serde_json::Value::as_array)?;
+    if raw_options.is_empty() {
+        return None;
+    }
+
+    let mut options = Vec::with_capacity(raw_options.len());
+    let mut total_votes = 0_i64;
+    for option in raw_options {
+        let title = option
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?
+            .to_string();
+        let option_votes = option
+            .get("replies")
+            .and_then(|replies| replies.get("totalItems"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        total_votes += option_votes;
+        options.push((title, option_votes));
+    }
+
+    let expires_at = object
+        .get("endTime")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| object.get("closed").and_then(serde_json::Value::as_str))?
+        .to_string();
+    let expired = object.get("closed").is_some_and(|value| match value {
+        serde_json::Value::Bool(expired) => *expired,
+        serde_json::Value::String(timestamp) => !timestamp.trim().is_empty(),
+        _ => false,
+    }) || chrono::DateTime::parse_from_rfc3339(&expires_at)
+        .ok()
+        .is_some_and(|timestamp| timestamp.with_timezone(&Utc) <= Utc::now());
+
+    Some(ParsedQuestionPoll {
+        expires_at,
+        expired,
+        multiple: object.get("anyOf").is_some(),
+        votes_count: total_votes,
+        voters_count: object
+            .get("votersCount")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(total_votes),
+        options,
+    })
+}
+
 fn push_alert_enabled(alerts: &PushAlerts, notification_type: NotificationType) -> bool {
     match notification_type {
         NotificationType::Mention => alerts.mention,
@@ -805,7 +868,7 @@ impl ActivityProcessor {
                         .get("type")
                         .and_then(|t| t.as_str())
                         .unwrap_or_default();
-                    if matches!(object_type, "Note" | "Article") {
+                    if matches!(object_type, "Note" | "Article" | "Question") {
                         if self.mentions_local_user(object) {
                             return PersistenceDecision::Persist;
                         }
@@ -888,7 +951,7 @@ impl ActivityProcessor {
             .unwrap_or("Unknown");
 
         // We mainly care about Note objects (posts)
-        if object_type != "Note" && object_type != "Article" {
+        if object_type != "Note" && object_type != "Article" && object_type != "Question" {
             return Ok(()); // Ignore other object types for now
         }
         if !object_attributed_to_matches_actor(object, actor_uri) {
@@ -1017,7 +1080,7 @@ impl ActivityProcessor {
             .and_then(|t| t.as_str())
             .unwrap_or_default();
 
-        if matches!(object_type, "Note" | "Article") {
+        if matches!(object_type, "Note" | "Article" | "Question") {
             if !object_attributed_to_matches_actor(object, actor_uri) {
                 return Err(AppError::Unauthorized);
             }
@@ -2122,6 +2185,8 @@ impl ActivityProcessor {
             self.db
                 .replace_remote_status_attachments(&status.id, &attachments)
                 .await?;
+            self.replace_remote_poll_for_status(&status.id, object)
+                .await?;
             return Ok(Some(status));
         }
 
@@ -2130,7 +2195,32 @@ impl ActivityProcessor {
         self.db
             .replace_remote_status_attachments(&status.id, &attachments)
             .await?;
+        self.replace_remote_poll_for_status(&status.id, object)
+            .await?;
         Ok(Some(status))
+    }
+
+    async fn replace_remote_poll_for_status(
+        &self,
+        status_id: &str,
+        object: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        if let Some(poll) = parse_question_poll(object) {
+            self.db
+                .replace_poll_for_status(
+                    status_id,
+                    &poll.expires_at,
+                    poll.expired,
+                    poll.multiple,
+                    poll.votes_count,
+                    poll.voters_count,
+                    &poll.options,
+                )
+                .await?;
+        } else {
+            self.db.delete_poll_by_status_id(status_id).await?;
+        }
+        Ok(())
     }
 
     fn cached_status_from_object(
@@ -2152,6 +2242,7 @@ impl ActivityProcessor {
             object
                 .get("content")
                 .and_then(|content| content.as_str())
+                .or_else(|| object.get("name").and_then(|name| name.as_str()))
                 .unwrap_or_default(),
         );
 
@@ -2207,10 +2298,7 @@ impl ActivityProcessor {
                 let remote_url = if let Some(url) = value.as_str() {
                     url.to_string()
                 } else {
-                    value
-                        .get("url")
-                        .and_then(serde_json::Value::as_str)?
-                        .to_string()
+                    extract_first_uri_reference(value.get("url")?)?
                 };
                 let (width, height) = extract_attachment_dimensions(value);
                 Some(crate::data::RemoteStatusAttachment {
@@ -2220,8 +2308,7 @@ impl ActivityProcessor {
                     preview_url: value
                         .get("icon")
                         .and_then(|icon| icon.get("url"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
+                        .and_then(extract_first_uri_reference),
                     content_type: value
                         .get("mediaType")
                         .and_then(serde_json::Value::as_str)
@@ -2895,13 +2982,16 @@ impl ActivityProcessor {
                 continue;
             }
 
-            let Some(url) = value.get("url").and_then(serde_json::Value::as_str) else {
+            let Some(url) = value.get("url").and_then(extract_first_uri_reference) else {
                 continue;
             };
 
             attachments.push(CachedAttachment {
-                url: url.to_string(),
-                thumbnail_url: None,
+                url,
+                thumbnail_url: value
+                    .get("icon")
+                    .and_then(|icon| icon.get("url"))
+                    .and_then(extract_first_uri_reference),
                 content_type: value
                     .get("mediaType")
                     .and_then(serde_json::Value::as_str)
@@ -2911,7 +3001,10 @@ impl ActivityProcessor {
                     .get("name")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
-                blurhash: None,
+                blurhash: value
+                    .get("blurhash")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             });
         }
 
@@ -3063,7 +3156,9 @@ impl ActivityProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistenceDecision, extract_follow_target, is_local_follow_target};
+    use super::{
+        PersistenceDecision, extract_follow_target, is_local_follow_target, parse_question_poll,
+    };
     use crate::data::{
         CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, NotificationType,
         PersistedReason, ProfileCache, PushAlerts, PushPayload, PushSubscription, TimelineCache,
@@ -3315,6 +3410,35 @@ mod tests {
         assert!(extract_follow_target(&non_string_id).is_err());
     }
 
+    #[test]
+    fn parse_question_poll_extracts_options_and_counts() {
+        let object = json!({
+            "type": "Question",
+            "endTime": "2026-01-10T00:00:00Z",
+            "votersCount": 3,
+            "oneOf": [
+                {
+                    "name": "yes",
+                    "replies": { "totalItems": 2 }
+                },
+                {
+                    "name": "no",
+                    "replies": { "totalItems": 1 }
+                }
+            ]
+        });
+
+        let poll = parse_question_poll(&object).expect("question poll should parse");
+        assert_eq!(poll.expires_at, "2026-01-10T00:00:00Z");
+        assert!(!poll.multiple);
+        assert_eq!(poll.votes_count, 3);
+        assert_eq!(poll.voters_count, 3);
+        assert_eq!(
+            poll.options,
+            vec![("yes".to_string(), 2), ("no".to_string(), 1)]
+        );
+    }
+
     #[tokio::test]
     async fn handle_follow_accepts_object_id_target_for_local_actor() {
         let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
@@ -3427,6 +3551,41 @@ mod tests {
 
         let result = processor.handle_follow(activity, actor_uri).await;
         assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn remote_status_attachments_from_object_accepts_link_arrays() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "attachment": [{
+                "type": "Document",
+                "mediaType": "image/jpeg",
+                "url": [{
+                    "type": "Link",
+                    "href": "https://remote.example/media/original.jpg"
+                }],
+                "icon": {
+                    "url": [{
+                        "type": "Link",
+                        "href": "https://remote.example/media/preview.jpg"
+                    }]
+                },
+                "name": "preview",
+                "blurhash": "hash"
+            }]
+        });
+
+        let attachments = processor.remote_status_attachments_from_object("status-1", &object);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].remote_url,
+            "https://remote.example/media/original.jpg"
+        );
+        assert_eq!(
+            attachments[0].preview_url.as_deref(),
+            Some("https://remote.example/media/preview.jpg")
+        );
+        assert_eq!(attachments[0].blurhash.as_deref(), Some("hash"));
     }
 
     #[tokio::test]

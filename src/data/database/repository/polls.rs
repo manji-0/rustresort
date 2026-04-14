@@ -116,6 +116,113 @@ impl Database {
         Ok(options)
     }
 
+    /// Remove any poll rows associated with a status.
+    pub async fn delete_poll_by_status_id(&self, status_id: &str) -> Result<(), AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<(), AppError> = async {
+            sqlx::query(
+                "DELETE FROM poll_options WHERE poll_id IN (SELECT id FROM polls WHERE status_id = ?)",
+            )
+            .bind(status_id)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("DELETE FROM polls WHERE status_id = ?")
+                .bind(status_id)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                super::rollback_with_log(&mut conn, "delete_poll_by_status_id").await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Replace a status poll and all options atomically.
+    pub async fn replace_poll_for_status(
+        &self,
+        status_id: &str,
+        expires_at: &str,
+        expired: bool,
+        multiple: bool,
+        votes_count: i64,
+        voters_count: i64,
+        options: &[(String, i64)],
+    ) -> Result<String, AppError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let result: Result<String, AppError> = async {
+            sqlx::query(
+                "DELETE FROM poll_options WHERE poll_id IN (SELECT id FROM polls WHERE status_id = ?)",
+            )
+            .bind(status_id)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("DELETE FROM polls WHERE status_id = ?")
+                .bind(status_id)
+                .execute(&mut *conn)
+                .await?;
+
+            let poll_id = EntityId::new_string();
+            sqlx::query(
+                r#"
+                INSERT INTO polls (id, status_id, expires_at, expired, multiple, votes_count, voters_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                "#,
+            )
+            .bind(&poll_id)
+            .bind(status_id)
+            .bind(expires_at)
+            .bind(expired as i64)
+            .bind(multiple as i64)
+            .bind(votes_count)
+            .bind(voters_count)
+            .execute(&mut *conn)
+            .await?;
+
+            for (index, (title, option_votes_count)) in options.iter().enumerate() {
+                sqlx::query(
+                    r#"
+                    INSERT INTO poll_options (id, poll_id, title, votes_count, option_index, created_at)
+                    VALUES (?, ?, ?, ?, ?, datetime('now'))
+                    "#,
+                )
+                .bind(EntityId::new_string())
+                .bind(&poll_id)
+                .bind(title)
+                .bind(*option_votes_count)
+                .bind(index as i64)
+                .execute(&mut *conn)
+                .await?;
+            }
+
+            Ok(poll_id)
+        }
+        .await;
+
+        match result {
+            Ok(poll_id) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(poll_id)
+            }
+            Err(error) => {
+                super::rollback_with_log(&mut conn, "replace_poll_for_status").await;
+                Err(error)
+            }
+        }
+    }
+
     /// Vote in poll
     pub async fn vote_in_poll(
         &self,

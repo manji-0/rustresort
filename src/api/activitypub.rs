@@ -228,6 +228,33 @@ fn activitypub_attachment_type(content_type: &str) -> &'static str {
     }
 }
 
+async fn build_status_tags(
+    state: &ActivityPubState,
+    content: &str,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let recipients =
+        crate::api::mastodon::federation_delivery::resolve_remote_recipients_with_dependencies(
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            crate::api::mastodon::federation_delivery::extract_remote_mentions_from_content(
+                content,
+                &state.config.server.domain,
+            ),
+        )
+        .await;
+    Ok(recipients
+        .into_iter()
+        .map(|recipient| {
+            serde_json::json!({
+                "type": "Mention",
+                "href": recipient.actor_uri,
+                "name": format!("@{}", recipient.address),
+            })
+        })
+        .collect())
+}
+
 async fn build_note_object(
     state: &ActivityPubState,
     actor_url: &str,
@@ -235,15 +262,56 @@ async fn build_note_object(
     status: &Status,
 ) -> Result<serde_json::Value, AppError> {
     let (to_audience, cc_audience) = activitypub_audience(followers_url, status.visibility);
-    let mut note = serde_json::json!({
-        "type": "Note",
-        "id": status.uri.clone(),
-        "attributedTo": actor_url,
-        "content": status.content.clone(),
-        "published": status.created_at.to_rfc3339(),
-        "to": to_audience,
-        "cc": cc_audience
-    });
+    let poll = state.db.get_poll_by_status_id(&status.id).await?;
+    let mut note =
+        if let Some((poll_id, expires_at, expired, multiple, _votes_count, voters_count)) = poll {
+            let options = state
+                .db
+                .get_poll_options(&poll_id)
+                .await?
+                .into_iter()
+                .map(|(_, title, votes_count)| {
+                    serde_json::json!({
+                        "type": "Note",
+                        "name": title,
+                        "replies": {
+                            "type": "Collection",
+                            "totalItems": votes_count,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut object = serde_json::json!({
+                "type": "Question",
+                "id": status.uri.clone(),
+                "attributedTo": actor_url,
+                "content": status.content.clone(),
+                "published": status.created_at.to_rfc3339(),
+                "to": to_audience,
+                "cc": cc_audience,
+                "endTime": expires_at,
+                "votersCount": voters_count,
+            });
+            if expired {
+                object["closed"] = serde_json::json!(expires_at);
+            }
+            if multiple {
+                object["anyOf"] = serde_json::json!(options);
+            } else {
+                object["oneOf"] = serde_json::json!(options);
+            }
+            object
+        } else {
+            serde_json::json!({
+                "type": "Note",
+                "id": status.uri.clone(),
+                "attributedTo": actor_url,
+                "content": status.content.clone(),
+                "published": status.created_at.to_rfc3339(),
+                "to": to_audience,
+                "cc": cc_audience
+            })
+        };
 
     if let Some(summary) = &status.content_warning {
         note["summary"] = serde_json::json!(summary);
@@ -261,6 +329,10 @@ async fn build_note_object(
         let mut content_map = serde_json::Map::new();
         content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
         note["contentMap"] = serde_json::Value::Object(content_map);
+    }
+    let tags = build_status_tags(state, &status.content).await?;
+    if !tags.is_empty() {
+        note["tag"] = serde_json::json!(tags);
     }
 
     let attachments = state

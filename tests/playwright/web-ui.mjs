@@ -101,13 +101,15 @@ async function main() {
     await page.waitForSelector(`text=${uniqueTextSecond}`);
     await page.waitForFunction(() => !document.querySelector(".detail-modal"));
     await page.locator(".status-card", { hasText: uniqueTextSecond }).first().click();
-    await page.waitForSelector(".status-card.selected");
+    await page.waitForSelector('.timeline-list .status-card[aria-selected="true"]');
+
     await page
       .locator(".status-card", { hasText: uniqueTextSecond })
       .first()
       .locator(".status-thread-link")
       .click();
-    await page.waitForSelector(".detail-modal");
+    await page.waitForSelector('.detail-modal[role="dialog"]');
+    await page.waitForSelector('.detail-modal [aria-selected="true"]');
     await page.click("#thread-close");
     await page.waitForFunction(() => !document.querySelector(".detail-modal"));
 
@@ -162,6 +164,8 @@ async function main() {
     await page.waitForSelector("text=Boosts");
     await page.waitForSelector("text=Mentions");
     await page.waitForSelector(`text=${uniqueTextSecond}`);
+    await page.locator(".notification-card").first().click();
+    await page.waitForSelector('.notification-card[aria-selected="true"]');
 
     console.log("web-ui-playwright: ok");
   } catch (error) {
