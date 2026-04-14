@@ -185,6 +185,34 @@ fn merge_explicit_recipient_audience(
     (to_audience, cc_audience)
 }
 
+fn actor_base_url(actor_uri: &str) -> Option<String> {
+    let parsed = url::Url::parse(actor_uri).ok()?;
+    Some(format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })?
+    ))
+}
+
+fn hashtag_tag_objects(base_url: &str, content: &str) -> Vec<serde_json::Value> {
+    crate::data::extract_hashtags_from_content(content)
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "type": "Hashtag",
+                "href": format!("{}/tags/{}", base_url, name),
+                "name": format!("#{}", name),
+            })
+        })
+        .collect()
+}
+
 fn build_undo_object(
     activity_uri: &str,
     activity_type: Option<&str>,
@@ -296,8 +324,12 @@ impl ActivityDelivery {
             content_map.insert(language.clone(), serde_json::json!(status.content.clone()));
             object["contentMap"] = serde_json::Value::Object(content_map);
         }
-        if !mention_tags.is_empty() {
-            object["tag"] = serde_json::json!(mention_tags);
+        let mut tags = mention_tags.to_vec();
+        if let Some(base_url) = actor_base_url(&self.actor_uri) {
+            tags.extend(hashtag_tag_objects(&base_url, &status.content));
+        }
+        if !tags.is_empty() {
+            object["tag"] = serde_json::json!(tags);
         }
 
         let attachments = queue
@@ -670,6 +702,30 @@ impl ActivityDelivery {
 
     fn build_like_activity(&self, like_activity_uri: &str, status_uri: &str) -> serde_json::Value {
         builder::like(like_activity_uri, &self.actor_uri, status_uri)
+    }
+
+    fn build_poll_vote_activity(
+        &self,
+        vote_activity_uri: &str,
+        vote_object_uri: &str,
+        poll_uri: &str,
+        option_title: &str,
+        target_actor_uri: &str,
+    ) -> serde_json::Value {
+        builder::create(
+            vote_activity_uri,
+            &self.actor_uri,
+            serde_json::json!({
+                "id": vote_object_uri,
+                "type": "Note",
+                "name": option_title,
+                "attributedTo": self.actor_uri,
+                "to": [target_actor_uri],
+                "inReplyTo": poll_uri,
+            }),
+            vec![target_actor_uri],
+            Vec::new(),
+        )
     }
 
     fn build_undo_activity(
@@ -1288,6 +1344,38 @@ impl ActivityDelivery {
         let activity = self.build_like_activity(like_activity_uri, status_uri);
         self.enqueue_activity(queue, target_inbox_uri, &activity)
             .await
+    }
+
+    pub async fn queue_poll_vote(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        poll_uri: &str,
+        option_titles: &[String],
+        target_actor_uri: &str,
+        target_inbox_uri: &str,
+    ) -> Result<(), AppError> {
+        if self
+            .should_skip_remote_delivery(queue, target_actor_uri)
+            .await?
+        {
+            return Ok(());
+        }
+
+        for option_title in option_titles {
+            let vote_object_uri = format!("{}/votes/{}", self.actor_uri, EntityId::new_string());
+            let vote_activity_uri = format!("{vote_object_uri}/activity");
+            let activity = self.build_poll_vote_activity(
+                &vote_activity_uri,
+                &vote_object_uri,
+                poll_uri,
+                option_title,
+                target_actor_uri,
+            );
+            self.enqueue_activity(queue, target_inbox_uri, &activity)
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Send Undo activity

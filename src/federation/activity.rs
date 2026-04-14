@@ -957,6 +957,9 @@ impl ActivityProcessor {
         if !object_attributed_to_matches_actor(object, actor_uri) {
             return Err(AppError::Unauthorized);
         }
+        if object_type == "Note" && self.handle_poll_vote_create(object, actor_uri).await? {
+            return Ok(());
+        }
 
         // Extract actor address
         let actor_address = self.extract_actor_address(actor_uri);
@@ -1062,6 +1065,67 @@ impl ActivityProcessor {
         }
 
         Ok(())
+    }
+
+    async fn handle_poll_vote_create(
+        &self,
+        object: &serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<bool, AppError> {
+        let Some(poll_uri) = object.get("inReplyTo").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(option_title) = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(false);
+        };
+        if object
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty())
+        {
+            return Ok(false);
+        }
+
+        let Some(status) = self.db.get_status_by_uri(poll_uri).await? else {
+            return Ok(false);
+        };
+        if !status.is_local {
+            return Ok(false);
+        }
+
+        let Some((poll_id, _expires_at, _expired, _multiple, _votes_count, _voters_count)) =
+            self.db.get_poll_by_status_id(&status.id).await?
+        else {
+            return Ok(false);
+        };
+        let option_ids = self
+            .db
+            .get_poll_options(&poll_id)
+            .await?
+            .into_iter()
+            .filter_map(|(option_id, title, _votes_count)| {
+                (title == option_title).then_some(option_id)
+            })
+            .collect::<Vec<_>>();
+        if option_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let voter_address = self.extract_actor_address(actor_uri);
+        if self
+            .db
+            .record_remote_poll_vote(&poll_id, &voter_address, &option_ids)
+            .await?
+        {
+            self.publish_local_status_update(&status).await;
+        }
+
+        Ok(true)
     }
 
     /// Handle Update activity (profile update)
@@ -2305,10 +2369,7 @@ impl ActivityProcessor {
                     id: format!("{status_id}:remote:{index}"),
                     status_id: status_id.to_string(),
                     remote_url: remote_url.clone(),
-                    preview_url: value
-                        .get("icon")
-                        .and_then(|icon| icon.get("url"))
-                        .and_then(extract_first_uri_reference),
+                    preview_url: value.get("icon").and_then(extract_first_uri_reference),
                     content_type: value
                         .get("mediaType")
                         .and_then(serde_json::Value::as_str)
@@ -2988,10 +3049,7 @@ impl ActivityProcessor {
 
             attachments.push(CachedAttachment {
                 url,
-                thumbnail_url: value
-                    .get("icon")
-                    .and_then(|icon| icon.get("url"))
-                    .and_then(extract_first_uri_reference),
+                thumbnail_url: value.get("icon").and_then(extract_first_uri_reference),
                 content_type: value
                     .get("mediaType")
                     .and_then(serde_json::Value::as_str)
@@ -3564,12 +3622,10 @@ mod tests {
                     "type": "Link",
                     "href": "https://remote.example/media/original.jpg"
                 }],
-                "icon": {
-                    "url": [{
-                        "type": "Link",
-                        "href": "https://remote.example/media/preview.jpg"
-                    }]
-                },
+                "icon": [{
+                    "type": "Link",
+                    "href": "https://remote.example/media/preview.jpg"
+                }],
                 "name": "preview",
                 "blurhash": "hash"
             }]

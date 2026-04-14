@@ -1340,7 +1340,7 @@ async fn test_activitypub_status_object_for_local_poll_includes_question_and_men
         .insert_status(&rustresort::data::Status {
             id: status_id.to_string(),
             uri: status_uri.clone(),
-            content: "<p>@alice@remote.example tea or coffee?</p>".to_string(),
+            content: "<p>@alice@remote.example tea or coffee? #breakfast</p>".to_string(),
             content_warning: None,
             visibility: rustresort::data::StatusVisibility::Public,
             language: Some("en".to_string()),
@@ -1378,8 +1378,20 @@ async fn test_activitypub_status_object_for_local_poll_includes_question_and_men
     let body = response.json::<Value>().await.unwrap();
     assert_eq!(body["type"], "Question");
     assert_eq!(body["oneOf"][0]["name"], "tea");
-    assert_eq!(body["tag"][0]["type"], "Mention");
-    assert_eq!(body["tag"][0]["href"], REMOTE_ACTOR_ID);
+    assert!(
+        body["tag"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["type"] == "Mention" && tag["href"] == REMOTE_ACTOR_ID)
+    );
+    assert!(
+        body["tag"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["type"] == "Hashtag" && tag["name"] == "#breakfast")
+    );
 
     let activity_response = server
         .client
@@ -1392,6 +1404,78 @@ async fn test_activitypub_status_object_for_local_poll_includes_question_and_men
     let activity_body = activity_response.json::<Value>().await.unwrap();
     assert_eq!(activity_body["type"], "Create");
     assert_eq!(activity_body["object"]["type"], "Question");
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_poll_vote_updates_local_poll() {
+    use chrono::Utc;
+    use rustresort::data::Status;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+
+    let status_id = "local-poll-vote";
+    let status_uri = server.public_url(&format!("/users/testuser/statuses/{status_id}"));
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: status_id.to_string(),
+            uri: status_uri.clone(),
+            content: "<p>Tea or coffee?</p>".to_string(),
+            content_warning: None,
+            visibility: rustresort::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: rustresort::data::PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        })
+        .await
+        .unwrap();
+    let poll_id = server
+        .state
+        .db
+        .create_poll(
+            status_id,
+            &["tea".to_string(), "coffee".to_string()],
+            600,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/users/alice#votes/1/activity",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "id": "https://remote.example/users/alice#votes/1",
+            "type": "Note",
+            "name": "tea",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "to": [server.public_url("/users/testuser")],
+            "inReplyTo": status_uri
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let poll = server.state.db.get_poll(&poll_id).await.unwrap().unwrap();
+    assert_eq!(poll.4, 1);
+    assert_eq!(poll.5, 1);
+    let options = server.state.db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options[0].2, 1);
+    assert_eq!(options[1].2, 0);
 }
 
 #[tokio::test]

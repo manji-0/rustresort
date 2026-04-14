@@ -224,6 +224,9 @@ pub struct ConversationsApiState {
 pub struct PollsApiState {
     pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub http_client: Arc<reqwest::Client>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
 }
 
 /// Minimal state required for Mastodon scheduled status endpoints.
@@ -366,7 +369,13 @@ impl_from_ref_state!(ConversationsApiState {
     db,
     profile_cache,
 });
-impl_from_ref_state!(PollsApiState { config, db });
+impl_from_ref_state!(PollsApiState {
+    config,
+    db,
+    profile_cache,
+    http_client,
+    federation_fetch_client,
+});
 impl_from_ref_state!(ScheduledStatusesApiState { db });
 impl_from_ref_state!(PushApiState {
     db,

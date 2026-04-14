@@ -232,6 +232,16 @@ async fn build_status_tags(
     state: &ActivityPubState,
     content: &str,
 ) -> Result<Vec<serde_json::Value>, AppError> {
+    let mut tags = crate::data::extract_hashtags_from_content(content)
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "type": "Hashtag",
+                "href": format!("{}/tags/{}", state.config.server.base_url(), name),
+                "name": format!("#{}", name),
+            })
+        })
+        .collect::<Vec<_>>();
     let recipients =
         crate::api::mastodon::federation_delivery::resolve_remote_recipients_with_dependencies(
             state.db.as_ref(),
@@ -243,16 +253,14 @@ async fn build_status_tags(
             ),
         )
         .await;
-    Ok(recipients
-        .into_iter()
-        .map(|recipient| {
-            serde_json::json!({
-                "type": "Mention",
-                "href": recipient.actor_uri,
-                "name": format!("@{}", recipient.address),
-            })
+    tags.extend(recipients.into_iter().map(|recipient| {
+        serde_json::json!({
+            "type": "Mention",
+            "href": recipient.actor_uri,
+            "name": format!("@{}", recipient.address),
         })
-        .collect())
+    }));
+    Ok(tags)
 }
 
 async fn build_note_object(

@@ -2893,6 +2893,144 @@ async fn test_vote_in_poll_rejects_when_expires_at_has_passed() {
 }
 
 #[tokio::test]
+async fn test_replace_poll_for_status_preserves_poll_id_and_votes_for_matching_options() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://example.com/status/poll-replace".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .replace_poll_for_status(
+            &status.id,
+            "2099-01-10T00:00:00Z",
+            false,
+            false,
+            1,
+            1,
+            &[("tea".to_string(), 1), ("coffee".to_string(), 0)],
+        )
+        .await
+        .unwrap();
+    let tea_option_id = db
+        .get_poll_options(&poll_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(_id, title, _votes_count)| title == "tea")
+        .map(|(id, _title, _votes_count)| id)
+        .expect("tea option");
+    db.vote_in_poll(&poll_id, "bob@example.com", &[tea_option_id])
+        .await
+        .unwrap();
+
+    let updated_poll_id = db
+        .replace_poll_for_status(
+            &status.id,
+            "2099-01-11T00:00:00Z",
+            false,
+            false,
+            2,
+            2,
+            &[("tea".to_string(), 2), ("juice".to_string(), 0)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated_poll_id, poll_id);
+    let own_votes = db
+        .get_user_poll_votes(&poll_id, "bob@example.com")
+        .await
+        .unwrap();
+    assert_eq!(own_votes.len(), 1);
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[0].1, "tea");
+    assert_eq!(options[0].2, 2);
+    assert_eq!(options[1].1, "juice");
+}
+
+#[tokio::test]
+async fn test_record_remote_poll_vote_allows_additional_choices_for_multiple_poll() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://example.com/status/poll-remote-multi".to_string(),
+        content: "<p>Poll</p>".to_string(),
+        content_warning: None,
+        visibility: crate::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    db.insert_status(&status).await.unwrap();
+
+    let poll_id = db
+        .create_poll(&status.id, &["a".to_string(), "b".to_string()], 600, true)
+        .await
+        .unwrap();
+    let options = db.get_poll_options(&poll_id).await.unwrap();
+    let first_option_id = options[0].0.clone();
+    let second_option_id = options[1].0.clone();
+
+    assert!(
+        db.record_remote_poll_vote(
+            &poll_id,
+            "alice@remote.example",
+            std::slice::from_ref(&first_option_id),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.record_remote_poll_vote(
+            &poll_id,
+            "alice@remote.example",
+            std::slice::from_ref(&second_option_id),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.record_remote_poll_vote(
+            &poll_id,
+            "alice@remote.example",
+            std::slice::from_ref(&second_option_id),
+        )
+        .await
+        .unwrap()
+    );
+
+    let options_after = db.get_poll_options(&poll_id).await.unwrap();
+    assert_eq!(options_after[0].2, 1);
+    assert_eq!(options_after[1].2, 1);
+    let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
+    assert_eq!(poll_after.4, 2);
+    assert_eq!(poll_after.5, 1);
+}
+
+#[tokio::test]
 async fn test_reserve_idempotency_key_reclaims_stale_pending_reservation() {
     let (db, _temp_dir) = create_test_db().await;
     let endpoint = "/api/v1/statuses";

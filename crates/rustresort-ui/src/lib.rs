@@ -705,6 +705,12 @@ impl App {
                 if event.ctrl_key() || event.meta_key() || event.alt_key() {
                     return;
                 }
+                let raw_key = event.key();
+                if raw_key == "Escape" {
+                    app.close_detail_modal();
+                    event.prevent_default();
+                    return;
+                }
                 if let Some(target) = event.target()
                     && let Ok(element) = target.dyn_into::<Element>()
                 {
@@ -717,16 +723,11 @@ impl App {
                     }
                 }
 
-                let key = event.key().to_ascii_lowercase();
-                let raw_key = event.key();
+                let key = raw_key.to_ascii_lowercase();
                 let shift_tab = event.shift_key() && raw_key == "Tab";
                 let handled = match raw_key.as_str() {
                     "N" => {
                         app.activate_mention_shortcut();
-                        true
-                    }
-                    "Escape" => {
-                        app.close_detail_modal();
                         true
                     }
                     _ => match key.as_str() {
@@ -931,46 +932,55 @@ impl App {
         self.blur_active_element();
         let should_render = {
             let mut model = self.model.borrow_mut();
+            let mut pane_changed = false;
             if model.active_pane != ActivePane::DetailModal {
+                pane_changed = model.active_pane != ActivePane::Timeline;
                 model.active_pane = ActivePane::Timeline;
                 model.last_non_modal_pane = Pane::Timeline;
             }
-            if model.selected_status_id.as_deref() == Some(status_id.as_str()) {
-                false
-            } else {
-                model.selected_status_id = Some(status_id.clone());
-                true
-            }
+            let selection_changed =
+                if model.selected_status_id.as_deref() == Some(status_id.as_str()) {
+                    false
+                } else {
+                    model.selected_status_id = Some(status_id.clone());
+                    true
+                };
+            pane_changed || selection_changed
         };
         if should_render {
             self.render();
         }
-        self.scroll_selected_into_view();
+        self.sync_selected_element();
     }
 
     fn set_selected_notification(self: &Rc<Self>, group_key: String) {
         self.blur_active_element();
         let should_render = {
             let mut model = self.model.borrow_mut();
+            let mut pane_changed = false;
             if model.active_pane != ActivePane::DetailModal {
+                pane_changed = model.active_pane != ActivePane::Notifications;
                 model.active_pane = ActivePane::Notifications;
                 model.last_non_modal_pane = Pane::Notifications;
             }
-            if model.selected_notification_key.as_deref() == Some(group_key.as_str()) {
-                false
-            } else {
-                model.selected_notification_key = Some(group_key.clone());
-                true
-            }
+            let selection_changed =
+                if model.selected_notification_key.as_deref() == Some(group_key.as_str()) {
+                    false
+                } else {
+                    model.selected_notification_key = Some(group_key.clone());
+                    true
+                };
+            pane_changed || selection_changed
         };
         if should_render {
             self.render();
         }
-        self.scroll_selected_into_view();
+        self.sync_selected_element();
     }
 
     fn move_selection(self: &Rc<Self>, delta: isize) {
-        match self.model.borrow().active_pane {
+        let active_pane = self.model.borrow().active_pane;
+        match active_pane {
             ActivePane::Timeline => self.move_timeline_selection(delta),
             ActivePane::Notifications => self.move_notification_selection(delta),
             ActivePane::DetailModal => self.move_detail_selection(delta),
@@ -1026,7 +1036,8 @@ impl App {
     }
 
     fn select_first_status(self: &Rc<Self>) {
-        match self.model.borrow().active_pane {
+        let active_pane = self.model.borrow().active_pane;
+        match active_pane {
             ActivePane::Timeline => {
                 let order = timeline_selection_order(&self.model.borrow());
                 let Some(status_id) = order.first() else {
@@ -1087,7 +1098,7 @@ impl App {
             };
         }
         self.render();
-        self.scroll_selected_into_view();
+        self.sync_selected_element();
     }
 
     async fn open_detail_modal(self: Rc<Self>, status_id: String) {
@@ -1110,7 +1121,7 @@ impl App {
             model.active_pane = ActivePane::DetailModal;
         }
         self.render();
-        self.scroll_selected_into_view();
+        self.sync_selected_element();
     }
 
     fn close_detail_modal(self: &Rc<Self>) {
@@ -1140,7 +1151,7 @@ impl App {
         };
         if should_render {
             self.render();
-            self.scroll_selected_into_view();
+            self.sync_selected_element();
         }
     }
 
@@ -1188,8 +1199,8 @@ impl App {
         self.focus_composer_input();
     }
 
-    fn scroll_selected_into_view(&self) {
-        let selector = match self.model.borrow().active_pane {
+    fn selected_focus_selector(&self) -> Option<String> {
+        match self.model.borrow().active_pane {
             ActivePane::Timeline => self
                 .model
                 .borrow()
@@ -1214,7 +1225,11 @@ impl App {
                 .selected_status_id
                 .clone()
                 .map(|status_id| format!(r#".detail-modal [data-focus-status="{}"]"#, status_id)),
-        };
+        }
+    }
+
+    fn sync_selected_element(&self) {
+        let selector = self.selected_focus_selector();
         let Some(selector) = selector else {
             return;
         };
@@ -1222,6 +1237,9 @@ impl App {
             return;
         };
         element.scroll_into_view();
+        if let Ok(html_element) = element.dyn_into::<HtmlElement>() {
+            let _ = html_element.focus();
+        }
     }
 
     fn shortcut_status(&self) -> Option<Status> {
@@ -2020,7 +2038,7 @@ fn render_app(model: &Model) -> String {
 
     {flash_banner}
 
-    <section class="timeline-list" aria-label="Timeline posts">
+    <section class="timeline-list" aria-label="Timeline posts" role="listbox">
       {timeline_cards}
     </section>
   </main>
@@ -2037,7 +2055,7 @@ fn render_app(model: &Model) -> String {
       <div class="filter-row" aria-label="Notification filters">
         {notification_filters}
       </div>
-      <div class="rail-list" aria-label="Notification groups">
+      <div class="rail-list" aria-label="Notification groups" role="listbox">
         {notifications}
       </div>
       <div class="rail-actions">
@@ -2416,7 +2434,7 @@ fn render_detail_modal(model: &Model) -> String {
         <button id="thread-close" class="ghost-button small detail-close">Close</button>
       </div>
     </div>
-    <div class="thread-panel">
+    <div class="thread-panel" role="listbox" aria-label="Thread statuses">
       {content}
     </div>
   </div>
@@ -2516,7 +2534,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
     let is_selected = model.selected_status_id.as_deref() == Some(primary.id.as_str());
 
     format!(
-        r#"<article class="{card_classes}" data-focus-status="{select_target}" tabindex="{tabindex}" aria-selected="{aria_selected}">
+        r#"<article class="{card_classes}" data-focus-status="{select_target}" tabindex="{tabindex}" role="option" aria-selected="{aria_selected}">
   {boost_banner}
   <div class="status-head">
     {avatar}
@@ -2782,7 +2800,7 @@ fn render_notifications(model: &Model) -> String {
             let dismiss_ids = encode_attribute(&group.ids.join("|"));
 
             format!(
-                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}" tabindex="{tabindex}" aria-selected="{aria_selected}">
+                r#"<div class="notification-card {selected}" data-focus-notification="{group_key}" tabindex="{tabindex}" role="option" aria-selected="{aria_selected}">
   <div class="notification-head">
     <strong>{kind}</strong>
     <span>{created_at}</span>

@@ -256,6 +256,83 @@ async fn test_status_edit_and_delete_deliver_update_and_delete_to_explicit_recip
 }
 
 #[tokio::test]
+async fn test_remote_poll_vote_delivers_create_note_to_remote_inbox() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let mut capture = ActivityCaptureServer::new().await;
+    let remote_actor_uri = "https://remote.example/users/alice";
+    let remote_status_uri = "https://remote.example/users/alice/statuses/poll-1";
+    insert_remote_profile(
+        &server,
+        "alice@remote.example",
+        remote_actor_uri,
+        &capture.inbox_url(),
+    )
+    .await;
+
+    let status_id = "remote-poll-status";
+    server
+        .state
+        .db
+        .insert_status(&rustresort::data::Status {
+            id: status_id.to_string(),
+            uri: remote_status_uri.to_string(),
+            content: "<p>Tea or coffee?</p>".to_string(),
+            content_warning: None,
+            visibility: rustresort::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: rustresort::data::PersistedReason::Timeline,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+    let poll_id = server
+        .state
+        .db
+        .replace_poll_for_status(
+            status_id,
+            "2026-04-30T00:00:00Z",
+            false,
+            false,
+            0,
+            0,
+            &[("tea".to_string(), 0), ("coffee".to_string(), 0)],
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .post(server.url(&format!("/api/v1/polls/{poll_id}/votes")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "choices": [0]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let delivered = capture.recv().await;
+    assert_eq!(delivered.body["type"], "Create");
+    assert_eq!(delivered.body["to"], serde_json::json!([remote_actor_uri]));
+    assert_eq!(delivered.body["object"]["type"], "Note");
+    assert_eq!(delivered.body["object"]["name"], "tea");
+    assert_eq!(delivered.body["object"]["inReplyTo"], remote_status_uri);
+    assert_eq!(
+        delivered.body["object"]["attributedTo"],
+        server.public_url("/users/testuser")
+    );
+}
+
+#[tokio::test]
 async fn test_create_with_media_delivers_activitypub_attachment_metadata() {
     let server = TestServer::new().await;
     server.create_test_account().await;

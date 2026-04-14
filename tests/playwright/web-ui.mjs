@@ -73,6 +73,28 @@ async function login(page) {
   await page.waitForSelector("text=Timeline");
 }
 
+async function waitForSelectedTimelineStatus(page, expectedText) {
+  await page.waitForFunction((text) => {
+    const selected = document.querySelector('.timeline-list .status-card[aria-selected="true"]');
+    return selected?.textContent?.includes(text) ?? false;
+  }, expectedText);
+}
+
+function selectedTimelineCard(page) {
+  return page.locator('.timeline-list .status-card[aria-selected="true"]').first();
+}
+
+function selectedNotificationCard(page) {
+  return page.locator('.notification-card[aria-selected="true"]').first();
+}
+
+async function waitForSelectedNotificationFocus(page) {
+  await page.waitForFunction(() => {
+    const selected = document.querySelector('.notification-card[aria-selected="true"]');
+    return !!selected && document.activeElement === selected;
+  });
+}
+
 async function main() {
   await ensureOutputDir();
   const browser = await chromium.launch({ headless });
@@ -91,17 +113,57 @@ async function main() {
     }
     await page.fill("#composer-input", "");
 
-    const uniqueText = `Playwright UI post ${Date.now()}`;
-    const uniqueTextSecond = `${uniqueText} follow-up`;
+    const uniqueSeed = Date.now();
+    const uniqueText = `Playwright UI alpha ${uniqueSeed}`;
+    const uniqueTextSecond = `Playwright UI beta ${uniqueSeed}`;
     await page.fill("#composer-input", uniqueText);
     await page.click("#composer-submit");
     await page.waitForSelector(`text=${uniqueText}`);
     await page.fill("#composer-input", uniqueTextSecond);
     await page.click("#composer-submit");
     await page.waitForSelector(`text=${uniqueTextSecond}`);
+    await page.waitForFunction(
+      ([firstText, secondText]) => {
+        const cards = Array.from(document.querySelectorAll(".timeline-list .status-card"))
+          .map((card) => card.textContent ?? "");
+        return cards.some((text) => text.includes(firstText)) &&
+          cards.some((text) => text.includes(secondText));
+      },
+      [uniqueText, uniqueTextSecond]
+    );
     await page.waitForFunction(() => !document.querySelector(".detail-modal"));
     await page.locator(".status-card", { hasText: uniqueTextSecond }).first().click();
     await page.waitForSelector('.timeline-list .status-card[aria-selected="true"]');
+    await waitForSelectedTimelineStatus(page, uniqueTextSecond);
+    await selectedTimelineCard(page).waitFor();
+    await selectedTimelineCard(page).focus();
+
+    await selectedTimelineCard(page).press("k");
+    await waitForSelectedTimelineStatus(page, uniqueText);
+    await selectedTimelineCard(page).press("j");
+    await waitForSelectedTimelineStatus(page, uniqueTextSecond);
+
+    await selectedTimelineCard(page).press("d");
+    await page.waitForSelector('.detail-modal[role="dialog"]');
+    await page.waitForSelector('.detail-modal [aria-selected="true"]:focus');
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".detail-modal"));
+
+    await selectedTimelineCard(page).press("n");
+    await page.waitForSelector(".composer-panel-popout");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".composer-panel-popout"));
+    await page.fill("#composer-input", "");
+
+    await selectedTimelineCard(page).press("Shift+N");
+    await page.waitForSelector(".composer-panel-popout");
+    const mentionDraft = await page.inputValue("#composer-input");
+    if (!mentionDraft.includes(`@${username}`)) {
+      throw new Error("expected Shift+N mention shortcut to seed a mention draft");
+    }
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".composer-panel-popout"));
+    await page.fill("#composer-input", "");
 
     await page
       .locator(".status-card", { hasText: uniqueTextSecond })
@@ -166,6 +228,14 @@ async function main() {
     await page.waitForSelector(`text=${uniqueTextSecond}`);
     await page.locator(".notification-card").first().click();
     await page.waitForSelector('.notification-card[aria-selected="true"]');
+    await page.waitForSelector('.app-shell[data-active-pane="notifications"]');
+    await waitForSelectedNotificationFocus(page);
+    await selectedNotificationCard(page).press("Shift+Tab");
+    await page.waitForSelector('.app-shell[data-active-pane="timeline"]');
+    await page.waitForSelector('.timeline-list .status-card[aria-selected="true"]:focus');
+    await selectedTimelineCard(page).press("Tab");
+    await page.waitForSelector('.app-shell[data-active-pane="notifications"]');
+    await waitForSelectedNotificationFocus(page);
 
     console.log("web-ui-playwright: ok");
   } catch (error) {
