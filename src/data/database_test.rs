@@ -2128,21 +2128,21 @@ async fn test_tag_timeline_query_uses_id_aligned_cursors() {
         .await
         .unwrap();
     let first_ids: Vec<String> = first_page.into_iter().map(|status| status.id).collect();
-    assert_eq!(first_ids, vec!["300".to_string(), "200".to_string()]);
+    assert_eq!(first_ids, vec!["100".to_string(), "200".to_string()]);
 
     let older_page = db
         .get_statuses_by_hashtag_in_window("rust", 2, Some("200"), None)
         .await
         .unwrap();
     let older_ids: Vec<String> = older_page.into_iter().map(|status| status.id).collect();
-    assert_eq!(older_ids, vec!["100".to_string()]);
+    assert_eq!(older_ids, vec!["300".to_string()]);
 
     let newer_page = db
         .get_statuses_by_hashtag_in_window("rust", 2, None, Some("200"))
         .await
         .unwrap();
     let newer_ids: Vec<String> = newer_page.into_iter().map(|status| status.id).collect();
-    assert_eq!(newer_ids, vec!["300".to_string()]);
+    assert_eq!(newer_ids, vec!["100".to_string()]);
 }
 
 #[tokio::test]

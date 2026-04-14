@@ -5,6 +5,15 @@ mod common;
 use common::TestServer;
 use serde_json::Value;
 
+const REMOTE_ACTOR_ID: &str = "https://remote.example/users/alice";
+const REMOTE_ACTOR_ADDRESS: &str = "alice@remote.example";
+
+fn register_default_remote_key(server: &TestServer) -> String {
+    let key_id = format!("{REMOTE_ACTOR_ID}#main-key");
+    server.register_inbound_public_key(&key_id, common::test_public_key_pem());
+    key_id
+}
+
 #[tokio::test]
 async fn test_home_timeline_without_auth() {
     let server = TestServer::new().await;
@@ -57,6 +66,95 @@ async fn test_public_timeline() {
         let json: Value = response.json().await.unwrap();
         assert!(json.is_array());
     }
+}
+
+#[tokio::test]
+async fn test_public_timeline_honors_since_id_and_min_id() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let now = Utc::now();
+
+    let oldest = Status {
+        id: "remote-oldest".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/oldest".to_string(),
+        content: "<p>oldest</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(3),
+        fetched_at: None,
+    };
+    let middle = Status {
+        id: "remote-middle".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/middle".to_string(),
+        content: "<p>middle</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(2),
+        fetched_at: None,
+    };
+    let newest = Status {
+        id: "remote-newest".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/newest".to_string(),
+        content: "<p>newest</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(1),
+        fetched_at: None,
+    };
+
+    server.state.db.insert_status(&oldest).await.unwrap();
+    server.state.db.insert_status(&middle).await.unwrap();
+    server.state.db.insert_status(&newest).await.unwrap();
+
+    let since_response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .query(&[("since_id", middle.id.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(since_response.status(), 200);
+    let since_body: Value = since_response.json().await.unwrap();
+    let since_entries = since_body.as_array().expect("timeline should be array");
+    assert_eq!(since_entries.len(), 1);
+    assert_eq!(since_entries[0]["id"], newest.id);
+
+    let min_response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .query(&[("min_id", middle.id.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(min_response.status(), 200);
+    let min_body: Value = min_response.json().await.unwrap();
+    let min_entries = min_body.as_array().expect("timeline should be array");
+    assert_eq!(min_entries.len(), 1);
+    assert_eq!(min_entries[0]["id"], newest.id);
 }
 
 #[tokio::test]
@@ -234,6 +332,68 @@ async fn test_public_timeline_preserves_cached_quote_relationship() {
         .find(|item| item["uri"] == status_uri)
         .expect("public timeline should include cached quoted status");
     assert_eq!(cached_quote["quote"]["uri"], quoted_target.uri);
+}
+
+#[tokio::test]
+async fn test_tag_timeline_includes_persisted_remote_followee_status() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/alice".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/tagged";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/create-tagged",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>Hello #persistedtag</p>",
+            "published": "2026-01-02T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let timeline_response = server
+        .client
+        .get(server.url("/api/v1/timelines/tag/persistedtag"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeline_response.status(), 200);
+    let body: Value = timeline_response.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .expect("timeline should be array")
+            .iter()
+            .any(|item| item["uri"] == status_uri),
+        "tag timeline should materialize persisted followee statuses"
+    );
 }
 
 #[tokio::test]
@@ -533,6 +693,81 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
     assert!(ids.contains(&local_status.id));
     assert!(ids.contains(&remote_status.id));
     assert!(!ids.contains(&unrelated_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_includes_persisted_remote_followee_status() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/alice-list".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Remote persisted list", "list")
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_account_to_list(&list_id, REMOTE_ACTOR_ADDRESS)
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/list-persisted";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/create-list-persisted",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>Hello list timeline</p>",
+            "published": "2026-01-03T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), 200);
+
+    let timeline_response = server
+        .client
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeline_response.status(), 200);
+    let body: Value = timeline_response.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .expect("timeline should be array")
+            .iter()
+            .any(|item| item["uri"] == status_uri),
+        "list timeline should materialize persisted remote statuses for listed accounts"
+    );
 }
 
 #[tokio::test]
@@ -845,7 +1080,7 @@ async fn test_home_timeline_since_id_filters_older_statuses() {
 
     let response = server
         .client
-        .get(server.url("/api/v1/timelines/home?since_id=150"))
+        .get(server.url("/api/v1/timelines/home?since_id=100"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

@@ -130,6 +130,15 @@ impl Database {
         Ok(notifications)
     }
 
+    /// Count unread notifications exactly.
+    pub async fn count_unread_notifications(&self) -> Result<i64, AppError> {
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notifications WHERE read = 0")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
     /// Mark notification as read
     pub async fn mark_notification_read(&self, id: &str) -> Result<(), AppError> {
         sqlx::query("UPDATE notifications SET read = 1 WHERE id = ?")

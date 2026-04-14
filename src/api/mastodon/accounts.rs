@@ -1617,21 +1617,26 @@ pub async fn get_account_followers(
     }
 
     let paged_addresses = apply_account_address_pagination(identities, &params);
-    for address in paged_addresses.into_iter().take(limit) {
-        let Some(response) = resolve_remote_account_response_for_list(
-            state.config.as_ref(),
-            state.db.as_ref(),
-            state.profile_cache.as_ref(),
-            state.federation_fetch_client.as_ref(),
-            &address,
-            default_port,
-        )
-        .await
-        else {
-            continue;
-        };
-        followers.push(serde_json::to_value(response).unwrap());
-    }
+    let resolved = stream::iter(paged_addresses.into_iter().take(limit))
+        .map(|address| {
+            let state = state.clone();
+            async move {
+                resolve_remote_account_response_for_list(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    state.federation_fetch_client.as_ref(),
+                    &address,
+                    default_port,
+                )
+                .await
+                .map(|response| serde_json::to_value(response).unwrap())
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    followers.extend(resolved.into_iter().flatten());
 
     Ok(Json(followers))
 }
@@ -1681,21 +1686,26 @@ pub async fn get_account_following(
     }
 
     let paged_addresses = apply_account_address_pagination(identities, &params);
-    for address in paged_addresses.into_iter().take(limit) {
-        let Some(response) = resolve_remote_account_response_for_list(
-            state.config.as_ref(),
-            state.db.as_ref(),
-            state.profile_cache.as_ref(),
-            state.federation_fetch_client.as_ref(),
-            &address,
-            default_port,
-        )
-        .await
-        else {
-            continue;
-        };
-        following.push(serde_json::to_value(response).unwrap());
-    }
+    let resolved = stream::iter(paged_addresses.into_iter().take(limit))
+        .map(|address| {
+            let state = state.clone();
+            async move {
+                resolve_remote_account_response_for_list(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    state.federation_fetch_client.as_ref(),
+                    &address,
+                    default_port,
+                )
+                .await
+                .map(|response| serde_json::to_value(response).unwrap())
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<_>>()
+        .await;
+    following.extend(resolved.into_iter().flatten());
 
     Ok(Json(following))
 }

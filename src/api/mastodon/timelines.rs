@@ -130,6 +130,11 @@ pub async fn public_timeline(
 
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let local_only = params.local.unwrap_or(false);
+    let effective_min_id = params
+        .pagination
+        .min_id
+        .as_deref()
+        .or(params.pagination.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -139,7 +144,12 @@ pub async fn public_timeline(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let timeline_items = timeline_service
-        .public_timeline(local_only, limit, params.pagination.max_id.as_deref())
+        .public_timeline(
+            local_only,
+            limit,
+            params.pagination.max_id.as_deref(),
+            effective_min_id,
+        )
         .await?;
     let timeline_statuses: Vec<_> = timeline_items
         .iter()

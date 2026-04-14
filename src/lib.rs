@@ -533,6 +533,49 @@ impl AppState {
             profile_cache.initialize_from_addresses(&follower_addresses, &http_client),
         );
 
+        let recent_remote_statuses = db
+            .get_recent_remote_statuses(config.cache.timeline_max_items)
+            .await?;
+        for status in recent_remote_statuses {
+            let attachments = db
+                .get_media_by_status(&status.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|media| data::CachedAttachment {
+                    url: format!(
+                        "{}/{}",
+                        config.storage.media.public_url.trim_end_matches('/'),
+                        media.s3_key.trim_start_matches('/')
+                    ),
+                    thumbnail_url: media.thumbnail_s3_key.as_deref().map(|key| {
+                        format!(
+                            "{}/{}",
+                            config.storage.media.public_url.trim_end_matches('/'),
+                            key.trim_start_matches('/')
+                        )
+                    }),
+                    content_type: media.content_type,
+                    description: media.description,
+                    blurhash: media.blurhash,
+                })
+                .collect();
+            timeline_cache
+                .insert(data::CachedStatus {
+                    id: status.id.clone(),
+                    uri: status.uri.clone(),
+                    content: status.content.clone(),
+                    account_address: status.account_address.clone(),
+                    created_at: status.created_at,
+                    visibility: status.visibility.to_string(),
+                    attachments,
+                    reply_to_uri: status.in_reply_to_uri.clone(),
+                    boost_of_uri: status.boost_of_uri.clone(),
+                    quote_of_uri: status.quote_of_uri.clone(),
+                })
+                .await;
+        }
+
         // 8. Initialize admin user
         Self::ensure_admin_user(&db, &config).await?;
 

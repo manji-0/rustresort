@@ -88,6 +88,7 @@ impl TimelineService {
         local_only: bool,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -96,7 +97,7 @@ impl TimelineService {
         let fetch_limit = Self::overfetch_limit(limit);
         let local_statuses = self
             .db
-            .get_local_public_statuses(fetch_limit, max_id)
+            .get_local_public_statuses(fetch_limit, max_id, min_id)
             .await?;
         let cached_statuses = if local_only {
             Vec::new()

@@ -13,6 +13,41 @@ use crate::data::{
 use crate::error::AppError;
 use crate::service::{StreamEvent, StreamTarget, StreamingEventBus, WebPushSender};
 
+async fn fetch_remote_actor_document(
+    http_client: &reqwest::Client,
+    actor_uri: &str,
+) -> Result<serde_json::Value, AppError> {
+    let actor_url = url::Url::parse(actor_uri).map_err(|error| {
+        AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
+    })?;
+    let response = http_client
+        .get(actor_url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Actor fetch failed for {}: {}", actor_uri, error))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Federation(format!(
+            "Actor fetch failed for {}: HTTP {}",
+            actor_uri,
+            response.status()
+        )));
+    }
+
+    response.json().await.map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to decode actor document {}: {}",
+            actor_uri, error
+        ))
+    })
+}
+
 /// Return true when a Follow target references the local actor.
 ///
 /// Accepted forms:
@@ -641,7 +676,7 @@ impl ActivityProcessor {
         // 4. Dispatch to type-specific handler
         match activity_type {
             ActivityType::Create => {
-                self.handle_create(activity, actor_uri, persistence_decision)
+                self.handle_create(activity, actor_uri, persistence_decision, actor_is_followee)
                     .await
             }
             ActivityType::Update => {
@@ -732,9 +767,9 @@ impl ActivityProcessor {
                     {
                         return PersistenceDecision::Persist;
                     }
-                    // Create from followee -> CacheOnly
+                    // Create from followee -> Persist for durable timelines and restart safety.
                     if actor_is_followee {
-                        return PersistenceDecision::CacheOnly;
+                        return PersistenceDecision::Persist;
                     }
                 }
                 PersistenceDecision::Ignore
@@ -762,7 +797,7 @@ impl ActivityProcessor {
                             return PersistenceDecision::Persist;
                         }
                         if actor_is_followee {
-                            return PersistenceDecision::CacheOnly;
+                            return PersistenceDecision::Persist;
                         }
                     } else {
                         // Profile-like updates should still refresh cache state.
@@ -814,6 +849,7 @@ impl ActivityProcessor {
         activity: serde_json::Value,
         actor_uri: &str,
         persistence_decision: PersistenceDecision,
+        actor_is_followee: bool,
     ) -> Result<(), AppError> {
         // 1. Extract object (Note, etc.)
         let object = activity
@@ -850,17 +886,18 @@ impl ActivityProcessor {
             .as_deref()
             .is_some_and(|quote_uri| self.is_local_status(quote_uri));
 
-        if should_persist_notification && (mentions_local || replies_to_local || quotes_local) {
+        if should_persist_notification {
+            let persisted_reason = if mentions_local || replies_to_local || quotes_local {
+                PersistedReason::Mentioned
+            } else {
+                PersistedReason::Timeline
+            };
             if let Some(status) = self
-                .upsert_remote_status_from_object(
-                    object,
-                    actor_uri,
-                    PersistedReason::Mentioned,
-                    false,
-                )
+                .upsert_remote_status_from_object(object, actor_uri, persisted_reason, false)
                 .await?
             {
-                self.publish_remote_status_update(&status, false).await;
+                self.publish_remote_status_update(&status, actor_is_followee)
+                    .await;
             }
         }
 
@@ -965,6 +1002,9 @@ impl ActivityProcessor {
                 .and_then(|r| r.as_str())
                 .is_some_and(|in_reply_to| self.is_local_status(in_reply_to));
             let quote_target_uri = self.extract_quote_uri_from_object(object);
+            let quotes_local = quote_target_uri
+                .as_deref()
+                .is_some_and(|quote_uri| self.is_local_status(quote_uri));
             let status_uri = object.get("id").and_then(|id| id.as_str());
             let existing_status = if let Some(status_uri) = status_uri {
                 self.db.get_status_by_uri(status_uri).await?
@@ -983,20 +1023,21 @@ impl ActivityProcessor {
                 matches!(persistence_decision, PersistenceDecision::Persist)
                     || known_in_db
                     || mentions_local
-                    || replies_to_local;
+                    || replies_to_local
+                    || quotes_local;
             let should_cache_status =
                 matches!(persistence_decision, PersistenceDecision::CacheOnly)
                     || actor_is_followee
                     || known_in_cache;
 
             if should_persist_status {
+                let persisted_reason = if mentions_local || replies_to_local || quotes_local {
+                    PersistedReason::Mentioned
+                } else {
+                    PersistedReason::Timeline
+                };
                 if let Some(status) = self
-                    .upsert_remote_status_from_object(
-                        object,
-                        actor_uri,
-                        PersistedReason::Mentioned,
-                        true,
-                    )
+                    .upsert_remote_status_from_object(object, actor_uri, persisted_reason, true)
                     .await?
                 {
                     let activity_uri = activity.get("id").and_then(|id| id.as_str());
@@ -1270,6 +1311,10 @@ impl ActivityProcessor {
         let _ = self
             .db
             .delete_follow(&actor_address, actor_default_port)
+            .await;
+        let _ = self
+            .db
+            .delete_follower(&actor_address, actor_default_port)
             .await;
         tracing::info!(actor_uri, "Recorded remote block");
         Ok(())
@@ -1583,17 +1628,24 @@ impl ActivityProcessor {
             return Ok(());
         }
 
-        if let Some(also_known_as) = activity
-            .get("target")
-            .and_then(|target| target.get("alsoKnownAs"))
-            && !activity_value_contains_identity(also_known_as, actor_uri)
-        {
-            tracing::debug!(
-                actor_uri,
-                target_uri,
-                "Ignoring Move because embedded target alsoKnownAs does not reference actor"
-            );
-            return Ok(());
+        let embedded_target = activity.get("target").filter(|value| value.is_object());
+        if let Some(target) = embedded_target {
+            let Some(also_known_as) = target.get("alsoKnownAs") else {
+                tracing::debug!(
+                    actor_uri,
+                    target_uri,
+                    "Ignoring Move because embedded target lacks alsoKnownAs"
+                );
+                return Ok(());
+            };
+            if !activity_value_contains_identity(also_known_as, actor_uri) {
+                tracing::debug!(
+                    actor_uri,
+                    target_uri,
+                    "Ignoring Move because embedded target alsoKnownAs does not reference actor"
+                );
+                return Ok(());
+            }
         }
 
         let actor_address = self.extract_actor_address(actor_uri);
@@ -1627,6 +1679,30 @@ impl ActivityProcessor {
         }
 
         let target_inbox_uri = if let Some(inbox_uri) = extract_move_target_inbox_uri(&activity) {
+            if embedded_target.is_none() {
+                let Some(client) = &self.federation_fetch_client else {
+                    return Err(AppError::Federation(
+                        "Cannot verify Move target without federation fetch client".to_string(),
+                    ));
+                };
+                let actor_document = fetch_remote_actor_document(client, &target_uri).await?;
+                let Some(also_known_as) = actor_document.get("alsoKnownAs") else {
+                    tracing::debug!(
+                        actor_uri,
+                        target_uri,
+                        "Ignoring Move because target actor document lacks alsoKnownAs"
+                    );
+                    return Ok(());
+                };
+                if !activity_value_contains_identity(also_known_as, actor_uri) {
+                    tracing::debug!(
+                        actor_uri,
+                        target_uri,
+                        "Ignoring Move because target actor document does not reference actor via alsoKnownAs"
+                    );
+                    return Ok(());
+                }
+            }
             inbox_uri
         } else if let Some(client) = &self.federation_fetch_client {
             let (resolved_actor_uri, resolved_inbox_uri) = crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
@@ -1643,6 +1719,23 @@ impl ActivityProcessor {
                     target_uri,
                     resolved_actor_uri,
                     "Ignoring Move because resolved target actor differs from activity target"
+                );
+                return Ok(());
+            }
+            let actor_document = fetch_remote_actor_document(client, &resolved_actor_uri).await?;
+            let Some(also_known_as) = actor_document.get("alsoKnownAs") else {
+                tracing::debug!(
+                    actor_uri,
+                    target_uri,
+                    "Ignoring Move because resolved target actor document lacks alsoKnownAs"
+                );
+                return Ok(());
+            };
+            if !activity_value_contains_identity(also_known_as, actor_uri) {
+                tracing::debug!(
+                    actor_uri,
+                    target_uri,
+                    "Ignoring Move because resolved target actor document does not reference actor via alsoKnownAs"
                 );
                 return Ok(());
             }
@@ -3268,8 +3361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_caches_status_without_db_persist_case_insensitive_match()
-    {
+    async fn process_create_from_followee_persists_status_case_insensitive_match() {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://remote.example/users/bob";
@@ -3300,11 +3392,16 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        let persisted = db
+            .get_status_by_uri(status_uri)
+            .await
+            .unwrap()
+            .expect("followee status should be persisted");
+        assert_eq!(persisted.persisted_reason, PersistedReason::Timeline);
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_with_default_https_port_actor_uri_caches_status() {
+    async fn process_create_from_followee_with_default_https_port_actor_uri_persists_status() {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://remote.example:443/users/bob";
@@ -3335,12 +3432,12 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_with_explicit_default_port_follow_address_caches_status()
-    {
+    async fn process_create_from_followee_with_explicit_default_port_follow_address_persists_status()
+     {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://remote.example/users/bob";
@@ -3371,11 +3468,11 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_with_at_actor_uri_caches_status() {
+    async fn process_create_from_followee_with_at_actor_uri_persists_status() {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://remote.example/@bob";
@@ -3406,11 +3503,11 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_with_accounts_actor_uri_caches_status() {
+    async fn process_create_from_followee_with_accounts_actor_uri_persists_status() {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://remote.example/accounts/bob";
@@ -3441,11 +3538,11 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn process_create_from_followee_with_ipv6_actor_uri_caches_status() {
+    async fn process_create_from_followee_with_ipv6_actor_uri_persists_status() {
         let (processor, db, timeline_cache, _temp_dir) =
             create_test_processor_with_timeline("alice@example.com", "https").await;
         let actor_uri = "https://[2001:db8::1]/users/bob";
@@ -3476,7 +3573,7 @@ mod tests {
         processor.process(activity, actor_uri).await.unwrap();
 
         assert!(timeline_cache.get_by_uri(status_uri).await.is_some());
-        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_some());
     }
 
     #[tokio::test]

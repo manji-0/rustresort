@@ -332,6 +332,52 @@ fn build_cached_profile_from_actor(
     })
 }
 
+fn extract_username_from_actor_uri(actor_uri: &str) -> Option<String> {
+    let parsed = url::Url::parse(actor_uri).ok()?;
+    let mut parts = parsed
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    let first = parts.next()?;
+
+    if let Some(username) = first.strip_prefix('@') {
+        return (!username.is_empty()).then(|| username.to_string());
+    }
+
+    if matches!(first, "users" | "accounts" | "u" | "profile") {
+        let username = parts.next()?;
+        return (!username.is_empty()).then(|| username.to_string());
+    }
+
+    None
+}
+
+fn actor_address_from_document(
+    actor_uri: &str,
+    actor_document: &serde_json::Value,
+) -> Option<String> {
+    let parsed = url::Url::parse(actor_uri).ok()?;
+    let host = parsed.host_str()?;
+    let normalized_host = host.to_ascii_lowercase();
+    let authority_host = if normalized_host.contains(':') {
+        format!("[{}]", normalized_host)
+    } else {
+        normalized_host.clone()
+    };
+    let authority = match parsed.port() {
+        Some(port) => format!("{}:{}", authority_host, port),
+        None => authority_host,
+    };
+    let username = actor_document
+        .get("preferredUsername")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_username_from_actor_uri(actor_uri))?;
+    Some(format!("{}@{}", username, authority))
+}
+
 // =============================================================================
 // Timeline Cache
 // =============================================================================
@@ -881,12 +927,6 @@ impl ProfileCache {
     ///
     /// Called when receiving Update activity for a known actor.
     pub async fn update_from_activity(&self, actor_uri: &str, update_data: serde_json::Value) {
-        let existing_profiles = self.get_profiles_by_uri(actor_uri).await;
-
-        if existing_profiles.is_empty() {
-            return;
-        }
-
         let actor_object = update_data
             .get("object")
             .unwrap_or(&update_data)
@@ -908,6 +948,17 @@ impl ProfileCache {
         }
 
         let actor_value = serde_json::Value::Object(actor_object.clone());
+        let existing_profiles = self.get_profiles_by_uri(actor_uri).await;
+
+        if existing_profiles.is_empty() {
+            if let Some(address) = actor_address_from_document(actor_uri, &actor_value)
+                && let Some(profile) =
+                    build_cached_profile_from_actor(&address, actor_uri, &actor_value)
+            {
+                self.insert(profile).await;
+            }
+            return;
+        }
 
         for mut updated in existing_profiles {
             if actor_object.contains_key("name") {

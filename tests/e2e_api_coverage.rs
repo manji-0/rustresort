@@ -2751,9 +2751,29 @@ async fn test_get_notifications_applies_type_filter_before_pagination() {
 
 #[tokio::test]
 async fn test_get_unread_count() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    for idx in 0..1005 {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: EntityId::new_string(),
+                notification_type: NotificationType::Mention,
+                origin_account_address: format!("alice{idx}@remote.example"),
+                status_uri: None,
+                read: false,
+                created_at: now - Duration::milliseconds(idx as i64),
+            })
+            .await
+            .unwrap();
+    }
 
     let response = server
         .client
@@ -2764,6 +2784,8 @@ async fn test_get_unread_count() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["count"], 1005);
 }
 
 // ============================================================================

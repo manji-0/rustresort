@@ -26,6 +26,20 @@ impl Database {
         Ok(status)
     }
 
+    async fn status_cursor_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<(chrono::DateTime<chrono::Utc>, String)>, AppError> {
+        let cursor = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT created_at FROM statuses WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|created_at| (created_at, id.to_string()));
+        Ok(cursor)
+    }
+
     /// Get local statuses that quote the specified status URI.
     pub async fn get_local_statuses_by_quote_of_uri(
         &self,
@@ -39,6 +53,27 @@ impl Database {
             "#,
         )
         .bind(quote_of_uri)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(statuses)
+    }
+
+    /// Get recent persisted remote statuses for cache hydration.
+    pub async fn get_recent_remote_statuses(&self, limit: usize) -> Result<Vec<Status>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let statuses = sqlx::query_as::<_, Status>(
+            r#"
+            SELECT * FROM statuses
+            WHERE is_local = 0
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
 
@@ -66,11 +101,19 @@ impl Database {
         let placeholders = vec!["?"; lowered_candidates.len()].join(", ");
         let mut query =
             format!("SELECT * FROM statuses WHERE LOWER(account_address) IN ({placeholders})");
-        if max_id.is_some() {
-            query.push_str(" AND id < ?");
+        let max_cursor = match max_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        let min_cursor = match min_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        if max_cursor.is_some() {
+            query.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
         }
-        if min_id.is_some() {
-            query.push_str(" AND id > ?");
+        if min_cursor.is_some() {
+            query.push_str(" AND (created_at > ? OR (created_at = ? AND id > ?))");
         }
         query.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
 
@@ -78,11 +121,11 @@ impl Database {
         for candidate in &lowered_candidates {
             builder = builder.bind(candidate);
         }
-        if let Some(max_id) = max_id {
-            builder = builder.bind(max_id);
+        if let Some((created_at, id)) = max_cursor {
+            builder = builder.bind(created_at).bind(created_at).bind(id);
         }
-        if let Some(min_id) = min_id {
-            builder = builder.bind(min_id);
+        if let Some((created_at, id)) = min_cursor {
+            builder = builder.bind(created_at).bind(created_at).bind(id);
         }
 
         let statuses = builder.bind(limit as i64).fetch_all(&self.pool).await?;
@@ -899,32 +942,66 @@ impl Database {
         max_id: Option<&str>,
         min_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError> {
-        let statuses = match (max_id, min_id) {
-            (Some(max_id), Some(min_id)) => {
+        let max_cursor = match max_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        let min_cursor = match min_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+
+        let statuses = match (max_cursor, min_cursor) {
+            (Some((max_created_at, max_id)), Some((min_created_at, min_id))) => {
                 sqlx::query_as::<_, Status>(
                     r#"
                     SELECT * FROM statuses 
-                    WHERE is_local = 1 AND id < ? AND id > ?
-                    ORDER BY created_at DESC
+                    WHERE is_local = 1
+                      AND (created_at < ? OR (created_at = ? AND id < ?))
+                      AND (created_at > ? OR (created_at = ? AND id > ?))
+                    ORDER BY created_at DESC, id DESC
                     LIMIT ?
                     "#,
                 )
+                .bind(max_created_at)
+                .bind(max_created_at)
                 .bind(max_id)
+                .bind(min_created_at)
+                .bind(min_created_at)
                 .bind(min_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
             }
-            (Some(max_id), None) => self.get_local_statuses(limit, Some(max_id)).await?,
-            (None, Some(min_id)) => {
+            (Some((max_created_at, max_id)), None) => {
                 sqlx::query_as::<_, Status>(
                     r#"
                     SELECT * FROM statuses 
-                    WHERE is_local = 1 AND id > ?
-                    ORDER BY created_at DESC
+                    WHERE is_local = 1
+                      AND (created_at < ? OR (created_at = ? AND id < ?))
+                    ORDER BY created_at DESC, id DESC
                     LIMIT ?
                     "#,
                 )
+                .bind(max_created_at)
+                .bind(max_created_at)
+                .bind(max_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some((min_created_at, min_id))) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1
+                      AND (created_at > ? OR (created_at = ? AND id > ?))
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_created_at)
+                .bind(min_created_at)
                 .bind(min_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -945,32 +1022,89 @@ impl Database {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError> {
-        let statuses = if let Some(max_id) = max_id {
-            sqlx::query_as::<_, Status>(
-                r#"
-                SELECT * FROM statuses 
-                WHERE is_local = 1 AND visibility = 'public' AND id < ?
-                ORDER BY created_at DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(max_id)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, Status>(
-                r#"
-                SELECT * FROM statuses 
-                WHERE is_local = 1 AND visibility = 'public'
-                ORDER BY created_at DESC
-                LIMIT ?
-                "#,
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?
+        let max_cursor = match max_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        let min_cursor = match min_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+
+        let statuses = match (max_cursor, min_cursor) {
+            (Some((max_created_at, max_id)), Some((min_created_at, min_id))) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1
+                      AND visibility = 'public'
+                      AND (created_at < ? OR (created_at = ? AND id < ?))
+                      AND (created_at > ? OR (created_at = ? AND id > ?))
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_created_at)
+                .bind(max_created_at)
+                .bind(max_id)
+                .bind(min_created_at)
+                .bind(min_created_at)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some((max_created_at, max_id)), None) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1
+                      AND visibility = 'public'
+                      AND (created_at < ? OR (created_at = ? AND id < ?))
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_created_at)
+                .bind(max_created_at)
+                .bind(max_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some((min_created_at, min_id))) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1
+                      AND visibility = 'public'
+                      AND (created_at > ? OR (created_at = ? AND id > ?))
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_created_at)
+                .bind(min_created_at)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT * FROM statuses 
+                    WHERE is_local = 1 AND visibility = 'public'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
         };
 
         Ok(statuses)
@@ -989,8 +1123,17 @@ impl Database {
             return Ok(Vec::new());
         }
 
-        let statuses = match (max_id, min_id) {
-            (Some(max_id), Some(min_id)) => {
+        let max_cursor = match max_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        let min_cursor = match min_id {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+
+        let statuses = match (max_cursor, min_cursor) {
+            (Some((max_created_at, max_id)), Some((min_created_at, min_id))) => {
                 sqlx::query_as::<_, Status>(
                     r#"
                     SELECT s.*
@@ -999,20 +1142,24 @@ impl Database {
                     INNER JOIN hashtags h ON h.id = sh.hashtag_id
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
-                      AND s.id < ?
-                      AND s.id > ?
-                    ORDER BY s.id DESC
+                      AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))
+                      AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))
+                    ORDER BY s.created_at DESC, s.id DESC
                     LIMIT ?
                     "#,
                 )
                 .bind(hashtag)
+                .bind(max_created_at)
+                .bind(max_created_at)
                 .bind(max_id)
+                .bind(min_created_at)
+                .bind(min_created_at)
                 .bind(min_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
             }
-            (Some(max_id), None) => {
+            (Some((max_created_at, max_id)), None) => {
                 sqlx::query_as::<_, Status>(
                     r#"
                     SELECT s.*
@@ -1021,18 +1168,20 @@ impl Database {
                     INNER JOIN hashtags h ON h.id = sh.hashtag_id
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
-                      AND s.id < ?
-                    ORDER BY s.id DESC
+                      AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))
+                    ORDER BY s.created_at DESC, s.id DESC
                     LIMIT ?
                     "#,
                 )
                 .bind(hashtag)
+                .bind(max_created_at)
+                .bind(max_created_at)
                 .bind(max_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await?
             }
-            (None, Some(min_id)) => {
+            (None, Some((min_created_at, min_id))) => {
                 sqlx::query_as::<_, Status>(
                     r#"
                     SELECT s.*
@@ -1041,12 +1190,14 @@ impl Database {
                     INNER JOIN hashtags h ON h.id = sh.hashtag_id
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
-                      AND s.id > ?
-                    ORDER BY s.id DESC
+                      AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))
+                    ORDER BY s.created_at DESC, s.id DESC
                     LIMIT ?
                     "#,
                 )
                 .bind(hashtag)
+                .bind(min_created_at)
+                .bind(min_created_at)
                 .bind(min_id)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
@@ -1061,7 +1212,7 @@ impl Database {
                     INNER JOIN hashtags h ON h.id = sh.hashtag_id
                     WHERE h.name = ? COLLATE NOCASE
                       AND s.visibility = 'public'
-                    ORDER BY s.id DESC
+                    ORDER BY s.created_at DESC, s.id DESC
                     LIMIT ?
                     "#,
                 )
@@ -1140,16 +1291,35 @@ impl Database {
 
         query_builder.push(")");
 
-        if let Some(max_id) = query.max_id.as_deref() {
+        let max_cursor = match query.max_id.as_deref() {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+        let min_cursor = match query.min_id.as_deref() {
+            Some(id) => self.status_cursor_by_id(id).await?,
+            None => None,
+        };
+
+        if let Some((created_at, id)) = max_cursor {
+            query_builder.push(" AND (s.created_at < ");
+            query_builder.push_bind(created_at);
+            query_builder.push(" OR (s.created_at = ");
+            query_builder.push_bind(created_at);
             query_builder.push(" AND s.id < ");
-            query_builder.push_bind(max_id);
+            query_builder.push_bind(id);
+            query_builder.push("))");
         }
-        if let Some(min_id) = query.min_id.as_deref() {
+        if let Some((created_at, id)) = min_cursor {
+            query_builder.push(" AND (s.created_at > ");
+            query_builder.push_bind(created_at);
+            query_builder.push(" OR (s.created_at = ");
+            query_builder.push_bind(created_at);
             query_builder.push(" AND s.id > ");
-            query_builder.push_bind(min_id);
+            query_builder.push_bind(id);
+            query_builder.push("))");
         }
 
-        query_builder.push(" ORDER BY s.id DESC LIMIT ");
+        query_builder.push(" ORDER BY s.created_at DESC, s.id DESC LIMIT ");
         query_builder.push_bind(query.limit as i64);
 
         let statuses = query_builder

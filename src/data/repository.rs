@@ -211,6 +211,7 @@ pub trait TimelineRepository: Send + Sync {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError>;
     async fn get_statuses_by_hashtag_in_window(
         &self,
@@ -588,8 +589,9 @@ impl TimelineRepository for Database {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError> {
-        Database::get_local_public_statuses(self, limit, max_id).await
+        Database::get_local_public_statuses(self, limit, max_id, min_id).await
     }
 
     async fn get_statuses_by_hashtag_in_window(

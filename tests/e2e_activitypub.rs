@@ -1150,7 +1150,7 @@ async fn test_signed_shared_inbox_create_reply_to_local_persists_status_and_noti
 }
 
 #[tokio::test]
-async fn test_signed_shared_inbox_create_from_followee_caches_without_persisting() {
+async fn test_signed_shared_inbox_create_from_followee_persists_and_caches_for_timelines() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow};
 
@@ -1191,15 +1191,16 @@ async fn test_signed_shared_inbox_create_from_followee_caches_without_persisting
         .post_signed_activity("/inbox", &activity, &key_id)
         .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert!(
-        server
-            .state
-            .db
-            .get_status_by_uri(status_uri)
-            .await
-            .unwrap()
-            .is_none(),
-        "followee posts without mention/reply should stay out of the DB"
+    let persisted = server
+        .state
+        .db
+        .get_status_by_uri(status_uri)
+        .await
+        .unwrap()
+        .expect("followee posts should be persisted for restart-safe timelines");
+    assert_eq!(
+        persisted.persisted_reason,
+        rustresort::data::PersistedReason::Timeline
     );
     assert!(
         server
@@ -2380,12 +2381,124 @@ async fn test_signed_shared_inbox_block_records_remote_block_and_filters_deliver
         server
             .state
             .db
+            .get_follower(REMOTE_ACTOR_ADDRESS, Some(443))
+            .await
+            .unwrap()
+            .is_none(),
+        "remote Block should remove the follower row as well"
+    );
+    assert!(
+        server
+            .state
+            .db
             .get_notifications(10, None, false)
             .await
             .unwrap()
             .is_empty(),
         "Block should not create notifications"
     );
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_move_with_uri_target_requires_target_backlink() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/original".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let key_id = register_default_remote_key(&server);
+    let new_actor_uri = "https://remote.example/users/alice-new";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/move-with-uri-target",
+        "type": "Move",
+        "actor": REMOTE_ACTOR_ID,
+        "object": REMOTE_ACTOR_ID,
+        "target": {
+            "id": new_actor_uri,
+            "inbox": "https://remote.example/users/alice-new/inbox"
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        server
+            .state
+            .db
+            .get_follow(REMOTE_ACTOR_ADDRESS, None)
+            .await
+            .unwrap()
+            .is_some(),
+        "Move without alsoKnownAs backlink should keep the original follow"
+    );
+    assert!(
+        server
+            .state
+            .db
+            .get_follow("alice-new@remote.example", None)
+            .await
+            .unwrap()
+            .is_none(),
+        "unverified Move target must not receive a replacement follow"
+    );
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_update_person_populates_profile_cache_when_missing() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/update-person-http",
+        "type": "Update",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "id": REMOTE_ACTOR_ID,
+            "type": "Person",
+            "preferredUsername": "alice",
+            "name": "Alice Remote",
+            "summary": "<p>Updated profile</p>",
+            "inbox": "https://remote.example/inbox",
+            "publicKey": {
+                "id": "https://remote.example/users/alice#main-key",
+                "owner": REMOTE_ACTOR_ID,
+                "publicKeyPem": common::test_public_key_pem()
+            }
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let profile = server
+        .state
+        .profile_cache
+        .get_by_uri(REMOTE_ACTOR_ID)
+        .await
+        .expect("Update(Person) should populate the profile cache");
+    assert_eq!(profile.address, REMOTE_ACTOR_ADDRESS);
+    assert_eq!(profile.display_name.as_deref(), Some("Alice Remote"));
+    assert_eq!(profile.inbox_uri, "https://remote.example/inbox");
 }
 
 #[tokio::test]

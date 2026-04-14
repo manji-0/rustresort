@@ -351,16 +351,7 @@ pub async fn get_unread_count(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get unread notifications
-    let unread_notifications = state
-        .db
-        .get_notifications(
-            1000, // Get all unread notifications
-            None, true, // Only unread
-        )
-        .await?;
-
-    let count = unread_notifications.len();
+    let count = state.db.count_unread_notifications().await?;
 
     Ok(Json(serde_json::json!({
         "count": count
