@@ -1085,8 +1085,34 @@ impl ActivityProcessor {
                 .ok()
                 .map(|url| url.scheme().to_ascii_lowercase());
             let actor_is_followee = self.is_followee(actor_uri).await;
+            let cached_status = self.timeline_cache.get_by_uri(&uri).await;
+            let persisted_status = self.db.get_status_by_uri(&uri).await?;
 
-            if let Some(cached_status) = self.timeline_cache.get_by_uri(&uri).await {
+            if let Some(status) = persisted_status {
+                if !status.is_local
+                    && follow_addresses_match(
+                        &actor_address,
+                        &status.account_address,
+                        actor_scheme.as_deref(),
+                    )
+                {
+                    if cached_status.is_some() {
+                        self.timeline_cache.remove_by_uri(&uri).await;
+                    }
+                    self.publish_remote_status_delete(&status, actor_is_followee)
+                        .await;
+                    self.db.delete_status(&status.id).await?;
+                    return Ok(());
+                } else if !status.is_local {
+                    tracing::debug!(
+                        "Delete actor {} does not own persisted status {}, ignoring",
+                        actor_address,
+                        uri
+                    );
+                }
+            }
+
+            if let Some(cached_status) = cached_status {
                 if follow_addresses_match(
                     &actor_address,
                     &cached_status.account_address,
@@ -1098,26 +1124,6 @@ impl ActivityProcessor {
                 } else {
                     tracing::debug!(
                         "Delete actor {} does not own cached status {}, ignoring",
-                        actor_address,
-                        uri
-                    );
-                }
-            }
-
-            if let Some(status) = self.db.get_status_by_uri(&uri).await? {
-                if !status.is_local
-                    && follow_addresses_match(
-                        &actor_address,
-                        &status.account_address,
-                        actor_scheme.as_deref(),
-                    )
-                {
-                    self.publish_remote_status_delete(&status, actor_is_followee)
-                        .await;
-                    self.db.delete_status(&status.id).await?;
-                } else if !status.is_local {
-                    tracing::debug!(
-                        "Delete actor {} does not own persisted status {}, ignoring",
                         actor_address,
                         uri
                     );
@@ -1204,9 +1210,20 @@ impl ActivityProcessor {
             created_at: chrono::Utc::now(),
         };
 
+        // 4. Queue Accept activity before committing the follower row so
+        // remote state does not advance unless we can actually acknowledge it.
+        if let Some(ref delivery) = self.delivery {
+            delivery
+                .queue_accept(self.db.as_ref(), &follow_activity_uri, &inbox_uri)
+                .await?;
+            tracing::info!("Queued Accept for {}", inbox_uri);
+        } else {
+            tracing::warn!("No delivery service configured, cannot send Accept");
+        }
+
         self.db.insert_follower(&follower).await?;
 
-        // 4. Create notification
+        // 5. Create notification
         let notification = crate::data::Notification {
             id: crate::data::EntityId::new_string(),
             notification_type: NotificationType::Follow,
@@ -1221,25 +1238,6 @@ impl ActivityProcessor {
             activity.get("id").and_then(|id| id.as_str()),
         )
         .await?;
-
-        // 5. Send Accept activity
-        if let Some(ref delivery) = self.delivery {
-            match delivery
-                .queue_accept(self.db.as_ref(), &follow_activity_uri, &inbox_uri)
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!("Queued Accept for {}", inbox_uri);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to queue Accept for {}: {}", inbox_uri, e);
-                    // Don't fail the whole operation if Accept sending fails
-                    // The follower is already added to the database
-                }
-            }
-        } else {
-            tracing::warn!("No delivery service configured, cannot send Accept");
-        }
 
         Ok(())
     }
@@ -1431,6 +1429,8 @@ impl ActivityProcessor {
                         Ok(())
                     }
                     "Like" | "Announce" => {
+                        self.remove_remote_interaction_for_undo(obj, &actor_address)
+                            .await?;
                         self.remove_notification_for_undo(obj, &actor_address)
                             .await?;
                         Ok(())
@@ -1454,12 +1454,19 @@ impl ActivityProcessor {
                 }
             } else if let Some(follow_uri) = obj.as_str() {
                 // Compact Undo representation where object is the activity URI.
-                if self
+                let removed_follower = self
+                    .db
+                    .delete_follower_by_address_and_uri(
+                        &actor_address,
+                        follow_uri,
+                        actor_default_port,
+                    )
+                    .await?;
+                let removed_notifications = self
                     .db
                     .delete_notifications_by_activity_uri(follow_uri)
-                    .await?
-                    > 0
-                {
+                    .await?;
+                if removed_follower || removed_notifications > 0 {
                     return Ok(());
                 }
 
@@ -1513,6 +1520,16 @@ impl ActivityProcessor {
 
         // Extract actor address
         let actor_address = self.extract_actor_address(actor_uri);
+        let local_status = self.db.get_status_by_uri(object).await?;
+        if let Some(status) = local_status.as_ref().filter(|status| status.is_local) {
+            self.db
+                .upsert_remote_favourite(
+                    &status.id,
+                    &actor_address,
+                    activity.get("id").and_then(|id| id.as_str()),
+                )
+                .await?;
+        }
 
         // 2. Create notification
         let notification = crate::data::Notification {
@@ -1529,6 +1546,9 @@ impl ActivityProcessor {
             activity.get("id").and_then(|id| id.as_str()),
         )
         .await?;
+        if let Some(status) = local_status.as_ref().filter(|status| status.is_local) {
+            self.publish_local_status_update(&status).await;
+        }
 
         Ok(())
     }
@@ -1700,6 +1720,9 @@ impl ActivityProcessor {
         // Check if it's a quote boost (embedded object) or regular boost (URI)
         if object.is_object() {
             // Quote boost: Announce with embedded Note/Article
+            if !object_attributed_to_matches_actor(object, actor_uri) {
+                return Err(AppError::Unauthorized);
+            }
             let mentions_local = self.mentions_local_user(object);
             let quote_target_uri = self.extract_quote_uri_from_object(object);
             let quotes_local = quote_target_uri
@@ -1759,6 +1782,22 @@ impl ActivityProcessor {
             // Regular boost: just a URI reference
             // Check if it's our status being boosted
             if self.is_local_status(object_uri) {
+                let mut boosted_status = None;
+                if let Some(status) = self
+                    .db
+                    .get_status_by_uri(object_uri)
+                    .await?
+                    .filter(|status| status.is_local)
+                {
+                    self.db
+                        .upsert_remote_repost(
+                            &status.id,
+                            &actor_address,
+                            activity.get("id").and_then(|id| id.as_str()),
+                        )
+                        .await?;
+                    boosted_status = Some(status);
+                }
                 // Create reblog notification for boost of our status
                 let notification = crate::data::Notification {
                     id: crate::data::EntityId::new_string(),
@@ -1774,6 +1813,9 @@ impl ActivityProcessor {
                     activity.get("id").and_then(|id| id.as_str()),
                 )
                 .await?;
+                if let Some(status) = boosted_status.as_ref() {
+                    self.publish_local_status_update(status).await;
+                }
             }
             // If boosting someone else's status, ignore (future: could cache if from followee)
         }
@@ -1948,6 +1990,74 @@ impl ActivityProcessor {
         self.db
             .delete_notifications_by_identity(notification_type, actor_address, status_uri)
             .await?;
+        Ok(())
+    }
+
+    async fn remove_remote_interaction_for_undo(
+        &self,
+        object: &serde_json::Value,
+        actor_address: &str,
+    ) -> Result<(), AppError> {
+        let Some(obj_type) = object.get("type").and_then(|t| t.as_str()) else {
+            return Ok(());
+        };
+
+        let status_uri = object
+            .get("object")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                object
+                    .get("object")
+                    .and_then(|value| value.get("id"))
+                    .and_then(|id| id.as_str())
+            });
+        let Some(status_uri) = status_uri else {
+            return Ok(());
+        };
+        let Some(status) = self.db.get_status_by_uri(status_uri).await? else {
+            return Ok(());
+        };
+        if !status.is_local {
+            return Ok(());
+        }
+
+        let removed = match obj_type {
+            "Like" => {
+                if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
+                    self.db
+                        .delete_remote_favourite_by_activity_uri(activity_uri)
+                        .await?
+                        || self
+                            .db
+                            .delete_remote_favourite_by_actor_and_status(actor_address, &status.id)
+                            .await?
+                } else {
+                    self.db
+                        .delete_remote_favourite_by_actor_and_status(actor_address, &status.id)
+                        .await?
+                }
+            }
+            "Announce" => {
+                if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
+                    self.db
+                        .delete_remote_repost_by_activity_uri(activity_uri)
+                        .await?
+                        || self
+                            .db
+                            .delete_remote_repost_by_actor_and_status(actor_address, &status.id)
+                            .await?
+                } else {
+                    self.db
+                        .delete_remote_repost_by_actor_and_status(actor_address, &status.id)
+                        .await?
+                }
+            }
+            _ => false,
+        };
+
+        if removed {
+            self.publish_local_status_update(&status).await;
+        }
         Ok(())
     }
 
@@ -2140,6 +2250,48 @@ impl ActivityProcessor {
 
         if let Err(error) = streaming_event_bus.publish(event).await {
             tracing::warn!(%error, "failed to publish remote status delete event");
+        }
+    }
+
+    async fn publish_local_status_update(&self, status: &Status) {
+        let Some(streaming_event_bus) = &self.streaming_event_bus else {
+            return;
+        };
+
+        let mut targets = std::collections::HashSet::new();
+        let local_account_id = self.local_account_id().to_string();
+        targets.insert(StreamTarget::User {
+            account_id: local_account_id.clone(),
+        });
+
+        match status.visibility {
+            StatusVisibility::Public => {
+                targets.insert(StreamTarget::Public);
+                targets.insert(StreamTarget::PublicLocal);
+                for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
+                    targets.insert(StreamTarget::Hashtag { hashtag });
+                }
+            }
+            StatusVisibility::Direct => {
+                targets.insert(StreamTarget::Direct {
+                    account_id: local_account_id,
+                });
+            }
+            StatusVisibility::Unlisted | StatusVisibility::Private => {}
+        }
+
+        let event = StreamEvent::Update {
+            payload: serde_json::json!({
+                "id": status.id.as_str(),
+                "uri": status.uri.as_str(),
+                "visibility": status.visibility.as_str(),
+                "created_at": status.created_at.to_rfc3339(),
+            }),
+            targets: targets.into_iter().collect(),
+        };
+
+        if let Err(error) = streaming_event_bus.publish(event).await {
+            tracing::warn!(%error, "failed to publish local status update event");
         }
     }
 

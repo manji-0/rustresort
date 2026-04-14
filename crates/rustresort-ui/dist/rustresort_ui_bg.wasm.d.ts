@@ -3,7 +3,7 @@
 export const memory: WebAssembly.Memory;
 export const start: () => void;
 export const wasm_bindgen__convert__closures_____invoke__hac261d4203024293: (a: number, b: number, c: any) => [number, number];
-export const wasm_bindgen__convert__closures_____invoke__h64647816f668502f: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h36d9a5db1b7895d4: (a: number, b: number, c: any) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_exn_store: (a: number) => void;

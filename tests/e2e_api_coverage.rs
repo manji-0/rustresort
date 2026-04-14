@@ -129,6 +129,20 @@ async fn test_instance_rules() {
     assert_eq!(response.status(), 200);
 }
 
+#[tokio::test]
+async fn test_custom_emojis_endpoint_returns_array() {
+    let server = TestServer::new().await;
+    let response = server
+        .client
+        .get(server.url("/api/v1/custom_emojis"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body, json!([]));
+}
+
 // ============================================================================
 // Apps Endpoints (2 endpoints)
 // ============================================================================
@@ -217,6 +231,46 @@ async fn test_verify_credentials() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_preferences_endpoint_returns_default_preferences() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/preferences"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["posting:default:visibility"], "public");
+    assert_eq!(body["posting:default:sensitive"], false);
+}
+
+#[tokio::test]
+async fn test_account_lookup_returns_local_account() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/lookup"))
+        .query(&[("acct", "testuser")])
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["acct"], "testuser");
 }
 
 #[tokio::test]
@@ -2370,6 +2424,23 @@ async fn test_get_notifications() {
     let response = server
         .client
         .get(server.url("/api/v1/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_notifications_v2() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/notifications"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

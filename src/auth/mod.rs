@@ -15,8 +15,9 @@ use std::net::SocketAddr;
 
 pub use local::{LocalAuthService, auth_router, ensure_local_auth_config};
 pub use middleware::{
-    CurrentUser, OAuthAccess, ScopePolicy, require_auth, require_auth_scopes,
-    require_auth_scopes_with_policy, require_metrics_auth, require_session_auth,
+    CurrentOAuthAccess, CurrentUser, OAuthAccess, ScopePolicy, require_app_auth, require_auth,
+    require_auth_scopes, require_auth_scopes_with_policy, require_metrics_auth,
+    require_session_auth,
 };
 pub use session::{Session, create_session_token, verify_session_token};
 

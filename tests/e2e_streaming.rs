@@ -248,6 +248,62 @@ async fn test_user_stream_receives_remote_follow_notification_events() {
 }
 
 #[tokio::test]
+async fn test_root_stream_public_dispatches_to_public_stream() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/root-stream-public".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming"))
+        .query(&[("stream", "public")])
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let key_id = register_default_remote_key(&server);
+    let status_uri = "https://remote.example/users/alice/statuses/root-stream-public-1";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/root-stream-public-1",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>public federated root stream event</p>",
+            "published": "2026-01-01T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let send_future = server.post_signed_activity("/inbox", &activity, &key_id);
+    let read_future = read_sse_event(response);
+    let (send_response, (event_name, data)) = tokio::join!(send_future, read_future);
+
+    assert_eq!(send_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(event_name, "update");
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["uri"], status_uri);
+}
+
+#[tokio::test]
 async fn test_hashtag_stream_receives_remote_public_status_updates() {
     let server = TestServer::new().await;
     server.create_test_account().await;

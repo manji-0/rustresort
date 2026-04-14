@@ -58,7 +58,7 @@ async fn test_password_login_returns_bearer_token_and_sets_session_cookie() {
     assert!(set_cookie.contains("session="));
 
     let body: serde_json::Value = response.json().await.expect("login json");
-    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["token_type"], "Session");
     assert_eq!(body["username"], "testuser");
     assert_eq!(body["auth_method"], "password");
     assert!(body["access_token"].as_str().is_some());

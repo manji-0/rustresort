@@ -1091,7 +1091,7 @@ async fn login_password(
         jar.add(cookie),
         Json(LoginResponse {
             access_token: token,
-            token_type: "Bearer",
+            token_type: "Session",
             username: account.username,
             auth_method: "password".to_string(),
         }),
@@ -1328,7 +1328,7 @@ async fn finish_passkey_authentication(
         jar.add(cookie),
         Json(LoginResponse {
             access_token: token,
-            token_type: "Bearer",
+            token_type: "Session",
             username: account.username,
             auth_method: "passkey".to_string(),
         }),

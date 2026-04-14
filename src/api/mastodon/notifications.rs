@@ -256,6 +256,15 @@ pub async fn get_notifications(
     Ok(Json(responses))
 }
 
+/// GET /api/v2/notifications
+pub async fn get_notifications_v2(
+    state: State<TimelineApiState>,
+    session: CurrentUser,
+    raw_query: RawQuery,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    get_notifications(state, session, raw_query).await
+}
+
 /// POST /api/v1/notifications/:id/dismiss
 pub async fn dismiss_notification(
     State(state): State<TimelineApiState>,

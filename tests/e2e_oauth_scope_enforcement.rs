@@ -175,3 +175,40 @@ async fn test_passkey_registration_listing_starts_empty() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body, json!([]));
 }
+
+#[tokio::test]
+async fn test_client_credentials_token_can_verify_app_but_cannot_access_user_endpoints() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server
+        .create_oauth_client_credentials_token("read:accounts write:statuses")
+        .await;
+
+    let app_verify = server
+        .client
+        .get(server.url("/api/v1/apps/verify_credentials"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(app_verify.status(), StatusCode::OK);
+
+    let verify = server
+        .client
+        .get(server.url("/api/v1/accounts/verify_credentials"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::FORBIDDEN);
+
+    let create_status = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .bearer_auth(&token)
+        .json(&json!({ "status": "client credentials must not post" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_status.status(), StatusCode::FORBIDDEN);
+}

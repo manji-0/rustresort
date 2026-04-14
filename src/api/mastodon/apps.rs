@@ -21,6 +21,7 @@ use crate::auth::verify_session_token;
 use crate::error::AppError;
 
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS: i64 = 7_200;
+const OAUTH_REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
 const OAUTH_CLIENT_SECRET_HASH_PREFIX: &str = "sha256:";
 const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
@@ -49,9 +50,11 @@ pub struct AppResponse {
 pub struct TokenRequest {
     pub grant_type: String,
     pub code: Option<String>,
+    pub code_verifier: Option<String>,
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: Option<String>,
+    pub refresh_token: Option<String>,
     pub scope: Option<String>,
 }
 
@@ -60,6 +63,8 @@ pub struct AuthorizeRequest {
     pub response_type: Option<String>,
     pub client_id: Option<String>,
     pub redirect_uri: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
     pub scope: Option<String>,
     pub state: Option<String>,
 }
@@ -74,6 +79,8 @@ pub struct RevokeTokenRequest {
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
     pub token_type: String,
     pub scope: String,
     pub created_at: i64,
@@ -85,6 +92,8 @@ struct AuthorizeContext {
     app_name: String,
     redirect_uri: String,
     requested_scopes: String,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
 }
 
 fn normalize_scopes(scopes: &str) -> String {
@@ -152,6 +161,39 @@ fn build_authorize_redirect_location(
         location.push_str(&urlencoding::encode(state));
     }
     location
+}
+
+fn normalize_pkce_method(method: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(method) = method.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match method {
+        "plain" | "S256" => Ok(Some(method.to_string())),
+        _ => Err(AppError::Validation(
+            "code_challenge_method must be plain or S256".to_string(),
+        )),
+    }
+}
+
+fn verify_pkce_code_verifier(
+    code_verifier: &str,
+    code_challenge: &str,
+    code_challenge_method: Option<&str>,
+) -> bool {
+    match code_challenge_method.unwrap_or("plain") {
+        "plain" => {
+            use subtle::ConstantTimeEq;
+            code_verifier
+                .as_bytes()
+                .ct_eq(code_challenge.as_bytes())
+                .into()
+        }
+        "S256" => {
+            let digest = sha2::Sha256::digest(code_verifier.as_bytes());
+            URL_SAFE_NO_PAD.encode(digest) == code_challenge
+        }
+        _ => false,
+    }
 }
 
 fn parse_body<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<T, AppError> {
@@ -255,11 +297,26 @@ async fn validate_authorize_request(
         return Err(AppError::Unauthorized);
     }
 
+    let code_challenge = req
+        .code_challenge
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let code_challenge_method = normalize_pkce_method(req.code_challenge_method.as_deref())?;
+    if code_challenge.is_none() && code_challenge_method.is_some() {
+        return Err(AppError::Validation(
+            "code_challenge is required when code_challenge_method is provided".to_string(),
+        ));
+    }
+
     Ok(AuthorizeContext {
         app_id: app.id,
         app_name: app.name,
         redirect_uri: redirect_uri.to_string(),
         requested_scopes,
+        code_challenge,
+        code_challenge_method,
     })
 }
 
@@ -277,6 +334,8 @@ async fn issue_authorization_code_response(
         code: code_value.clone(),
         redirect_uri: context.redirect_uri.clone(),
         scopes: context.requested_scopes.clone(),
+        code_challenge: context.code_challenge.clone(),
+        code_challenge_method: context.code_challenge_method.clone(),
         created_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::minutes(10),
     };
@@ -444,7 +503,10 @@ pub async fn create_token(
     .await?;
 
     let req: TokenRequest = parse_body(&headers, &body)?;
-    if req.grant_type != "client_credentials" && req.grant_type != "authorization_code" {
+    if req.grant_type != "client_credentials"
+        && req.grant_type != "authorization_code"
+        && req.grant_type != "refresh_token"
+    {
         return Err(AppError::Validation("invalid grant_type".to_string()));
     }
 
@@ -457,7 +519,9 @@ pub async fn create_token(
         return Err(AppError::Unauthorized);
     }
 
-    let scopes = match req.grant_type.as_str() {
+    let issued_at = Utc::now();
+    let refresh_expires_at = issued_at + chrono::Duration::seconds(OAUTH_REFRESH_TOKEN_TTL_SECONDS);
+    let (grant_type, scopes, refresh_token) = match req.grant_type.as_str() {
         "client_credentials" => {
             let requested_scopes = req
                 .scope
@@ -468,7 +532,7 @@ pub async fn create_token(
             if !scopes_are_subset(&requested_scopes, &app.scopes) {
                 return Err(AppError::Unauthorized);
             }
-            requested_scopes
+            ("client_credentials".to_string(), requested_scopes, None)
         }
         "authorization_code" => {
             let code = req
@@ -496,6 +560,25 @@ pub async fn create_token(
                 .consume_oauth_authorization_code(code, &app.id, redirect_uri, Utc::now())
                 .await?
                 .ok_or(AppError::Unauthorized)?;
+            if let Some(code_challenge) = authorization_code.code_challenge.as_deref() {
+                let code_verifier = req
+                    .code_verifier
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AppError::Validation(
+                            "code_verifier is required when PKCE is used".to_string(),
+                        )
+                    })?;
+                if !verify_pkce_code_verifier(
+                    code_verifier,
+                    code_challenge,
+                    authorization_code.code_challenge_method.as_deref(),
+                ) {
+                    return Err(AppError::Unauthorized);
+                }
+            }
             let requested_scopes = req
                 .scope
                 .as_deref()
@@ -507,26 +590,64 @@ pub async fn create_token(
             {
                 return Err(AppError::Unauthorized);
             }
-            requested_scopes
+            (
+                "authorization_code".to_string(),
+                requested_scopes,
+                Some(EntityId::new_string()),
+            )
+        }
+        "refresh_token" => {
+            let refresh_token = req
+                .refresh_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "refresh_token is required for refresh_token grant".to_string(),
+                    )
+                })?;
+            let existing = state
+                .db
+                .get_oauth_token_by_refresh_token(refresh_token)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
+            if existing.app_id != app.id {
+                return Err(AppError::Unauthorized);
+            }
+            if !matches!(
+                existing.grant_type.as_str(),
+                "authorization_code" | "refresh_token"
+            ) {
+                return Err(AppError::Unauthorized);
+            }
+            state.db.revoke_oauth_token(refresh_token).await?;
+            (
+                "refresh_token".to_string(),
+                existing.scopes,
+                Some(EntityId::new_string()),
+            )
         }
         _ => unreachable!(),
     };
 
-    let issued_at = Utc::now();
     let token = OAuthToken {
         id: EntityId::new_string(),
         app_id: app.id,
         access_token: EntityId::new_string(),
-        grant_type: req.grant_type,
+        refresh_token: refresh_token.clone(),
+        grant_type,
         scopes: scopes.clone(),
         created_at: issued_at,
         expires_at: issued_at + chrono::Duration::seconds(OAUTH_ACCESS_TOKEN_TTL_SECONDS),
+        refresh_expires_at: refresh_token.as_ref().map(|_| refresh_expires_at),
         revoked: false,
     };
     state.db.insert_oauth_token(&token).await?;
 
     Ok(Json(serde_json::json!(TokenResponse {
         access_token: token.access_token,
+        refresh_token,
         token_type: "Bearer".to_string(),
         scope: token.scopes,
         created_at: issued_at.timestamp(),

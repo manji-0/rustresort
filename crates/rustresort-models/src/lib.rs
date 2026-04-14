@@ -493,10 +493,12 @@ pub struct OAuthToken {
     pub id: String,
     pub app_id: String,
     pub access_token: String,
+    pub refresh_token: Option<String>,
     pub grant_type: String,
     pub scopes: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub refresh_expires_at: Option<DateTime<Utc>>,
     pub revoked: bool,
 }
 
@@ -508,6 +510,8 @@ pub struct OAuthAuthorizationCode {
     pub code: String,
     pub redirect_uri: String,
     pub scopes: String,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }

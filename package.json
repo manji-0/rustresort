@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "install:browsers": "playwright install chromium",
-    "test:settings-ui": "node tests/playwright/settings-ui.mjs"
+    "test:settings-ui": "node tests/playwright/settings-ui.mjs",
+    "test:web-ui": "node tests/playwright/web-ui.mjs"
   },
   "devDependencies": {
     "playwright": "^1.55.0"

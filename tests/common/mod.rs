@@ -349,10 +349,12 @@ impl TestServer {
             id: EntityId::new_string(),
             app_id: app.id.clone(),
             access_token: access_token.clone(),
+            refresh_token: None,
             grant_type: "authorization_code".to_string(),
             scopes: app.scopes.clone(),
             created_at: now,
             expires_at: now + Duration::days(7),
+            refresh_expires_at: None,
             revoked: false,
         };
         self.state.db.insert_oauth_token(&token).await.unwrap();
@@ -484,6 +486,40 @@ impl TestServer {
             .send()
             .await
             .expect("token exchange request");
+        assert!(
+            token.status().is_success(),
+            "token exchange failed: {}",
+            token.status()
+        );
+        token
+            .json::<serde_json::Value>()
+            .await
+            .expect("token exchange body")["access_token"]
+            .as_str()
+            .expect("oauth access token")
+            .to_string()
+    }
+
+    /// Create a client_credentials OAuth token for the given scopes.
+    pub async fn create_oauth_client_credentials_token(&self, scopes: &str) -> String {
+        let app = self
+            .create_oauth_app("urn:ietf:wg:oauth:2.0:oob", scopes)
+            .await;
+        let client_id = app["client_id"].as_str().expect("client_id");
+        let client_secret = app["client_secret"].as_str().expect("client_secret");
+
+        let token = self
+            .client
+            .post(self.url("/oauth/token"))
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("scope", scopes),
+            ])
+            .send()
+            .await
+            .expect("client credentials token request");
         assert!(
             token.status().is_success(),
             "token exchange failed: {}",

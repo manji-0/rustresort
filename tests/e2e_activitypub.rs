@@ -1674,6 +1674,7 @@ async fn test_signed_personal_inbox_undo_follow_removes_follower() {
 async fn test_signed_shared_inbox_like_creates_favourite_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
+    let token = server.create_test_token().await;
     let key_id = register_default_remote_key(&server);
     let local_status_uri = insert_local_status(&server, "liked-status").await;
 
@@ -1703,12 +1704,31 @@ async fn test_signed_shared_inbox_like_creates_favourite_notification() {
         }),
         "Like should create a favourite notification"
     );
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["favourites_count"], 1);
 }
 
 #[tokio::test]
 async fn test_signed_shared_inbox_announce_regular_creates_reblog_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
+    let token = server.create_test_token().await;
     let key_id = register_default_remote_key(&server);
     let local_status_uri = insert_local_status(&server, "boost-target").await;
 
@@ -1738,6 +1758,24 @@ async fn test_signed_shared_inbox_announce_regular_creates_reblog_notification()
         }),
         "Announce of a local status should create a reblog notification"
     );
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["reblogs_count"], 1);
 }
 
 #[tokio::test]
@@ -1811,6 +1849,7 @@ async fn test_signed_shared_inbox_announce_quote_mention_persists_status_and_not
         "actor": REMOTE_ACTOR_ID,
         "object": {
             "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
             "id": quote_status_uri,
             "content": "<p>Quoting @testuser</p>",
             "published": "2026-01-04T00:00:00Z",
@@ -1863,6 +1902,7 @@ async fn test_signed_shared_inbox_announce_quote_and_mention_creates_both_notifi
         "actor": REMOTE_ACTOR_ID,
         "object": {
             "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
             "id": quote_status_uri,
             "content": "<p>Quoting @testuser</p>",
             "published": "2026-01-04T00:00:00Z",
@@ -2078,6 +2118,7 @@ async fn test_signed_shared_inbox_update_note_creates_quoted_update_for_each_loc
 async fn test_signed_shared_inbox_undo_like_removes_favourite_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
+    let token = server.create_test_token().await;
     let key_id = register_default_remote_key(&server);
     let local_status_uri = insert_local_status(&server, "undo-like-target").await;
     let like_id = "https://remote.example/likes/http-undo";
@@ -2118,12 +2159,30 @@ async fn test_signed_shared_inbox_undo_like_removes_favourite_notification() {
         }),
         "Undo Like should remove the favourite notification"
     );
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["favourites_count"], 0);
 }
 
 #[tokio::test]
 async fn test_signed_shared_inbox_undo_announce_removes_reblog_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
+    let token = server.create_test_token().await;
     let key_id = register_default_remote_key(&server);
     let local_status_uri = insert_local_status(&server, "undo-announce-target").await;
     let announce_id = "https://remote.example/announces/http-undo";
@@ -2165,6 +2224,103 @@ async fn test_signed_shared_inbox_undo_announce_removes_reblog_notification() {
             notification.notification_type != rustresort::data::NotificationType::Reblog
         }),
         "Undo Announce should remove the reblog notification"
+    );
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["reblogs_count"], 0);
+}
+
+#[tokio::test]
+async fn test_signed_user_inbox_compact_undo_follow_removes_follower_after_follow_notification() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+    let follow_uri = "https://remote.example/follows/compact-undo-http";
+
+    let follow = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_uri,
+        "type": "Follow",
+        "actor": REMOTE_ACTOR_ID,
+        "object": server.public_url("/users/testuser")
+    });
+    let follow_response = server
+        .post_signed_activity("/users/testuser/inbox", &follow, &key_id)
+        .await;
+    assert_eq!(follow_response.status(), reqwest::StatusCode::OK);
+
+    let undo = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/compact-undo-follow-http",
+        "type": "Undo",
+        "actor": REMOTE_ACTOR_ID,
+        "object": follow_uri
+    });
+    let undo_response = server
+        .post_signed_activity("/users/testuser/inbox", &undo, &key_id)
+        .await;
+    assert_eq!(undo_response.status(), reqwest::StatusCode::OK);
+    assert!(
+        server
+            .state
+            .db
+            .get_follower(REMOTE_ACTOR_ADDRESS, Some(443))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_announce_embedded_quote_rejects_mismatched_attribution() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "quoted-target-mismatch").await;
+    let quote_status_uri = "https://remote.example/users/alice/statuses/mismatch-quote";
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/announces/mismatched-attribution",
+        "type": "Announce",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "id": quote_status_uri,
+            "attributedTo": "https://evil.example/users/mallory",
+            "content": "<p>forged quote</p>",
+            "published": "2026-01-04T00:00:00Z",
+            "quoteUri": local_status_uri,
+            "to": [server.public_url("/users/testuser")]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        server
+            .state
+            .db
+            .get_status_by_uri(quote_status_uri)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 

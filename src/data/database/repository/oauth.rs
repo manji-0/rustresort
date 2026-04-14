@@ -71,8 +71,8 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO oauth_authorization_codes (
-                id, app_id, code, redirect_uri, scopes, created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, app_id, code, redirect_uri, scopes, code_challenge, code_challenge_method, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&code.id)
@@ -80,6 +80,8 @@ impl Database {
         .bind(&code.code)
         .bind(&code.redirect_uri)
         .bind(&code.scopes)
+        .bind(&code.code_challenge)
+        .bind(&code.code_challenge_method)
         .bind(code.created_at)
         .bind(code.expires_at)
         .execute(&self.pool)
@@ -143,20 +145,23 @@ impl Database {
     /// Insert OAuth token
     pub async fn insert_oauth_token(&self, token: &OAuthToken) -> Result<(), AppError> {
         let access_token_hash = hash_oauth_access_token(&token.access_token);
+        let refresh_token_hash = token.refresh_token.as_deref().map(hash_oauth_token_secret);
         sqlx::query(
             r#"
             INSERT INTO oauth_tokens (
-                id, app_id, access_token, grant_type, scopes, created_at, expires_at, revoked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, app_id, access_token, refresh_token, grant_type, scopes, created_at, expires_at, refresh_expires_at, revoked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&token.id)
         .bind(&token.app_id)
         .bind(&access_token_hash)
+        .bind(&refresh_token_hash)
         .bind(&token.grant_type)
         .bind(&token.scopes)
         .bind(token.created_at)
         .bind(token.expires_at)
+        .bind(token.refresh_expires_at)
         .bind(token.revoked)
         .execute(&self.pool)
         .await?;
@@ -185,11 +190,39 @@ impl Database {
     /// Revoke OAuth token
     pub async fn revoke_oauth_token(&self, access_token: &str) -> Result<(), AppError> {
         let access_token_hash = hash_oauth_access_token(access_token);
-        sqlx::query("UPDATE oauth_tokens SET revoked = 1 WHERE access_token = ?")
-            .bind(&access_token_hash)
-            .execute(&self.pool)
-            .await?;
+        let refresh_token_hash = hash_oauth_token_secret(access_token);
+        sqlx::query(
+            "UPDATE oauth_tokens SET revoked = 1 WHERE access_token = ? OR refresh_token = ?",
+        )
+        .bind(&access_token_hash)
+        .bind(&refresh_token_hash)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
+    }
+
+    /// Get OAuth token by refresh token.
+    pub async fn get_oauth_token_by_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<OAuthToken>, AppError> {
+        let refresh_token_hash = hash_oauth_token_secret(refresh_token);
+        let now = Utc::now();
+        let token = sqlx::query_as::<_, OAuthToken>(
+            r#"
+            SELECT *
+            FROM oauth_tokens
+            WHERE refresh_token = ?
+              AND revoked = 0
+              AND (refresh_expires_at IS NULL OR refresh_expires_at > ?)
+            "#,
+        )
+        .bind(&refresh_token_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(token)
     }
 }

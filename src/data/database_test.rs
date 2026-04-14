@@ -41,10 +41,12 @@ fn test_oauth_token(app_id: &str, access_token: &str) -> OAuthToken {
         id: EntityId::new_string(),
         app_id: app_id.to_string(),
         access_token: access_token.to_string(),
+        refresh_token: None,
         grant_type: "authorization_code".to_string(),
         scopes: "read write".to_string(),
         created_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
+        refresh_expires_at: None,
         revoked: false,
     }
 }

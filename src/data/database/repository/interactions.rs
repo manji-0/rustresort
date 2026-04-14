@@ -67,11 +67,18 @@ impl Database {
 
     /// Count favourites for a status.
     pub async fn count_favourites(&self, status_id: &str) -> Result<i64, AppError> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM favourites WHERE status_id = ?")
-            .bind(status_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(Into::into)
+        sqlx::query_scalar(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM favourites WHERE status_id = ?)
+              + (SELECT COUNT(*) FROM remote_favourites WHERE status_id = ?)
+            "#,
+        )
+        .bind(status_id)
+        .bind(status_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Get favourited status IDs
@@ -319,6 +326,59 @@ impl Database {
         Ok(id)
     }
 
+    /// Insert or update a remote favourite interaction.
+    pub async fn upsert_remote_favourite(
+        &self,
+        status_id: &str,
+        actor_address: &str,
+        activity_uri: Option<&str>,
+    ) -> Result<(), AppError> {
+        let id = EntityId::new_string();
+        sqlx::query(
+            r#"
+            INSERT INTO remote_favourites (id, status_id, actor_address, activity_uri, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(status_id, actor_address) DO UPDATE SET
+                activity_uri = excluded.activity_uri
+            "#,
+        )
+        .bind(&id)
+        .bind(status_id)
+        .bind(actor_address)
+        .bind(activity_uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a remote favourite by its activity URI.
+    pub async fn delete_remote_favourite_by_activity_uri(
+        &self,
+        activity_uri: &str,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM remote_favourites WHERE activity_uri = ?")
+            .bind(activity_uri)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a remote favourite by actor and status.
+    pub async fn delete_remote_favourite_by_actor_and_status(
+        &self,
+        actor_address: &str,
+        status_id: &str,
+    ) -> Result<bool, AppError> {
+        let result =
+            sqlx::query("DELETE FROM remote_favourites WHERE actor_address = ? AND status_id = ?")
+                .bind(actor_address)
+                .bind(status_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Delete repost
     pub async fn delete_repost(&self, status_id: &str) -> Result<(), AppError> {
         sqlx::query("DELETE FROM reposts WHERE status_id = ?")
@@ -395,11 +455,71 @@ impl Database {
 
     /// Count reposts for a status.
     pub async fn count_reposts(&self, status_id: &str) -> Result<i64, AppError> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM reposts WHERE status_id = ?")
-            .bind(status_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(Into::into)
+        sqlx::query_scalar(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM reposts WHERE status_id = ?)
+              + (SELECT COUNT(*) FROM remote_reposts WHERE status_id = ?)
+            "#,
+        )
+        .bind(status_id)
+        .bind(status_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Insert or update a remote reblog interaction.
+    pub async fn upsert_remote_repost(
+        &self,
+        status_id: &str,
+        actor_address: &str,
+        activity_uri: Option<&str>,
+    ) -> Result<(), AppError> {
+        let id = EntityId::new_string();
+        sqlx::query(
+            r#"
+            INSERT INTO remote_reposts (id, status_id, actor_address, activity_uri, created_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(status_id, actor_address) DO UPDATE SET
+                activity_uri = excluded.activity_uri
+            "#,
+        )
+        .bind(&id)
+        .bind(status_id)
+        .bind(actor_address)
+        .bind(activity_uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a remote reblog by its activity URI.
+    pub async fn delete_remote_repost_by_activity_uri(
+        &self,
+        activity_uri: &str,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query("DELETE FROM remote_reposts WHERE activity_uri = ?")
+            .bind(activity_uri)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a remote reblog by actor and status.
+    pub async fn delete_remote_repost_by_actor_and_status(
+        &self,
+        actor_address: &str,
+        status_id: &str,
+    ) -> Result<bool, AppError> {
+        let result =
+            sqlx::query("DELETE FROM remote_reposts WHERE actor_address = ? AND status_id = ?")
+                .bind(actor_address)
+                .bind(status_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Insert status pin marker.

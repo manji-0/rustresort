@@ -228,13 +228,17 @@ pub(super) fn parse_json_value(raw: Option<String>) -> Option<serde_json::Value>
     raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
 }
 
-pub(super) fn hash_oauth_access_token(access_token: &str) -> String {
-    let digest = Sha256::digest(access_token.as_bytes());
+pub(super) fn hash_oauth_token_secret(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
     format!(
         "{}{}",
         OAUTH_ACCESS_TOKEN_HASH_PREFIX,
         URL_SAFE_NO_PAD.encode(digest)
     )
+}
+
+pub(super) fn hash_oauth_access_token(access_token: &str) -> String {
+    hash_oauth_token_secret(access_token)
 }
 
 pub(super) fn is_hashed_oauth_access_token(stored_access_token: &str) -> bool {

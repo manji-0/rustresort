@@ -4,6 +4,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::HeaderMap,
     response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
 };
@@ -22,10 +23,20 @@ use crate::service::{EventReceiver, StreamEvent};
 
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
+    stream: Option<String>,
     /// Only for hashtag stream
     tag: Option<String>,
     /// Only for list stream
     list: Option<String>,
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// GET /api/v1/streaming/health
@@ -342,4 +353,86 @@ pub async fn stream_direct(
         .subscribe_direct(account_id)
         .await?;
     Ok(build_sse_stream(state, receiver))
+}
+
+async fn enforce_root_stream_scopes(
+    state: &StreamingApiState,
+    headers: &HeaderMap,
+    required_scopes: &[&str],
+) -> Result<(), AppError> {
+    let Some(token) = bearer_token(headers) else {
+        return Ok(());
+    };
+    let oauth_token = state
+        .db
+        .get_oauth_token(token)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let granted = oauth_token.scopes.split_whitespace().collect::<Vec<_>>();
+    let granted_matches = |required: &&str| {
+        granted.iter().any(|scope| {
+            scope == required
+                || required
+                    .split_once(':')
+                    .map(|(prefix, _)| scope == &prefix)
+                    .unwrap_or(false)
+        })
+    };
+    if required_scopes.iter().all(granted_matches) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden)
+}
+
+/// GET /api/v1/streaming
+/// Mastodon-compatible streaming multiplexer using the `stream` query parameter.
+pub async fn stream_root(
+    State(state): State<StreamingApiState>,
+    session: CurrentUser,
+    headers: HeaderMap,
+    Query(params): Query<StreamParams>,
+) -> Result<impl IntoResponse, AppError> {
+    match params.stream.as_deref().unwrap_or_default() {
+        "user" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses", "read:notifications"])
+                .await?;
+            stream_user(State(state), session)
+                .await
+                .map(IntoResponse::into_response)
+        }
+        "public" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            stream_public(State(state), Query(params))
+                .await
+                .map(IntoResponse::into_response)
+        }
+        "public:local" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            stream_public_local(State(state))
+                .await
+                .map(IntoResponse::into_response)
+        }
+        "hashtag" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            stream_hashtag(State(state), Query(params))
+                .await
+                .map(IntoResponse::into_response)
+        }
+        "list" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            stream_list(State(state), session, Query(params))
+                .await
+                .map(IntoResponse::into_response)
+        }
+        "direct" => {
+            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            stream_direct(State(state), session)
+                .await
+                .map(IntoResponse::into_response)
+        }
+        _ => Err(AppError::Validation(
+            "stream parameter must be one of user, public, public:local, hashtag, list, direct"
+                .to_string(),
+        )),
+    }
 }

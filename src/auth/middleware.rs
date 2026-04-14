@@ -58,6 +58,10 @@ fn session_from_oauth_token(
     }
 }
 
+fn oauth_grant_represents_user_session(grant_type: &str) -> bool {
+    matches!(grant_type, "authorization_code" | "refresh_token")
+}
+
 async fn authenticate_oauth_bearer_token(
     state: &AuthState,
     token: &str,
@@ -91,13 +95,27 @@ async fn authenticate_oauth_bearer_token(
     Ok((session, Some(oauth_access)))
 }
 
+async fn authenticate_user_oauth_bearer_token(
+    state: &AuthState,
+    token: &str,
+) -> Result<(Session, Option<OAuthAccess>), AppError> {
+    let (session, oauth_access) = authenticate_oauth_bearer_token(state, token).await?;
+    let Some(oauth_access) = oauth_access else {
+        return Err(AppError::Unauthorized);
+    };
+    if !oauth_grant_represents_user_session(&oauth_access.grant_type) {
+        return Err(AppError::Forbidden);
+    }
+    Ok((session, Some(oauth_access)))
+}
+
 async fn authenticate_request(
     state: &AuthState,
     bearer_token: Option<String>,
     cookie_token: Option<String>,
 ) -> Result<(Session, Option<OAuthAccess>), AppError> {
     if let Some(token) = bearer_token.as_deref() {
-        return authenticate_oauth_bearer_token(state, token).await;
+        return authenticate_user_oauth_bearer_token(state, token).await;
     }
 
     if let Some(cookie_token) = cookie_token.as_deref() {
@@ -106,6 +124,20 @@ async fn authenticate_request(
     }
 
     Err(AppError::Unauthorized)
+}
+
+pub async fn require_app_auth(
+    State(state): State<AuthState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    let token = bearer_token(request.headers()).ok_or(AppError::Unauthorized)?;
+    let (_, oauth_access) = authenticate_oauth_bearer_token(&state, &token).await?;
+    let mut request = request;
+    if let Some(oauth_access) = oauth_access {
+        request.extensions_mut().insert(oauth_access);
+    }
+    Ok(next.run(request).await)
 }
 
 fn scope_matches(granted: &str, required: &str) -> bool {
@@ -292,6 +324,26 @@ where
             .get::<Session>()
             .cloned()
             .map(CurrentUser)
+            .ok_or(AppError::Unauthorized)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentOAuthAccess(pub OAuthAccess);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for CurrentOAuthAccess
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<OAuthAccess>()
+            .cloned()
+            .map(CurrentOAuthAccess)
             .ok_or(AppError::Unauthorized)
     }
 }

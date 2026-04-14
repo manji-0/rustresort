@@ -9,7 +9,7 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly start: () => void;
     readonly wasm_bindgen__convert__closures_____invoke__hac261d4203024293: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen__convert__closures_____invoke__h64647816f668502f: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h36d9a5db1b7895d4: (a: number, b: number, c: any) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

@@ -188,6 +188,11 @@ fn rules_to_json(rule_texts: &[String]) -> serde_json::Value {
     )
 }
 
+/// GET /api/v1/custom_emojis
+pub async fn custom_emojis() -> Json<serde_json::Value> {
+    Json(serde_json::json!([]))
+}
+
 /// GET /api/v1/instance
 pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     use crate::api::dto::*;

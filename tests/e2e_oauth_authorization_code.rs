@@ -1,7 +1,9 @@
 mod common;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::TestServer;
 use reqwest::StatusCode;
+use sha2::Digest;
 
 #[tokio::test]
 async fn test_oauth_authorize_redirects_to_login_when_session_is_missing() {
@@ -133,4 +135,170 @@ async fn test_password_login_token_cannot_access_mastodon_api_as_bearer() {
         .await
         .unwrap();
     assert_eq!(verify.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_oauth_authorization_code_flow_supports_pkce_s256() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let redirect_uri = "https://client.example/callback";
+    let app = server.create_oauth_app(redirect_uri, "read:accounts").await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+    let (_, session_cookie) = server.login_password().await;
+
+    let verifier = "pkce-verifier-1234567890";
+    let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let authorize = client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", "read:accounts"),
+            ("state", "pkce-state"),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ])
+        .header("Cookie", session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(authorize.status().is_redirection());
+
+    let redirect_location = authorize
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let redirect_url = url::Url::parse(redirect_location).unwrap();
+    let code = redirect_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+
+    let token = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("code", code.as_str()),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+
+    let body = token.json::<serde_json::Value>().await.unwrap();
+    assert!(body["access_token"].as_str().is_some());
+    assert!(body["refresh_token"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_oauth_refresh_token_grant_rotates_tokens() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let redirect_uri = "https://client.example/callback";
+    let app = server
+        .create_oauth_app(redirect_uri, "read:accounts write:statuses")
+        .await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+    let (_, session_cookie) = server.login_password().await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let authorize = client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", "read:accounts write:statuses"),
+        ])
+        .header("Cookie", session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(authorize.status().is_redirection());
+    let redirect_location = authorize
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let redirect_url = url::Url::parse(redirect_location).unwrap();
+    let code = redirect_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+
+    let token = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("code", code.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+    let body = token.json::<serde_json::Value>().await.unwrap();
+    let access_token = body["access_token"].as_str().unwrap().to_string();
+    let refresh_token = body["refresh_token"].as_str().unwrap().to_string();
+
+    let refreshed = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    let refreshed_body = refreshed.json::<serde_json::Value>().await.unwrap();
+    let new_access_token = refreshed_body["access_token"].as_str().unwrap().to_string();
+    let new_refresh_token = refreshed_body["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_ne!(new_access_token, access_token);
+    assert_ne!(new_refresh_token, refresh_token);
+
+    let reused = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
 }

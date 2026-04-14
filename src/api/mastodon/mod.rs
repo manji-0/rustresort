@@ -115,6 +115,18 @@ where
             },
         ))
     };
+    let app_auth = |router: MethodRouter<S>| {
+        let auth_state = auth_state.clone();
+        router.route_layer(middleware::from_fn(
+            move |request: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let auth_state = auth_state.clone();
+                async move {
+                    crate::auth::require_app_auth(axum::extract::State(auth_state), request, next)
+                        .await
+                }
+            },
+        ))
+    };
 
     // Public endpoints (no authentication required)
     let public_routes = Router::new()
@@ -125,6 +137,7 @@ where
         .route("/v1/instance/rules", get(instance::instance_rules))
         .route("/v2/instance", get(instance::instance_v2))
         .route("/v1/apps", post(apps::create_app))
+        .route("/v1/custom_emojis", get(instance::custom_emojis))
         // Public timelines
         .route("/v1/timelines/public", get(timelines::public_timeline))
         // Public account and status views
@@ -149,11 +162,15 @@ where
         // Accounts - authenticated operations
         .route(
             "/v1/apps/verify_credentials",
-            scoped(get(apps::verify_app_credentials), SESSION_ONLY),
+            app_auth(get(apps::verify_app_credentials)),
         )
         .route(
             "/v1/accounts/verify_credentials",
             scoped(get(accounts::verify_credentials), READ_ACCOUNTS),
+        )
+        .route(
+            "/v1/preferences",
+            scoped(get(accounts::preferences), READ_ACCOUNTS),
         )
         .route(
             "/v1/accounts/update_credentials",
@@ -161,6 +178,10 @@ where
                 axum::routing::patch(accounts::update_credentials),
                 WRITE_ACCOUNTS,
             ),
+        )
+        .route(
+            "/v1/accounts/lookup",
+            scoped(get(accounts::lookup_account), READ_ACCOUNTS),
         )
         .route(
             "/v1/accounts/:id/followers",
@@ -311,6 +332,10 @@ where
         .route(
             "/v1/notifications",
             scoped(get(notifications::get_notifications), READ_NOTIFICATIONS),
+        )
+        .route(
+            "/v2/notifications",
+            scoped(get(notifications::get_notifications_v2), READ_NOTIFICATIONS),
         )
         .route(
             "/v1/notifications/:id",
@@ -476,6 +501,10 @@ where
         .route(
             "/v1/streaming/health",
             scoped(get(streaming::streaming_health), READ_STATUSES),
+        )
+        .route(
+            "/v1/streaming",
+            scoped(get(streaming::stream_root), SESSION_ONLY),
         )
         .route(
             "/v1/streaming/user",

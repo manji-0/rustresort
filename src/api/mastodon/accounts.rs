@@ -70,6 +70,11 @@ pub struct SearchParams {
     pub following: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LookupParams {
+    pub acct: String,
+}
+
 fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
     let trimmed = encoded.trim();
     if trimmed.is_empty() {
@@ -874,6 +879,14 @@ fn local_account_matches_identity(
         return true;
     }
 
+    let normalized_username = account.username.trim();
+    if trimmed
+        .trim_start_matches('@')
+        .eq_ignore_ascii_case(normalized_username)
+    {
+        return true;
+    }
+
     let local_address = format!("{}@{}", account.username, config.server.domain);
     if normalize_account_address(trimmed).ok().as_deref()
         == normalize_account_address(&local_address).ok().as_deref()
@@ -1280,6 +1293,19 @@ pub async fn verify_credentials(
         );
     }
     Ok(Json(value))
+}
+
+/// GET /api/v1/preferences
+pub async fn preferences(
+    CurrentUser(_session): CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(serde_json::json!({
+        "posting:default:visibility": "public",
+        "posting:default:sensitive": false,
+        "posting:default:language": serde_json::Value::Null,
+        "reading:expand:media": "default",
+        "reading:expand:spoilers": false,
+    })))
 }
 
 /// PATCH /api/v1/accounts/update_credentials
@@ -2139,6 +2165,30 @@ pub async fn search_accounts(
     results.truncate(limit);
 
     Ok(Json(results))
+}
+
+/// GET /api/v1/accounts/lookup
+pub async fn lookup_account(
+    State(state): State<AccountApiState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<LookupParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let identity = params.acct.trim();
+    if identity.is_empty() {
+        return Err(AppError::Validation("acct is required".to_string()));
+    }
+
+    let response = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        Some(state.federation_fetch_client.as_ref()),
+        identity,
+    )
+    .await
+    .ok_or(AppError::NotFound)?;
+
+    Ok(Json(serde_json::to_value(response).unwrap()))
 }
 
 /// GET /api/v1/accounts/:id/lists
