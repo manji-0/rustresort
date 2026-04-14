@@ -517,7 +517,11 @@ impl AppState {
         let push_subject = format!("mailto:{}", config.instance.contact_email.trim());
         let web_push_sender = service::DbWebPushSender::new(db.clone(), push_subject)?;
 
-        // 7. Fetch followee/follower profiles
+        // 7. Hydrate persisted remote profiles, then refresh followee/follower profiles.
+        for profile in db.list_remote_profiles().await? {
+            profile_cache.insert(profile.into()).await;
+        }
+
         let follow_addresses = db.get_all_follow_addresses().await?;
         let follower_addresses = db.get_all_follower_addresses().await?;
 
@@ -823,4 +827,136 @@ async fn append_security_headers(
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    const TEST_PRIVATE_KEY_PEM: &str = include_str!("../tests/fixtures/test_private_key.pem");
+    const TEST_PUBLIC_KEY_PEM: &str = include_str!("../tests/fixtures/test_public_key.pem");
+
+    fn test_config(temp_dir: &TempDir) -> config::AppConfig {
+        config::AppConfig {
+            server: config::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                domain: "test.example.com".to_string(),
+                protocol: "https".to_string(),
+                trusted_proxy_ips: Vec::new(),
+            },
+            database: config::DatabaseConfig {
+                path: temp_dir.path().join("test.db"),
+                sync: config::DatabaseSyncConfig::default(),
+            },
+            storage: config::StorageConfig {
+                media: config::MediaStorageConfig {
+                    bucket: "test-media".to_string(),
+                    public_url: "https://media.test.example.com".to_string(),
+                },
+                backup: config::BackupStorageConfig {
+                    enabled: false,
+                    bucket: "test-backup".to_string(),
+                    interval_seconds: 86400,
+                    retention_count: 7,
+                    encryption: config::BackupEncryptionConfig::default(),
+                },
+            },
+            cloudflare: config::CloudflareConfig {
+                account_id: "test-account".to_string(),
+                r2_access_key_id: "test-key".to_string(),
+                r2_secret_access_key: "test-secret".to_string(),
+            },
+            auth: config::AuthConfig {
+                username: "testuser".to_string(),
+                password: Some("test-password".to_string()),
+                session_secret: "test-secret-key-32-bytes-long!!".to_string(),
+                session_max_age: 604800,
+            },
+            instance: config::InstanceConfig {
+                title: "Test Instance".to_string(),
+                description: "Test RustResort Instance".to_string(),
+                contact_email: "test@example.com".to_string(),
+            },
+            admin: config::AdminConfig {
+                display_name: "Test User".to_string(),
+                email: Some("testuser@test.example.com".to_string()),
+                note: Some("Test account".to_string()),
+            },
+            cache: config::CacheConfig {
+                timeline_max_items: 2000,
+                profile_ttl: 86400,
+            },
+            ui: config::UiConfig::default(),
+            metrics: config::MetricsConfig { auth_token: None },
+            logging: config::LoggingConfig {
+                level: "info".to_string(),
+                format: "pretty".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn app_state_hydrates_persisted_remote_profiles_into_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let db = data::Database::connect(&config.database.path)
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        db.upsert_account(&data::Account {
+            id: data::EntityId::new_string(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: Some("Test account".to_string()),
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: TEST_PRIVATE_KEY_PEM.to_string(),
+            public_key_pem: TEST_PUBLIC_KEY_PEM.to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+        db.upsert_remote_profile(&data::RemoteProfile {
+            address: "bob@remote.example".to_string(),
+            uri: "https://remote.example/users/bob".to_string(),
+            display_name: Some("Bob".to_string()),
+            note: Some("persisted".to_string()),
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "persisted-key".to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/outbox".to_string()),
+            followers_count: Some(7),
+            following_count: Some(9),
+            fetched_at: now,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+        drop(db);
+
+        let state = AppState::new(config).await.unwrap();
+        let profile = state
+            .profile_cache
+            .get("bob@remote.example")
+            .await
+            .expect("persisted profile should be hydrated");
+
+        assert_eq!(profile.uri, "https://remote.example/users/bob");
+        assert_eq!(profile.display_name.as_deref(), Some("Bob"));
+        assert_eq!(profile.note.as_deref(), Some("persisted"));
+        assert_eq!(profile.public_key_pem, "persisted-key");
+        assert_eq!(profile.inbox_uri, "https://remote.example/inbox");
+        assert_eq!(profile.followers_count, Some(7));
+        assert_eq!(profile.following_count, Some(9));
+    }
 }

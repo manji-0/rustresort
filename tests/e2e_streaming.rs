@@ -230,7 +230,10 @@ async fn test_user_stream_receives_remote_follow_notification_events() {
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": "https://remote.example/activities/stream-follow-1",
         "type": "Follow",
-        "actor": REMOTE_ACTOR_ID,
+        "actor": {
+            "id": REMOTE_ACTOR_ID,
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
         "object": server.public_url("/users/testuser")
     });
 
@@ -425,6 +428,136 @@ async fn test_list_stream_receives_remote_followed_account_updates() {
     let json: Value = serde_json::from_str(&data).unwrap();
     assert_eq!(json["uri"], status_uri);
     assert_eq!(json["account"]["acct"], REMOTE_ACTOR_ADDRESS);
+}
+
+#[tokio::test]
+async fn test_list_stream_ignores_remote_direct_updates() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/stream-list-direct".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Streaming list direct exclusion", "list")
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, &[REMOTE_ACTOR_ADDRESS.to_string()])
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/streaming/list?list={}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let key_id = register_default_remote_key(&server);
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/list-stream-direct-1",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": "https://remote.example/users/alice/statuses/list-stream-direct-1",
+            "content": "<p>direct list leak</p>",
+            "published": "2026-01-01T00:00:00Z",
+            "to": [server.public_url("/users/testuser")]
+        }
+    });
+
+    let send_response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(send_response.status(), reqwest::StatusCode::OK);
+    expect_no_sse_event(response, Duration::from_millis(750)).await;
+}
+
+#[tokio::test]
+async fn test_public_stream_receives_embedded_announce_quote_update() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let quoted_local_status = rustresort::data::Status {
+        id: "local-quoted-stream-target".to_string(),
+        uri: server.public_url("/users/testuser/statuses/local-quoted-stream-target"),
+        content: "<p>Quoted target</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: chrono::Utc::now(),
+        fetched_at: None,
+    };
+    server
+        .state
+        .db
+        .insert_status(&quoted_local_status)
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/public"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let key_id = register_default_remote_key(&server);
+    let status_uri = "https://remote.example/users/alice/statuses/announce-quote-stream-1";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/announce-quote-stream-1",
+        "type": "Announce",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "id": status_uri,
+            "attributedTo": REMOTE_ACTOR_ID,
+            "content": "<p>quoted remote note</p>",
+            "published": "2026-01-01T00:00:00Z",
+            "quoteUri": quoted_local_status.uri,
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let send_future = server.post_signed_activity("/inbox", &activity, &key_id);
+    let read_future = read_sse_event(response);
+    let (send_response, (event_name, data)) = tokio::join!(send_future, read_future);
+
+    assert_eq!(send_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(event_name, "update");
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["uri"], status_uri);
 }
 
 #[tokio::test]

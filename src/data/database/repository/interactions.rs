@@ -364,6 +364,20 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Get remote favourite actor/status pair by activity URI.
+    pub async fn get_remote_favourite_actor_and_status_by_activity_uri(
+        &self,
+        activity_uri: &str,
+    ) -> Result<Option<(String, String)>, AppError> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_address, status_id FROM remote_favourites WHERE activity_uri = ? LIMIT 1",
+        )
+        .bind(activity_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Delete a remote favourite by actor and status.
     pub async fn delete_remote_favourite_by_actor_and_status(
         &self,
@@ -505,6 +519,20 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Get remote reblog actor/status pair by activity URI.
+    pub async fn get_remote_repost_actor_and_status_by_activity_uri(
+        &self,
+        activity_uri: &str,
+    ) -> Result<Option<(String, String)>, AppError> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_address, status_id FROM remote_reposts WHERE activity_uri = ? LIMIT 1",
+        )
+        .bind(activity_uri)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Delete a remote reblog by actor and status.

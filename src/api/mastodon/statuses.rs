@@ -431,6 +431,7 @@ async fn resolve_explicit_remote_recipients(
     addresses.extend(extra_addresses);
 
     let recipients = resolve_remote_recipients_with_dependencies(
+        state.db.as_ref(),
         state.profile_cache.as_ref(),
         state.federation_fetch_client.as_ref(),
         addresses,
@@ -1246,6 +1247,7 @@ pub async fn favourite_status(
         spawn_best_effort_delivery("favourite_status", async move {
             let (target_actor_uri, target_inbox_uri) =
                 resolve_remote_actor_and_inbox_with_dependencies(
+                    state_for_delivery.db.as_ref(),
                     state_for_delivery.profile_cache.as_ref(),
                     state_for_delivery.federation_fetch_client.as_ref(),
                     &account_address_for_delivery,
@@ -1328,6 +1330,7 @@ pub async fn unfavourite_status(
         spawn_best_effort_delivery("unfavourite_status", async move {
             let (target_actor_uri, target_inbox_uri) =
                 resolve_remote_actor_and_inbox_with_dependencies(
+                    state_for_delivery.db.as_ref(),
                     state_for_delivery.profile_cache.as_ref(),
                     state_for_delivery.federation_fetch_client.as_ref(),
                     &account_address_for_delivery,

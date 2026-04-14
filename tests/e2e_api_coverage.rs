@@ -468,6 +468,7 @@ async fn test_account_followers_applies_max_id_cursor() {
         .as_str()
         .expect("first followers page should include id")
         .to_string();
+    assert_eq!(first_id, "carol@remote.example");
 
     let second_page_response = server
         .client
@@ -484,7 +485,7 @@ async fn test_account_followers_applies_max_id_cursor() {
     let second_id = second_page[0]["id"]
         .as_str()
         .expect("second followers page should include id");
-    assert_ne!(second_id, first_id);
+    assert_eq!(second_id, "bob@remote.example");
 }
 
 #[tokio::test]
@@ -531,6 +532,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
         .as_str()
         .expect("first followers page should include id")
         .to_string();
+    assert_eq!(first_id, "https://remote.example/Users/Bob");
 
     let second_page_response = server
         .client
@@ -547,7 +549,7 @@ async fn test_account_followers_actor_uri_cursor_preserves_case() {
     let second_id = second_page[0]["id"]
         .as_str()
         .expect("second followers page should include id");
-    assert_ne!(second_id, first_id);
+    assert_eq!(second_id, "https://remote.example/Users/Alice");
 }
 
 #[tokio::test]
@@ -594,6 +596,7 @@ async fn test_account_following_applies_max_id_cursor() {
         .as_str()
         .expect("first following page should include id")
         .to_string();
+    assert_eq!(first_id, "carol@remote.example");
 
     let second_page_response = server
         .client
@@ -610,7 +613,7 @@ async fn test_account_following_applies_max_id_cursor() {
     let second_id = second_page[0]["id"]
         .as_str()
         .expect("second following page should include id");
-    assert_ne!(second_id, first_id);
+    assert_eq!(second_id, "bob@remote.example");
 }
 
 #[tokio::test]

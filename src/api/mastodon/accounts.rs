@@ -728,6 +728,7 @@ pub(crate) async fn resolve_remote_account_response(
     }
     if profile.is_none()
         && resolve_remote_actor_and_inbox_with_dependencies(
+            db,
             profile_cache,
             federation_fetch_client,
             &normalized_address,
@@ -1044,6 +1045,7 @@ async fn resolve_remote_actor_and_inbox(
     address: &str,
 ) -> Result<(String, String), AppError> {
     resolve_remote_actor_and_inbox_with_dependencies(
+        state.db.as_ref(),
         state.profile_cache.as_ref(),
         state.federation_fetch_client.as_ref(),
         address,
@@ -1633,7 +1635,7 @@ pub async fn get_account_followers(
                 .map(|response| serde_json::to_value(response).unwrap())
             }
         })
-        .buffer_unordered(8)
+        .buffered(8)
         .collect::<Vec<_>>()
         .await;
     followers.extend(resolved.into_iter().flatten());
@@ -1702,7 +1704,7 @@ pub async fn get_account_following(
                 .map(|response| serde_json::to_value(response).unwrap())
             }
         })
-        .buffer_unordered(8)
+        .buffered(8)
         .collect::<Vec<_>>()
         .await;
     following.extend(resolved.into_iter().flatten());

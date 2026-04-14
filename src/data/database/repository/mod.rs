@@ -16,6 +16,7 @@ mod passkeys;
 mod polls;
 mod push_subscriptions;
 mod remote_blocks;
+mod remote_profiles;
 mod scheduled_statuses;
 mod search;
 mod settings;

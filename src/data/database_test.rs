@@ -67,6 +67,52 @@ async fn test_database_connection() {
 }
 
 #[tokio::test]
+async fn test_remote_profiles_persist_across_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+    let db = Database::connect(&db_path).await.unwrap();
+    let now = Utc::now();
+
+    db.upsert_remote_profile(&RemoteProfile {
+        address: "bob@remote.example".to_string(),
+        uri: "https://remote.example/users/bob".to_string(),
+        display_name: Some("Bob".to_string()),
+        note: Some("cached".to_string()),
+        avatar_url: Some("https://remote.example/avatar.png".to_string()),
+        header_url: None,
+        public_key_pem: "test-key".to_string(),
+        inbox_uri: "https://remote.example/inbox".to_string(),
+        outbox_uri: Some("https://remote.example/outbox".to_string()),
+        followers_count: Some(12),
+        following_count: Some(34),
+        fetched_at: now,
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .unwrap();
+    drop(db);
+
+    let reopened = Database::connect(&db_path).await.unwrap();
+    let profiles = reopened.list_remote_profiles().await.unwrap();
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.address == "bob@remote.example")
+        .expect("persisted remote profile should exist");
+
+    assert_eq!(profile.uri, "https://remote.example/users/bob");
+    assert_eq!(profile.display_name.as_deref(), Some("Bob"));
+    assert_eq!(profile.note.as_deref(), Some("cached"));
+    assert_eq!(
+        profile.avatar_url.as_deref(),
+        Some("https://remote.example/avatar.png")
+    );
+    assert_eq!(profile.inbox_uri, "https://remote.example/inbox");
+    assert_eq!(profile.followers_count, Some(12));
+    assert_eq!(profile.following_count, Some(34));
+}
+
+#[tokio::test]
 async fn test_delivery_job_enqueue_claim_and_mark_delivered() {
     let (db, _temp_dir) = create_test_db().await;
 

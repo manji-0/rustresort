@@ -7,9 +7,17 @@ use serde_json::Value;
 
 const REMOTE_ACTOR_ID: &str = "https://remote.example/users/alice";
 const REMOTE_ACTOR_ADDRESS: &str = "alice@remote.example";
+const EVIL_ACTOR_ID: &str = "https://evil.example/users/mallory";
+const EVIL_ACTOR_ADDRESS: &str = "mallory@evil.example";
 
 fn register_default_remote_key(server: &TestServer) -> String {
     let key_id = format!("{REMOTE_ACTOR_ID}#main-key");
+    server.register_inbound_public_key(&key_id, common::test_public_key_pem());
+    key_id
+}
+
+fn register_evil_remote_key(server: &TestServer) -> String {
+    let key_id = format!("{EVIL_ACTOR_ID}#main-key");
     server.register_inbound_public_key(&key_id, common::test_public_key_pem());
     key_id
 }
@@ -2180,6 +2188,123 @@ async fn test_signed_shared_inbox_undo_like_removes_favourite_notification() {
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_compact_undo_like_removes_remote_favourite_count() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "compact-undo-like-target").await;
+    let like_id = "https://remote.example/likes/compact-undo";
+
+    let like = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": like_id,
+        "type": "Like",
+        "actor": REMOTE_ACTOR_ID,
+        "object": local_status_uri
+    });
+    let like_response = server.post_signed_activity("/inbox", &like, &key_id).await;
+    assert_eq!(like_response.status(), reqwest::StatusCode::OK);
+
+    let undo = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/compact-undo-like",
+        "type": "Undo",
+        "actor": REMOTE_ACTOR_ID,
+        "object": like_id
+    });
+    let undo_response = server.post_signed_activity("/inbox", &undo, &key_id).await;
+    assert_eq!(undo_response.status(), reqwest::StatusCode::OK);
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["favourites_count"], 0);
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_undo_like_cannot_remove_another_actors_favourite() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let evil_key_id = register_evil_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "forged-undo-like-target").await;
+    let like_id = "https://remote.example/likes/forged-undo";
+
+    let like = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": like_id,
+        "type": "Like",
+        "actor": REMOTE_ACTOR_ID,
+        "object": local_status_uri
+    });
+    let like_response = server.post_signed_activity("/inbox", &like, &key_id).await;
+    assert_eq!(like_response.status(), reqwest::StatusCode::OK);
+
+    let forged_undo = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://evil.example/activities/forged-undo-like",
+        "type": "Undo",
+        "actor": EVIL_ACTOR_ID,
+        "object": {
+            "type": "Like",
+            "id": like_id,
+            "object": local_status_uri
+        }
+    });
+    let undo_response = server
+        .post_signed_activity("/inbox", &forged_undo, &evil_key_id)
+        .await;
+    assert_eq!(undo_response.status(), reqwest::StatusCode::OK);
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["favourites_count"], 1);
+
+    let notifications = server
+        .state
+        .db
+        .get_notifications(10, None, false)
+        .await
+        .unwrap();
+    assert!(notifications.iter().any(|notification| {
+        notification.notification_type == rustresort::data::NotificationType::Favourite
+            && notification.origin_account_address == REMOTE_ACTOR_ADDRESS
+    }));
+    assert!(
+        notifications
+            .iter()
+            .all(|notification| { notification.origin_account_address != EVIL_ACTOR_ADDRESS })
+    );
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_undo_announce_removes_reblog_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2246,6 +2371,55 @@ async fn test_signed_shared_inbox_undo_announce_removes_reblog_notification() {
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_compact_undo_announce_removes_remote_repost_count() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "compact-undo-announce-target").await;
+    let announce_id = "https://remote.example/announces/compact-undo";
+
+    let announce = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": announce_id,
+        "type": "Announce",
+        "actor": REMOTE_ACTOR_ID,
+        "object": local_status_uri
+    });
+    let announce_response = server
+        .post_signed_activity("/inbox", &announce, &key_id)
+        .await;
+    assert_eq!(announce_response.status(), reqwest::StatusCode::OK);
+
+    let undo = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/compact-undo-announce",
+        "type": "Undo",
+        "actor": REMOTE_ACTOR_ID,
+        "object": announce_id
+    });
+    let undo_response = server.post_signed_activity("/inbox", &undo, &key_id).await;
+    assert_eq!(undo_response.status(), reqwest::StatusCode::OK);
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["reblogs_count"], 0);
+}
+
+#[tokio::test]
 async fn test_signed_user_inbox_compact_undo_follow_removes_follower_after_follow_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2256,7 +2430,10 @@ async fn test_signed_user_inbox_compact_undo_follow_removes_follower_after_follo
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": follow_uri,
         "type": "Follow",
-        "actor": REMOTE_ACTOR_ID,
+        "actor": {
+            "id": REMOTE_ACTOR_ID,
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
         "object": server.public_url("/users/testuser")
     });
     let follow_response = server

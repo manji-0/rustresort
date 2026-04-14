@@ -2,22 +2,25 @@ use std::{cell::RefCell, rc::Rc};
 
 use gloo_net::http::{Request, RequestBuilder, Response};
 use html_escape::encode_text;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Document, Element, Event, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, Window,
+    Document, Element, Event, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement,
+    KeyboardEvent, Storage, Window,
 };
 
 const APP_TITLE: &str = "RustResort";
 const DEFAULT_FEED_LIMIT: usize = 20;
 const DEFAULT_MAX_CHARACTERS: usize = 500;
+const COMPOSER_DRAFT_STORAGE_KEY: &str = "rustresort-ui-composer-draft";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FeedMode {
     Home,
     Public,
     Profile,
+    Hashtags,
 }
 
 impl Default for FeedMode {
@@ -32,6 +35,7 @@ impl FeedMode {
             Self::Home => "Home",
             Self::Public => "Local",
             Self::Profile => "Posts",
+            Self::Hashtags => "Hashtags",
         }
     }
 }
@@ -81,7 +85,7 @@ struct FlashMessage {
     text: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ComposerDraft {
     status: String,
     spoiler_text: String,
@@ -89,6 +93,8 @@ struct ComposerDraft {
     language: String,
     in_reply_to_id: Option<String>,
     in_reply_to_label: Option<String>,
+    quoted_status_id: Option<String>,
+    quoted_status_label: Option<String>,
 }
 
 impl Default for ComposerDraft {
@@ -100,6 +106,8 @@ impl Default for ComposerDraft {
             language: String::new(),
             in_reply_to_id: None,
             in_reply_to_label: None,
+            quoted_status_id: None,
+            quoted_status_label: None,
         }
     }
 }
@@ -127,6 +135,10 @@ struct Model {
     notifications_unread: usize,
     thread: ThreadView,
     composer: ComposerDraft,
+    composer_popout: bool,
+    hashtag_query: String,
+    selected_status_id: Option<String>,
+    thread_history: Vec<String>,
     backups: Vec<BackupInfo>,
     domain_blocks: Vec<String>,
     flash: Option<FlashMessage>,
@@ -209,7 +221,11 @@ struct Status {
     reblogs_count: i64,
     favourites_count: i64,
     #[serde(default)]
+    text: String,
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    filtered: Vec<serde_json::Value>,
     #[serde(default)]
     reblog: Option<Box<Status>>,
     account: StatusAccount,
@@ -239,9 +255,22 @@ struct Notification {
     id: String,
     #[serde(rename = "type")]
     notification_type: String,
+    #[serde(default)]
+    group_key: String,
     created_at: String,
     account: StatusAccount,
     status: Option<Status>,
+}
+
+#[derive(Clone)]
+struct NotificationGroup {
+    group_key: String,
+    ids: Vec<String>,
+    notification_type: String,
+    created_at: String,
+    accounts: Vec<StatusAccount>,
+    status: Option<Status>,
+    count: usize,
 }
 
 #[derive(Clone, Deserialize)]
@@ -285,14 +314,24 @@ pub fn start() -> Result<(), JsValue> {
         .get_element_by_id("app")
         .ok_or_else(|| JsValue::from_str("#app not found"))?;
 
+    let mut model = Model::default();
+    if let Some(draft) = restore_composer_draft(&window) {
+        model.composer = draft;
+        model.flash = Some(FlashMessage {
+            tone: FlashTone::Success,
+            text: "Recovered unsent draft.".to_string(),
+        });
+    }
+
     let app = Rc::new(App {
         window,
         document,
         root,
-        model: RefCell::new(Model::default()),
+        model: RefCell::new(model),
     });
 
     app.render();
+    app.attach_keyboard_shortcuts();
     spawn_local({
         let app = app.clone();
         async move {
@@ -323,6 +362,10 @@ impl App {
             let app = self.clone();
             move || app.set_feed_mode(FeedMode::Profile)
         });
+        self.attach_click("nav-hashtags", {
+            let app = self.clone();
+            move || app.set_feed_mode(FeedMode::Hashtags)
+        });
         self.attach_click("refresh-feed", {
             let app = self.clone();
             move || {
@@ -349,6 +392,18 @@ impl App {
             let app = self.clone();
             move || {
                 app.clear_reply_target();
+            }
+        });
+        self.attach_click("composer-cancel-quote", {
+            let app = self.clone();
+            move || {
+                app.clear_quote_target();
+            }
+        });
+        self.attach_click("composer-toggle-popout", {
+            let app = self.clone();
+            move || {
+                app.toggle_composer_popout();
             }
         });
         self.attach_click("logout-action", {
@@ -408,28 +463,37 @@ impl App {
         self.attach_textarea_input("composer-input", {
             let app = self.clone();
             move |value| {
-                app.model.borrow_mut().composer.status = value;
+                app.update_composer(move |composer| composer.status = value);
             }
         });
         self.attach_input_change("composer-spoiler", {
             let app = self.clone();
             move |value| {
-                app.model.borrow_mut().composer.spoiler_text = value;
+                app.update_composer(move |composer| composer.spoiler_text = value);
             }
         });
         self.attach_input_change("composer-language", {
             let app = self.clone();
             move |value| {
-                app.model.borrow_mut().composer.language = value;
+                app.update_composer(move |composer| composer.language = value);
+            }
+        });
+        self.attach_input_change("hashtag-query", {
+            let app = self.clone();
+            move |value| {
+                {
+                    let mut model = app.model.borrow_mut();
+                    model.hashtag_query = value;
+                }
+                app.render();
             }
         });
         self.attach_select_change("composer-visibility", {
             let app = self.clone();
             move |value| {
-                app.model.borrow_mut().composer.visibility = value;
+                app.update_composer(move |composer| composer.visibility = value);
             }
         });
-
         self.attach_dynamic_action("[data-domain-remove]", move |app, element| {
             let Some(domain) = element.get_attribute("data-domain-remove") else {
                 return;
@@ -445,6 +509,12 @@ impl App {
             spawn_local(async move {
                 app.load_thread(status_id).await;
             });
+        });
+        self.attach_dynamic_action("[data-focus-status]", move |app, element| {
+            let Some(status_id) = element.get_attribute("data-focus-status") else {
+                return;
+            };
+            app.set_selected_status(status_id);
         });
         self.attach_dynamic_action("[data-reply-status]", move |app, element| {
             let Some(status_id) = element.get_attribute("data-reply-status") else {
@@ -467,11 +537,16 @@ impl App {
             });
         });
         self.attach_dynamic_action("[data-dismiss-notification]", move |app, element| {
-            let Some(notification_id) = element.get_attribute("data-dismiss-notification") else {
+            let Some(notification_ids) = element.get_attribute("data-dismiss-notification") else {
                 return;
             };
             spawn_local(async move {
-                app.dismiss_notification(notification_id).await;
+                let ids = notification_ids
+                    .split('|')
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                app.dismiss_notifications(ids).await;
             });
         });
         self.attach_dynamic_action("[data-notification-filter]", move |app, element| {
@@ -581,10 +656,112 @@ impl App {
         }
     }
 
+    fn attach_keyboard_shortcuts(self: &Rc<Self>) {
+        let closure = Closure::<dyn FnMut(_)>::wrap(Box::new({
+            let app = self.clone();
+            move |event: KeyboardEvent| {
+                if event.ctrl_key() || event.meta_key() || event.alt_key() {
+                    return;
+                }
+                if let Some(target) = event.target()
+                    && let Ok(element) = target.dyn_into::<Element>()
+                {
+                    let tag_name = element.tag_name().to_ascii_lowercase();
+                    if matches!(tag_name.as_str(), "input" | "textarea" | "select") {
+                        return;
+                    }
+                    if element.get_attribute("contenteditable").as_deref() == Some("true") {
+                        return;
+                    }
+                }
+
+                let key = event.key().to_ascii_lowercase();
+                let raw_key = event.key();
+                let handled = match raw_key.as_str() {
+                    "N" => {
+                        app.activate_mention_shortcut();
+                        true
+                    }
+                    _ => match key.as_str() {
+                        "j" => {
+                            app.move_selection(-1);
+                            true
+                        }
+                        "k" => {
+                            app.move_selection(1);
+                            true
+                        }
+                        "g" => {
+                            app.window.scroll_to_with_x_and_y(0.0, 0.0);
+                            app.select_first_status();
+                            true
+                        }
+                        "l" => {
+                            app.open_selected_status();
+                            true
+                        }
+                        "h" => {
+                            app.go_back_from_thread();
+                            true
+                        }
+                        "n" => {
+                            app.open_composer_popout();
+                            true
+                        }
+                        "f" => {
+                            if let Some(status_id) = app.shortcut_status_id() {
+                                spawn_local({
+                                    let app = app.clone();
+                                    async move {
+                                        app.execute_status_action(
+                                            "favourite".to_string(),
+                                            status_id,
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+                            true
+                        }
+                        "r" => {
+                            if let Some(status_id) = app.shortcut_status_id() {
+                                spawn_local({
+                                    let app = app.clone();
+                                    async move {
+                                        app.execute_status_action("reblog".to_string(), status_id)
+                                            .await;
+                                    }
+                                });
+                            }
+                            true
+                        }
+                        "q" => {
+                            app.activate_quote_shortcut();
+                            true
+                        }
+                        _ => false,
+                    },
+                };
+                if handled {
+                    event.prevent_default();
+                }
+            }
+        }));
+        let _ = self
+            .document
+            .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
+        closure.forget();
+    }
+
     fn input_value(&self, id: &str) -> Option<String> {
         let element = self.document.get_element_by_id(id)?;
         let input: HtmlInputElement = element.dyn_into().ok()?;
         Some(input.value())
+    }
+
+    fn textarea(&self, id: &str) -> Option<HtmlTextAreaElement> {
+        let element = self.document.get_element_by_id(id)?;
+        element.dyn_into::<HtmlTextAreaElement>().ok()
     }
 
     fn set_feed_mode(self: &Rc<Self>, feed_mode: FeedMode) {
@@ -621,7 +798,10 @@ impl App {
             let mut model = self.model.borrow_mut();
             model.composer.in_reply_to_id = Some(status_id);
             model.composer.in_reply_to_label = Some(label);
+            model.composer.quoted_status_id = None;
+            model.composer.quoted_status_label = None;
         }
+        self.save_composer_draft();
         self.render();
     }
 
@@ -631,13 +811,237 @@ impl App {
             model.composer.in_reply_to_id = None;
             model.composer.in_reply_to_label = None;
         }
+        self.save_composer_draft();
         self.render();
+    }
+
+    fn set_quote_target(self: &Rc<Self>, status_id: String, label: String) {
+        {
+            let mut model = self.model.borrow_mut();
+            model.composer.quoted_status_id = Some(status_id);
+            model.composer.quoted_status_label = Some(label);
+            model.composer.in_reply_to_id = None;
+            model.composer.in_reply_to_label = None;
+            model.composer_popout = true;
+        }
+        self.save_composer_draft();
+        self.render();
+        self.focus_composer_input();
+    }
+
+    fn clear_quote_target(self: &Rc<Self>) {
+        {
+            let mut model = self.model.borrow_mut();
+            model.composer.quoted_status_id = None;
+            model.composer.quoted_status_label = None;
+        }
+        self.save_composer_draft();
+        self.render();
+    }
+
+    fn toggle_composer_popout(self: &Rc<Self>) {
+        {
+            let mut model = self.model.borrow_mut();
+            model.composer_popout = !model.composer_popout;
+        }
+        self.render();
+        self.focus_composer_input();
+    }
+
+    fn open_composer_popout(self: &Rc<Self>) {
+        {
+            let mut model = self.model.borrow_mut();
+            model.composer_popout = true;
+        }
+        self.render();
+        self.focus_composer_input();
+    }
+
+    fn focus_composer_input(&self) {
+        if let Some(textarea) = self.textarea("composer-input") {
+            let _ = textarea.focus();
+        }
+    }
+
+    fn set_selected_status(self: &Rc<Self>, status_id: String) {
+        let should_render = {
+            let mut model = self.model.borrow_mut();
+            if model.selected_status_id.as_deref() == Some(status_id.as_str()) {
+                false
+            } else {
+                model.selected_status_id = Some(status_id.clone());
+                true
+            }
+        };
+        if should_render {
+            self.render();
+        }
+        self.scroll_selected_into_view();
+    }
+
+    fn current_selection_order(&self) -> Vec<String> {
+        let model = self.model.borrow();
+        selection_order(&model)
+    }
+
+    fn move_selection(self: &Rc<Self>, delta: isize) {
+        let order = self.current_selection_order();
+        if order.is_empty() {
+            return;
+        }
+
+        let current_id = self.model.borrow().selected_status_id.clone();
+        let current_index = current_id
+            .as_deref()
+            .and_then(|status_id| order.iter().position(|candidate| candidate == status_id))
+            .unwrap_or(0);
+
+        let target_index = if delta.is_negative() {
+            current_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            (current_index + delta as usize).min(order.len().saturating_sub(1))
+        };
+
+        self.set_selected_status(order[target_index].clone());
+    }
+
+    fn select_first_status(self: &Rc<Self>) {
+        let order = self.current_selection_order();
+        let Some(status_id) = order.first() else {
+            return;
+        };
+        self.set_selected_status(status_id.clone());
+    }
+
+    fn open_selected_status(self: &Rc<Self>) {
+        let Some(status_id) = self.shortcut_status_id() else {
+            return;
+        };
+        spawn_local({
+            let app = self.clone();
+            async move {
+                app.load_thread(status_id).await;
+            }
+        });
+    }
+
+    fn go_back_from_thread(self: &Rc<Self>) {
+        let previous_status_id = {
+            let mut model = self.model.borrow_mut();
+            if model.thread.status_id.is_none() {
+                return;
+            }
+            model.thread_history.pop()
+        };
+
+        if let Some(status_id) = previous_status_id {
+            spawn_local({
+                let app = self.clone();
+                async move {
+                    app.load_thread_internal(status_id, false).await;
+                }
+            });
+        } else {
+            self.clear_thread();
+        }
+    }
+
+    fn activate_mention_shortcut(self: &Rc<Self>) {
+        let Some(status) = self.shortcut_status() else {
+            return;
+        };
+        let primary = display_status(&status);
+        let mention = format!("@{}", primary.account.acct);
+        self.update_composer({
+            let mention = mention.clone();
+            move |composer| {
+                let already_present = composer
+                    .status
+                    .split_whitespace()
+                    .any(|word| word == mention.as_str());
+                if already_present {
+                    return;
+                }
+
+                if composer.status.trim().is_empty() {
+                    composer.status = format!("{mention} ");
+                } else {
+                    composer.status = format!("{}\n{mention} ", composer.status.trim_end());
+                }
+            }
+        });
+        {
+            let mut model = self.model.borrow_mut();
+            model.composer_popout = true;
+        }
+        self.render();
+        self.focus_composer_input();
+    }
+
+    fn scroll_selected_into_view(&self) {
+        let Some(status_id) = self.model.borrow().selected_status_id.clone() else {
+            return;
+        };
+        let Ok(Some(element)) = self
+            .document
+            .query_selector(&format!(r#"[data-focus-status="{}"]"#, status_id))
+        else {
+            return;
+        };
+        element.scroll_into_view();
+    }
+
+    fn shortcut_status(&self) -> Option<Status> {
+        if let Some(status_id) = self.model.borrow().selected_status_id.clone() {
+            return self
+                .find_status(&status_id)
+                .or_else(|| self.find_notification_status(&status_id));
+        }
+        self.current_selection_order()
+            .first()
+            .and_then(|status_id| self.find_status(status_id))
+    }
+
+    fn shortcut_status_id(&self) -> Option<String> {
+        self.shortcut_status()
+            .map(|status| display_status(&status).id.clone())
+    }
+
+    fn activate_quote_shortcut(self: &Rc<Self>) {
+        let Some(status) = self.shortcut_status() else {
+            return;
+        };
+        let primary = display_status(&status);
+        let label = format!(
+            "@{} · {}",
+            primary.account.acct,
+            summarize_html(&primary.content)
+        );
+        let quote_target = if primary.uri.trim().is_empty() {
+            primary.id.clone()
+        } else {
+            primary.uri.clone()
+        };
+        self.set_quote_target(quote_target, label);
+    }
+
+    fn update_composer<F>(&self, update: F)
+    where
+        F: FnOnce(&mut ComposerDraft),
+    {
+        {
+            let mut model = self.model.borrow_mut();
+            update(&mut model.composer);
+        }
+        self.save_composer_draft();
     }
 
     fn clear_thread(self: &Rc<Self>) {
         {
             let mut model = self.model.borrow_mut();
             model.thread = ThreadView::default();
+            model.thread_history.clear();
+            normalize_selected_status(&mut model);
         }
         self.render();
     }
@@ -659,12 +1063,12 @@ impl App {
             }
         };
 
-        let feed_url = self.feed_url();
         let notifications_url = self.notifications_url();
+        let statuses_future = self.fetch_active_feed();
         let (instance, account, statuses, notifications, unread, backups, domain_blocks) = futures::join!(
             fetch_json::<Instance>("/api/v1/instance"),
             fetch_json::<Account>("/api/v1/accounts/verify_credentials"),
-            fetch_json::<Vec<Status>>(&feed_url),
+            statuses_future,
             fetch_json::<Vec<Notification>>(&notifications_url),
             fetch_json::<UnreadCount>("/api/v1/notifications/unread_count"),
             fetch_json::<Vec<BackupInfo>>("/admin/backups"),
@@ -696,6 +1100,7 @@ impl App {
         model.domain_blocks = domain_blocks.unwrap_or_default();
         model.dashboard_loading = false;
         model.feed_loading = false;
+        normalize_selected_status(&mut model);
         drop(model);
         self.render();
     }
@@ -707,16 +1112,16 @@ impl App {
         }
         self.render();
 
-        let feed_url = self.feed_url();
         let notifications_url = self.notifications_url();
         let selected_thread = {
             let model = self.model.borrow();
             focus_status.or_else(|| model.thread.status_id.clone())
         };
 
+        let statuses_future = self.fetch_active_feed();
         let (account, statuses, notifications, unread) = futures::join!(
             fetch_json::<Account>("/api/v1/accounts/verify_credentials"),
-            fetch_json::<Vec<Status>>(&feed_url),
+            statuses_future,
             fetch_json::<Vec<Notification>>(&notifications_url),
             fetch_json::<UnreadCount>("/api/v1/notifications/unread_count"),
         );
@@ -748,6 +1153,7 @@ impl App {
                     text: error,
                 });
             }
+            normalize_selected_status(&mut model);
         }
         self.render();
 
@@ -780,6 +1186,54 @@ impl App {
         self.render();
     }
 
+    async fn fetch_active_feed(&self) -> Result<Vec<Status>, String> {
+        let (mode, hashtag_query) = {
+            let model = self.model.borrow();
+            (model.feed_mode, model.hashtag_query.clone())
+        };
+
+        match mode {
+            FeedMode::Hashtags => self.fetch_hashtag_feed(&hashtag_query).await,
+            _ => {
+                let feed_url = self.feed_url();
+                fetch_json::<Vec<Status>>(&feed_url).await
+            }
+        }
+    }
+
+    async fn fetch_hashtag_feed(&self, raw_query: &str) -> Result<Vec<Status>, String> {
+        let hashtags = parse_hashtag_query(raw_query);
+        if hashtags.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut merged = Vec::<Status>::new();
+        for hashtag in hashtags {
+            let endpoint = format!(
+                "/api/v1/timelines/tag/{}?limit={DEFAULT_FEED_LIMIT}",
+                encode_path_segment(&hashtag)
+            );
+            let statuses = fetch_json::<Vec<Status>>(&endpoint).await?;
+            for status in statuses {
+                let primary_uri = display_status(&status).uri.clone();
+                let seen = merged
+                    .iter()
+                    .any(|existing| display_status(existing).uri == primary_uri);
+                if !seen {
+                    merged.push(status);
+                }
+            }
+        }
+        merged.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        merged.truncate(DEFAULT_FEED_LIMIT);
+        Ok(merged)
+    }
+
     async fn refresh_admin(self: Rc<Self>) {
         let (backups, domain_blocks) = futures::join!(
             fetch_json::<Vec<BackupInfo>>("/admin/backups"),
@@ -794,14 +1248,27 @@ impl App {
     }
 
     async fn load_thread(self: Rc<Self>, status_id: String) {
+        self.load_thread_internal(status_id, true).await;
+    }
+
+    async fn load_thread_internal(self: Rc<Self>, status_id: String, record_history: bool) {
         let initial_focus = self
             .find_status(&status_id)
             .or_else(|| self.find_notification_status(&status_id));
         {
             let mut model = self.model.borrow_mut();
+            let is_new_thread = model.thread.status_id.as_deref() != Some(status_id.as_str());
+            if record_history
+                && let Some(previous_status_id) = model.thread.status_id.clone()
+                && previous_status_id != status_id
+                && model.thread_history.last() != Some(&previous_status_id)
+            {
+                model.thread_history.push(previous_status_id);
+            }
             model.thread.status_id = Some(status_id.clone());
+            model.selected_status_id = Some(status_id.clone());
             model.thread.loading = true;
-            if model.thread.focus.is_none() {
+            if model.thread.focus.is_none() || is_new_thread {
                 model.thread.focus = initial_focus;
             }
         }
@@ -839,6 +1306,7 @@ impl App {
                 });
             }
         }
+        normalize_selected_status(&mut model);
         drop(model);
         self.render();
     }
@@ -875,6 +1343,12 @@ impl App {
                 serde_json::Value::String(reply_to.clone()),
             );
         }
+        if let Some(quote_target) = composer.quoted_status_id.as_ref() {
+            payload.insert(
+                "quoted_status_id".to_string(),
+                serde_json::Value::String(quote_target.clone()),
+            );
+        }
 
         match send_json::<Status>(
             "POST",
@@ -896,6 +1370,7 @@ impl App {
                         text: "Post published through the Mastodon API.".to_string(),
                     });
                 }
+                self.clear_saved_draft();
                 self.render();
                 self.refresh_social(Some(status.id)).await;
             }
@@ -968,18 +1443,28 @@ impl App {
         }
     }
 
-    async fn dismiss_notification(self: Rc<Self>, notification_id: String) {
-        let url = format!(
-            "/api/v1/notifications/{}/dismiss",
-            encode_path_segment(&notification_id)
-        );
-        match send_request("POST", &url, None).await {
-            Ok(_) => {
-                self.set_flash(FlashTone::Success, "Notification dismissed.");
-                self.refresh_notifications().await;
-            }
-            Err(error) => self.set_flash(FlashTone::Error, &error),
+    async fn dismiss_notifications(self: Rc<Self>, notification_ids: Vec<String>) {
+        if notification_ids.is_empty() {
+            return;
         }
+
+        for notification_id in &notification_ids {
+            let url = format!(
+                "/api/v1/notifications/{}/dismiss",
+                encode_path_segment(notification_id)
+            );
+            if let Err(error) = send_request("POST", &url, None).await {
+                self.set_flash(FlashTone::Error, &error);
+                return;
+            }
+        }
+        let success_message = if notification_ids.len() > 1 {
+            "Notification group dismissed."
+        } else {
+            "Notification dismissed."
+        };
+        self.set_flash(FlashTone::Success, success_message);
+        self.refresh_notifications().await;
     }
 
     async fn clear_notifications(self: Rc<Self>) {
@@ -1058,6 +1543,30 @@ impl App {
         input.set_value("");
     }
 
+    fn storage(&self) -> Option<Storage> {
+        self.window.local_storage().ok().flatten()
+    }
+
+    fn save_composer_draft(&self) {
+        let Some(storage) = self.storage() else {
+            return;
+        };
+        let composer = self.model.borrow().composer.clone();
+        if !composer_has_saved_state(&composer) {
+            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+            return;
+        }
+        if let Ok(serialized) = serde_json::to_string(&composer) {
+            let _ = storage.set_item(COMPOSER_DRAFT_STORAGE_KEY, &serialized);
+        }
+    }
+
+    fn clear_saved_draft(&self) {
+        if let Some(storage) = self.storage() {
+            let _ = storage.remove_item(COMPOSER_DRAFT_STORAGE_KEY);
+        }
+    }
+
     fn feed_url(&self) -> String {
         let model = self.model.borrow();
         match model.feed_mode {
@@ -1075,6 +1584,7 @@ impl App {
                     )
                 })
                 .unwrap_or_else(|| format!("/api/v1/timelines/home?limit={DEFAULT_FEED_LIMIT}")),
+            FeedMode::Hashtags => String::new(),
         }
     }
 
@@ -1172,6 +1682,18 @@ fn render_app(model: &Model) -> String {
         .filter(|title| !title.is_empty())
         .unwrap_or(APP_TITLE);
 
+    let composer_panel = if model.composer_popout {
+        String::new()
+    } else {
+        render_composer(model, false)
+    };
+    let composer_popout = if model.composer_popout {
+        render_composer(model, true)
+    } else {
+        String::new()
+    };
+    let hashtag_query = encode_attribute(&model.hashtag_query);
+
     format!(
         r#"
 <div class="app-shell">
@@ -1188,6 +1710,11 @@ fn render_app(model: &Model) -> String {
       <button id="nav-home" class="sidebar-link {home_active}">Home timeline</button>
       <button id="nav-public" class="sidebar-link {public_active}">Local timeline</button>
       <button id="nav-profile" class="sidebar-link {profile_active}">My posts</button>
+      <button id="nav-hashtags" class="sidebar-link {hashtags_active}">Hashtag timeline</button>
+      <label class="field sidebar-field">
+        <span>Hashtags</span>
+        <input id="hashtag-query" type="text" value="{hashtag_query}" placeholder="rust, wasm, activitypub" />
+      </label>
       <a class="sidebar-link" href="/settings">Legacy settings</a>
       <a class="sidebar-link" href="/api/v1/accounts/verify_credentials">Raw Mastodon JSON</a>
       <button id="logout-action" class="sidebar-link danger">Log out</button>
@@ -1206,36 +1733,13 @@ fn render_app(model: &Model) -> String {
         <h2>{feed_label}</h2>
         <p class="subtle-line">{feed_subtitle}</p>
       </div>
-      <button id="refresh-feed" class="ghost-button">Refresh</button>
+      <div class="timeline-actions">
+        <button id="composer-toggle-popout" class="ghost-button">Compose</button>
+        <button id="refresh-feed" class="ghost-button">Refresh</button>
+      </div>
     </header>
 
-    <section class="composer-panel">
-      <div class="composer-avatar">{composer_avatar}</div>
-      <div class="composer-stack">
-        {reply_banner}
-        <textarea id="composer-input" placeholder="What do you want to post?">{composer_text}</textarea>
-        <div class="composer-grid">
-          <label class="field">
-            <span>Visibility</span>
-            <select id="composer-visibility">
-              {visibility_options}
-            </select>
-          </label>
-          <label class="field">
-            <span>Content warning</span>
-            <input id="composer-spoiler" type="text" value="{spoiler_text}" placeholder="Optional spoiler or summary" />
-          </label>
-          <label class="field">
-            <span>Language</span>
-            <input id="composer-language" type="text" value="{language}" placeholder="en, ja, ..." />
-          </label>
-        </div>
-        <div class="composer-footer">
-          <span class="muted-copy">Character budget: {composer_count}/{max_characters}</span>
-          <button id="composer-submit" class="primary-button">Post</button>
-        </div>
-      </div>
-    </section>
+    {composer_panel}
 
     {flash_banner}
     {thread_panel}
@@ -1296,6 +1800,7 @@ fn render_app(model: &Model) -> String {
     </section>
   </aside>
 </div>
+{composer_popout}
 "#,
         brand_title = encode_text(brand_title),
         home_active = if model.feed_mode == FeedMode::Home {
@@ -1313,17 +1818,17 @@ fn render_app(model: &Model) -> String {
         } else {
             ""
         },
+        hashtags_active = if model.feed_mode == FeedMode::Hashtags {
+            "active"
+        } else {
+            ""
+        },
+        hashtag_query = hashtag_query,
         profile_panel = render_profile_panel(model),
         feed_label = encode_text(model.feed_mode.label()),
         feed_subtitle = encode_text(&feed_subtitle(model)),
-        composer_avatar = render_avatar_monogram(model),
-        reply_banner = render_reply_banner(model),
-        composer_text = encode_text(&model.composer.status),
-        visibility_options = render_visibility_options(&model.composer.visibility),
-        spoiler_text = encode_attribute(&model.composer.spoiler_text),
-        language = encode_attribute(&model.composer.language),
-        composer_count = model.composer.status.chars().count(),
-        max_characters = composer_limit(model),
+        composer_panel = composer_panel,
+        composer_popout = composer_popout,
         flash_banner = render_flash(model),
         thread_panel = render_thread_panel(model),
         timeline_cards = render_timeline(model),
@@ -1332,6 +1837,74 @@ fn render_app(model: &Model) -> String {
         notifications = render_notifications(model),
         backups = render_backups(model),
         domain_blocks = render_domain_blocks(model),
+    )
+}
+
+fn render_composer(model: &Model, popout: bool) -> String {
+    let reply_banner = render_reply_banner(model);
+    let quote_banner = render_quote_banner(model);
+    let shell_class = if popout { "composer-popout-shell" } else { "" };
+    let panel_class = if popout {
+        "composer-panel composer-panel-popout"
+    } else {
+        "composer-panel"
+    };
+    let dismiss = if popout {
+        r#"<button id="composer-toggle-popout" class="ghost-button">Close</button>"#.to_string()
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<section class="{shell_class}">
+  <section class="{panel_class}">
+    <div class="composer-avatar">{composer_avatar}</div>
+    <div class="composer-stack">
+      <div class="composer-head">
+        <div>
+          <p class="micro-label">Compose</p>
+          <h3>New post</h3>
+        </div>
+        {dismiss}
+      </div>
+      {reply_banner}
+      {quote_banner}
+      <textarea id="composer-input" placeholder="What do you want to post?">{composer_text}</textarea>
+      <div class="composer-grid">
+        <label class="field">
+          <span>Visibility</span>
+          <select id="composer-visibility">
+            {visibility_options}
+          </select>
+        </label>
+        <label class="field">
+          <span>Content warning</span>
+          <input id="composer-spoiler" type="text" value="{spoiler_text}" placeholder="Optional spoiler or summary" />
+        </label>
+        <label class="field">
+          <span>Language</span>
+          <input id="composer-language" type="text" value="{language}" placeholder="en, ja, ..." />
+        </label>
+      </div>
+      <div class="composer-footer">
+        <span class="muted-copy">Character budget: {composer_count}/{max_characters}</span>
+        <button id="composer-submit" class="primary-button">Post</button>
+      </div>
+    </div>
+  </section>
+</section>"#,
+        shell_class = shell_class,
+        panel_class = panel_class,
+        composer_avatar = render_avatar_monogram(model),
+        dismiss = dismiss,
+        reply_banner = reply_banner,
+        quote_banner = quote_banner,
+        composer_text = encode_text(&model.composer.status),
+        visibility_options = render_visibility_options(&model.composer.visibility),
+        spoiler_text = encode_attribute(&model.composer.spoiler_text),
+        language = encode_attribute(&model.composer.language),
+        composer_count = model.composer.status.chars().count(),
+        max_characters = composer_limit(model),
     )
 }
 
@@ -1417,6 +1990,20 @@ fn render_reply_banner(model: &Model) -> String {
     )
 }
 
+fn render_quote_banner(model: &Model) -> String {
+    let Some(label) = model.composer.quoted_status_label.as_ref() else {
+        return String::new();
+    };
+
+    format!(
+        r#"<div class="reply-banner quote-banner">
+  <span>Quoting {label}</span>
+  <button id="composer-cancel-quote" class="ghost-button small">Cancel</button>
+</div>"#,
+        label = encode_text(label),
+    )
+}
+
 fn render_visibility_options(selected: &str) -> String {
     ["public", "unlisted", "private", "direct"]
         .into_iter()
@@ -1466,7 +2053,7 @@ fn render_thread_panel(model: &Model) -> String {
                     .thread
                     .ancestors
                     .iter()
-                    .map(|status| render_status_card(status, model, true))
+                    .map(|status| render_status_card(status, model, true, false))
                     .collect::<Vec<_>>()
                     .join("")
             )
@@ -1480,7 +2067,7 @@ fn render_thread_panel(model: &Model) -> String {
                     .thread
                     .descendants
                     .iter()
-                    .map(|status| render_status_card(status, model, true))
+                    .map(|status| render_status_card(status, model, true, false))
                     .collect::<Vec<_>>()
                     .join("")
             )
@@ -1493,11 +2080,23 @@ fn render_thread_panel(model: &Model) -> String {
 </div>
 {descendants}"#,
             ancestors = ancestors,
-            focus = render_status_card(focus, model, false),
+            focus = render_status_card(focus, model, false, true),
             descendants = descendants,
         )
     } else {
         r#"<div class="thread-empty">Conversation unavailable.</div>"#.to_string()
+    };
+
+    let thread_badge = if model.thread.focus.is_some() {
+        let total = model.thread.ancestors.len() + model.thread.descendants.len() + 1;
+        let position = model.thread.ancestors.len() + 1;
+        if total > 1 {
+            format!(r#"<span class="status-chip subtle">Thread {position}/{total}</span>"#)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
     };
 
     format!(
@@ -1506,11 +2105,13 @@ fn render_thread_panel(model: &Model) -> String {
     <div>
       <p class="micro-label">Conversation</p>
       <h3>Selected thread</h3>
+      {thread_badge}
     </div>
     <button id="thread-close" class="ghost-button small">Close</button>
   </div>
   {content}
 </section>"#,
+        thread_badge = thread_badge,
         content = content,
     )
 }
@@ -1529,13 +2130,20 @@ fn render_timeline(model: &Model) -> String {
     model
         .statuses
         .iter()
-        .map(|status| render_status_card(status, model, false))
+        .map(|status| render_status_card(status, model, false, false))
         .collect::<Vec<_>>()
         .join("")
 }
 
-fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
+fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: bool) -> String {
     let primary = display_status(status);
+    let mut card_classes = vec!["status-card"];
+    if compact {
+        card_classes.push("compact");
+    }
+    if model.selected_status_id.as_deref() == Some(primary.id.as_str()) {
+        card_classes.push("selected");
+    }
     let boost_banner = status.reblog.as_ref().map(|_| {
         format!(
             r#"<div class="boost-banner">Boosted by @{acct}</div>"#,
@@ -1589,16 +2197,21 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
     let open_url = permalink(primary);
     let action_target = encode_attribute(&primary.id);
     let select_target = encode_attribute(&primary.id);
+    let handle = compact_handle_markup(
+        &display_name_from_status(&primary.account),
+        &primary.account.acct,
+    );
+    let content_markup = render_status_content(primary, expanded);
 
     format!(
-        r#"<article class="status-card {compact}">
+        r#"<article class="{card_classes}" data-focus-status="{select_target}">
   {boost_banner}
   <div class="status-head">
     {avatar}
     <div class="status-meta">
       <div class="status-line">
         <strong>{display_name}</strong>
-        <span>@{acct}</span>
+        {handle}
         <span>{created_at}</span>
         {edited}
       </div>
@@ -1623,7 +2236,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
     <a class="action-link" href="{open_url}" target="_blank" rel="noreferrer">Open</a>
   </div>
 </article>"#,
-        compact = if compact { "compact" } else { "" },
+        card_classes = card_classes.join(" "),
         boost_banner = boost_banner.unwrap_or_default(),
         avatar = avatar_markup(
             "status-avatar",
@@ -1631,7 +2244,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
             &display_name_from_status(&primary.account)
         ),
         display_name = encode_text(&display_name_from_status(&primary.account)),
-        acct = encode_text(&primary.account.acct),
+        handle = handle,
         created_at = encode_text(&short_timestamp(&primary.created_at)),
         edited = edited,
         visibility = encode_text(&primary.visibility),
@@ -1643,11 +2256,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool) -> String {
         language_chip = language_chip,
         select_target = select_target,
         spoiler = spoiler,
-        content = if primary.content.trim().is_empty() {
-            "<p class=\"muted-copy\">No text content</p>".to_string()
-        } else {
-            primary.content.clone()
-        },
+        content = content_markup,
         media = media,
         action_target = action_target,
         reply_label = encode_attribute(&reply_label),
@@ -1719,6 +2328,13 @@ fn render_media_attachments(media: &[MediaAttachment]) -> String {
             if preview.trim().is_empty() {
                 return None;
             }
+            let kind = if attachment.media_type.trim().is_empty() {
+                "media".to_string()
+            } else if matches!(attachment.media_type.as_str(), "video" | "gifv") {
+                format!("{} · preview only", attachment.media_type)
+            } else {
+                attachment.media_type.clone()
+            };
             Some(format!(
                 r#"<figure class="media-tile">
   <img src="{preview}" alt="{alt}" />
@@ -1731,11 +2347,7 @@ fn render_media_attachments(media: &[MediaAttachment]) -> String {
                         .as_deref()
                         .unwrap_or("attached media preview"),
                 ),
-                kind = encode_text(if attachment.media_type.trim().is_empty() {
-                    "media"
-                } else {
-                    &attachment.media_type
-                }),
+                kind = encode_text(&kind),
             ))
         })
         .collect::<Vec<_>>()
@@ -1746,6 +2358,41 @@ fn render_media_attachments(media: &[MediaAttachment]) -> String {
     }
 
     format!(r#"<div class="media-grid">{items}</div>"#)
+}
+
+fn render_status_content(status: &Status, expanded: bool) -> String {
+    if !expanded && !status.filtered.is_empty() {
+        let labels = filtered_labels(&status.filtered);
+        let title = if labels.is_empty() {
+            "Filtered post".to_string()
+        } else {
+            format!("Filtered: {}", labels.join(", "))
+        };
+        return format!(
+            r#"<div class="filtered-post-warning">
+  <strong>{}</strong>
+  <p>Open thread to reveal this post.</p>
+</div>"#,
+            encode_text(&title),
+        );
+    }
+
+    if status.content.trim().is_empty() {
+        return "<p class=\"muted-copy\">No text content</p>".to_string();
+    }
+
+    if !expanded && should_collapse_hashtag_stuffing(status) {
+        let preview = summarize_text_for_collapsed_post(status);
+        return format!(
+            r#"<div class="collapsed-post">
+  <p>{}</p>
+  <small>Hashtag-heavy post collapsed. Open thread to expand.</small>
+</div>"#,
+            encode_text(&preview),
+        );
+    }
+
+    status.content.clone()
 }
 
 fn render_notification_filters(model: &Model) -> String {
@@ -1772,22 +2419,22 @@ fn render_notification_filters(model: &Model) -> String {
 }
 
 fn render_notifications(model: &Model) -> String {
-    if model.notifications.is_empty() {
+    let groups = group_notifications(&model.notifications);
+    if groups.is_empty() {
         return r#"<div class="notification-card empty"><p>No notifications for this filter.</p></div>"#
             .to_string();
     }
 
-    model
-        .notifications
+    groups
         .iter()
-        .map(|notification| {
-            let preview = notification
+        .map(|group| {
+            let preview = group
                 .status
                 .as_ref()
                 .map(|status| summarize_html(&display_status(status).content))
                 .filter(|summary| !summary.is_empty())
                 .unwrap_or_else(|| "Account-level event".to_string());
-            let thread_button = notification
+            let thread_button = group
                 .status
                 .as_ref()
                 .map(|status| {
@@ -1797,6 +2444,22 @@ fn render_notifications(model: &Model) -> String {
                     )
                 })
                 .unwrap_or_default();
+            let primary_account = group
+                .accounts
+                .first()
+                .cloned()
+                .unwrap_or_else(StatusAccount::default);
+            let actor_label = grouped_actor_label(&group.accounts);
+            let actor_handle = compact_handle_markup(
+                &display_name_from_status(&primary_account),
+                &primary_account.acct,
+            );
+            let count_badge = if group.count > 1 {
+                format!(r#"<span class="notification-count-badge">+{}</span>"#, group.count - 1)
+            } else {
+                String::new()
+            };
+            let dismiss_ids = encode_attribute(&group.ids.join("|"));
 
             format!(
                 r#"<div class="notification-card">
@@ -1808,8 +2471,9 @@ fn render_notifications(model: &Model) -> String {
     {avatar}
     <div>
       <strong>{display_name}</strong>
-      <span>@{acct}</span>
+      {handle}
     </div>
+    {count_badge}
   </div>
   <p>{preview}</p>
   <div class="notification-actions">
@@ -1817,18 +2481,19 @@ fn render_notifications(model: &Model) -> String {
     <button class="ghost-button small" data-dismiss-notification="{notification_id}">Dismiss</button>
   </div>
 </div>"#,
-                kind = encode_text(&notification.notification_type),
-                created_at = encode_text(&short_timestamp(&notification.created_at)),
+                kind = encode_text(notification_kind_label(&group.notification_type)),
+                created_at = encode_text(&short_timestamp(&group.created_at)),
                 avatar = avatar_markup(
                     "status-avatar small",
-                    &notification.account.avatar,
-                    &display_name_from_status(&notification.account)
+                    &primary_account.avatar,
+                    &display_name_from_status(&primary_account)
                 ),
-                display_name = encode_text(&display_name_from_status(&notification.account)),
-                acct = encode_text(&notification.account.acct),
+                display_name = encode_text(&actor_label),
+                handle = actor_handle,
+                count_badge = count_badge,
                 preview = encode_text(&preview),
                 thread_button = thread_button,
-                notification_id = encode_attribute(&notification.id),
+                notification_id = dismiss_ids,
             )
         })
         .collect::<Vec<_>>()
@@ -1923,6 +2588,52 @@ fn render_avatar_monogram(model: &Model) -> String {
         .unwrap_or_else(|| "R".to_string())
 }
 
+fn selection_order(model: &Model) -> Vec<String> {
+    if model.thread.status_id.is_some() {
+        let mut ids = model
+            .thread
+            .ancestors
+            .iter()
+            .map(|status| display_status(status).id.clone())
+            .collect::<Vec<_>>();
+        if let Some(focus) = model.thread.focus.as_ref() {
+            ids.push(display_status(focus).id.clone());
+        }
+        ids.extend(
+            model
+                .thread
+                .descendants
+                .iter()
+                .map(|status| display_status(status).id.clone()),
+        );
+        return ids;
+    }
+
+    model
+        .statuses
+        .iter()
+        .map(|status| display_status(status).id.clone())
+        .collect()
+}
+
+fn normalize_selected_status(model: &mut Model) {
+    let order = selection_order(model);
+    if order.is_empty() {
+        model.selected_status_id = None;
+        return;
+    }
+
+    if model
+        .selected_status_id
+        .as_deref()
+        .is_some_and(|status_id| order.iter().any(|candidate| candidate == status_id))
+    {
+        return;
+    }
+
+    model.selected_status_id = order.first().cloned();
+}
+
 fn feed_subtitle(model: &Model) -> String {
     if model.feed_loading {
         return "Refreshing feed and notifications…".to_string();
@@ -1938,6 +2649,14 @@ fn feed_subtitle(model: &Model) -> String {
         }
         FeedMode::Profile => {
             "Your account statuses from the account timeline endpoint.".to_string()
+        }
+        FeedMode::Hashtags => {
+            let hashtags = parse_hashtag_query(&model.hashtag_query);
+            if hashtags.is_empty() {
+                "Combine multiple hashtags into one merged timeline.".to_string()
+            } else {
+                format!("Merged hashtag timeline for #{}.", hashtags.join(", #"))
+            }
         }
     }
 }
@@ -2000,6 +2719,131 @@ fn display_name_from_status(account: &StatusAccount) -> String {
     }
 }
 
+fn composer_has_saved_state(composer: &ComposerDraft) -> bool {
+    !composer.status.trim().is_empty()
+        || !composer.spoiler_text.trim().is_empty()
+        || !composer.language.trim().is_empty()
+        || composer.visibility != "public"
+        || composer.in_reply_to_id.is_some()
+        || composer.quoted_status_id.is_some()
+}
+
+fn restore_composer_draft(window: &Window) -> Option<ComposerDraft> {
+    let storage = window.local_storage().ok().flatten()?;
+    let raw = storage
+        .get_item(COMPOSER_DRAFT_STORAGE_KEY)
+        .ok()
+        .flatten()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn parse_hashtag_query(raw_query: &str) -> Vec<String> {
+    raw_query
+        .split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('#').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .fold(Vec::<String>::new(), |mut values, hashtag| {
+            if !values.iter().any(|existing| existing == &hashtag) {
+                values.push(hashtag);
+            }
+            values
+        })
+}
+
+fn compact_handle_markup(display_name: &str, acct: &str) -> String {
+    let handle = short_acct(acct);
+    if normalized_identity_label(display_name) == normalized_identity_label(&handle) {
+        return String::new();
+    }
+    format!(r#"<span>@{}</span>"#, encode_text(&handle))
+}
+
+fn short_acct(acct: &str) -> String {
+    acct.split('@')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(acct)
+        .to_string()
+}
+
+fn normalized_identity_label(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .flat_map(|character| character.to_lowercase())
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn notification_group_key(notification: &Notification) -> String {
+    if !notification.group_key.trim().is_empty()
+        && !notification.group_key.starts_with("ungrouped-")
+    {
+        return notification.group_key.clone();
+    }
+    let status_key = notification
+        .status
+        .as_ref()
+        .map(|status| status.uri.as_str())
+        .unwrap_or(notification.account.acct.as_str());
+    format!("{}::{status_key}", notification.notification_type)
+}
+
+fn group_notifications(notifications: &[Notification]) -> Vec<NotificationGroup> {
+    let mut groups = Vec::<NotificationGroup>::new();
+    for notification in notifications {
+        let key = notification_group_key(notification);
+        if let Some(existing) = groups.iter_mut().find(|group| group.group_key == key) {
+            existing.ids.push(notification.id.clone());
+            existing.count += 1;
+            if !existing
+                .accounts
+                .iter()
+                .any(|account| account.acct == notification.account.acct)
+            {
+                existing.accounts.push(notification.account.clone());
+            }
+            continue;
+        }
+
+        groups.push(NotificationGroup {
+            group_key: key,
+            ids: vec![notification.id.clone()],
+            notification_type: notification.notification_type.clone(),
+            created_at: notification.created_at.clone(),
+            accounts: vec![notification.account.clone()],
+            status: notification.status.clone(),
+            count: 1,
+        });
+    }
+    groups
+}
+
+fn grouped_actor_label(accounts: &[StatusAccount]) -> String {
+    let Some(first) = accounts.first() else {
+        return "Unknown actor".to_string();
+    };
+    let first_label = display_name_from_status(first);
+    if accounts.len() == 1 {
+        return first_label;
+    }
+    format!("{first_label} +{}", accounts.len() - 1)
+}
+
+fn notification_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "mention" => "Mentions",
+        "favourite" => "Likes",
+        "reblog" => "Boosts",
+        "follow" => "Follows",
+        "status" => "Posts",
+        _ => "Activity",
+    }
+}
+
 fn short_timestamp(value: &str) -> String {
     let normalized = value
         .replace('T', " ")
@@ -2028,6 +2872,58 @@ fn summarize_html(value: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn summarize_text_for_collapsed_post(status: &Status) -> String {
+    let source = if status.text.trim().is_empty() {
+        summarize_html(&status.content)
+    } else {
+        status.text.trim().to_string()
+    };
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = normalized.chars().take(160).collect::<String>();
+    if normalized.chars().count() > 160 {
+        format!("{truncated}…")
+    } else {
+        normalized
+    }
+}
+
+fn should_collapse_hashtag_stuffing(status: &Status) -> bool {
+    let source = if status.text.trim().is_empty() {
+        summarize_html(&status.content)
+    } else {
+        status.text.trim().to_string()
+    };
+    let tokens = source.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 4 {
+        return false;
+    }
+    let hashtag_tokens = tokens
+        .iter()
+        .filter(|token| token.starts_with('#') && token.len() > 1)
+        .count();
+    hashtag_tokens >= 4 && hashtag_tokens * 10 >= tokens.len() * 6 && source.chars().count() > 80
+}
+
+fn filtered_labels(entries: &[serde_json::Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    entry
+                        .get("filter")
+                        .and_then(|value| value.get("title"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .collect()
 }
 
 fn permalink(status: &Status) -> String {

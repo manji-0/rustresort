@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::data::ListTimelineQuery;
+use crate::data::{ListTimelineQuery, TimelineCursorKey};
 
 impl Database {
     // =========================================================================
@@ -40,6 +40,33 @@ impl Database {
         Ok(cursor)
     }
 
+    fn push_status_window_clauses(
+        query_builder: &mut QueryBuilder<Sqlite>,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+        table_alias: &str,
+    ) {
+        if let Some(cursor) = max_cursor {
+            query_builder.push(format!(" AND ({table_alias}created_at < "));
+            query_builder.push_bind(cursor.created_at);
+            query_builder.push(format!(" OR ({table_alias}created_at = "));
+            query_builder.push_bind(cursor.created_at);
+            query_builder.push(format!(" AND {table_alias}id < "));
+            query_builder.push_bind(cursor.id.clone());
+            query_builder.push("))");
+        }
+
+        if let Some(cursor) = min_cursor {
+            query_builder.push(format!(" AND ({table_alias}created_at > "));
+            query_builder.push_bind(cursor.created_at);
+            query_builder.push(format!(" OR ({table_alias}created_at = "));
+            query_builder.push_bind(cursor.created_at);
+            query_builder.push(format!(" AND {table_alias}id > "));
+            query_builder.push_bind(cursor.id.clone());
+            query_builder.push("))");
+        }
+    }
+
     /// Get local statuses that quote the specified status URI.
     pub async fn get_local_statuses_by_quote_of_uri(
         &self,
@@ -69,6 +96,7 @@ impl Database {
             r#"
             SELECT * FROM statuses
             WHERE is_local = 0
+              AND persisted_reason NOT IN ('reposted', 'favourited', 'bookmarked')
             ORDER BY created_at DESC, id DESC
             LIMIT ?
             "#,
@@ -78,6 +106,76 @@ impl Database {
         .await?;
 
         Ok(statuses)
+    }
+
+    /// Get home timeline statuses from durable storage.
+    ///
+    /// Returns local statuses plus persisted remote statuses from followed accounts.
+    pub async fn get_home_statuses_in_window(
+        &self,
+        followee_addresses: &[String],
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError> {
+        let mut remote_candidates = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for address in followee_addresses {
+            let lowered = address.trim().to_ascii_lowercase();
+            if !lowered.is_empty() && seen.insert(lowered.clone()) {
+                remote_candidates.push(lowered);
+            }
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT s.* FROM statuses s WHERE (s.is_local = 1",
+        );
+        if !remote_candidates.is_empty() {
+            query_builder.push(
+                " OR (s.is_local = 0 AND s.account_address <> '' AND LOWER(s.account_address) IN (",
+            );
+            {
+                let mut separated = query_builder.separated(", ");
+                for candidate in remote_candidates {
+                    separated.push_bind(candidate);
+                }
+            }
+            query_builder.push("))");
+        }
+        query_builder.push(")");
+        Self::push_status_window_clauses(&mut query_builder, max_cursor, min_cursor, "s.");
+        query_builder.push(" ORDER BY s.created_at DESC, s.id DESC LIMIT ");
+        query_builder.push_bind(limit as i64);
+
+        query_builder
+            .build_query_as::<Status>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get public timeline statuses from durable storage.
+    ///
+    /// Remote statuses persisted only for local interactions must not become
+    /// timeline-visible after restart.
+    pub async fn get_public_statuses_in_window(
+        &self,
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError> {
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "SELECT s.* FROM statuses s WHERE s.visibility = 'public' AND (s.is_local = 1 OR s.persisted_reason NOT IN ('reposted', 'favourited', 'bookmarked'))",
+        );
+        Self::push_status_window_clauses(&mut query_builder, max_cursor, min_cursor, "s.");
+        query_builder.push(" ORDER BY s.created_at DESC, s.id DESC LIMIT ");
+        query_builder.push_bind(limit as i64);
+
+        query_builder
+            .build_query_as::<Status>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     /// Get statuses authored by a specific account in a pagination window.
@@ -1290,6 +1388,7 @@ impl Database {
         }
 
         query_builder.push(")");
+        query_builder.push(" AND s.visibility <> 'direct'");
 
         let max_cursor = match query.max_id.as_deref() {
             Some(id) => self.status_cursor_by_id(id).await?,

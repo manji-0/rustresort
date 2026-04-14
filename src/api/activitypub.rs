@@ -919,7 +919,10 @@ mod tests {
         let activity = json!({
             "id": "https://remote.example/follows/1",
             "type": "Follow",
-            "actor": "https://remote.example/users/alice",
+            "actor": {
+                "id": "https://remote.example/users/alice",
+                "inbox": "https://remote.example/users/alice/inbox"
+            },
             "object": "https://test.example.com/users/testuser"
         });
         let body = serde_json::to_vec(&activity).unwrap();

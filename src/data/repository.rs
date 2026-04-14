@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::error::AppError;
 
-use super::{Account, Database, Follow, MediaAttachment, Status};
+use super::{Account, Database, Follow, MediaAttachment, Status, TimelineCursorKey};
 
 #[derive(Debug, Clone)]
 pub struct AccountCredentialsPatch {
@@ -192,7 +192,21 @@ pub trait StatusRepository: Send + Sync {
 /// Data access used by `TimelineService`.
 #[async_trait]
 pub trait TimelineRepository: Send + Sync {
+    async fn get_status(&self, id: &str) -> Result<Option<Status>, AppError>;
     async fn get_all_follows(&self) -> Result<Vec<Follow>, AppError>;
+    async fn get_home_statuses_in_window(
+        &self,
+        followee_addresses: &[String],
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError>;
+    async fn get_public_statuses_in_window(
+        &self,
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError>;
     async fn get_statuses_by_account_address_in_window(
         &self,
         account_address: &str,
@@ -553,8 +567,38 @@ impl StatusRepository for Database {
 
 #[async_trait]
 impl TimelineRepository for Database {
+    async fn get_status(&self, id: &str) -> Result<Option<Status>, AppError> {
+        Database::get_status(self, id).await
+    }
+
     async fn get_all_follows(&self) -> Result<Vec<Follow>, AppError> {
         Database::get_all_follows(self).await
+    }
+
+    async fn get_home_statuses_in_window(
+        &self,
+        followee_addresses: &[String],
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_home_statuses_in_window(
+            self,
+            followee_addresses,
+            limit,
+            max_cursor,
+            min_cursor,
+        )
+        .await
+    }
+
+    async fn get_public_statuses_in_window(
+        &self,
+        limit: usize,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_public_statuses_in_window(self, limit, max_cursor, min_cursor).await
     }
 
     async fn get_statuses_by_account_address_in_window(

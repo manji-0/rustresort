@@ -335,6 +335,248 @@ async fn test_public_timeline_preserves_cached_quote_relationship() {
 }
 
 #[tokio::test]
+async fn test_public_timeline_since_id_filters_cached_remote_statuses_by_sort_order() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::CachedStatus;
+
+    let server = TestServer::new().await;
+    let now = Utc::now();
+
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: "100".to_string(),
+            uri: "https://remote.example/users/alice/statuses/cached-newest".to_string(),
+            content: "<p>Newest cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: now,
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: "300".to_string(),
+            uri: "https://remote.example/users/alice/statuses/cached-oldest".to_string(),
+            content: "<p>Oldest cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: now - Duration::seconds(30),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .query(&[("since_id", "300")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], "100");
+}
+
+#[tokio::test]
+async fn test_public_timeline_max_id_cache_cursor_excludes_newer_local_statuses() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{CachedStatus, EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let now = Utc::now();
+
+    let local_status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/local-newer-public"),
+        content: "<p>Newer local public post</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now,
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&local_status).await.unwrap();
+
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: "cached-older-public".to_string(),
+            uri: "https://remote.example/users/alice/statuses/cached-older-public".to_string(),
+            content: "<p>Older cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: now - Duration::seconds(30),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .query(&[("max_id", "cached-older-public")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(
+        entries.is_empty(),
+        "newer local rows must not be reintroduced when max_id points at a cache-only remote status"
+    );
+}
+
+#[tokio::test]
+async fn test_home_timeline_includes_persisted_remote_followee_status_after_cache_eviction() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/home-persisted".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/home-db-after-eviction";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/home-db-after-eviction",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>Persisted followee post</p>",
+            "published": "2026-01-04T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), 200);
+
+    server.state.timeline_cache.remove_by_uri(status_uri).await;
+
+    let timeline_response = server
+        .client
+        .get(server.url("/api/v1/timelines/home"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeline_response.status(), 200);
+    let body: Value = timeline_response.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .expect("timeline should be array")
+            .iter()
+            .any(|item| item["uri"] == status_uri),
+        "home timeline should still materialize persisted followee statuses after cache eviction"
+    );
+}
+
+#[tokio::test]
+async fn test_public_timeline_includes_persisted_remote_status_after_cache_eviction() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/public-persisted".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/public-db-after-eviction";
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/public-db-after-eviction",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>Persisted public followee post</p>",
+            "published": "2026-01-05T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), 200);
+
+    server.state.timeline_cache.remove_by_uri(status_uri).await;
+
+    let timeline_response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeline_response.status(), 200);
+    let body: Value = timeline_response.json().await.unwrap();
+    assert!(
+        body.as_array()
+            .expect("timeline should be array")
+            .iter()
+            .any(|item| item["uri"] == status_uri),
+        "public timeline should still materialize persisted remote statuses after cache eviction"
+    );
+}
+
+#[tokio::test]
 async fn test_tag_timeline_includes_persisted_remote_followee_status() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow};
@@ -767,6 +1009,65 @@ async fn test_list_timeline_includes_persisted_remote_followee_status() {
             .iter()
             .any(|item| item["uri"] == status_uri),
         "list timeline should materialize persisted remote statuses for listed accounts"
+    );
+}
+
+#[tokio::test]
+async fn test_list_timeline_excludes_direct_statuses_from_listed_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Direct exclusion list", "list")
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, std::slice::from_ref(&account.id))
+        .await
+        .unwrap();
+
+    let direct_status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/list-direct-hidden"),
+        content: "<p>Direct list hidden</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Direct,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&direct_status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert!(
+        json.as_array()
+            .expect("timeline should be array")
+            .iter()
+            .all(|item| item["id"] != direct_status.id),
+        "direct statuses must not leak into list timelines"
     );
 }
 

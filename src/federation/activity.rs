@@ -1102,6 +1102,11 @@ impl ActivityProcessor {
             self.profile_cache
                 .update_from_activity(actor_uri, activity)
                 .await;
+            if let Some(profile) = self.profile_cache.get_by_uri(actor_uri).await {
+                self.db
+                    .upsert_remote_profile(&crate::data::RemoteProfile::from(profile.as_ref()))
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -1208,6 +1213,7 @@ impl ActivityProcessor {
             inbox_uri
         } else if let Some(client) = &self.federation_fetch_client {
             match crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.db.as_ref(),
                 self.profile_cache.as_ref(),
                 client.as_ref(),
                 actor_uri,
@@ -1222,13 +1228,16 @@ impl ActivityProcessor {
                     tracing::warn!(
                         actor_uri,
                         %error,
-                        "failed to resolve canonical actor inbox; falling back to suffix-based inbox URI"
+                        "failed to resolve canonical actor inbox for Follow"
                     );
-                    format!("{}/inbox", actor_uri)
+                    return Err(error);
                 }
             }
         } else {
-            format!("{}/inbox", actor_uri)
+            return Err(AppError::Federation(
+                "Cannot process Follow without actor inbox metadata or federation fetch client"
+                    .to_string(),
+            ));
         };
 
         // Extract actor address from URI
@@ -1360,6 +1369,7 @@ impl ActivityProcessor {
 
         if let Some(client) = &self.federation_fetch_client {
             let _ = crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.db.as_ref(),
                 self.profile_cache.as_ref(),
                 client.as_ref(),
                 actor_uri,
@@ -1507,11 +1517,17 @@ impl ActivityProcessor {
                         actor_default_port,
                     )
                     .await?;
-                let removed_notifications = self
-                    .db
-                    .delete_notifications_by_activity_uri(follow_uri)
+                let removed_interactions = self
+                    .remove_remote_interaction_for_undo_activity_uri(follow_uri, &actor_address)
                     .await?;
-                if removed_follower || removed_notifications > 0 {
+                let removed_notifications = if removed_follower || removed_interactions {
+                    self.db
+                        .delete_notifications_by_activity_uri(follow_uri)
+                        .await?
+                } else {
+                    0
+                };
+                if removed_follower || removed_interactions || removed_notifications > 0 {
                     return Ok(());
                 }
 
@@ -1706,6 +1722,7 @@ impl ActivityProcessor {
             inbox_uri
         } else if let Some(client) = &self.federation_fetch_client {
             let (resolved_actor_uri, resolved_inbox_uri) = crate::api::mastodon::federation_delivery::resolve_remote_actor_and_inbox_with_dependencies(
+                self.db.as_ref(),
                 self.profile_cache.as_ref(),
                 client.as_ref(),
                 &target_uri,
@@ -1823,13 +1840,17 @@ impl ActivityProcessor {
                 .is_some_and(|quote_uri| self.is_local_status(quote_uri));
 
             if mentions_local || quotes_local {
-                self.upsert_remote_status_from_object(
-                    object,
-                    actor_uri,
-                    PersistedReason::Mentioned,
-                    false,
-                )
-                .await?;
+                if let Some(status) = self
+                    .upsert_remote_status_from_object(
+                        object,
+                        actor_uri,
+                        PersistedReason::Mentioned,
+                        false,
+                    )
+                    .await?
+                {
+                    self.publish_remote_status_update(&status, false).await;
+                }
 
                 let status_uri = object
                     .get("id")
@@ -2052,16 +2073,6 @@ impl ActivityProcessor {
         object: &serde_json::Value,
         actor_address: &str,
     ) -> Result<(), AppError> {
-        if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
-            let removed = self
-                .db
-                .delete_notifications_by_activity_uri(activity_uri)
-                .await?;
-            if removed > 0 {
-                return Ok(());
-            }
-        }
-
         let Some(obj_type) = object.get("type").and_then(|t| t.as_str()) else {
             return Ok(());
         };
@@ -2080,6 +2091,30 @@ impl ActivityProcessor {
                     .and_then(|value| value.get("id"))
                     .and_then(|id| id.as_str())
             });
+
+        if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
+            let owned_by_actor = match obj_type {
+                "Like" => self
+                    .db
+                    .get_remote_favourite_actor_and_status_by_activity_uri(activity_uri)
+                    .await?
+                    .is_none_or(|(stored_actor, _)| {
+                        stored_actor.eq_ignore_ascii_case(actor_address)
+                    }),
+                "Announce" => self
+                    .db
+                    .get_remote_repost_actor_and_status_by_activity_uri(activity_uri)
+                    .await?
+                    .is_none_or(|(stored_actor, _)| {
+                        stored_actor.eq_ignore_ascii_case(actor_address)
+                    }),
+                _ => true,
+            };
+            if !owned_by_actor {
+                return Ok(());
+            }
+        }
+
         self.db
             .delete_notifications_by_identity(notification_type, actor_address, status_uri)
             .await?;
@@ -2090,9 +2125,9 @@ impl ActivityProcessor {
         &self,
         object: &serde_json::Value,
         actor_address: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let Some(obj_type) = object.get("type").and_then(|t| t.as_str()) else {
-            return Ok(());
+            return Ok(false);
         };
 
         let status_uri = object
@@ -2105,25 +2140,37 @@ impl ActivityProcessor {
                     .and_then(|id| id.as_str())
             });
         let Some(status_uri) = status_uri else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(status) = self.db.get_status_by_uri(status_uri).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if !status.is_local {
-            return Ok(());
+            return Ok(false);
         }
 
         let removed = match obj_type {
             "Like" => {
                 if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
-                    self.db
-                        .delete_remote_favourite_by_activity_uri(activity_uri)
+                    if let Some((stored_actor, stored_status_id)) = self
+                        .db
+                        .get_remote_favourite_actor_and_status_by_activity_uri(activity_uri)
                         .await?
-                        || self
-                            .db
+                    {
+                        if stored_actor.eq_ignore_ascii_case(actor_address)
+                            && stored_status_id == status.id
+                        {
+                            self.db
+                                .delete_remote_favourite_by_activity_uri(activity_uri)
+                                .await?
+                        } else {
+                            false
+                        }
+                    } else {
+                        self.db
                             .delete_remote_favourite_by_actor_and_status(actor_address, &status.id)
                             .await?
+                    }
                 } else {
                     self.db
                         .delete_remote_favourite_by_actor_and_status(actor_address, &status.id)
@@ -2132,13 +2179,25 @@ impl ActivityProcessor {
             }
             "Announce" => {
                 if let Some(activity_uri) = object.get("id").and_then(|id| id.as_str()) {
-                    self.db
-                        .delete_remote_repost_by_activity_uri(activity_uri)
+                    if let Some((stored_actor, stored_status_id)) = self
+                        .db
+                        .get_remote_repost_actor_and_status_by_activity_uri(activity_uri)
                         .await?
-                        || self
-                            .db
+                    {
+                        if stored_actor.eq_ignore_ascii_case(actor_address)
+                            && stored_status_id == status.id
+                        {
+                            self.db
+                                .delete_remote_repost_by_activity_uri(activity_uri)
+                                .await?
+                        } else {
+                            false
+                        }
+                    } else {
+                        self.db
                             .delete_remote_repost_by_actor_and_status(actor_address, &status.id)
                             .await?
+                    }
                 } else {
                     self.db
                         .delete_remote_repost_by_actor_and_status(actor_address, &status.id)
@@ -2151,7 +2210,59 @@ impl ActivityProcessor {
         if removed {
             self.publish_local_status_update(&status).await;
         }
-        Ok(())
+        Ok(removed)
+    }
+
+    async fn remove_remote_interaction_for_undo_activity_uri(
+        &self,
+        activity_uri: &str,
+        actor_address: &str,
+    ) -> Result<bool, AppError> {
+        let mut removed_any = false;
+
+        if let Some((stored_actor, status_id)) = self
+            .db
+            .get_remote_favourite_actor_and_status_by_activity_uri(activity_uri)
+            .await?
+            && stored_actor.eq_ignore_ascii_case(actor_address)
+            && self
+                .db
+                .delete_remote_favourite_by_activity_uri(activity_uri)
+                .await?
+        {
+            removed_any = true;
+            if let Some(status) = self
+                .db
+                .get_status(&status_id)
+                .await?
+                .filter(|status| status.is_local)
+            {
+                self.publish_local_status_update(&status).await;
+            }
+        }
+
+        if let Some((stored_actor, status_id)) = self
+            .db
+            .get_remote_repost_actor_and_status_by_activity_uri(activity_uri)
+            .await?
+            && stored_actor.eq_ignore_ascii_case(actor_address)
+            && self
+                .db
+                .delete_remote_repost_by_activity_uri(activity_uri)
+                .await?
+        {
+            removed_any = true;
+            if let Some(status) = self
+                .db
+                .get_status(&status_id)
+                .await?
+                .filter(|status| status.is_local)
+            {
+                self.publish_local_status_update(&status).await;
+            }
+        }
+
+        Ok(removed_any)
     }
 
     fn local_account_id(&self) -> &str {
@@ -2267,12 +2378,14 @@ impl ActivityProcessor {
             StatusVisibility::Unlisted | StatusVisibility::Private => {}
         }
 
-        for list_id in self
-            .db
-            .get_list_ids_for_account(account_address, self.local_default_port())
-            .await?
-        {
-            targets.insert(StreamTarget::List { list_id });
+        if !matches!(visibility, StatusVisibility::Direct) {
+            for list_id in self
+                .db
+                .get_list_ids_for_account(account_address, self.local_default_port())
+                .await?
+            {
+                targets.insert(StreamTarget::List { list_id });
+            }
         }
 
         Ok(targets.into_iter().collect())
@@ -2989,7 +3102,10 @@ mod tests {
         let activity = json!({
             "type": "Follow",
             "id": "https://remote.example/follows/1",
-            "actor": actor_uri,
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
             "object": {
                 "id": "https://example.com/users/alice"
             }
@@ -3015,7 +3131,10 @@ mod tests {
         let activity = json!({
             "type": "Follow",
             "id": format!("{actor_uri}/follows/1"),
-            "actor": actor_uri,
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
             "object": "https://example.com/users/alice"
         });
 
@@ -3050,7 +3169,10 @@ mod tests {
         let activity = json!({
             "type": "Follow",
             "id": format!("{actor_uri}/follows/1"),
-            "actor": actor_uri,
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
             "object": "https://example.com/users/alice"
         });
 
@@ -3089,7 +3211,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_update_applies_profile_cache_updates() {
-        let (processor, _db, _timeline_cache, profile_cache, _temp_dir) =
+        let (processor, db, _timeline_cache, profile_cache, _temp_dir) =
             create_test_processor_with_timeline_and_profile("alice@example.com", "https").await;
         let actor_uri = "https://remote.example/users/bob";
         profile_cache
@@ -3140,6 +3262,18 @@ mod tests {
         assert_eq!(updated.inbox_uri, "https://remote.example/inbox-new");
         assert_eq!(updated.followers_count, Some(10));
         assert_eq!(updated.following_count, Some(20));
+
+        let persisted = db.list_remote_profiles().await.unwrap();
+        let bob = persisted
+            .iter()
+            .find(|profile| profile.address == "bob@remote.example")
+            .expect("persisted profile should exist");
+        assert_eq!(bob.display_name.as_deref(), Some("Bob Updated"));
+        assert_eq!(bob.note.as_deref(), Some("after"));
+        assert_eq!(bob.public_key_pem, "new-key");
+        assert_eq!(bob.inbox_uri, "https://remote.example/inbox-new");
+        assert_eq!(bob.followers_count, Some(10));
+        assert_eq!(bob.following_count, Some(20));
     }
 
     #[tokio::test]
@@ -4058,13 +4192,19 @@ mod tests {
         let first = json!({
             "id": "https://remote.example/follows/1",
             "type": "Follow",
-            "actor": actor_uri,
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
             "object": "https://example.com/users/alice"
         });
         let second = json!({
             "id": "https://remote.example/follows/1",
             "type": "Follow",
-            "actor": actor_uri,
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
             "object": "https://example.com/users/alice"
         });
 

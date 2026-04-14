@@ -129,6 +129,25 @@ pub struct PushSubscription {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A persisted cache entry for a remote actor profile.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RemoteProfile {
+    pub address: String,
+    pub uri: String,
+    pub display_name: Option<String>,
+    pub note: Option<String>,
+    pub avatar_url: Option<String>,
+    pub header_url: Option<String>,
+    pub public_key_pem: String,
+    pub inbox_uri: String,
+    pub outbox_uri: Option<String>,
+    pub followers_count: Option<i64>,
+    pub following_count: Option<i64>,
+    pub fetched_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Notification categories enabled for Web Push.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

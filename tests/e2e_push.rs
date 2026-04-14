@@ -263,7 +263,10 @@ async fn test_push_delivery_for_remote_follow_notification() {
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": "https://remote.example/activities/push-follow-1",
         "type": "Follow",
-        "actor": "https://remote.example/users/alice",
+        "actor": {
+            "id": "https://remote.example/users/alice",
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
         "object": server.public_url("/users/testuser")
     });
 
@@ -322,7 +325,10 @@ async fn test_push_delivery_skips_disabled_alerts() {
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": "https://remote.example/activities/push-follow-disabled",
         "type": "Follow",
-        "actor": "https://remote.example/users/alice",
+        "actor": {
+            "id": "https://remote.example/users/alice",
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
         "object": server.public_url("/users/testuser")
     });
 

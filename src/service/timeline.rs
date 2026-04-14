@@ -6,7 +6,7 @@ use std::{collections::HashSet, future::Future, sync::Arc};
 
 use crate::data::{
     CachedStatus, Follow, ListTimelineQuery, PersistedReason, ProfileCache, Status,
-    StatusVisibility, TimelineCache, TimelineRepository,
+    StatusVisibility, TimelineCache, TimelineCursorKey, TimelineRepository,
 };
 use crate::error::AppError;
 
@@ -58,19 +58,32 @@ impl TimelineService {
             return Ok(Vec::new());
         }
 
+        let max_cursor = self.resolve_cursor_key(max_id).await?;
+        let min_cursor = self.resolve_cursor_key(min_id).await?;
         let fetch_limit = Self::overfetch_limit(limit);
-        let local_statuses = self
-            .db
-            .get_local_statuses_in_window(fetch_limit, max_id, min_id)
-            .await?;
         let follows = self.db.get_all_follows().await?;
+        let db_followee_addresses = Self::followee_db_addresses(&follows);
+        let db_statuses = self
+            .db
+            .get_home_statuses_in_window(
+                &db_followee_addresses,
+                fetch_limit,
+                max_cursor.as_ref(),
+                min_cursor.as_ref(),
+            )
+            .await?;
         let followee_identities = Self::followee_cache_identities(&follows);
         let cached_statuses = self
             .timeline_cache
-            .get_home_timeline(&followee_identities, fetch_limit, max_id)
+            .get_home_timeline(
+                &followee_identities,
+                fetch_limit,
+                max_cursor.as_ref(),
+                min_cursor.as_ref(),
+            )
             .await;
         let statuses = self
-            .merge_statuses(local_statuses, cached_statuses, limit, min_id)
+            .merge_statuses(db_statuses, cached_statuses, limit, min_cursor.as_ref())
             .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
@@ -94,20 +107,31 @@ impl TimelineService {
             return Ok(Vec::new());
         }
 
+        let max_cursor = self.resolve_cursor_key(max_id).await?;
+        let min_cursor = self.resolve_cursor_key(min_id).await?;
         let fetch_limit = Self::overfetch_limit(limit);
-        let local_statuses = self
-            .db
-            .get_local_public_statuses(fetch_limit, max_id, min_id)
-            .await?;
+        let db_statuses = if local_only {
+            self.db
+                .get_local_public_statuses(fetch_limit, max_id, min_id)
+                .await?
+        } else {
+            self.db
+                .get_public_statuses_in_window(
+                    fetch_limit,
+                    max_cursor.as_ref(),
+                    min_cursor.as_ref(),
+                )
+                .await?
+        };
         let cached_statuses = if local_only {
             Vec::new()
         } else {
             self.timeline_cache
-                .get_public_timeline(fetch_limit, max_id)
+                .get_public_timeline(fetch_limit, max_cursor.as_ref(), min_cursor.as_ref())
                 .await
         };
         let statuses = self
-            .merge_statuses(local_statuses, cached_statuses, limit, None)
+            .merge_statuses(db_statuses, cached_statuses, limit, min_cursor.as_ref())
             .await?;
         self.build_timeline_items_with_interactions(statuses).await
     }
@@ -407,6 +431,36 @@ impl TimelineService {
             .collect())
     }
 
+    async fn resolve_cursor_key(
+        &self,
+        cursor_id: Option<&str>,
+    ) -> Result<Option<TimelineCursorKey>, AppError> {
+        let Some(cursor_id) = cursor_id else {
+            return Ok(None);
+        };
+
+        if let Some(status) = self.db.get_status(cursor_id).await? {
+            return Ok(Some(TimelineCursorKey {
+                created_at: status.created_at,
+                id: status.id,
+            }));
+        }
+
+        if let Some(status) = self.timeline_cache.get(cursor_id).await {
+            return Ok(Some(TimelineCursorKey {
+                created_at: status.created_at,
+                id: status.id.clone(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn is_after_cursor(status: &Status, cursor: &TimelineCursorKey) -> bool {
+        status.created_at > cursor.created_at
+            || (status.created_at == cursor.created_at && status.id > cursor.id)
+    }
+
     fn cached_status_to_status(cached: &CachedStatus) -> Status {
         Status {
             id: cached.id.clone(),
@@ -493,12 +547,27 @@ impl TimelineService {
         identities
     }
 
+    fn followee_db_addresses(follows: &[Follow]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut addresses = Vec::new();
+
+        for follow in follows {
+            let lowered = follow.target_address.trim().to_ascii_lowercase();
+            if lowered.is_empty() || !seen.insert(lowered.clone()) {
+                continue;
+            }
+            addresses.push(lowered);
+        }
+
+        addresses
+    }
+
     async fn merge_statuses(
         &self,
         db_statuses: Vec<Status>,
         cached_statuses: Vec<Arc<CachedStatus>>,
         limit: usize,
-        min_id: Option<&str>,
+        min_cursor: Option<&TimelineCursorKey>,
     ) -> Result<Vec<Status>, AppError> {
         let mut merged = Vec::with_capacity(db_statuses.len() + cached_statuses.len());
         let mut seen_uris = HashSet::new();
@@ -512,7 +581,10 @@ impl TimelineService {
 
         for cached in cached_statuses {
             let status = Self::cached_status_to_status(&cached);
-            if min_id.is_some_and(|cursor| status.id.as_str() <= cursor) {
+            if min_cursor
+                .as_ref()
+                .is_some_and(|cursor| !Self::is_after_cursor(&status, cursor))
+            {
                 continue;
             }
             if seen_uris.contains(&status.uri) || seen_ids.contains(&status.id) {

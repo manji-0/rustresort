@@ -81,13 +81,86 @@ async function main() {
   try {
     await login(page);
 
+    const recoveredDraftText = `Recovered draft ${Date.now()}`;
+    await page.fill("#composer-input", recoveredDraftText);
+    await page.reload({ waitUntil: "networkidle" });
+    await page.waitForSelector("text=Timeline");
+    const restoredDraft = await page.inputValue("#composer-input");
+    if (restoredDraft !== recoveredDraftText) {
+      throw new Error("expected unsent composer draft to survive a reload");
+    }
+    await page.fill("#composer-input", "");
+
     const uniqueText = `Playwright UI post ${Date.now()}`;
+    const uniqueTextSecond = `${uniqueText} follow-up`;
     await page.fill("#composer-input", uniqueText);
     await page.click("#composer-submit");
     await page.waitForSelector(`text=${uniqueText}`);
+    await page.fill("#composer-input", uniqueTextSecond);
+    await page.click("#composer-submit");
+    await page.waitForSelector(`text=${uniqueTextSecond}`);
+    if (await page.locator(".thread-panel").count()) {
+      await page.click("#thread-close");
+      await page.waitForFunction(() => !document.querySelector(".thread-panel"));
+    }
 
-    await page.locator(".status-card", { hasText: uniqueText }).first().waitFor();
-    const localStatusUri = await getLocalStatusUri(page, uniqueText);
+    await page.locator(".status-card").first().click();
+    await page.keyboard.press("g");
+    await page.waitForSelector(".status-card.selected");
+    const initiallySelectedStatus = await page
+      .locator(".status-card.selected")
+      .first()
+      .getAttribute("data-focus-status");
+    if (!initiallySelectedStatus) {
+      throw new Error("expected a selected timeline status after pressing g");
+    }
+
+    await page.keyboard.press("k");
+    await page.waitForFunction(
+      (previousId) =>
+        document.querySelector(".status-card.selected")?.getAttribute("data-focus-status") !==
+        previousId,
+      initiallySelectedStatus
+    );
+    const movedSelectionStatus = await page
+      .locator(".status-card.selected")
+      .first()
+      .getAttribute("data-focus-status");
+    if (!movedSelectionStatus || movedSelectionStatus === initiallySelectedStatus) {
+      throw new Error("expected k to move the selected post");
+    }
+
+    await page.keyboard.press("j");
+    await page.waitForFunction(
+      (expectedId) =>
+        document.querySelector(".status-card.selected")?.getAttribute("data-focus-status") ===
+        expectedId,
+      initiallySelectedStatus
+    );
+
+    await page.keyboard.press("l");
+    await page.waitForSelector(".thread-panel");
+    await page.keyboard.press("h");
+    await page.waitForFunction(() => !document.querySelector(".thread-panel"));
+
+    await page.keyboard.press("n");
+    await page.waitForSelector(".composer-panel-popout");
+    await page.click("#composer-toggle-popout");
+    await page.waitForFunction(() => !document.querySelector(".composer-panel-popout"));
+
+    await page.fill("#composer-input", "");
+    await page.locator(".status-card.selected").first().click();
+    await page.keyboard.press("Shift+N");
+    await page.waitForSelector(".composer-panel-popout");
+    const mentionDraft = await page.inputValue("#composer-input");
+    if (!mentionDraft.trim().startsWith("@")) {
+      throw new Error("expected Shift+N to open a mention composer for the selected post");
+    }
+    await page.click("#composer-toggle-popout");
+    await page.waitForFunction(() => !document.querySelector(".composer-panel-popout"));
+
+    await page.locator(".status-card", { hasText: uniqueTextSecond }).first().waitFor();
+    const localStatusUri = await getLocalStatusUri(page, uniqueTextSecond);
 
     await runActivityFixture("mention");
     await runActivityFixture("like", ["--object-uri", localStatusUri]);
@@ -128,9 +201,10 @@ async function main() {
       const cards = Array.from(document.querySelectorAll(".notification-card"));
       return cards.some((card) => !card.classList.contains("empty"));
     });
-    await page.waitForSelector("text=favourite");
-    await page.waitForSelector("text=reblog");
-    await page.waitForSelector(`text=${uniqueText}`);
+    await page.waitForSelector("text=Likes");
+    await page.waitForSelector("text=Boosts");
+    await page.waitForSelector("text=Mentions");
+    await page.waitForSelector(`text=${uniqueTextSecond}`);
 
     console.log("web-ui-playwright: ok");
   } catch (error) {

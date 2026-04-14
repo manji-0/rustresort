@@ -823,7 +823,10 @@ impl StatusService {
             }
         }
 
-        if status.is_local && status.account_address.trim().is_empty() {
+        if !matches!(status.visibility, StatusVisibility::Direct)
+            && status.is_local
+            && status.account_address.trim().is_empty()
+        {
             let mut local_keys = self.local_account_address_candidates.clone();
             if let Some(account) = self.db.get_account().await? {
                 local_keys.push(account.id);
@@ -837,7 +840,7 @@ impl StatusService {
                     targets.insert(StreamTarget::List { list_id });
                 }
             }
-        } else {
+        } else if !matches!(status.visibility, StatusVisibility::Direct) {
             let account_address = status.account_address.trim();
             if !account_address.is_empty() {
                 for list_id in self

@@ -223,6 +223,7 @@ async fn publish_scheduled_status(
     }
     let explicit_recipients =
         crate::api::mastodon::federation_delivery::resolve_remote_recipients_with_dependencies(
+            state.db.as_ref(),
             state.profile_cache.as_ref(),
             state.federation_fetch_client.as_ref(),
             explicit_addresses,

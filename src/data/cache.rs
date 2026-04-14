@@ -36,6 +36,12 @@ pub struct CachedStatus {
     pub quote_of_uri: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TimelineCursorKey {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+}
+
 /// Cached media attachment
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedAttachment {
@@ -589,7 +595,8 @@ impl TimelineCache {
         &self,
         followee_addresses: &HashSet<String>,
         limit: usize,
-        max_id: Option<&str>,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
     ) -> Vec<Arc<CachedStatus>> {
         if followee_addresses.is_empty() || limit == 0 {
             return Vec::new();
@@ -605,8 +612,13 @@ impl TimelineCache {
             .map(|entry| &entry.status)
             .filter(|status| followee_addresses.contains(&status.account_address))
             .filter(|status| {
-                max_id
-                    .map(|cursor| status.id.as_str() < cursor)
+                max_cursor
+                    .map(|cursor| is_before_cursor(status, cursor))
+                    .unwrap_or(true)
+            })
+            .filter(|status| {
+                min_cursor
+                    .map(|cursor| is_after_cursor(status, cursor))
                     .unwrap_or(true)
             })
             .cloned()
@@ -627,7 +639,8 @@ impl TimelineCache {
     pub async fn get_public_timeline(
         &self,
         limit: usize,
-        max_id: Option<&str>,
+        max_cursor: Option<&TimelineCursorKey>,
+        min_cursor: Option<&TimelineCursorKey>,
     ) -> Vec<Arc<CachedStatus>> {
         if limit == 0 {
             return Vec::new();
@@ -643,8 +656,13 @@ impl TimelineCache {
             .map(|entry| &entry.status)
             .filter(|status| status.visibility == "public")
             .filter(|status| {
-                max_id
-                    .map(|cursor| status.id.as_str() < cursor)
+                max_cursor
+                    .map(|cursor| is_before_cursor(status, cursor))
+                    .unwrap_or(true)
+            })
+            .filter(|status| {
+                min_cursor
+                    .map(|cursor| is_after_cursor(status, cursor))
                     .unwrap_or(true)
             })
             .cloned()
@@ -687,6 +705,54 @@ pub struct CachedProfile {
     pub following_count: Option<u64>,
     /// When this profile was last fetched
     pub fetched_at: DateTime<Utc>,
+}
+
+impl From<super::RemoteProfile> for CachedProfile {
+    fn from(value: super::RemoteProfile) -> Self {
+        Self {
+            address: value.address,
+            uri: value.uri,
+            display_name: value.display_name,
+            note: value.note,
+            avatar_url: value.avatar_url,
+            header_url: value.header_url,
+            public_key_pem: value.public_key_pem,
+            inbox_uri: value.inbox_uri,
+            outbox_uri: value.outbox_uri,
+            followers_count: value
+                .followers_count
+                .and_then(|count| u64::try_from(count).ok()),
+            following_count: value
+                .following_count
+                .and_then(|count| u64::try_from(count).ok()),
+            fetched_at: value.fetched_at,
+        }
+    }
+}
+
+impl From<&CachedProfile> for super::RemoteProfile {
+    fn from(value: &CachedProfile) -> Self {
+        Self {
+            address: value.address.clone(),
+            uri: value.uri.clone(),
+            display_name: value.display_name.clone(),
+            note: value.note.clone(),
+            avatar_url: value.avatar_url.clone(),
+            header_url: value.header_url.clone(),
+            public_key_pem: value.public_key_pem.clone(),
+            inbox_uri: value.inbox_uri.clone(),
+            outbox_uri: value.outbox_uri.clone(),
+            followers_count: value
+                .followers_count
+                .and_then(|count| i64::try_from(count).ok()),
+            following_count: value
+                .following_count
+                .and_then(|count| i64::try_from(count).ok()),
+            fetched_at: value.fetched_at,
+            created_at: value.fetched_at,
+            updated_at: value.fetched_at,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -819,7 +885,7 @@ impl ProfileCache {
         // Fetch profiles in parallel (max 10 concurrent)
         use futures::stream::{self, StreamExt};
 
-        let unique_addresses: Vec<String> = addresses
+        let mut unique_addresses: Vec<String> = addresses
             .iter()
             .map(|address| address.trim())
             .filter(|address| !address.is_empty())
@@ -827,6 +893,17 @@ impl ProfileCache {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+
+        let cutoff = Utc::now().timestamp_millis() - self.ttl_ms;
+        {
+            let state = self.state.read().await;
+            unique_addresses.retain(|address| {
+                !state
+                    .profiles_by_address
+                    .get(address)
+                    .is_some_and(|profile| profile.fetched_at.timestamp_millis() >= cutoff)
+            });
+        }
 
         stream::iter(unique_addresses)
             .map(|address| async move {
@@ -1400,4 +1477,13 @@ mod tests {
         assert_eq!(updated_alias.display_name.as_deref(), Some("After"));
         assert_eq!(updated_alias.inbox_uri, "https://remote.example/inbox-new");
     }
+}
+fn is_before_cursor(status: &CachedStatus, cursor: &TimelineCursorKey) -> bool {
+    status.created_at < cursor.created_at
+        || (status.created_at == cursor.created_at && status.id < cursor.id)
+}
+
+fn is_after_cursor(status: &CachedStatus, cursor: &TimelineCursorKey) -> bool {
+    status.created_at > cursor.created_at
+        || (status.created_at == cursor.created_at && status.id > cursor.id)
 }

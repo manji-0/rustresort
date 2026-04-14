@@ -141,6 +141,10 @@ code {
   gap: 10px;
 }
 
+.sidebar-field {
+  padding: 4px 2px 0;
+}
+
 .sidebar-link,
 .primary-button,
 .ghost-button,
@@ -371,6 +375,39 @@ code {
   border: 1px solid rgba(29, 155, 240, 0.22);
 }
 
+.quote-banner {
+  background: rgba(255, 185, 0, 0.1);
+  border-color: rgba(255, 185, 0, 0.24);
+}
+
+.composer-head,
+.timeline-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.composer-popout-shell {
+  display: contents;
+}
+
+.composer-panel-popout {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  width: min(760px, calc(100vw - 32px));
+  transform: translate(-50%, -50%);
+  z-index: 30;
+}
+
+.composer-panel-popout::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 6, 10, 0.74);
+  z-index: -1;
+}
+
 .composer-panel textarea,
 .field input,
 .field select {
@@ -451,6 +488,29 @@ code {
   gap: 10px;
 }
 
+.status-actions {
+  opacity: 0;
+  max-height: 0;
+  overflow: hidden;
+  pointer-events: none;
+  margin-top: -8px;
+  transition:
+    opacity 140ms ease,
+    max-height 180ms ease,
+    margin-top 140ms ease;
+}
+
+.status-card:hover .status-actions,
+.status-card:focus-within .status-actions,
+.status-card.selected .status-actions,
+.status-card.compact .status-actions,
+.thread-focus .status-actions {
+  opacity: 1;
+  max-height: 120px;
+  pointer-events: auto;
+  margin-top: 0;
+}
+
 .filter-pill.active,
 .action-pill.active {
   background: var(--accent-soft);
@@ -518,6 +578,21 @@ code {
   padding: 18px;
   display: grid;
   gap: 14px;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+
+.status-card.selected {
+  border-color: rgba(29, 155, 240, 0.42);
+  background:
+    linear-gradient(180deg, rgba(29, 155, 240, 0.08), rgba(29, 155, 240, 0.03)),
+    var(--panel);
+  box-shadow:
+    0 0 0 1px rgba(29, 155, 240, 0.18),
+    var(--shadow);
 }
 
 .status-card.compact {
@@ -598,6 +673,31 @@ code {
   background: rgba(255, 255, 255, 0.03);
 }
 
+.filtered-post-warning,
+.collapsed-post {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.filtered-post-warning {
+  border-color: rgba(244, 33, 46, 0.22);
+  background: rgba(244, 33, 46, 0.08);
+}
+
+.collapsed-post {
+  color: var(--muted);
+}
+
+.filtered-post-warning p,
+.collapsed-post p,
+.collapsed-post small {
+  margin: 0;
+}
+
 .status-content {
   line-height: 1.55;
   word-break: break-word;
@@ -669,6 +769,16 @@ code {
   display: flex;
   justify-content: space-between;
   gap: 12px;
+}
+
+.notification-count-badge {
+  margin-left: auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
 }
 
 .admin-grid {

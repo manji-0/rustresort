@@ -180,6 +180,7 @@ async fn validate_actor_and_inbox_urls(actor_uri: &str, inbox_uri: &str) -> Resu
 }
 
 pub async fn resolve_remote_actor_and_inbox_with_dependencies(
+    db: &crate::data::Database,
     profile_cache: &crate::data::ProfileCache,
     federation_fetch_client: &reqwest::Client,
     address: &str,
@@ -204,11 +205,15 @@ pub async fn resolve_remote_actor_and_inbox_with_dependencies(
         &discovered.inbox_uri,
         &discovered.actor_document,
     ) {
+        db.upsert_remote_profile(&crate::data::RemoteProfile::from(&profile))
+            .await?;
         profile_cache.insert(profile.clone()).await;
 
         if profile.address != discovered.actor_uri {
             let mut actor_uri_alias = profile;
             actor_uri_alias.address = discovered.actor_uri.clone();
+            db.upsert_remote_profile(&crate::data::RemoteProfile::from(&actor_uri_alias))
+                .await?;
             profile_cache.insert(actor_uri_alias).await;
         }
     } else {
@@ -320,6 +325,7 @@ pub fn extract_remote_mentions_from_content(content: &str, local_domain: &str) -
 }
 
 pub async fn resolve_remote_recipients_with_dependencies(
+    db: &crate::data::Database,
     profile_cache: &crate::data::ProfileCache,
     federation_fetch_client: &reqwest::Client,
     addresses: impl IntoIterator<Item = String>,
@@ -335,6 +341,7 @@ pub async fn resolve_remote_recipients_with_dependencies(
         }
 
         match resolve_remote_actor_and_inbox_with_dependencies(
+            db,
             profile_cache,
             federation_fetch_client,
             &normalized,
