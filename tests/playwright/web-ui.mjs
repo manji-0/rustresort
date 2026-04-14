@@ -37,6 +37,30 @@ async function runActivityFixture(fixture, extraArgs = []) {
   );
 }
 
+async function getLocalStatusUri(page, expectedText) {
+  return page.evaluate(async (text) => {
+    const credentialsResponse = await fetch("/api/v1/accounts/verify_credentials", {
+      credentials: "same-origin"
+    });
+    if (!credentialsResponse.ok) {
+      throw new Error(`verify_credentials failed: ${credentialsResponse.status}`);
+    }
+    const account = await credentialsResponse.json();
+    const statusesResponse = await fetch(`/api/v1/accounts/${account.id}/statuses?limit=10`, {
+      credentials: "same-origin"
+    });
+    if (!statusesResponse.ok) {
+      throw new Error(`account statuses failed: ${statusesResponse.status}`);
+    }
+    const statuses = await statusesResponse.json();
+    const match = statuses.find((status) => status.content?.includes(text));
+    if (!match?.uri) {
+      throw new Error("could not resolve local status uri for activity fixture");
+    }
+    return match.uri;
+  }, expectedText);
+}
+
 async function login(page) {
   await page.goto(`${baseUrl}/login?next=${encodeURIComponent("/ui")}`, {
     waitUntil: "networkidle"
@@ -63,8 +87,11 @@ async function main() {
     await page.waitForSelector(`text=${uniqueText}`);
 
     await page.locator(".status-card", { hasText: uniqueText }).first().waitFor();
+    const localStatusUri = await getLocalStatusUri(page, uniqueText);
 
     await runActivityFixture("mention");
+    await runActivityFixture("like", ["--object-uri", localStatusUri]);
+    await runActivityFixture("announce", ["--object-uri", localStatusUri]);
 
     await page.click("#refresh-feed");
     await page.waitForSelector(".notification-card");
@@ -80,8 +107,30 @@ async function main() {
     if (!Array.isArray(mentionNotifications) || mentionNotifications.length === 0) {
       throw new Error("expected at least one mention notification after signed remote activity");
     }
-    await page.waitForSelector(".notification-card");
-    await page.waitForSelector("text=Hello @admin@localhost:3011 from Playwright");
+    const activityNotifications = await page.evaluate(async () => {
+      const response = await fetch(
+        "/api/v1/notifications?types[]=favourite&types[]=reblog&types[]=follow&types[]=status",
+        {
+          credentials: "same-origin"
+        }
+      );
+      if (!response.ok) {
+        throw new Error(`activity notifications fetch failed: ${response.status}`);
+      }
+      return response.json();
+    });
+    const activityTypes = new Set(activityNotifications.map((value) => value.type));
+    if (!activityTypes.has("favourite") || !activityTypes.has("reblog")) {
+      throw new Error("expected favourite and reblog notifications after signed remote activity");
+    }
+    await page.click("#refresh-feed");
+    await page.waitForFunction(() => {
+      const cards = Array.from(document.querySelectorAll(".notification-card"));
+      return cards.some((card) => !card.classList.contains("empty"));
+    });
+    await page.waitForSelector("text=favourite");
+    await page.waitForSelector("text=reblog");
+    await page.waitForSelector(`text=${uniqueText}`);
 
     console.log("web-ui-playwright: ok");
   } catch (error) {

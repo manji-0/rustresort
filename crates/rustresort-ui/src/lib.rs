@@ -794,14 +794,15 @@ impl App {
     }
 
     async fn load_thread(self: Rc<Self>, status_id: String) {
+        let initial_focus = self
+            .find_status(&status_id)
+            .or_else(|| self.find_notification_status(&status_id));
         {
             let mut model = self.model.borrow_mut();
             model.thread.status_id = Some(status_id.clone());
             model.thread.loading = true;
             if model.thread.focus.is_none() {
-                model.thread.focus = self
-                    .find_status(&status_id)
-                    .or_else(|| self.find_notification_status(&status_id));
+                model.thread.focus = initial_focus;
             }
         }
         self.render();
