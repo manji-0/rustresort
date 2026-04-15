@@ -176,6 +176,8 @@ pub struct AppsApiState {
 pub struct AdminApiState {
     pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
 }
 
 /// Minimal state required for Mastodon account endpoints.
@@ -349,7 +351,12 @@ impl_from_ref_state!(AppsApiState {
     web_push_sender,
 });
 impl_from_ref_state!(InstanceApiState { config, db });
-impl_from_ref_state!(AdminApiState { config, db });
+impl_from_ref_state!(AdminApiState {
+    config,
+    db,
+    profile_cache,
+    federation_fetch_client,
+});
 impl_from_ref_state!(AccountApiState {
     config,
     db,

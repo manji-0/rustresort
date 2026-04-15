@@ -6,8 +6,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::accounts::{
+    build_remote_account_placeholder_response, resolve_account_response_for_identity,
+};
 use crate::AdminApiState;
 use crate::auth::CurrentUser;
+use crate::data::{NotificationType, Status};
 use crate::error::AppError;
 
 #[derive(Debug, Deserialize)]
@@ -166,12 +170,123 @@ pub struct AdminReport {
     pub statuses: Vec<serde_json::Value>,
 }
 
+async fn get_report_status(state: &AdminApiState, status_uri: &str) -> Option<Status> {
+    state.db.get_status_by_uri(status_uri).await.ok().flatten()
+}
+
+async fn build_report_status_response(
+    state: &AdminApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    status: &Status,
+) -> Result<serde_json::Value, AppError> {
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        std::slice::from_ref(status),
+    )
+    .await?
+    .get(status.account_address.trim())
+    .cloned();
+
+    let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        state.db.as_ref(),
+        status,
+        account,
+        &state.config,
+        account_stats,
+        remote_account_stats,
+        crate::api::StatusInteractions::default(),
+    )
+    .await?;
+
+    serde_json::to_value(response)
+        .map_err(|error| AppError::serialization("admin report status response", error))
+}
+
 /// GET /api/v1/admin/reports
 pub async fn list_reports(
-    State(_state): State<AdminApiState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<AdminReport>>, AppError> {
-    Ok(Json(vec![]))
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let local_account_response =
+        crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
+    let local_account_value = serde_json::to_value(&local_account_response)
+        .map_err(|error| AppError::serialization("admin local account response", error))?;
+
+    let mut reports = Vec::new();
+    let mut cursor: Option<String> = None;
+    const FETCH_LIMIT: usize = 200;
+
+    loop {
+        let notifications = state
+            .db
+            .get_notifications(FETCH_LIMIT, cursor.as_deref(), false)
+            .await?;
+        if notifications.is_empty() {
+            break;
+        }
+
+        let reached_end = notifications.len() < FETCH_LIMIT;
+        cursor = notifications
+            .last()
+            .map(|notification| notification.id.clone());
+
+        for notification in notifications
+            .into_iter()
+            .filter(|notification| notification.notification_type == NotificationType::AdminReport)
+        {
+            let report_account = resolve_account_response_for_identity(
+                state.config.as_ref(),
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                Some(state.federation_fetch_client.as_ref()),
+                &notification.origin_account_address,
+            )
+            .await
+            .or_else(|| {
+                build_remote_account_placeholder_response(
+                    &notification.origin_account_address,
+                    &state.config,
+                    0,
+                )
+            })
+            .unwrap_or_else(|| local_account_response.clone());
+            let account_value = serde_json::to_value(&report_account)
+                .map_err(|error| AppError::serialization("admin report account response", error))?;
+
+            let mut statuses = Vec::new();
+            if let Some(status_uri) = notification.status_uri.as_deref()
+                && let Some(status) = get_report_status(&state, status_uri).await
+            {
+                statuses.push(
+                    build_report_status_response(&state, &account, account_stats, &status).await?,
+                );
+            }
+
+            reports.push(AdminReport {
+                id: notification.id,
+                action_taken: false,
+                comment: String::new(),
+                created_at: notification.created_at.to_rfc3339(),
+                updated_at: notification.created_at.to_rfc3339(),
+                account: account_value,
+                target_account: local_account_value.clone(),
+                assigned_account: None,
+                action_taken_by_account: None,
+                statuses,
+            });
+        }
+
+        if reached_end {
+            break;
+        }
+    }
+
+    Ok(Json(reports))
 }
 
 #[derive(Debug, Serialize)]

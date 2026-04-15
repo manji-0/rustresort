@@ -373,7 +373,7 @@ async fn resolve_interaction_account_response(
     local_account_stats: crate::api::AccountStats,
     identity: &str,
 ) -> Option<serde_json::Value> {
-    super::accounts::resolve_account_response_for_identity(
+    if let Some(response) = super::accounts::resolve_account_response_for_identity(
         state.config.as_ref(),
         state.db.as_ref(),
         state.profile_cache.as_ref(),
@@ -381,24 +381,23 @@ async fn resolve_interaction_account_response(
         identity,
     )
     .await
-    .or_else(|| {
-        super::accounts::build_remote_account_placeholder_response(identity, &state.config, 0)
-    })
-    .or_else(|| {
-        (identity.eq_ignore_ascii_case(&local_account.id)
-            || identity.eq_ignore_ascii_case(&local_actor_uri(state, &local_account.username))
-            || identity.eq_ignore_ascii_case(&local_account.username)
-            || identity.eq_ignore_ascii_case(&format!(
-                "{}@{}",
-                local_account.username, state.config.server.domain
-            )))
-        .then(|| {
-            crate::api::account_to_response_with_stats(
-                local_account,
-                &state.config,
-                local_account_stats,
-            )
-        })
+    {
+        return serde_json::to_value(response).ok();
+    }
+
+    (identity.eq_ignore_ascii_case(&local_account.id)
+        || identity.eq_ignore_ascii_case(&local_actor_uri(state, &local_account.username))
+        || identity.eq_ignore_ascii_case(&local_account.username)
+        || identity.eq_ignore_ascii_case(&format!(
+            "{}@{}",
+            local_account.username, state.config.server.domain
+        )))
+    .then(|| {
+        crate::api::account_to_response_with_stats(
+            local_account,
+            &state.config,
+            local_account_stats,
+        )
     })
     .and_then(|response| serde_json::to_value(response).ok())
 }

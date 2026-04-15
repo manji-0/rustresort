@@ -2607,6 +2607,67 @@ async fn test_notifications_return_origin_account() {
 }
 
 #[tokio::test]
+async fn test_admin_reports_return_reporting_account_and_status() {
+    use chrono::Utc;
+    use rustresort::data::{
+        EntityId, Notification, NotificationType, PersistedReason, Status, StatusVisibility,
+    };
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/admin-report-target"),
+        content: "<p>Flagged local status</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: EntityId::new_string(),
+            notification_type: NotificationType::AdminReport,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: Some(status.uri.clone()),
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/admin/reports"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let reports = body.as_array().expect("reports should be array");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["account"]["id"], "alice@remote.example");
+    assert_eq!(reports[0]["target_account"]["username"], "testuser");
+    assert_eq!(reports[0]["statuses"][0]["uri"], status.uri);
+}
+
+#[tokio::test]
 async fn test_notifications_embed_status_with_current_interactions() {
     use chrono::Utc;
     use rustresort::data::{

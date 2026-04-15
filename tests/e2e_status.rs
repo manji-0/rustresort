@@ -972,6 +972,81 @@ async fn test_favourited_by_includes_remote_accounts() {
 }
 
 #[tokio::test]
+async fn test_favourited_by_remote_placeholder_uses_observed_status_count() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let target_status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/remote-favourite-placeholder"),
+        content: "<p>Remote favourite placeholder target</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&target_status).await.unwrap();
+
+    let remote_status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/placeholder-source".to_string(),
+        content: "<p>Observed remote status</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Mentioned,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    server.state.db.insert_status(&remote_status).await.unwrap();
+
+    server
+        .state
+        .db
+        .upsert_remote_favourite(
+            &target_status.id,
+            "alice@remote.example",
+            Some("https://remote.example/activities/like-placeholder"),
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/statuses/{}/favourited_by",
+            target_status.id
+        )))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let accounts = body
+        .as_array()
+        .expect("favourited_by response should be an array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alice@remote.example");
+    assert_eq!(accounts[0]["statuses_count"], 1);
+}
+
+#[tokio::test]
 async fn test_boost_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
