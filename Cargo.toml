@@ -79,7 +79,8 @@ urlencoding = "2"
 time = "0.3"
 html-escape = "0.2"
 ammonia = "4"
-image = { version = "0.25", default-features = false, features = ["webp"] }
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "gif"] }
+multer = "3"
 web-push = "0.10"
 rustresort-models = { path = "crates/rustresort-models" }
 rustresort-storage = { path = "crates/rustresort-storage" }

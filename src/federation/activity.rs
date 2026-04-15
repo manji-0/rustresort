@@ -3289,8 +3289,8 @@ mod tests {
     };
     use crate::data::{
         Account, CachedProfile, CachedStatus, Database, EntityId, Follow, Follower,
-        NotificationType,
-        PersistedReason, ProfileCache, PushAlerts, PushPayload, PushSubscription, TimelineCache,
+        NotificationType, PersistedReason, ProfileCache, PushAlerts, PushPayload, PushSubscription,
+        TimelineCache,
     };
     use crate::error::AppError;
     use crate::service::WebPushSender;
@@ -3836,6 +3836,10 @@ mod tests {
                 display_name: Some("Bob".to_string()),
                 note: Some("before".to_string()),
                 profile_fields_json: None,
+                locked: false,
+                bot: false,
+                discoverable: true,
+                indexable: true,
                 avatar_url: None,
                 header_url: None,
                 public_key_pem: "old-key".to_string(),

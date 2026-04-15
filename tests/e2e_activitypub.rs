@@ -1524,6 +1524,10 @@ async fn test_activitypub_status_object_for_local_poll_includes_question_and_men
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: common::test_public_key_pem().to_string(),
@@ -2065,6 +2069,10 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
             display_name: Some("Alice".to_string()),
             note: Some("before".to_string()),
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "old-key".to_string(),
@@ -2096,6 +2104,10 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
                 "name": "Website",
                 "value": "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>"
             }],
+            "manuallyApprovesFollowers": true,
+            "bot": true,
+            "discoverable": false,
+            "indexable": false,
             "inbox": "https://remote.example/inbox-new",
             "outbox": "https://remote.example/outbox-new",
             "followersCount": 10,
@@ -2133,6 +2145,10 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
         updated.header_url.as_deref(),
         Some("https://cdn.remote.example/alice-header.png")
     );
+    assert!(updated.locked);
+    assert!(updated.bot);
+    assert!(!updated.discoverable);
+    assert!(!updated.indexable);
     assert_eq!(updated.inbox_uri, "https://remote.example/inbox-new");
     assert_eq!(
         updated.outbox_uri.as_deref(),

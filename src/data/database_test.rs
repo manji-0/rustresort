@@ -79,6 +79,10 @@ async fn test_remote_profiles_persist_across_reopen() {
         display_name: Some("Bob".to_string()),
         note: Some("cached".to_string()),
         profile_fields_json: None,
+        locked: true,
+        bot: true,
+        discoverable: false,
+        indexable: false,
         avatar_url: Some("https://remote.example/avatar.png".to_string()),
         header_url: None,
         public_key_pem: "test-key".to_string(),
@@ -108,6 +112,10 @@ async fn test_remote_profiles_persist_across_reopen() {
         profile.avatar_url.as_deref(),
         Some("https://remote.example/avatar.png")
     );
+    assert!(profile.locked);
+    assert!(profile.bot);
+    assert!(!profile.discoverable);
+    assert!(!profile.indexable);
     assert_eq!(profile.inbox_uri, "https://remote.example/inbox");
     assert_eq!(profile.followers_count, Some(12));
     assert_eq!(profile.following_count, Some(34));

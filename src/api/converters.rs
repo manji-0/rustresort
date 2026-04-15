@@ -15,11 +15,21 @@ pub struct AccountStats {
 }
 
 /// Remote account counters used for status response placeholders.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RemoteAccountStats {
     pub followers_count: i32,
     pub following_count: i32,
     pub statuses_count: i32,
+    pub uri: Option<String>,
+    pub display_name: Option<String>,
+    pub note: Option<String>,
+    pub profile_fields_json: Option<String>,
+    pub avatar_url: Option<String>,
+    pub header_url: Option<String>,
+    pub locked: bool,
+    pub bot: bool,
+    pub discoverable: bool,
+    pub indexable: bool,
 }
 
 fn saturating_i32(value: i64) -> i32 {
@@ -420,6 +430,16 @@ pub async fn load_remote_account_stats_map(
                 profile.followers_count.map(saturating_u64_i32).unwrap_or(0);
             remote_stats.following_count =
                 profile.following_count.map(saturating_u64_i32).unwrap_or(0);
+            remote_stats.uri = Some(profile.uri.clone());
+            remote_stats.display_name = profile.display_name.clone();
+            remote_stats.note = profile.note.clone();
+            remote_stats.profile_fields_json = profile.profile_fields_json.clone();
+            remote_stats.avatar_url = profile.avatar_url.clone();
+            remote_stats.header_url = profile.header_url.clone();
+            remote_stats.locked = profile.locked;
+            remote_stats.bot = profile.bot;
+            remote_stats.discoverable = profile.discoverable;
+            remote_stats.indexable = profile.indexable;
         }
 
         account_stats_map.insert(account_address.to_string(), remote_stats);
@@ -497,7 +517,7 @@ pub fn account_to_response_with_stats(
 fn remote_account_to_response(
     status: &Status,
     config: &AppConfig,
-    remote_stats: Option<RemoteAccountStats>,
+    remote_stats: Option<&RemoteAccountStats>,
 ) -> AccountResponse {
     let placeholder_created_at = chrono::DateTime::from_timestamp(0, 0)
         .expect("unix epoch timestamp should always be valid");
@@ -510,34 +530,52 @@ fn remote_account_to_response(
     let normalized_domain = domain.to_ascii_lowercase();
     let acct = format!("{}@{}", normalized_username, normalized_domain);
 
+    let stats = remote_stats.cloned().unwrap_or_default();
+
     AccountResponse {
         id: acct.clone(),
         username: normalized_username.clone(),
         acct,
-        uri: format!(
-            "https://{}/users/{}",
-            normalized_domain, normalized_username
-        ),
-        display_name: normalized_username.clone(),
-        locked: false,
-        bot: false,
-        discoverable: true,
+        uri: stats.uri.unwrap_or_else(|| {
+            format!(
+                "https://{}/users/{}",
+                normalized_domain, normalized_username
+            )
+        }),
+        display_name: stats
+            .display_name
+            .unwrap_or_else(|| normalized_username.clone()),
+        locked: stats.locked,
+        bot: stats.bot,
+        discoverable: stats.discoverable,
         group: false,
-        indexable: true,
+        indexable: stats.indexable,
         // Remote account creation timestamp is unavailable; use a deterministic placeholder.
         created_at: placeholder_created_at,
-        note: String::new(),
+        note: stats.note.unwrap_or_default(),
         url: format!("https://{}/@{}", normalized_domain, normalized_username),
-        avatar: format!("{}/default-avatar.png", media_url),
-        avatar_static: format!("{}/default-avatar.png", media_url),
-        header: format!("{}/default-header.png", media_url),
-        header_static: format!("{}/default-header.png", media_url),
-        followers_count: remote_stats.map(|stats| stats.followers_count).unwrap_or(0),
-        following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
-        statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
+        avatar: stats
+            .avatar_url
+            .clone()
+            .unwrap_or_else(|| format!("{}/default-avatar.png", media_url)),
+        avatar_static: stats
+            .avatar_url
+            .unwrap_or_else(|| format!("{}/default-avatar.png", media_url)),
+        header: stats
+            .header_url
+            .clone()
+            .unwrap_or_else(|| format!("{}/default-header.png", media_url)),
+        header_static: stats
+            .header_url
+            .unwrap_or_else(|| format!("{}/default-header.png", media_url)),
+        followers_count: stats.followers_count,
+        following_count: stats.following_count,
+        statuses_count: stats.statuses_count,
         last_status_at: None,
         emojis: vec![],
-        fields: vec![],
+        fields: crate::profile_fields::profile_fields_for_response(
+            stats.profile_fields_json.as_deref(),
+        ),
         roles: vec![],
         moved: None,
         source: None,
@@ -750,6 +788,7 @@ fn boost_stub_status(
     let placeholder_created_at = chrono::DateTime::from_timestamp(0, 0)
         .expect("unix epoch timestamp should always be valid");
     let media_url = &config.storage.media.public_url;
+    let remote_stats = remote_account_stats.as_ref();
     let boost_account = if local_status_id_from_uri(boost_of_uri, config).is_some() {
         account_to_response_with_stats(account, config, account_stats)
     } else if let Ok(parsed) = url::Url::parse(boost_of_uri) {
@@ -814,15 +853,9 @@ fn boost_stub_status(
             avatar_static: format!("{}/default-avatar.png", media_url),
             header: format!("{}/default-header.png", media_url),
             header_static: format!("{}/default-header.png", media_url),
-            followers_count: remote_account_stats
-                .map(|stats| stats.followers_count)
-                .unwrap_or(0),
-            following_count: remote_account_stats
-                .map(|stats| stats.following_count)
-                .unwrap_or(0),
-            statuses_count: remote_account_stats
-                .map(|stats| stats.statuses_count)
-                .unwrap_or(0),
+            followers_count: remote_stats.map(|stats| stats.followers_count).unwrap_or(0),
+            following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
+            statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
@@ -849,15 +882,9 @@ fn boost_stub_status(
             avatar_static: format!("{}/default-avatar.png", media_url),
             header: format!("{}/default-header.png", media_url),
             header_static: format!("{}/default-header.png", media_url),
-            followers_count: remote_account_stats
-                .map(|stats| stats.followers_count)
-                .unwrap_or(0),
-            following_count: remote_account_stats
-                .map(|stats| stats.following_count)
-                .unwrap_or(0),
-            statuses_count: remote_account_stats
-                .map(|stats| stats.statuses_count)
-                .unwrap_or(0),
+            followers_count: remote_stats.map(|stats| stats.followers_count).unwrap_or(0),
+            following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
+            statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
             last_status_at: None,
             emojis: vec![],
             fields: vec![],
@@ -1026,7 +1053,7 @@ pub fn status_to_response_with_media(
     let account_response = if status.is_local || status.account_address.trim().is_empty() {
         account_to_response_with_stats(account, config, account_stats)
     } else {
-        remote_account_to_response(status, config, remote_account_stats)
+        remote_account_to_response(status, config, remote_account_stats.as_ref())
     };
     let text = status_content_to_source_text(&status.content);
     let tags = build_status_tags(&status.content, &base_url);
@@ -1318,6 +1345,97 @@ mod tests {
         assert!(!response.muted);
         assert!(!response.bookmarked);
         assert!(!response.pinned);
+    }
+
+    #[test]
+    fn test_status_to_response_remote_account_uses_cached_profile_metadata() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".into(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "remote-2".to_string(),
+            uri: "https://remote.example/users/alice/statuses/124".to_string(),
+            content: "<p>Remote</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "alice@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Timeline,
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        let remote_stats = RemoteAccountStats {
+            followers_count: 7,
+            following_count: 8,
+            statuses_count: 9,
+            uri: Some("https://remote.example/users/alice".to_string()),
+            display_name: Some("Alice Remote".to_string()),
+            note: Some("cached note".to_string()),
+            profile_fields_json: Some(
+                serde_json::to_string(&vec![serde_json::json!({
+                    "name": "Website",
+                    "value": "https://alice.example",
+                    "verified_at": serde_json::Value::Null,
+                })])
+                .unwrap(),
+            ),
+            avatar_url: Some("https://cdn.remote.example/alice.png".to_string()),
+            header_url: Some("https://cdn.remote.example/alice-header.png".to_string()),
+            locked: true,
+            bot: true,
+            discoverable: false,
+            indexable: false,
+        };
+
+        let response = status_to_response_with_account_stats_and_remote_stats(
+            &status,
+            &account,
+            &config,
+            AccountStats::default(),
+            Some(remote_stats),
+            StatusInteractions::default(),
+        );
+
+        assert_eq!(response.account.display_name, "Alice Remote");
+        assert_eq!(response.account.note, "cached note");
+        assert_eq!(response.account.uri, "https://remote.example/users/alice");
+        assert_eq!(
+            response.account.avatar,
+            "https://cdn.remote.example/alice.png"
+        );
+        assert_eq!(
+            response.account.header,
+            "https://cdn.remote.example/alice-header.png"
+        );
+        assert!(response.account.locked);
+        assert!(response.account.bot);
+        assert!(!response.account.discoverable);
+        assert!(!response.account.indexable);
+        assert_eq!(response.account.fields[0]["name"], "Website");
+        assert_eq!(response.account.followers_count, 7);
+        assert_eq!(response.account.following_count, 8);
+        assert_eq!(response.account.statuses_count, 9);
     }
 
     #[test]

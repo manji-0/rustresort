@@ -79,7 +79,7 @@ pub async fn home_timeline(
     for item in &timeline_items {
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
-            .copied();
+            .cloned();
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -172,7 +172,7 @@ pub async fn public_timeline(
     for item in &timeline_items {
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
-            .copied();
+            .cloned();
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -236,7 +236,7 @@ pub async fn tag_timeline(
     for item in &timeline_items {
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
-            .copied();
+            .cloned();
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -354,7 +354,7 @@ pub async fn list_timeline(
     for item in &timeline_items {
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
-            .copied();
+            .cloned();
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,

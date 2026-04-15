@@ -218,7 +218,7 @@ pub async fn search_v2(
                     for status in filtered_statuses {
                         let remote_stats = remote_account_stats
                             .get(status.account_address.trim())
-                            .copied();
+                            .cloned();
                         let status_response =
                             crate::api::build_status_response_with_account_stats_and_remote_stats(
                                 state.db.as_ref(),
@@ -226,7 +226,7 @@ pub async fn search_v2(
                                 &account,
                                 &state.config,
                                 account_stats,
-                                remote_stats,
+                                remote_stats.clone(),
                                 crate::api::StatusInteractions::new(
                                     Some(false),
                                     Some(false),

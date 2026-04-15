@@ -1514,6 +1514,10 @@ async fn test_create_reply_status_delivers_to_remote_reply_target_inbox_without_
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1622,6 +1626,10 @@ async fn test_create_quote_status_delivers_to_remote_quote_target_inbox_without_
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"

@@ -80,7 +80,7 @@ async fn build_conversation_response(
                 )
                 .await
                 .ok()
-                .and_then(|stats| stats.get(status.account_address.trim()).copied())
+                .and_then(|stats| stats.get(status.account_address.trim()).cloned())
             };
             Some(
                 serde_json::to_value(

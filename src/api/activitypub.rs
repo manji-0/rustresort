@@ -447,8 +447,9 @@ pub(crate) fn build_local_actor_document(
     account: &Account,
 ) -> serde_json::Value {
     let actor_url = format!("{}/users/{}", base_url, account.username);
-    let attachments =
-        crate::profile_fields::activitypub_profile_attachments(account.profile_fields_json.as_deref());
+    let attachments = crate::profile_fields::activitypub_profile_attachments(
+        account.profile_fields_json.as_deref(),
+    );
     let mut actor = serde_json::json!({
         "@context": activitypub_actor_context(),
         "type": "Person",

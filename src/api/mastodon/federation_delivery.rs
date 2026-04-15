@@ -530,6 +530,22 @@ fn build_cached_profile(
         )
         .ok()
         .flatten(),
+        locked: actor_document
+            .get("manuallyApprovesFollowers")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        bot: actor_document
+            .get("bot")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        discoverable: actor_document
+            .get("discoverable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        indexable: actor_document
+            .get("indexable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
         avatar_url: actor_document.get("icon").and_then(extract_url),
         header_url: actor_document.get("image").and_then(extract_url),
         public_key_pem,

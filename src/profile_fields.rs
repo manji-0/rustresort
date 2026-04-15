@@ -38,7 +38,9 @@ pub(crate) fn normalize_profile_fields_request(
                 .into_iter()
                 .map(|(_, value)| serde_json::from_value::<ProfileFieldInput>(value))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| AppError::Validation(format!("invalid fields_attributes: {error}")))?
+                .map_err(|error| {
+                    AppError::Validation(format!("invalid fields_attributes: {error}"))
+                })?
         }
         _ => {
             return Err(AppError::Validation(
@@ -96,7 +98,9 @@ pub(crate) fn parse_profile_fields_json(raw: Option<&str>) -> Vec<ProfileField> 
         .unwrap_or_default()
 }
 
-pub(crate) fn serialize_profile_fields(fields: &[ProfileField]) -> Result<Option<String>, AppError> {
+pub(crate) fn serialize_profile_fields(
+    fields: &[ProfileField],
+) -> Result<Option<String>, AppError> {
     if fields.is_empty() {
         return Ok(None);
     }
@@ -144,7 +148,9 @@ pub(crate) fn activitypub_profile_attachments(raw: Option<&str>) -> Vec<serde_js
         .collect()
 }
 
-pub(crate) fn extract_profile_fields_from_actor(actor_document: &serde_json::Value) -> Vec<ProfileField> {
+pub(crate) fn extract_profile_fields_from_actor(
+    actor_document: &serde_json::Value,
+) -> Vec<ProfileField> {
     actor_document
         .get("attachment")
         .and_then(serde_json::Value::as_array)

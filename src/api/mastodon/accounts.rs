@@ -1,13 +1,15 @@
 //! Account endpoints
 
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    body::to_bytes,
+    extract::{Path, Query, RawQuery, Request, State},
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::Json,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::{collections::HashSet, convert::Infallible};
 
 use super::federation_delivery::{
     resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_delivery,
@@ -65,6 +67,26 @@ pub struct UpdateCredentialsRequest {
     pub _hide_collections: Option<bool>,
 }
 
+#[derive(Debug)]
+enum ProfileImageInput {
+    Encoded(String),
+    Binary(Vec<u8>),
+}
+
+#[derive(Debug, Default)]
+struct ParsedUpdateCredentialsRequest {
+    display_name: Option<String>,
+    note: Option<String>,
+    avatar: Option<ProfileImageInput>,
+    header: Option<ProfileImageInput>,
+    fields_attributes: Option<serde_json::Value>,
+    moved_to_account_id: Option<String>,
+    locked: Option<bool>,
+    bot: Option<bool>,
+    discoverable: Option<bool>,
+    indexable: Option<bool>,
+}
+
 /// Search query parameters
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -77,6 +99,191 @@ pub struct SearchParams {
 #[derive(Debug, Deserialize)]
 pub struct LookupParams {
     pub acct: String,
+}
+
+const MAX_UPDATE_CREDENTIALS_BODY_BYTES: usize = 12 * 1024 * 1024;
+const MAX_PROFILE_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+const MAX_PROFILE_IMAGE_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+fn parse_update_credentials_bool(field: &str, value: &str) -> Result<bool, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(AppError::Validation(format!(
+            "{field} must be a boolean value"
+        ))),
+    }
+}
+
+fn parse_fields_attribute_key(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix("fields_attributes[")?;
+    let (index, attribute) = rest.split_once("][")?;
+    let attribute = attribute.strip_suffix(']')?;
+    if index.is_empty() || attribute.is_empty() {
+        return None;
+    }
+    Some((index.to_string(), attribute.to_string()))
+}
+
+fn merge_fields_attribute(
+    fields_attributes: &mut Option<serde_json::Value>,
+    key: &str,
+    value: String,
+) -> Result<(), AppError> {
+    let Some((index, attribute)) = parse_fields_attribute_key(key) else {
+        return Ok(());
+    };
+
+    let root = fields_attributes.get_or_insert_with(|| serde_json::json!({}));
+    let Some(root_map) = root.as_object_mut() else {
+        return Err(AppError::Validation(
+            "fields_attributes must be an object, array, or null".to_string(),
+        ));
+    };
+    let entry = root_map
+        .entry(index)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(entry_map) = entry.as_object_mut() else {
+        return Err(AppError::Validation(
+            "fields_attributes entries must be objects".to_string(),
+        ));
+    };
+    entry_map.insert(attribute, serde_json::Value::String(value));
+    Ok(())
+}
+
+fn apply_update_credentials_pair(
+    request: &mut ParsedUpdateCredentialsRequest,
+    key: &str,
+    value: String,
+) -> Result<(), AppError> {
+    match key {
+        "display_name" => request.display_name = Some(value),
+        "note" => request.note = Some(value),
+        "avatar" => request.avatar = Some(ProfileImageInput::Encoded(value)),
+        "header" => request.header = Some(ProfileImageInput::Encoded(value)),
+        "moved_to_account_id" => request.moved_to_account_id = Some(value),
+        "locked" => request.locked = Some(parse_update_credentials_bool("locked", &value)?),
+        "bot" => request.bot = Some(parse_update_credentials_bool("bot", &value)?),
+        "discoverable" => {
+            request.discoverable = Some(parse_update_credentials_bool("discoverable", &value)?);
+        }
+        "indexable" => {
+            request.indexable = Some(parse_update_credentials_bool("indexable", &value)?);
+        }
+        "fields_attributes" => {
+            let parsed = if value.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str::<serde_json::Value>(&value).map_err(|error| {
+                    AppError::Validation(format!("invalid fields_attributes JSON: {error}"))
+                })?
+            };
+            request.fields_attributes = Some(parsed);
+        }
+        _ if key.starts_with("fields_attributes[") => {
+            merge_fields_attribute(&mut request.fields_attributes, key, value)?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn parse_update_credentials_json(body: &[u8]) -> Result<ParsedUpdateCredentialsRequest, AppError> {
+    let request: UpdateCredentialsRequest = serde_json::from_slice(body)
+        .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")))?;
+    Ok(ParsedUpdateCredentialsRequest {
+        display_name: request.display_name,
+        note: request.note,
+        avatar: request.avatar.map(ProfileImageInput::Encoded),
+        header: request.header.map(ProfileImageInput::Encoded),
+        fields_attributes: request.fields_attributes,
+        moved_to_account_id: request.moved_to_account_id,
+        locked: request.locked,
+        bot: request.bot,
+        discoverable: request.discoverable,
+        indexable: request.indexable,
+    })
+}
+
+fn parse_update_credentials_form(body: &[u8]) -> Result<ParsedUpdateCredentialsRequest, AppError> {
+    let mut request = ParsedUpdateCredentialsRequest::default();
+    for (key, value) in url::form_urlencoded::parse(body).into_owned() {
+        apply_update_credentials_pair(&mut request, &key, value)?;
+    }
+    Ok(request)
+}
+
+async fn parse_update_credentials_multipart(
+    body: axum::body::Bytes,
+    content_type: &str,
+) -> Result<ParsedUpdateCredentialsRequest, AppError> {
+    let boundary = multer::parse_boundary(content_type)
+        .map_err(|error| AppError::Validation(format!("invalid multipart boundary: {error}")))?;
+    let stream = stream::once(async move { Ok::<_, Infallible>(body) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    let mut request = ParsedUpdateCredentialsRequest::default();
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to parse multipart body: {error}")))?
+    {
+        let Some(name) = field.name().map(ToString::to_string) else {
+            continue;
+        };
+
+        let is_binary_upload = name == "avatar" || name == "header";
+        if is_binary_upload && (field.file_name().is_some() || field.content_type().is_some()) {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
+                AppError::Validation(format!("failed to read multipart field `{name}`: {error}"))
+            })? {
+                if bytes.len() + chunk.len() > MAX_PROFILE_IMAGE_UPLOAD_BYTES {
+                    return Err(AppError::Validation(format!(
+                        "{name} image exceeds {MAX_PROFILE_IMAGE_UPLOAD_BYTES} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            match name.as_str() {
+                "avatar" => request.avatar = Some(ProfileImageInput::Binary(bytes)),
+                "header" => request.header = Some(ProfileImageInput::Binary(bytes)),
+                _ => {}
+            }
+            continue;
+        }
+
+        let value = field.text().await.map_err(|error| {
+            AppError::Validation(format!("failed to read multipart field `{name}`: {error}"))
+        })?;
+        apply_update_credentials_pair(&mut request, &name, value)?;
+    }
+
+    Ok(request)
+}
+
+async fn parse_update_credentials_request(
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<ParsedUpdateCredentialsRequest, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("multipart/form-data") {
+        return parse_update_credentials_multipart(body, content_type).await;
+    }
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return parse_update_credentials_form(&body);
+    }
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return parse_update_credentials_json(&body);
+    }
+
+    parse_update_credentials_json(&body).or_else(|_| parse_update_credentials_form(&body))
 }
 
 fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppError> {
@@ -99,9 +306,9 @@ fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppE
                 "{field} data URL must include ;base64"
             )));
         }
-        if !meta_lower.starts_with("data:image/webp") {
+        if !meta_lower.starts_with("data:image/") {
             return Err(AppError::Validation(format!(
-                "{field} data URL must use image/webp MIME type"
+                "{field} data URL must use an image MIME type"
             )));
         }
         body
@@ -123,18 +330,55 @@ fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppE
         .decode(normalized)
         .map_err(|_| AppError::Validation(format!("{field} image is not valid base64")))?;
 
-    if !is_valid_webp_container(&decoded) {
+    normalize_image_bytes_to_webp(field, decoded)
+}
+
+fn normalize_image_bytes_to_webp(field: &str, bytes: Vec<u8>) -> Result<Vec<u8>, AppError> {
+    if bytes.is_empty() {
         return Err(AppError::Validation(format!(
-            "{field} image must contain WebP bytes"
+            "{field} image must not be empty"
         )));
     }
-    if !is_decodable_webp_image(&decoded) {
+    if bytes.len() > MAX_PROFILE_IMAGE_UPLOAD_BYTES {
+        return Err(AppError::Validation(format!(
+            "{field} image exceeds {MAX_PROFILE_IMAGE_UPLOAD_BYTES} bytes"
+        )));
+    }
+
+    let image = image::load_from_memory(&bytes).map_err(|error| {
+        AppError::Validation(format!("{field} image must be a supported image: {error}"))
+    })?;
+    let rgba = image.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    if width == 0 || height == 0 {
+        return Err(AppError::Validation(format!(
+            "{field} image must have non-zero dimensions"
+        )));
+    }
+    if rgba.len() > MAX_PROFILE_IMAGE_DECODED_BYTES {
+        return Err(AppError::Validation(format!(
+            "{field} image is too large after decoding"
+        )));
+    }
+
+    let mut encoded = Vec::new();
+    image::codecs::webp::WebPEncoder::new_lossless(&mut encoded)
+        .encode(
+            rgba.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| AppError::Validation(format!("{field} image encode failed: {error}")))?;
+
+    if !is_valid_webp_container(&encoded) || !is_decodable_webp_image(&encoded) {
         return Err(AppError::Validation(format!(
             "{field} image must contain decodable WebP bytes"
         )));
     }
 
-    Ok(decoded)
+    Ok(encoded)
 }
 
 async fn decode_base64_image_field_blocking(
@@ -144,6 +388,15 @@ async fn decode_base64_image_field_blocking(
     tokio::task::spawn_blocking(move || decode_base64_image_field(field, &encoded))
         .await
         .map_err(|error| AppError::task_join("base64 image decode", error))?
+}
+
+async fn normalize_binary_image_field_blocking(
+    field: &'static str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, AppError> {
+    tokio::task::spawn_blocking(move || normalize_image_bytes_to_webp(field, bytes))
+        .await
+        .map_err(|error| AppError::task_join("multipart image decode", error))?
 }
 
 fn is_decodable_webp_image(bytes: &[u8]) -> bool {
@@ -630,11 +883,11 @@ fn build_remote_account_response_with_profile(
         acct: normalized_address.to_string(),
         uri: profile.uri.clone(),
         display_name,
-        locked: false,
-        bot: false,
-        discoverable: true,
+        locked: profile.locked,
+        bot: profile.bot,
+        discoverable: profile.discoverable,
         group: false,
-        indexable: true,
+        indexable: profile.indexable,
         created_at: profile.fetched_at,
         note: profile.note.clone().unwrap_or_default(),
         url,
@@ -1323,12 +1576,18 @@ pub async fn preferences(
 pub async fn update_credentials(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
-    Json(req): Json<UpdateCredentialsRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let account_service =
         crate::service::AccountService::new(state.db.clone(), state.storage.clone());
 
-    let UpdateCredentialsRequest {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, MAX_UPDATE_CREDENTIALS_BODY_BYTES)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = parse_update_credentials_request(&parts.headers, body).await?;
+
+    let ParsedUpdateCredentialsRequest {
         display_name,
         note,
         avatar,
@@ -1339,7 +1598,6 @@ pub async fn update_credentials(
         bot,
         discoverable,
         indexable,
-        _hide_collections: _,
     } = req;
 
     let profile_fields_json =
@@ -1350,22 +1608,22 @@ pub async fn update_credentials(
         None => None,
     };
 
-    let avatar_bytes = avatar
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let avatar_bytes = match avatar_bytes {
-        Some(encoded) => Some(decode_base64_image_field_blocking("avatar", encoded).await?),
+    let avatar_bytes = match avatar {
+        Some(ProfileImageInput::Encoded(encoded)) => {
+            Some(decode_base64_image_field_blocking("avatar", encoded).await?)
+        }
+        Some(ProfileImageInput::Binary(bytes)) => {
+            Some(normalize_binary_image_field_blocking("avatar", bytes).await?)
+        }
         None => None,
     };
-    let header_bytes = header
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let header_bytes = match header_bytes {
-        Some(encoded) => Some(decode_base64_image_field_blocking("header", encoded).await?),
+    let header_bytes = match header {
+        Some(ProfileImageInput::Encoded(encoded)) => {
+            Some(decode_base64_image_field_blocking("header", encoded).await?)
+        }
+        Some(ProfileImageInput::Binary(bytes)) => {
+            Some(normalize_binary_image_field_blocking("header", bytes).await?)
+        }
         None => None,
     };
 
@@ -1576,7 +1834,7 @@ pub async fn account_statuses(
         let is_pinned = state.db.is_status_pinned(&item.status.id).await?;
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
-            .copied();
+            .cloned();
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -2789,9 +3047,11 @@ pub async fn reject_follow_request(
 
 #[cfg(test)]
 mod image_decode_tests {
-    use super::decode_base64_image_field;
+    use super::{decode_base64_image_field, normalize_image_bytes_to_webp};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     const VALID_WEBP_BASE64: &str = "UklGRhoAAABXRUJQVlA4TA4AAAAvAAAAEM1VICIC0f+IBA==";
+    const VALID_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
     #[test]
     fn decode_base64_image_field_accepts_raw_base64() {
@@ -2819,58 +3079,72 @@ mod image_decode_tests {
     }
 
     #[test]
-    fn decode_base64_image_field_rejects_non_webp_data_url_mime() {
-        let encoded = "data:image/png;base64,aGVsbG8=";
-        let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("image/webp"));
+    fn decode_base64_image_field_accepts_png_data_url() {
+        let encoded = format!("data:image/png;base64,{}", VALID_PNG_BASE64);
+        let decoded = decode_base64_image_field("avatar", &encoded).expect("decode should succeed");
+        assert_eq!(&decoded[0..4], b"RIFF");
+        assert_eq!(&decoded[8..12], b"WEBP");
+        assert!(decoded.len() >= 20);
+    }
+
+    #[test]
+    fn normalize_image_bytes_to_webp_accepts_png_bytes() {
+        let decoded = normalize_image_bytes_to_webp(
+            "avatar",
+            BASE64_STANDARD.decode(VALID_PNG_BASE64).unwrap(),
+        )
+        .expect("decode should succeed");
+        assert_eq!(&decoded[0..4], b"RIFF");
+        assert_eq!(&decoded[8..12], b"WEBP");
+        assert!(decoded.len() >= 20);
     }
 
     #[test]
     fn decode_base64_image_field_rejects_raw_non_webp_bytes() {
         let encoded = "aGVsbG8=";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_truncated_webp_header_only() {
         let encoded = "UklGRgAAAABXRUJQ";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_invalid_vp8x_chunk_payload() {
         let encoded = "UklGRgwAAABXRUJQVlA4WAAAAAA=";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_vp8x_header_without_frame_data() {
         let encoded = "UklGRhYAAABXRUJQVlA4WAoAAAAAAAAAAAAAAAAA";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_invalid_vp8_frame_header() {
         let encoded = "UklGRhYAAABXRUJQVlA4IAoAAAAAAACdASoAAAAA";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_invalid_vp8l_header_fields() {
         let encoded = "UklGRhIAAABXRUJQVlA4TAUAAAAvAAAA4AA=";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 
     #[test]
     fn decode_base64_image_field_rejects_non_decodable_vp8_payload() {
         let encoded = "UklGRhgAAABXRUJQVlA4IAwAAAAAAQCdASoEAA0AGsY=";
         let error = decode_base64_image_field("avatar", encoded).expect_err("must fail");
-        assert!(format!("{error}").contains("WebP"));
+        assert!(format!("{error}").contains("supported image"));
     }
 }

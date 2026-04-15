@@ -129,7 +129,7 @@ async fn build_notification_status_response(
     .unwrap_or_default();
     let remote_stats = remote_account_stats
         .get(status.account_address.trim())
-        .copied();
+        .cloned();
     let thread_uri = state.db.resolve_thread_root_uri(status).await?;
     let interactions = crate::api::StatusInteractions::new(
         Some(state.db.is_favourited(&status.id).await?),

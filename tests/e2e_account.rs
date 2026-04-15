@@ -111,9 +111,74 @@ async fn test_update_credentials() {
             json["fields"][0]["value"],
             "<a href=\"https://example.com/@testuser\" rel=\"me nofollow noopener noreferrer\" target=\"_blank\">https://example.com/@testuser</a>"
         );
-        assert_eq!(json["source"]["fields"][0]["value"], "https://example.com/@testuser");
+        assert_eq!(
+            json["source"]["fields"][0]["value"],
+            "https://example.com/@testuser"
+        );
         assert_eq!(json["source"]["fields"][1]["value"], "RustResort");
     }
+}
+
+#[tokio::test]
+async fn test_update_credentials_accepts_form_urlencoded() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .patch(server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(concat!(
+            "display_name=Form+Name&",
+            "note=Form+bio&",
+            "locked=true&",
+            "fields_attributes%5B0%5D%5Bname%5D=Website&",
+            "fields_attributes%5B0%5D%5Bvalue%5D=https%3A%2F%2Fexample.com%2F%40testuser"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["display_name"], "Form Name");
+    assert_eq!(json["locked"], true);
+    assert_eq!(json["fields"][0]["name"], "Website");
+    assert_eq!(
+        json["source"]["fields"][0]["value"],
+        "https://example.com/@testuser"
+    );
+}
+
+#[tokio::test]
+async fn test_update_credentials_accepts_multipart_form_data() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let form = reqwest::multipart::Form::new()
+        .text("display_name", "Multipart Name")
+        .text("locked", "true")
+        .text("fields_attributes[0][name]", "Project")
+        .text("fields_attributes[0][value]", "RustResort");
+
+    let response = server
+        .client
+        .patch(server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["display_name"], "Multipart Name");
+    assert_eq!(json["locked"], true);
+    assert_eq!(json["source"]["fields"][0]["name"], "Project");
+    assert_eq!(json["source"]["fields"][0]["value"], "RustResort");
 }
 
 #[tokio::test]
@@ -138,9 +203,14 @@ async fn test_remote_lookup_returns_cached_profile_fields() {
             display_name: Some("Alice".to_string()),
             note: Some("Remote".to_string()),
             profile_fields_json: Some(profile_fields_json),
+            locked: true,
+            bot: true,
+            discoverable: false,
+            indexable: false,
             avatar_url: None,
             header_url: None,
-            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----".to_string(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
             inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
             outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
             followers_count: Some(3),
@@ -161,6 +231,10 @@ async fn test_remote_lookup_returns_cached_profile_fields() {
     assert_eq!(response.status(), 200);
     let json: Value = response.json().await.unwrap();
     assert_eq!(json["acct"], "alice@remote.example");
+    assert_eq!(json["locked"], true);
+    assert_eq!(json["bot"], true);
+    assert_eq!(json["discoverable"], false);
+    assert_eq!(json["indexable"], false);
     assert_eq!(json["fields"][0]["name"], "Website");
     assert_eq!(
         json["fields"][0]["value"],
@@ -802,6 +876,10 @@ async fn test_unfollow_account_uses_stored_actor_uri_alias_for_delivery() {
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1063,6 +1141,10 @@ async fn test_block_and_unblock_account_deliver_outbound_activities() {
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1200,6 +1282,10 @@ async fn test_block_and_unblock_use_stored_actor_uri_alias_for_delivery() {
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1301,6 +1387,10 @@ async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delive
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1401,6 +1491,10 @@ async fn test_unblock_account_without_existing_block_skips_outbound_undo_deliver
             display_name: Some("Alice".to_string()),
             note: None,
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"

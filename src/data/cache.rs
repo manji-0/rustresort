@@ -84,6 +84,10 @@ fn extract_public_key_pem(actor_document: &serde_json::Value) -> Option<String> 
         })
 }
 
+fn actor_bool(actor_document: &serde_json::Value, key: &str) -> Option<bool> {
+    actor_document.get(key).and_then(|value| value.as_bool())
+}
+
 fn extract_explicit_port_from_domain(domain: &str) -> Option<u16> {
     let domain = domain.trim();
 
@@ -327,6 +331,10 @@ fn build_cached_profile_from_actor(
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
         profile_fields_json,
+        locked: actor_bool(actor_document, "manuallyApprovesFollowers").unwrap_or(false),
+        bot: actor_bool(actor_document, "bot").unwrap_or(false),
+        discoverable: actor_bool(actor_document, "discoverable").unwrap_or(true),
+        indexable: actor_bool(actor_document, "indexable").unwrap_or(true),
         avatar_url: actor_document.get("icon").and_then(extract_url),
         header_url: actor_document.get("image").and_then(extract_url),
         public_key_pem,
@@ -701,6 +709,10 @@ pub struct CachedProfile {
     pub display_name: Option<String>,
     pub note: Option<String>,
     pub profile_fields_json: Option<String>,
+    pub locked: bool,
+    pub bot: bool,
+    pub discoverable: bool,
+    pub indexable: bool,
     pub avatar_url: Option<String>,
     pub header_url: Option<String>,
     /// RSA public key for signature verification
@@ -723,6 +735,10 @@ impl From<super::RemoteProfile> for CachedProfile {
             display_name: value.display_name,
             note: value.note,
             profile_fields_json: value.profile_fields_json,
+            locked: value.locked,
+            bot: value.bot,
+            discoverable: value.discoverable,
+            indexable: value.indexable,
             avatar_url: value.avatar_url,
             header_url: value.header_url,
             public_key_pem: value.public_key_pem,
@@ -747,6 +763,10 @@ impl From<&CachedProfile> for super::RemoteProfile {
             display_name: value.display_name.clone(),
             note: value.note.clone(),
             profile_fields_json: value.profile_fields_json.clone(),
+            locked: value.locked,
+            bot: value.bot,
+            discoverable: value.discoverable,
+            indexable: value.indexable,
             avatar_url: value.avatar_url.clone(),
             header_url: value.header_url.clone(),
             public_key_pem: value.public_key_pem.clone(),
@@ -1072,6 +1092,30 @@ impl ProfileCache {
                 .ok()
                 .flatten();
             }
+            if actor_object.contains_key("manuallyApprovesFollowers") {
+                updated.locked = actor_object
+                    .get("manuallyApprovesFollowers")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+            }
+            if actor_object.contains_key("bot") {
+                updated.bot = actor_object
+                    .get("bot")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+            }
+            if actor_object.contains_key("discoverable") {
+                updated.discoverable = actor_object
+                    .get("discoverable")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+            }
+            if actor_object.contains_key("indexable") {
+                updated.indexable = actor_object
+                    .get("indexable")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true);
+            }
 
             if actor_object.contains_key("icon") {
                 updated.avatar_url = actor_object.get("icon").and_then(extract_url);
@@ -1156,6 +1200,10 @@ mod tests {
             display_name: Some("Alice".to_string()),
             note: Some("note".to_string()),
             profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             avatar_url: None,
             header_url: None,
             public_key_pem: "pem".to_string(),

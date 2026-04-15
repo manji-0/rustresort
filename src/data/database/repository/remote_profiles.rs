@@ -11,6 +11,10 @@ impl Database {
                 display_name,
                 note,
                 profile_fields_json,
+                locked,
+                bot,
+                discoverable,
+                indexable,
                 avatar_url,
                 header_url,
                 public_key_pem,
@@ -43,6 +47,10 @@ impl Database {
                 display_name,
                 note,
                 profile_fields_json,
+                locked,
+                bot,
+                discoverable,
+                indexable,
                 avatar_url,
                 header_url,
                 public_key_pem,
@@ -54,12 +62,16 @@ impl Database {
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address) DO UPDATE SET
                 uri = excluded.uri,
                 display_name = excluded.display_name,
                 note = excluded.note,
                 profile_fields_json = excluded.profile_fields_json,
+                locked = excluded.locked,
+                bot = excluded.bot,
+                discoverable = excluded.discoverable,
+                indexable = excluded.indexable,
                 avatar_url = excluded.avatar_url,
                 header_url = excluded.header_url,
                 public_key_pem = excluded.public_key_pem,
@@ -76,6 +88,10 @@ impl Database {
         .bind(&profile.display_name)
         .bind(&profile.note)
         .bind(&profile.profile_fields_json)
+        .bind(profile.locked)
+        .bind(profile.bot)
+        .bind(profile.discoverable)
+        .bind(profile.indexable)
         .bind(&profile.avatar_url)
         .bind(&profile.header_url)
         .bind(&profile.public_key_pem)
