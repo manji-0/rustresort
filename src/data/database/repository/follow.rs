@@ -77,6 +77,22 @@ impl Database {
         Ok(count)
     }
 
+    /// Count locally-authored statuses created within a time range.
+    pub async fn count_local_statuses_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<i64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM statuses WHERE is_local = 1 AND created_at >= ? AND created_at < ?",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     /// Count statuses attributed to a specific account address (case-insensitive exact match).
     pub async fn count_statuses_by_account_address(
         &self,

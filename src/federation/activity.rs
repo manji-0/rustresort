@@ -584,6 +584,7 @@ pub enum ActivityType {
     Announce,
     Block,
     Move,
+    Flag,
     Add,
     Remove,
 }
@@ -603,6 +604,7 @@ impl ActivityType {
             "Announce" => Some(Self::Announce),
             "Block" => Some(Self::Block),
             "Move" => Some(Self::Move),
+            "Flag" => Some(Self::Flag),
             "Add" => Some(Self::Add),
             "Remove" => Some(Self::Remove),
             _ => None,
@@ -780,6 +782,7 @@ impl ActivityProcessor {
             }
             ActivityType::Block => self.handle_block(activity, actor_uri).await,
             ActivityType::Move => self.handle_move(activity, actor_uri).await,
+            ActivityType::Flag => self.handle_flag(activity, actor_uri).await,
             ActivityType::Add | ActivityType::Remove => Ok(()),
         }
     }
@@ -918,6 +921,10 @@ impl ActivityProcessor {
             Some(ActivityType::Block) => {
                 // Remote blocks targeting the local account must always be processed
                 // so delivery suppression and follow teardown can be enforced.
+                PersistenceDecision::Persist
+            }
+            Some(ActivityType::Flag) => {
+                // Remote reports for the local actor/statuses should surface to the admin.
                 PersistenceDecision::Persist
             }
             Some(ActivityType::Move) => {
@@ -2038,6 +2045,83 @@ impl ActivityProcessor {
         self.db
             .delete_follow(&actor_address, actor_default_port)
             .await?;
+        Ok(())
+    }
+
+    fn flag_references_local_interest(&self, value: &serde_json::Value) -> (bool, Option<String>) {
+        match value {
+            serde_json::Value::String(candidate) => {
+                let targets_local_actor =
+                    is_local_follow_target(candidate, &self.local_address, &self.local_protocol);
+                let local_status_uri = self.is_local_status(candidate).then(|| candidate.clone());
+                (
+                    targets_local_actor || local_status_uri.is_some(),
+                    local_status_uri,
+                )
+            }
+            serde_json::Value::Array(items) => {
+                let mut targets_local = false;
+                let mut local_status_uri = None;
+                for item in items {
+                    let (item_targets_local, item_status_uri) =
+                        self.flag_references_local_interest(item);
+                    targets_local |= item_targets_local;
+                    if local_status_uri.is_none() {
+                        local_status_uri = item_status_uri;
+                    }
+                }
+                (targets_local, local_status_uri)
+            }
+            serde_json::Value::Object(map) => {
+                let mut targets_local = false;
+                let mut local_status_uri = None;
+                for key in ["id", "object", "target", "href", "url"] {
+                    if let Some(candidate) = map.get(key) {
+                        let (item_targets_local, item_status_uri) =
+                            self.flag_references_local_interest(candidate);
+                        targets_local |= item_targets_local;
+                        if local_status_uri.is_none() {
+                            local_status_uri = item_status_uri;
+                        }
+                    }
+                }
+                (targets_local, local_status_uri)
+            }
+            _ => (false, None),
+        }
+    }
+
+    /// Handle Flag activity targeting the local actor or one of its statuses.
+    async fn handle_flag(
+        &self,
+        activity: serde_json::Value,
+        actor_uri: &str,
+    ) -> Result<(), AppError> {
+        let object = activity
+            .get("object")
+            .ok_or_else(|| AppError::Validation("Missing object in Flag".to_string()))?;
+        let (targets_local, local_status_uri) = self.flag_references_local_interest(object);
+        if !targets_local {
+            tracing::debug!(
+                actor_uri,
+                "Ignoring Flag that does not target the local instance"
+            );
+            return Ok(());
+        }
+
+        let notification = crate::data::Notification {
+            id: crate::data::EntityId::new_string(),
+            notification_type: NotificationType::AdminReport,
+            origin_account_address: self.extract_actor_address(actor_uri),
+            status_uri: local_status_uri,
+            read: false,
+            created_at: Utc::now(),
+        };
+        let activity_uri = activity.get("id").and_then(serde_json::Value::as_str);
+        self.db
+            .insert_notification_if_new(&notification, activity_uri)
+            .await?;
+
         Ok(())
     }
 
@@ -3801,11 +3885,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_ignores_unknown_activity_type() {
+    async fn process_creates_admin_report_notification_for_flag_targeting_local_actor() {
         let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
         let activity = json!({
             "type": "Flag",
             "id": "https://remote.example/activities/flag-1",
+            "actor": "https://remote.example/users/bob",
+            "object": "https://example.com/users/alice"
+        });
+
+        processor
+            .process(activity, "https://remote.example/users/bob")
+            .await
+            .unwrap();
+
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].notification_type,
+            NotificationType::AdminReport
+        );
+        assert_eq!(
+            notifications[0].origin_account_address,
+            "bob@remote.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_ignores_unknown_activity_type() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let activity = json!({
+            "type": "Questionnaire",
+            "id": "https://remote.example/activities/questionnaire-1",
             "actor": "https://remote.example/users/bob",
             "object": "https://example.com/users/alice"
         });

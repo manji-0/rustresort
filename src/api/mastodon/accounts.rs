@@ -921,7 +921,7 @@ pub(crate) fn build_remote_account_placeholder_response(
             (
                 username.to_string(),
                 trimmed.to_string(),
-                trimmed.to_string(),
+                parsed_address,
                 trimmed.to_string(),
             )
         } else if let Some((username, domain)) = trimmed.split_once('@') {
@@ -1429,26 +1429,69 @@ async fn resolve_target_address(state: &AccountApiState, id: &str) -> Result<Str
     ))
 }
 
-fn build_remote_account_stub(address: &str) -> serde_json::Value {
-    let username = address.split('@').next().unwrap_or(address);
-    let domain = address.split('@').nth(1).unwrap_or("");
+fn build_remote_account_stub(
+    config: &crate::config::AppConfig,
+    raw_identity: &str,
+    statuses_count: i32,
+) -> serde_json::Value {
+    if let Some(response) =
+        build_remote_account_placeholder_response(raw_identity, config, statuses_count)
+    {
+        return serde_json::to_value(response).unwrap_or_else(|_| {
+            serde_json::json!({
+                "id": raw_identity,
+                "username": raw_identity,
+                "acct": raw_identity,
+                "uri": raw_identity,
+                "display_name": raw_identity,
+                "locked": false,
+                "bot": false,
+                "discoverable": true,
+                "group": false,
+                "indexable": true,
+                "created_at": remote_account_placeholder_created_at(),
+                "note": "",
+                "url": raw_identity,
+                "avatar": format!("{}/default-avatar.png", config.storage.media.public_url),
+                "avatar_static": format!("{}/default-avatar.png", config.storage.media.public_url),
+                "header": format!("{}/default-header.png", config.storage.media.public_url),
+                "header_static": format!("{}/default-header.png", config.storage.media.public_url),
+                "followers_count": 0,
+                "following_count": 0,
+                "statuses_count": statuses_count,
+                "last_status_at": serde_json::Value::Null,
+                "emojis": [],
+                "fields": [],
+                "roles": [],
+            })
+        });
+    }
+
     serde_json::json!({
-        "id": address,
-        "username": username,
-        "acct": address,
-        "display_name": "",
+        "id": raw_identity,
+        "username": raw_identity,
+        "acct": raw_identity,
+        "uri": raw_identity,
+        "display_name": raw_identity,
+        "locked": false,
+        "bot": false,
+        "discoverable": true,
+        "group": false,
+        "indexable": true,
+        "created_at": remote_account_placeholder_created_at(),
         "note": "",
-        "url": if domain.is_empty() {
-            "".to_string()
-        } else {
-            format!("https://{}", domain)
-        },
-        "avatar": "",
-        "header": "",
+        "url": raw_identity,
+        "avatar": format!("{}/default-avatar.png", config.storage.media.public_url),
+        "avatar_static": format!("{}/default-avatar.png", config.storage.media.public_url),
+        "header": format!("{}/default-header.png", config.storage.media.public_url),
+        "header_static": format!("{}/default-header.png", config.storage.media.public_url),
         "followers_count": 0,
         "following_count": 0,
-        "statuses_count": 0,
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "statuses_count": statuses_count,
+        "last_status_at": serde_json::Value::Null,
+        "emojis": [],
+        "fields": [],
+        "roles": [],
     })
 }
 
@@ -1457,6 +1500,8 @@ async fn resolve_remote_account_or_stub(
     address: String,
     default_port: Option<u16>,
 ) -> serde_json::Value {
+    let statuses_count =
+        observed_statuses_count_for_address(state.db.as_ref(), default_port, &address).await;
     if let Some(response) = resolve_remote_account_response_for_list(
         state.config.as_ref(),
         state.db.as_ref(),
@@ -1467,10 +1512,37 @@ async fn resolve_remote_account_or_stub(
     )
     .await
     {
-        return serde_json::to_value(response)
-            .unwrap_or_else(|_| build_remote_account_stub(&address));
+        return serde_json::to_value(response).unwrap_or_else(|_| {
+            build_remote_account_stub(state.config.as_ref(), &address, statuses_count)
+        });
     }
-    build_remote_account_stub(&address)
+    build_remote_account_stub(state.config.as_ref(), &address, statuses_count)
+}
+
+pub(crate) async fn resolve_remote_account_value_for_list(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
+    raw_identity: &str,
+    default_port: Option<u16>,
+) -> serde_json::Value {
+    let statuses_count = observed_statuses_count_for_address(db, default_port, raw_identity).await;
+    if let Some(response) = resolve_remote_account_response_for_list(
+        config,
+        db,
+        profile_cache,
+        federation_fetch_client,
+        raw_identity,
+        default_port,
+    )
+    .await
+    {
+        return serde_json::to_value(response)
+            .unwrap_or_else(|_| build_remote_account_stub(config, raw_identity, statuses_count));
+    }
+
+    build_remote_account_stub(config, raw_identity, statuses_count)
 }
 
 /// GET /api/v1/accounts/verify_credentials
@@ -2924,7 +2996,7 @@ pub async fn get_follow_request(
         .await?
         .and_then(|(_, _, actor_uri)| actor_uri)
         .unwrap_or_else(|| requester_address.clone());
-    let account = if let Some(response) = resolve_remote_account_response_for_list(
+    let account = resolve_remote_account_value_for_list(
         state.config.as_ref(),
         state.db.as_ref(),
         state.profile_cache.as_ref(),
@@ -2932,13 +3004,7 @@ pub async fn get_follow_request(
         &actor_identity,
         default_port,
     )
-    .await
-    {
-        serde_json::to_value(response)
-            .unwrap_or_else(|_| build_remote_account_stub(&actor_identity))
-    } else {
-        build_remote_account_stub(&actor_identity)
-    };
+    .await;
 
     Ok(Json(account))
 }

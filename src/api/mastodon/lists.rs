@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::ListsApiState;
@@ -175,35 +176,38 @@ pub async fn get_list_accounts(
     State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
 
     // Get account addresses in list
     let addresses = state.db.get_list_accounts(&id).await?;
+    let limit = params._limit.unwrap_or(40).min(80);
+    let default_port = match state.config.server.protocol.to_ascii_lowercase().as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
 
-    // For single-user instance, we can only return minimal account info
-    // In a full implementation, we would fetch account details from remote servers
-    let accounts: Vec<serde_json::Value> = addresses
-        .into_iter()
+    let accounts = stream::iter(addresses.into_iter().take(limit))
         .map(|address| {
-            serde_json::json!({
-                "id": address.clone(),
-                "username": address.split('@').next().unwrap_or(&address),
-                "acct": address,
-                "display_name": "",
-                "note": "",
-                "url": format!("https://{}", address.split('@').nth(1).unwrap_or("")),
-                "avatar": "",
-                "header": "",
-                "followers_count": 0,
-                "following_count": 0,
-                "statuses_count": 0,
-                "created_at": chrono::Utc::now().to_rfc3339(),
-            })
+            let state = state.clone();
+            async move {
+                super::accounts::resolve_remote_account_value_for_list(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    state.federation_fetch_client.as_ref(),
+                    &address,
+                    default_port,
+                )
+                .await
+            }
         })
-        .collect();
+        .buffered(8)
+        .collect::<Vec<_>>()
+        .await;
 
     Ok(Json(accounts))
 }

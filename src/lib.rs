@@ -203,7 +203,10 @@ pub struct MediaApiState {
 /// Minimal state required for Mastodon list endpoints.
 #[derive(Clone)]
 pub struct ListsApiState {
+    pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
+    pub federation_fetch_client: Arc<reqwest::Client>,
 }
 
 /// Minimal state required for Mastodon filter endpoints.
@@ -363,7 +366,12 @@ impl_from_ref_state!(MediaApiState {
     storage,
     streaming_event_bus,
 });
-impl_from_ref_state!(ListsApiState { db });
+impl_from_ref_state!(ListsApiState {
+    config,
+    db,
+    profile_cache,
+    federation_fetch_client,
+});
 impl_from_ref_state!(FiltersApiState { db });
 impl_from_ref_state!(ConversationsApiState {
     config,

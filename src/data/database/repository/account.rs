@@ -18,6 +18,22 @@ impl Database {
         Ok(account)
     }
 
+    /// Count local accounts created within a time range.
+    pub async fn count_accounts_created_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<i64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM account WHERE created_at >= ? AND created_at < ?",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     /// Create or update the admin account
     ///
     /// # Arguments

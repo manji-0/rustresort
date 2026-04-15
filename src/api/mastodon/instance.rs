@@ -1,6 +1,7 @@
 //! Instance endpoints
 
 use axum::{extract::State, response::Json};
+use chrono::{Datelike, Timelike};
 use std::collections::BTreeSet;
 
 use crate::InstanceApiState;
@@ -319,19 +320,36 @@ pub async fn instance_peers(State(_state): State<InstanceApiState>) -> Json<serd
 ///
 /// Instance activity over the last 3 months, binned weekly.
 pub async fn instance_activity(State(_state): State<InstanceApiState>) -> Json<serde_json::Value> {
-    // Return activity statistics for the last 12 weeks
-    // For single-user instance, return minimal activity data
-
     let mut activity = Vec::new();
     let now = chrono::Utc::now();
+    let week_floor = now
+        - chrono::Duration::days(i64::from(now.weekday().num_days_from_monday()))
+        - chrono::Duration::seconds(i64::from(now.num_seconds_from_midnight()))
+        - chrono::Duration::nanoseconds(i64::from(now.nanosecond()));
 
     for i in 0..12 {
-        let week_start = now - chrono::Duration::weeks(11 - i);
+        let week_start = week_floor - chrono::Duration::weeks(11 - i);
+        let week_end = week_start + chrono::Duration::weeks(1);
+        let statuses = _state
+            .db
+            .count_local_statuses_between(week_start, week_end)
+            .await
+            .unwrap_or(0);
+        let logins = _state
+            .db
+            .count_user_oauth_tokens_created_between(week_start, week_end)
+            .await
+            .unwrap_or(0);
+        let registrations = _state
+            .db
+            .count_accounts_created_between(week_start, week_end)
+            .await
+            .unwrap_or(0);
         activity.push(serde_json::json!({
             "week": week_start.timestamp().to_string(),
-            "statuses": "0",
-            "logins": "0",
-            "registrations": "0"
+            "statuses": statuses.to_string(),
+            "logins": logins.to_string(),
+            "registrations": registrations.to_string()
         }));
     }
 

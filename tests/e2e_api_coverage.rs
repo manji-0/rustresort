@@ -118,6 +118,21 @@ async fn test_instance_peers() {
 #[tokio::test]
 async fn test_instance_activity() {
     let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Weekly activity sample",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+
     let response = server
         .client
         .get(server.url("/api/v1/instance/activity"))
@@ -125,6 +140,14 @@ async fn test_instance_activity() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let activity = body
+        .as_array()
+        .expect("instance activity should be an array");
+    assert_eq!(activity.len(), 12);
+    assert!(activity.iter().any(|item| item["statuses"] == "1"));
+    assert!(activity.iter().any(|item| item["logins"] == "1"));
+    assert!(activity.iter().any(|item| item["registrations"] == "1"));
 }
 
 #[tokio::test]
@@ -832,8 +855,10 @@ async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_account
     let followers = body.as_array().expect("followers should be array");
     assert_eq!(followers.len(), 1);
     assert_eq!(followers[0]["id"], actor_uri_address);
-    assert_eq!(followers[0]["acct"], actor_uri_address);
+    assert_eq!(followers[0]["acct"], "12345@remote.example");
     assert_eq!(followers[0]["url"], actor_uri_address);
+    assert!(followers[0].get("avatar_static").is_some());
+    assert!(followers[0].get("header_static").is_some());
 }
 
 #[tokio::test]
@@ -872,8 +897,10 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
     let following = body.as_array().expect("following should be array");
     assert_eq!(following.len(), 1);
     assert_eq!(following[0]["id"], actor_uri_address);
-    assert_eq!(following[0]["acct"], actor_uri_address);
+    assert_eq!(following[0]["acct"], "12345@remote.example");
     assert_eq!(following[0]["url"], actor_uri_address);
+    assert!(following[0].get("avatar_static").is_some());
+    assert!(following[0].get("header_static").is_some());
 }
 
 #[tokio::test]
@@ -954,7 +981,7 @@ async fn test_account_followers_actor_uri_with_at_path_keeps_valid_username_and_
     let followers = body.as_array().expect("followers should be array");
     assert_eq!(followers.len(), 1);
     assert_eq!(followers[0]["id"], actor_uri_address);
-    assert_eq!(followers[0]["acct"], actor_uri_address);
+    assert_eq!(followers[0]["acct"], "alice@remote.example");
     assert_eq!(followers[0]["username"], "alice");
     assert_eq!(followers[0]["url"], actor_uri_address);
 }
@@ -1076,6 +1103,45 @@ async fn test_get_blocks() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_blocks_actor_uri_fallback_returns_mastodon_account_shape() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/actors/12345";
+
+    server
+        .state
+        .db
+        .block_account_with_remote_metadata(
+            actor_uri,
+            None,
+            Some("https://remote.example/inbox"),
+            Some(443),
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let blocks = body.as_array().expect("blocks should be array");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["id"], actor_uri);
+    assert_eq!(blocks[0]["acct"], "12345@remote.example");
+    assert_eq!(blocks[0]["url"], actor_uri);
+    assert!(blocks[0].get("avatar_static").is_some());
+    assert!(blocks[0].get("header_static").is_some());
+    assert!(blocks[0].get("locked").is_some());
 }
 
 #[tokio::test]
@@ -1824,6 +1890,44 @@ async fn test_get_follow_request_prefers_stored_actor_uri_profile_alias() {
     assert_eq!(body["id"], "alice@remote.example");
     assert_eq!(body["acct"], "alice@remote.example");
     assert_eq!(body["display_name"], "Alice Alias");
+}
+
+#[tokio::test]
+async fn test_get_follow_request_actor_uri_fallback_returns_mastodon_account_shape() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/actors/12345";
+
+    server
+        .state
+        .db
+        .insert_follow_request_with_actor_uri(
+            actor_uri,
+            "https://remote.example/inbox",
+            "https://remote.example/follows/12345",
+            None,
+        )
+        .await
+        .unwrap();
+    let encoded_actor_uri = urlencoding::encode(actor_uri);
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/follow_requests/{encoded_actor_uri}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["id"], actor_uri);
+    assert_eq!(body["acct"], "12345@remote.example");
+    assert_eq!(body["url"], actor_uri);
+    assert!(body.get("avatar_static").is_some());
+    assert!(body.get("header_static").is_some());
+    assert!(body.get("locked").is_some());
 }
 
 #[tokio::test]
@@ -2984,16 +3088,38 @@ async fn test_get_list_accounts() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    let list_id = server
+        .state
+        .db
+        .create_list("Remote list", "list")
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, &["alice@remote.example".to_string()])
+        .await
+        .unwrap();
+    cache_remote_profile(&server, "alice@remote.example").await;
 
     let response = server
         .client
-        .get(server.url("/api/v1/lists/test_list_id/accounts"))
+        .get(server.url(&format!("/api/v1/lists/{list_id}/accounts")))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("list accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alice@remote.example");
+    assert_eq!(accounts[0]["display_name"], "Alice Remote");
+    assert!(accounts[0].get("avatar_static").is_some());
+    assert!(accounts[0].get("header_static").is_some());
+    assert!(accounts[0].get("locked").is_some());
+    assert!(accounts[0]["emojis"].is_array());
 }
 
 #[tokio::test]

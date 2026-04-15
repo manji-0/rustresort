@@ -29,6 +29,29 @@ impl Database {
         Ok(())
     }
 
+    /// Count user-authorized OAuth tokens created within a time range.
+    pub async fn count_user_oauth_tokens_created_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<i64, AppError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM oauth_tokens
+            WHERE created_at >= ?
+              AND created_at < ?
+              AND grant_type != 'client_credentials'
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
     /// Get OAuth app by client ID
     pub async fn get_oauth_app_by_client_id(
         &self,
