@@ -345,15 +345,62 @@ async fn status_response_without_interaction_state(
     account_stats: crate::api::AccountStats,
     status: &crate::data::Status,
 ) -> Result<crate::api::StatusResponse, AppError> {
-    crate::api::build_status_response_with_account_stats(
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        std::slice::from_ref(status),
+    )
+    .await?
+    .get(status.account_address.trim())
+    .cloned();
+
+    crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
         status,
         account,
         &state.config,
         account_stats,
+        remote_account_stats,
         crate::api::StatusInteractions::default(),
     )
     .await
+}
+
+async fn resolve_interaction_account_response(
+    state: &StatusApiState,
+    local_account: &Account,
+    local_account_stats: crate::api::AccountStats,
+    identity: &str,
+) -> Option<serde_json::Value> {
+    super::accounts::resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        Some(state.federation_fetch_client.as_ref()),
+        identity,
+    )
+    .await
+    .or_else(|| {
+        super::accounts::build_remote_account_placeholder_response(identity, &state.config, 0)
+    })
+    .or_else(|| {
+        (identity.eq_ignore_ascii_case(&local_account.id)
+            || identity.eq_ignore_ascii_case(&local_actor_uri(state, &local_account.username))
+            || identity.eq_ignore_ascii_case(&local_account.username)
+            || identity.eq_ignore_ascii_case(&format!(
+                "{}@{}",
+                local_account.username, state.config.server.domain
+            )))
+        .then(|| {
+            crate::api::account_to_response_with_stats(
+                local_account,
+                &state.config,
+                local_account_stats,
+            )
+        })
+    })
+    .and_then(|response| serde_json::to_value(response).ok())
 }
 
 fn status_content_to_source_text(content: &str) -> String {
@@ -1164,50 +1211,82 @@ pub async fn get_status_context(
 pub async fn get_reblogged_by(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let status_service = build_status_service(&state);
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
     ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let limit = params.limit.unwrap_or(40).min(80);
 
-    // For single-user instance, only the owner can reblog
-    // In a full implementation, we would query the reposts table
-    // and fetch account information for each user who reblogged
+    let mut identities = Vec::new();
+    if state.db.is_reposted(&status.id).await? && identities.len() < limit {
+        identities.push(local_actor_uri(&state, &account.username));
+    }
+    if identities.len() < limit {
+        let remaining = limit - identities.len();
+        identities.extend(
+            state
+                .db
+                .list_remote_repost_actor_addresses(&status.id, remaining)
+                .await?,
+        );
+    }
 
-    // For now, return empty array as we don't track individual rebloggers
-    Ok(Json(vec![]))
+    let mut responses = Vec::new();
+    for identity in identities {
+        if let Some(account_response) =
+            resolve_interaction_account_response(&state, &account, account_stats, &identity).await
+        {
+            responses.push(account_response);
+        }
+    }
+
+    Ok(Json(responses))
 }
 
 /// GET /api/v1/statuses/:id/favourited_by
 pub async fn get_favourited_by(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
-    Query(_params): Query<PaginationParams>,
+    Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let status_service = build_status_service(&state);
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
     ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    let account = build_account_service(&state).get_account().await?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let limit = params.limit.unwrap_or(40).min(80);
 
-    // For single-user instance, only the owner can favourite
-    // Check if the status is favourited by the owner
-    let is_favourited = status_service.is_favourited(&status.id).await?;
-
-    if is_favourited {
-        // Return the owner's account
-        let account = build_account_service(&state).get_account().await?;
-        let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-
-        let account_response =
-            crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
-        Ok(Json(vec![serde_json::to_value(account_response).unwrap()]))
-    } else {
-        // Not favourited, return empty array
-        Ok(Json(vec![]))
+    let mut identities = Vec::new();
+    if status_service.is_favourited(&status.id).await? && identities.len() < limit {
+        identities.push(local_actor_uri(&state, &account.username));
     }
+    if identities.len() < limit {
+        let remaining = limit - identities.len();
+        identities.extend(
+            state
+                .db
+                .list_remote_favourite_actor_addresses(&status.id, remaining)
+                .await?,
+        );
+    }
+
+    let mut responses = Vec::new();
+    for identity in identities {
+        if let Some(account_response) =
+            resolve_interaction_account_response(&state, &account, account_stats, &identity).await
+        {
+            responses.push(account_response);
+        }
+    }
+
+    Ok(Json(responses))
 }
 
 /// GET /api/v1/statuses/:id/source

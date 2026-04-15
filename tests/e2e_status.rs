@@ -120,6 +120,116 @@ async fn test_get_status() {
 }
 
 #[tokio::test]
+async fn test_get_status_and_context_use_cached_remote_account_metadata() {
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let profile_fields_json = serde_json::to_string(&vec![serde_json::json!({
+        "name": "Website",
+        "value": "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>",
+        "verified_at": serde_json::Value::Null
+    })])
+    .unwrap();
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice Remote".to_string()),
+            note: Some("Remote bio".to_string()),
+            profile_fields_json: Some(profile_fields_json),
+            locked: true,
+            bot: true,
+            discoverable: false,
+            indexable: false,
+            avatar_url: Some("https://cdn.remote.example/alice.png".to_string()),
+            header_url: Some("https://cdn.remote.example/alice-header.png".to_string()),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
+            followers_count: Some(3),
+            following_count: Some(4),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let remote_status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/123".to_string(),
+        content: "<p>Remote root</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    server.state.db.insert_status(&remote_status).await.unwrap();
+
+    let local_reply = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/context-remote-meta"),
+        content: "<p>Reply</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: Some(remote_status.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&local_reply).await.unwrap();
+
+    let detail = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", remote_status.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail_json: Value = detail.json().await.unwrap();
+    assert_eq!(detail_json["account"]["display_name"], "Alice Remote");
+    assert_eq!(detail_json["account"]["locked"], true);
+    assert_eq!(detail_json["account"]["bot"], true);
+    assert_eq!(detail_json["account"]["discoverable"], false);
+    assert_eq!(detail_json["account"]["indexable"], false);
+    assert_eq!(detail_json["account"]["fields"][0]["name"], "Website");
+
+    let context = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/context", local_reply.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(context.status(), 200);
+    let context_json: Value = context.json().await.unwrap();
+    assert_eq!(
+        context_json["ancestors"][0]["account"]["display_name"],
+        "Alice Remote"
+    );
+    assert_eq!(context_json["ancestors"][0]["account"]["locked"], true);
+    assert_eq!(
+        context_json["ancestors"][0]["account"]["fields"][0]["name"],
+        "Website"
+    );
+}
+
+#[tokio::test]
 async fn test_private_status_is_hidden_from_public_status_endpoints() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -786,6 +896,82 @@ async fn test_favourited_by_uses_resolved_status_id_for_uri_path() {
 }
 
 #[tokio::test]
+async fn test_favourited_by_includes_remote_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/remote-favourited-by"),
+        content: "<p>Remote favourite target</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server
+        .state
+        .db
+        .upsert_remote_favourite(
+            &status.id,
+            "alice@remote.example",
+            Some("https://remote.example/activities/like-1"),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
+            followers_count: Some(1),
+            following_count: Some(2),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/favourited_by", status.id)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let accounts = body
+        .as_array()
+        .expect("favourited_by response should be an array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alice@remote.example");
+}
+
+#[tokio::test]
 async fn test_boost_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -827,6 +1013,82 @@ async fn test_boost_status() {
         let json: Value = response.json().await.unwrap();
         assert_eq!(json["reblogged"], true);
     }
+}
+
+#[tokio::test]
+async fn test_reblogged_by_includes_remote_accounts() {
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: server.public_url("/users/testuser/statuses/remote-reblogged-by"),
+        content: "<p>Remote reblog target</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server
+        .state
+        .db
+        .upsert_remote_repost(
+            &status.id,
+            "alice@remote.example",
+            Some("https://remote.example/activities/announce-1"),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
+            followers_count: Some(1),
+            following_count: Some(2),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/reblogged_by", status.id)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let accounts = body
+        .as_array()
+        .expect("reblogged_by response should be an array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alice@remote.example");
 }
 
 #[tokio::test]

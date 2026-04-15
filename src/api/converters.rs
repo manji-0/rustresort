@@ -1094,7 +1094,7 @@ pub fn status_to_response_with_media(
                 account,
                 config,
                 account_stats,
-                remote_account_stats,
+                None,
             ))
         }),
         application: None,
@@ -1436,6 +1436,80 @@ mod tests {
         assert_eq!(response.account.followers_count, 7);
         assert_eq!(response.account.following_count, 8);
         assert_eq!(response.account.statuses_count, 9);
+    }
+
+    #[test]
+    fn test_status_to_response_reblog_stub_does_not_reuse_wrapper_remote_stats() {
+        let config = create_test_config();
+        let account = Account {
+            id: "123".into(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private".to_string(),
+            public_key_pem: "public".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "remote-boost-1".to_string(),
+            uri: "https://remote.example/users/bob/statuses/ann-1".to_string(),
+            content: "<p>Boost wrapper</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: Some("https://remote.example/users/alice/statuses/999".to_string()),
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Timeline,
+            created_at: Utc::now(),
+            fetched_at: None,
+        };
+        let wrapper_stats = RemoteAccountStats {
+            followers_count: 42,
+            following_count: 24,
+            statuses_count: 12,
+            uri: Some("https://remote.example/users/bob".to_string()),
+            display_name: Some("Bob".to_string()),
+            note: Some("wrapper".to_string()),
+            profile_fields_json: None,
+            avatar_url: None,
+            header_url: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+        };
+
+        let response = status_to_response_with_account_stats_and_remote_stats(
+            &status,
+            &account,
+            &config,
+            AccountStats::default(),
+            Some(wrapper_stats),
+            StatusInteractions::default(),
+        );
+
+        let reblog = response
+            .reblog
+            .expect("boost should include reblog payload");
+        assert_eq!(response.account.username, "bob");
+        assert_eq!(reblog.account.username, "alice");
+        assert_eq!(reblog.account.followers_count, 0);
+        assert_eq!(reblog.account.following_count, 0);
+        assert_eq!(reblog.account.statuses_count, 0);
+        assert_eq!(reblog.account.note, "");
     }
 
     #[test]

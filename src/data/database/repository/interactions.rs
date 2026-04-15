@@ -393,6 +393,28 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// List remote favourite actor addresses for a status.
+    pub async fn list_remote_favourite_actor_addresses(
+        &self,
+        status_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT actor_address
+            FROM remote_favourites
+            WHERE status_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(status_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Delete repost
     pub async fn delete_repost(&self, status_id: &str) -> Result<(), AppError> {
         sqlx::query("DELETE FROM reposts WHERE status_id = ?")
@@ -548,6 +570,28 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// List remote reblog actor addresses for a status.
+    pub async fn list_remote_repost_actor_addresses(
+        &self,
+        status_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT actor_address
+            FROM remote_reposts
+            WHERE status_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(status_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Insert status pin marker.
