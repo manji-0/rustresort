@@ -131,6 +131,20 @@ pub struct RemoteBlock {
     pub created_at: DateTime<Utc>,
 }
 
+/// A persisted Mastodon-compatible domain block configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DomainBlockRecord {
+    pub id: String,
+    pub domain: String,
+    pub severity: String,
+    pub reject_media: bool,
+    pub reject_reports: bool,
+    pub private_comment: Option<String>,
+    pub public_comment: Option<String>,
+    pub obfuscate: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A stored Web Push subscription for the single local user.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PushSubscription {

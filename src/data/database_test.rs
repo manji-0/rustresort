@@ -1950,6 +1950,66 @@ async fn test_domain_block_operations() {
 }
 
 #[tokio::test]
+async fn test_domain_block_attributes_persist_and_update() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    let created = db
+        .upsert_domain_block(
+            "remote.example",
+            "silence",
+            false,
+            false,
+            Some("private note"),
+            Some("public note"),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.domain, "remote.example");
+    assert_eq!(created.severity, "silence");
+    assert!(!created.reject_media);
+    assert!(!created.reject_reports);
+    assert_eq!(created.private_comment.as_deref(), Some("private note"));
+    assert_eq!(created.public_comment.as_deref(), Some("public note"));
+    assert!(created.obfuscate);
+
+    let updated = db
+        .upsert_domain_block(
+            "remote.example",
+            "suspend",
+            true,
+            true,
+            Some("updated private"),
+            Some("updated public"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.severity, "suspend");
+    assert!(updated.reject_media);
+    assert!(updated.reject_reports);
+    assert_eq!(updated.private_comment.as_deref(), Some("updated private"));
+    assert_eq!(updated.public_comment.as_deref(), Some("updated public"));
+    assert!(!updated.obfuscate);
+
+    let fetched = db
+        .get_domain_block_by_id(&created.id)
+        .await
+        .unwrap()
+        .expect("persisted domain block");
+    assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.severity, "suspend");
+    assert!(fetched.reject_media);
+    assert!(fetched.reject_reports);
+    assert_eq!(fetched.private_comment.as_deref(), Some("updated private"));
+    assert_eq!(fetched.public_comment.as_deref(), Some("updated public"));
+    assert!(!fetched.obfuscate);
+}
+
+#[tokio::test]
 async fn test_settings_operations() {
     let (db, _temp_dir) = create_test_db().await;
 

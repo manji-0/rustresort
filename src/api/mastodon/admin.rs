@@ -5,6 +5,7 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 
 use super::accounts::{
     build_remote_account_placeholder_response, default_port_for_protocol,
@@ -19,23 +20,23 @@ use crate::error::AppError;
 #[derive(Debug, Deserialize)]
 pub struct AdminAccountParams {
     #[serde(rename = "local")]
-    _local: Option<bool>,
+    local: Option<bool>,
     #[serde(rename = "remote")]
-    _remote: Option<bool>,
+    remote: Option<bool>,
     #[serde(rename = "active")]
-    _active: Option<bool>,
+    active: Option<bool>,
     #[serde(rename = "pending")]
-    _pending: Option<bool>,
+    pending: Option<bool>,
     #[serde(rename = "disabled")]
-    _disabled: Option<bool>,
+    disabled: Option<bool>,
     #[serde(rename = "silenced")]
-    _silenced: Option<bool>,
+    silenced: Option<bool>,
     #[serde(rename = "suspended")]
-    _suspended: Option<bool>,
+    suspended: Option<bool>,
     #[serde(rename = "username")]
-    _username: Option<String>,
+    username: Option<String>,
     #[serde(rename = "display_name")]
-    _display_name: Option<String>,
+    display_name: Option<String>,
     #[serde(rename = "email")]
     _email: Option<String>,
     #[serde(rename = "ip")]
@@ -47,7 +48,7 @@ pub struct AdminAccountParams {
     #[serde(rename = "min_id")]
     _min_id: Option<String>,
     #[serde(rename = "limit")]
-    _limit: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +82,13 @@ enum AdminActionTarget {
         actor_uri: Option<String>,
         inbox_uri: Option<String>,
     },
+}
+
+#[derive(Clone)]
+struct AdminRemoteAccountCandidate {
+    identity: String,
+    suspended: bool,
+    silenced: bool,
 }
 
 fn normalize_domain_block_domain(domain: &str) -> Result<String, AppError> {
@@ -145,16 +153,84 @@ async fn resolve_admin_action_target(
     })
 }
 
-/// GET /api/v1/admin/accounts
-pub async fn list_accounts(
-    State(state): State<AdminApiState>,
-    CurrentUser(_session): CurrentUser,
-    Query(_params): Query<AdminAccountParams>,
-) -> Result<Json<Vec<AdminAccount>>, AppError> {
+fn admin_identity_key(identity: &str) -> Option<String> {
+    normalize_account_address(identity)
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .or_else(|| {
+            parse_actor_uri_account_address(identity)
+                .and_then(|value| normalize_account_address(&value).ok())
+                .map(|value| value.to_ascii_lowercase())
+        })
+        .or_else(|| {
+            let trimmed = identity.trim();
+            (!trimmed.is_empty()).then(|| trimmed.trim_end_matches('/').to_ascii_lowercase())
+        })
+}
+
+fn admin_account_matches_filters(account: &AdminAccount, params: &AdminAccountParams) -> bool {
+    let is_local = account.domain.is_none();
+
+    if let Some(local) = params.local
+        && local != is_local
+    {
+        return false;
+    }
+    if let Some(remote) = params.remote
+        && remote == is_local
+    {
+        return false;
+    }
+    if let Some(active) = params.active
+        && !active
+    {
+        return false;
+    }
+    if let Some(pending) = params.pending
+        && pending
+    {
+        return false;
+    }
+    if let Some(disabled) = params.disabled
+        && disabled != account.disabled
+    {
+        return false;
+    }
+    if let Some(silenced) = params.silenced
+        && silenced != account.silenced
+    {
+        return false;
+    }
+    if let Some(suspended) = params.suspended
+        && suspended != account.suspended
+    {
+        return false;
+    }
+    if let Some(username) = params.username.as_deref() {
+        let needle = username.trim().to_ascii_lowercase();
+        if !needle.is_empty() && !account.username.to_ascii_lowercase().contains(&needle) {
+            return false;
+        }
+    }
+    if let Some(display_name) = params.display_name.as_deref() {
+        let needle = display_name.trim().to_ascii_lowercase();
+        let haystack = account.account["display_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !needle.is_empty() && !haystack.contains(&needle) {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn build_local_admin_account(state: &AdminApiState) -> Result<AdminAccount, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let admin_account = AdminAccount {
+    Ok(AdminAccount {
         id: account.id.to_string(),
         username: account.username.clone(),
         domain: None,
@@ -172,10 +248,157 @@ pub async fn list_accounts(
             &state.config,
             account_stats,
         ))
-        .unwrap(),
+        .map_err(|error| AppError::serialization("admin local account", error))?,
+    })
+}
+
+async fn build_remote_admin_account(
+    state: &AdminApiState,
+    identity: &str,
+    suspended: bool,
+    silenced: bool,
+) -> Result<AdminAccount, AppError> {
+    let response = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        Some(state.federation_fetch_client.as_ref()),
+        identity,
+    )
+    .await
+    .or_else(|| build_remote_account_placeholder_response(identity, &state.config, 0))
+    .ok_or(AppError::NotFound)?;
+    let domain = response
+        .acct
+        .split_once('@')
+        .map(|(_, domain)| domain.to_string());
+
+    Ok(AdminAccount {
+        id: response.id.clone(),
+        username: response.username.clone(),
+        domain,
+        created_at: response.created_at.to_rfc3339(),
+        email: None,
+        ip: None,
+        role: "user".to_string(),
+        confirmed: true,
+        suspended,
+        silenced,
+        disabled: false,
+        approved: true,
+        account: serde_json::to_value(response)
+            .map_err(|error| AppError::serialization("admin remote account", error))?,
+    })
+}
+
+async fn collect_remote_admin_candidates(
+    state: &AdminApiState,
+) -> Result<Vec<AdminRemoteAccountCandidate>, AppError> {
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let mut candidates = BTreeMap::<String, AdminRemoteAccountCandidate>::new();
+
+    let mut insert_candidate = |identity: String, suspended: bool, silenced: bool| {
+        let Some(key) = admin_identity_key(&identity) else {
+            return;
+        };
+        candidates
+            .entry(key)
+            .and_modify(|candidate| {
+                candidate.suspended |= suspended;
+                candidate.silenced |= silenced;
+            })
+            .or_insert(AdminRemoteAccountCandidate {
+                identity,
+                suspended,
+                silenced,
+            });
     };
 
-    Ok(Json(vec![admin_account]))
+    for (address, actor_uri, _) in state.db.get_blocked_account_details(500).await? {
+        insert_candidate(actor_uri.unwrap_or(address), true, false);
+    }
+    for (address, actor_uri) in state.db.get_muted_account_details(500).await? {
+        insert_candidate(actor_uri.unwrap_or(address), false, true);
+    }
+    for (address, actor_uri) in state.db.get_follow_request_details(500).await? {
+        let identity = actor_uri.unwrap_or(address.clone());
+        let suspended = state.db.is_account_blocked(&address, default_port).await?;
+        let silenced = state.db.is_account_muted(&address, default_port).await?;
+        insert_candidate(identity, suspended, silenced);
+    }
+
+    let mut seen_notification_ids = HashSet::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let notifications = state
+            .db
+            .get_notifications(200, cursor.as_deref(), false)
+            .await?;
+        if notifications.is_empty() {
+            break;
+        }
+        let reached_end = notifications.len() < 200;
+        cursor = notifications
+            .last()
+            .map(|notification| notification.id.clone());
+
+        for notification in notifications
+            .into_iter()
+            .filter(|notification| notification.notification_type == NotificationType::AdminReport)
+        {
+            if !seen_notification_ids.insert(notification.id.clone()) {
+                continue;
+            }
+            let suspended = state
+                .db
+                .is_account_blocked(&notification.origin_account_address, default_port)
+                .await?;
+            let silenced = state
+                .db
+                .is_account_muted(&notification.origin_account_address, default_port)
+                .await?;
+            insert_candidate(notification.origin_account_address, suspended, silenced);
+        }
+
+        if reached_end {
+            break;
+        }
+    }
+
+    Ok(candidates.into_values().collect())
+}
+
+/// GET /api/v1/admin/accounts
+pub async fn list_accounts(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<AdminAccountParams>,
+) -> Result<Json<Vec<AdminAccount>>, AppError> {
+    let limit = params.limit.unwrap_or(100).min(200);
+    let mut accounts = Vec::new();
+
+    let local_account = build_local_admin_account(&state).await?;
+    if admin_account_matches_filters(&local_account, &params) {
+        accounts.push(local_account);
+    }
+
+    for candidate in collect_remote_admin_candidates(&state).await? {
+        let account = build_remote_admin_account(
+            &state,
+            &candidate.identity,
+            candidate.suspended,
+            candidate.silenced,
+        )
+        .await?;
+        if admin_account_matches_filters(&account, &params) {
+            accounts.push(account);
+        }
+        if accounts.len() == limit {
+            break;
+        }
+    }
+
+    Ok(Json(accounts))
 }
 
 /// GET /api/v1/admin/accounts/:id
@@ -184,35 +407,20 @@ pub async fn get_account(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<AdminAccount>, AppError> {
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-
-    if account.id.as_str() != id {
-        return Err(AppError::NotFound);
+    match resolve_admin_action_target(&state, &id).await? {
+        AdminActionTarget::Local(_) => Ok(Json(build_local_admin_account(&state).await?)),
+        AdminActionTarget::Remote {
+            address, actor_uri, ..
+        } => {
+            let default_port = default_port_for_protocol(&state.config.server.protocol);
+            let identity = actor_uri.unwrap_or(address.clone());
+            let suspended = state.db.is_account_blocked(&address, default_port).await?;
+            let silenced = state.db.is_account_muted(&address, default_port).await?;
+            Ok(Json(
+                build_remote_admin_account(&state, &identity, suspended, silenced).await?,
+            ))
+        }
     }
-
-    let admin_account = AdminAccount {
-        id: account.id.to_string(),
-        username: account.username.clone(),
-        domain: None,
-        created_at: account.created_at.to_rfc3339(),
-        email: None,
-        ip: None,
-        role: "owner".to_string(),
-        confirmed: true,
-        suspended: false,
-        silenced: false,
-        disabled: false,
-        approved: true,
-        account: serde_json::to_value(crate::api::account_to_response_with_stats(
-            &account,
-            &state.config,
-            account_stats,
-        ))
-        .unwrap(),
-    };
-
-    Ok(Json(admin_account))
 }
 
 /// POST /api/v1/admin/accounts/:id/action
@@ -449,16 +657,16 @@ pub async fn list_domain_blocks_v1(
 
     let domain_blocks: Vec<DomainBlock> = blocks
         .into_iter()
-        .map(|(id, domain, created_at)| DomainBlock {
-            id,
-            domain,
-            created_at: created_at.to_rfc3339(),
-            severity: "suspend".to_string(),
-            reject_media: true,
-            reject_reports: true,
-            private_comment: None,
-            public_comment: None,
-            obfuscate: false,
+        .map(|block| DomainBlock {
+            id: block.id,
+            domain: block.domain,
+            created_at: block.created_at.to_rfc3339(),
+            severity: block.severity,
+            reject_media: block.reject_media,
+            reject_reports: block.reject_reports,
+            private_comment: block.private_comment,
+            public_comment: block.public_comment,
+            obfuscate: block.obfuscate,
         })
         .collect();
 
@@ -472,21 +680,36 @@ pub async fn create_domain_block_v1(
     Json(req): Json<CreateDomainBlockRequest>,
 ) -> Result<Json<DomainBlock>, AppError> {
     let normalized_domain = normalize_domain_block_domain(&req.domain)?;
-    let (id, domain, created_at) = state
+    let severity = req
+        .severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("suspend")
+        .to_ascii_lowercase();
+    let block = state
         .db
-        .create_or_get_domain_block(&normalized_domain)
+        .upsert_domain_block(
+            &normalized_domain,
+            &severity,
+            req.reject_media.unwrap_or(true),
+            req.reject_reports.unwrap_or(true),
+            req.private_comment.as_deref(),
+            req.public_comment.as_deref(),
+            req.obfuscate.unwrap_or(false),
+        )
         .await?;
 
     Ok(Json(DomainBlock {
-        id,
-        domain,
-        created_at: created_at.to_rfc3339(),
-        severity: req.severity.unwrap_or_else(|| "suspend".to_string()),
-        reject_media: req.reject_media.unwrap_or(true),
-        reject_reports: req.reject_reports.unwrap_or(true),
-        private_comment: req.private_comment,
-        public_comment: req.public_comment,
-        obfuscate: req.obfuscate.unwrap_or(false),
+        id: block.id,
+        domain: block.domain,
+        created_at: block.created_at.to_rfc3339(),
+        severity: block.severity,
+        reject_media: block.reject_media,
+        reject_reports: block.reject_reports,
+        private_comment: block.private_comment,
+        public_comment: block.public_comment,
+        obfuscate: block.obfuscate,
     }))
 }
 

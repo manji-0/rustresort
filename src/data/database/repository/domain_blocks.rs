@@ -28,24 +28,49 @@ impl Database {
 
     /// Block a domain
     pub async fn block_domain(&self, domain: &str) -> Result<(), AppError> {
-        let id = EntityId::new_string();
-        sqlx::query(
-            "INSERT OR IGNORE INTO domain_blocks (id, domain, created_at) VALUES (?, ?, datetime('now'))",
-        )
-        .bind(&id)
-        .bind(domain)
-        .execute(&self.pool)
-        .await?;
-
+        self.upsert_domain_block(domain, "suspend", true, true, None, None, false)
+            .await?;
         Ok(())
     }
 
-    /// Create the domain block if missing, then return the persisted row.
-    pub async fn create_or_get_domain_block(
+    /// Insert or update a Mastodon-compatible domain block configuration.
+    pub async fn upsert_domain_block(
         &self,
         domain: &str,
-    ) -> Result<(String, String, chrono::DateTime<chrono::Utc>), AppError> {
-        self.block_domain(domain).await?;
+        severity: &str,
+        reject_media: bool,
+        reject_reports: bool,
+        private_comment: Option<&str>,
+        public_comment: Option<&str>,
+        obfuscate: bool,
+    ) -> Result<DomainBlockRecord, AppError> {
+        let id = EntityId::new_string();
+        sqlx::query(
+            r#"
+            INSERT INTO domain_blocks (
+                id, domain, severity, reject_media, reject_reports,
+                private_comment, public_comment, obfuscate, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(domain) DO UPDATE SET
+                severity = excluded.severity,
+                reject_media = excluded.reject_media,
+                reject_reports = excluded.reject_reports,
+                private_comment = excluded.private_comment,
+                public_comment = excluded.public_comment,
+                obfuscate = excluded.obfuscate
+            "#,
+        )
+        .bind(&id)
+        .bind(domain)
+        .bind(severity)
+        .bind(reject_media)
+        .bind(reject_reports)
+        .bind(private_comment)
+        .bind(public_comment)
+        .bind(obfuscate)
+        .execute(&self.pool)
+        .await?;
+
         self.get_domain_block_by_domain(domain)
             .await?
             .ok_or_else(|| AppError::Validation("failed to persist domain block".to_string()))
@@ -62,11 +87,15 @@ impl Database {
     }
 
     /// Get all domain blocks with details
-    pub async fn get_all_domain_blocks(
-        &self,
-    ) -> Result<Vec<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
-        let blocks = sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
-            "SELECT id, domain, created_at FROM domain_blocks ORDER BY created_at DESC",
+    pub async fn get_all_domain_blocks(&self) -> Result<Vec<DomainBlockRecord>, AppError> {
+        let blocks = sqlx::query_as::<_, DomainBlockRecord>(
+            r#"
+            SELECT
+                id, domain, severity, reject_media, reject_reports,
+                private_comment, public_comment, obfuscate, created_at
+            FROM domain_blocks
+            ORDER BY created_at DESC
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -78,9 +107,16 @@ impl Database {
     pub async fn get_domain_block_by_id(
         &self,
         id: &str,
-    ) -> Result<Option<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
-        let block = sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
-            "SELECT id, domain, created_at FROM domain_blocks WHERE id = ? LIMIT 1",
+    ) -> Result<Option<DomainBlockRecord>, AppError> {
+        let block = sqlx::query_as::<_, DomainBlockRecord>(
+            r#"
+            SELECT
+                id, domain, severity, reject_media, reject_reports,
+                private_comment, public_comment, obfuscate, created_at
+            FROM domain_blocks
+            WHERE id = ?
+            LIMIT 1
+            "#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -93,9 +129,16 @@ impl Database {
     pub async fn get_domain_block_by_domain(
         &self,
         domain: &str,
-    ) -> Result<Option<(String, String, chrono::DateTime<chrono::Utc>)>, AppError> {
-        let block = sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
-            "SELECT id, domain, created_at FROM domain_blocks WHERE domain = ? LIMIT 1",
+    ) -> Result<Option<DomainBlockRecord>, AppError> {
+        let block = sqlx::query_as::<_, DomainBlockRecord>(
+            r#"
+            SELECT
+                id, domain, severity, reject_media, reject_reports,
+                private_comment, public_comment, obfuscate, created_at
+            FROM domain_blocks
+            WHERE domain = ?
+            LIMIT 1
+            "#,
         )
         .bind(domain)
         .fetch_optional(&self.pool)
