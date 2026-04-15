@@ -7,7 +7,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::accounts::{
-    build_remote_account_placeholder_response, resolve_account_response_for_identity,
+    build_remote_account_placeholder_response, default_port_for_protocol,
+    normalize_account_address, parse_actor_uri_account_address,
+    resolve_account_response_for_identity,
 };
 use crate::AdminApiState;
 use crate::auth::CurrentUser;
@@ -70,6 +72,77 @@ pub struct AdminActionRequest {
     pub action: String,
     #[serde(rename = "reason")]
     pub _reason: Option<String>,
+}
+
+enum AdminActionTarget {
+    Local(crate::data::Account),
+    Remote {
+        address: String,
+        actor_uri: Option<String>,
+        inbox_uri: Option<String>,
+    },
+}
+
+fn normalize_domain_block_domain(domain: &str) -> Result<String, AppError> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(AppError::Validation("domain is required".to_string()));
+    }
+
+    match url::Host::parse(&normalized) {
+        Ok(url::Host::Domain(valid_domain)) => Ok(valid_domain.to_owned()),
+        _ => Err(AppError::Validation(
+            "domain must be a valid DNS hostname".to_string(),
+        )),
+    }
+}
+
+async fn resolve_admin_action_target(
+    state: &AdminApiState,
+    raw_id: &str,
+) -> Result<AdminActionTarget, AppError> {
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_actor_uri = format!(
+        "{}/users/{}",
+        state.config.server.base_url(),
+        account.username
+    );
+    let local_address = format!("{}@{}", account.username, state.config.server.domain);
+    let trimmed = raw_id.trim();
+
+    if trimmed.eq_ignore_ascii_case(account.id.as_str())
+        || trimmed.eq_ignore_ascii_case(local_actor_uri.as_str())
+        || normalize_account_address(trimmed).ok().as_deref()
+            == normalize_account_address(&local_address).ok().as_deref()
+    {
+        return Ok(AdminActionTarget::Local(account));
+    }
+
+    let (address, actor_uri, inbox_uri) =
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let address = parse_actor_uri_account_address(trimmed)
+                .ok_or_else(|| AppError::Validation("Invalid account ID format".to_string()))?;
+            let profile = state.profile_cache.get_by_uri(trimmed).await;
+            (
+                normalize_account_address(&address)?,
+                Some(trimmed.trim_end_matches('/').to_string()),
+                profile.map(|value| value.inbox_uri.clone()),
+            )
+        } else {
+            let normalized = normalize_account_address(trimmed)?;
+            let profile = state.profile_cache.get(&normalized).await;
+            (
+                normalized,
+                profile.as_ref().map(|value| value.uri.clone()),
+                profile.map(|value| value.inbox_uri.clone()),
+            )
+        };
+
+    Ok(AdminActionTarget::Remote {
+        address,
+        actor_uri,
+        inbox_uri,
+    })
 }
 
 /// GET /api/v1/admin/accounts
@@ -144,13 +217,67 @@ pub async fn get_account(
 
 /// POST /api/v1/admin/accounts/:id/action
 pub async fn account_action(
-    State(_state): State<AdminApiState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<AdminActionRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let target = resolve_admin_action_target(&state, &id).await?;
+    let action = req.action.trim().to_ascii_lowercase();
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+
+    match target {
+        AdminActionTarget::Local(account) => {
+            return Err(AppError::Validation(format!(
+                "admin action `{}` is not supported for the local owner account `{}`",
+                action, account.username
+            )));
+        }
+        AdminActionTarget::Remote {
+            address,
+            actor_uri,
+            inbox_uri,
+        } => match action.as_str() {
+            "suspend" | "disable" => {
+                state
+                    .db
+                    .block_account_with_remote_metadata(
+                        &address,
+                        actor_uri.as_deref(),
+                        inbox_uri.as_deref(),
+                        default_port,
+                    )
+                    .await?;
+            }
+            "unsuspend" | "enable" => {
+                state.db.unblock_account(&address, default_port).await?;
+            }
+            "silence" => {
+                state
+                    .db
+                    .mute_account_with_actor_uri(
+                        &address,
+                        true,
+                        None,
+                        actor_uri.as_deref(),
+                        default_port,
+                    )
+                    .await?;
+            }
+            "unsilence" => {
+                state.db.unmute_account(&address, default_port).await?;
+            }
+            _ => {
+                return Err(AppError::Validation(format!(
+                    "unsupported admin account action `{}`",
+                    action
+                )));
+            }
+        },
+    }
+
     Ok(Json(serde_json::json!({
-        "action": req.action,
+        "action": action,
         "account_id": id,
         "status": "completed"
     })))
@@ -344,16 +471,16 @@ pub async fn create_domain_block_v1(
     CurrentUser(_session): CurrentUser,
     Json(req): Json<CreateDomainBlockRequest>,
 ) -> Result<Json<DomainBlock>, AppError> {
-    use crate::data::EntityId;
-    use chrono::Utc;
-
-    let id = EntityId::new_string();
-    state.db.insert_domain_block(&req.domain).await?;
+    let normalized_domain = normalize_domain_block_domain(&req.domain)?;
+    let (id, domain, created_at) = state
+        .db
+        .create_or_get_domain_block(&normalized_domain)
+        .await?;
 
     Ok(Json(DomainBlock {
         id,
-        domain: req.domain,
-        created_at: Utc::now().to_rfc3339(),
+        domain,
+        created_at: created_at.to_rfc3339(),
         severity: req.severity.unwrap_or_else(|| "suspend".to_string()),
         reject_media: req.reject_media.unwrap_or(true),
         reject_reports: req.reject_reports.unwrap_or(true),
@@ -365,9 +492,13 @@ pub async fn create_domain_block_v1(
 
 /// DELETE /api/v1/admin/domain_blocks/:id
 pub async fn delete_domain_block_v1(
-    State(_state): State<AdminApiState>,
+    State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    if !state.db.delete_domain_block_by_id(&id).await? {
+        return Err(AppError::NotFound);
+    }
+
     Ok(Json(serde_json::json!({})))
 }

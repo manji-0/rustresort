@@ -577,7 +577,7 @@ fn is_valid_webp_container(bytes: &[u8]) -> bool {
     has_frame_data
 }
 
-fn default_port_for_protocol(protocol: &str) -> Option<u16> {
+pub(crate) fn default_port_for_protocol(protocol: &str) -> Option<u16> {
     if protocol.eq_ignore_ascii_case("http") {
         Some(80)
     } else if protocol.eq_ignore_ascii_case("https") {
@@ -664,7 +664,7 @@ fn is_same_local_account(target_address: &str, local_address: &str, local_protoc
     target_effective_port == local_effective_port
 }
 
-fn normalize_account_address(raw: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_account_address(raw: &str) -> Result<String, AppError> {
     fn normalize_domain(raw: &str) -> Result<String, AppError> {
         let parsed = url::Url::parse(&format!("https://{}", raw))
             .map_err(|_| AppError::Validation("Invalid account ID format".to_string()))?;
@@ -730,7 +730,7 @@ fn normalize_remote_lookup_account_address(raw: &str) -> Option<String> {
     normalize_account_address(trimmed).ok()
 }
 
-fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
+pub(crate) fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw.trim()).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;

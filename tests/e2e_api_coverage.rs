@@ -2668,6 +2668,141 @@ async fn test_admin_reports_return_reporting_account_and_status() {
 }
 
 #[tokio::test]
+async fn test_admin_account_action_suspend_and_unsuspend_round_trip() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let suspend_response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/action"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "action": "suspend" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(suspend_response.status(), 200);
+
+    let blocks_response = server
+        .client
+        .get(server.url("/api/v1/blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(blocks_response.status(), 200);
+    let blocks: serde_json::Value = blocks_response.json().await.unwrap();
+    assert!(
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|account| account["acct"] == "alice@remote.example")
+    );
+
+    let unsuspend_response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/action"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "action": "unsuspend" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(unsuspend_response.status(), 200);
+
+    let blocks_response = server
+        .client
+        .get(server.url("/api/v1/blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(blocks_response.status(), 200);
+    let blocks: serde_json::Value = blocks_response.json().await.unwrap();
+    assert!(
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|account| account["acct"] != "alice@remote.example")
+    );
+}
+
+#[tokio::test]
+async fn test_admin_domain_blocks_round_trip_by_returned_id() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/admin/domain_blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "domain": "Remote.Example"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), 200);
+    let created: serde_json::Value = create_response.json().await.unwrap();
+    assert_eq!(created["domain"], "remote.example");
+    let block_id = created["id"].as_str().expect("domain block id");
+
+    let list_response = server
+        .client
+        .get(server.url("/api/v1/admin/domain_blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), 200);
+    let blocks: serde_json::Value = list_response.json().await.unwrap();
+    assert!(
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| block["id"] == block_id && block["domain"] == "remote.example")
+    );
+
+    let delete_response = server
+        .client
+        .delete(server.url(&format!("/api/v1/admin/domain_blocks/{block_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(delete_response.status(), 200);
+
+    let list_response = server
+        .client
+        .get(server.url("/api/v1/admin/domain_blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), 200);
+    let blocks: serde_json::Value = list_response.json().await.unwrap();
+    assert!(
+        blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["id"] != block_id)
+    );
+}
+
+#[tokio::test]
 async fn test_notifications_embed_status_with_current_interactions() {
     use chrono::Utc;
     use rustresort::data::{
