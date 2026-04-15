@@ -774,6 +774,28 @@ impl ActivityDelivery {
         )
     }
 
+    fn build_add_featured_activity(&self, status_uri: &str) -> serde_json::Value {
+        let target = format!("{}/collections/featured", self.actor_uri);
+        builder::add(
+            &format!("{}/add/{}", target, EntityId::new_string()),
+            &self.actor_uri,
+            status_uri,
+            &target,
+            vec![&format!("{}/followers", self.actor_uri)],
+        )
+    }
+
+    fn build_remove_featured_activity(&self, status_uri: &str) -> serde_json::Value {
+        let target = format!("{}/collections/featured", self.actor_uri);
+        builder::remove(
+            &format!("{}/remove/{}", target, EntityId::new_string()),
+            &self.actor_uri,
+            status_uri,
+            &target,
+            vec![&format!("{}/followers", self.actor_uri)],
+        )
+    }
+
     fn build_update_actor_activity(
         &self,
         actor_object: serde_json::Value,
@@ -1197,6 +1219,28 @@ impl ActivityDelivery {
         inbox_uris: Vec<String>,
     ) -> Vec<DeliveryResult> {
         let activity = self.build_move_activity(new_account_uri);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_add_featured(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status_uri: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_add_featured_activity(status_uri);
+        self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
+            .await
+    }
+
+    pub async fn queue_remove_featured(
+        &self,
+        queue: &(impl DeliveryQueue + ?Sized),
+        status_uri: &str,
+        inbox_uris: Vec<String>,
+    ) -> Vec<DeliveryResult> {
+        let activity = self.build_remove_featured_activity(status_uri);
         self.enqueue_activity_to_followers(queue, &activity, inbox_uris)
             .await
     }
@@ -1800,6 +1844,32 @@ pub mod builder {
             "id": id,
             "actor": actor,
             "object": actor,
+            "target": target,
+            "to": to,
+            "published": chrono::Utc::now().to_rfc3339()
+        })
+    }
+
+    pub fn add(id: &str, actor: &str, object: &str, target: &str, to: Vec<&str>) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Add",
+            "id": id,
+            "actor": actor,
+            "object": object,
+            "target": target,
+            "to": to,
+            "published": chrono::Utc::now().to_rfc3339()
+        })
+    }
+
+    pub fn remove(id: &str, actor: &str, object: &str, target: &str, to: Vec<&str>) -> Value {
+        serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Remove",
+            "id": id,
+            "actor": actor,
+            "object": object,
             "target": target,
             "to": to,
             "published": chrono::Utc::now().to_rfc3339()

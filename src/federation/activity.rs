@@ -584,7 +584,8 @@ pub enum ActivityType {
     Announce,
     Block,
     Move,
-    // Add more as needed
+    Add,
+    Remove,
 }
 
 impl ActivityType {
@@ -602,6 +603,8 @@ impl ActivityType {
             "Announce" => Some(Self::Announce),
             "Block" => Some(Self::Block),
             "Move" => Some(Self::Move),
+            "Add" => Some(Self::Add),
+            "Remove" => Some(Self::Remove),
             _ => None,
         }
     }
@@ -777,6 +780,7 @@ impl ActivityProcessor {
             }
             ActivityType::Block => self.handle_block(activity, actor_uri).await,
             ActivityType::Move => self.handle_move(activity, actor_uri).await,
+            ActivityType::Add | ActivityType::Remove => Ok(()),
         }
     }
 

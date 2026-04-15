@@ -256,6 +256,80 @@ async fn test_status_edit_and_delete_deliver_update_and_delete_to_explicit_recip
 }
 
 #[tokio::test]
+async fn test_pin_and_unpin_deliver_add_and_remove_for_featured_collection() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let mut capture = ActivityCaptureServer::new().await;
+
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "bob@followers.example".to_string(),
+            actor_uri: Some("https://followers.example/users/bob".to_string()),
+            inbox_uri: capture.inbox_url(),
+            uri: "https://followers.example/follows/featured-1".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "Pin me for federation",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::OK);
+    let created: serde_json::Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap().to_string();
+    let status_uri = created["uri"].as_str().unwrap().to_string();
+    let initial_create = capture.recv().await;
+    assert_eq!(initial_create.body["type"], "Create");
+
+    let pin_response = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{status_id}/pin")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pin_response.status(), StatusCode::OK);
+
+    let add_activity = capture.recv().await;
+    assert_eq!(add_activity.body["type"], "Add");
+    assert_eq!(add_activity.body["object"], status_uri);
+    assert_eq!(
+        add_activity.body["target"],
+        server.public_url("/users/testuser/collections/featured")
+    );
+
+    let unpin_response = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{status_id}/unpin")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpin_response.status(), StatusCode::OK);
+
+    let remove_activity = capture.recv().await;
+    assert_eq!(remove_activity.body["type"], "Remove");
+    assert_eq!(remove_activity.body["object"], status_uri);
+    assert_eq!(
+        remove_activity.body["target"],
+        server.public_url("/users/testuser/collections/featured")
+    );
+}
+
+#[tokio::test]
 async fn test_remote_poll_vote_delivers_create_note_to_remote_inbox() {
     let server = TestServer::new().await;
     server.create_test_account().await;

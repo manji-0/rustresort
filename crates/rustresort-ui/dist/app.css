@@ -369,6 +369,7 @@ code {
 
 .timeline-feed-pill,
 .timeline-feed-context,
+.timeline-feed-query,
 .timeline-feed-contract {
   display: inline-flex;
   align-items: center;
@@ -396,6 +397,89 @@ code {
   background: rgba(0, 186, 124, 0.1);
   border-color: rgba(0, 186, 124, 0.2);
   color: #9be6c9;
+}
+
+.timeline-feed-query {
+  background: rgba(255, 255, 255, 0.035);
+  border-style: dashed;
+  color: #dde6eb;
+  max-width: min(34ch, 48vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.timeline-feed-query {
+  cursor: pointer;
+  transition:
+    transform 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease,
+    color 140ms ease;
+}
+
+button.timeline-feed-query:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.timeline-feed-query.empty {
+  color: #95a3ad;
+}
+
+.timeline-column.feed-home .timeline-feed-pill {
+  background: rgba(29, 155, 240, 0.16);
+  border-color: rgba(29, 155, 240, 0.28);
+  color: #d5efff;
+}
+
+.timeline-column.feed-home .timeline-feed-context {
+  background: rgba(29, 155, 240, 0.08);
+  border-color: rgba(29, 155, 240, 0.16);
+  color: #b9def8;
+}
+
+.timeline-column.feed-public .timeline-feed-pill {
+  background: rgba(0, 186, 124, 0.14);
+  border-color: rgba(0, 186, 124, 0.24);
+  color: #bff3df;
+}
+
+.timeline-column.feed-public .timeline-feed-context {
+  background: rgba(0, 186, 124, 0.07);
+  border-color: rgba(0, 186, 124, 0.14);
+  color: #a6dfcb;
+}
+
+.timeline-column.feed-profile .timeline-feed-pill {
+  background: rgba(255, 185, 0, 0.16);
+  border-color: rgba(255, 185, 0, 0.24);
+  color: #ffebb6;
+}
+
+.timeline-column.feed-profile .timeline-feed-context {
+  background: rgba(255, 185, 0, 0.07);
+  border-color: rgba(255, 185, 0, 0.14);
+  color: #e9d38c;
+}
+
+.timeline-column.feed-hashtags .timeline-feed-pill {
+  background: rgba(168, 85, 247, 0.16);
+  border-color: rgba(168, 85, 247, 0.24);
+  color: #e9d3ff;
+}
+
+.timeline-column.feed-hashtags .timeline-feed-context {
+  background: rgba(168, 85, 247, 0.07);
+  border-color: rgba(168, 85, 247, 0.14);
+  color: #d0b6ec;
+}
+
+.timeline-column.feed-hashtags .timeline-feed-query {
+  background: rgba(168, 85, 247, 0.08);
+  border-color: rgba(168, 85, 247, 0.18);
+  color: #ead8ff;
 }
 
 .shortcut-row {
@@ -1202,6 +1286,38 @@ code {
   gap: 14px;
 }
 
+.rail-card.admin-quiet {
+  background: rgba(12, 16, 20, 0.72);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22);
+}
+
+.rail-card.admin-quiet .micro-label,
+.rail-card.admin-quiet .muted-copy {
+  color: #7f8c97;
+}
+
+.rail-card.admin-quiet .rail-links a {
+  color: #8cccf6;
+}
+
+.notification-count.has-unread {
+  background: rgba(29, 155, 240, 0.14);
+  border-color: rgba(29, 155, 240, 0.22);
+  color: #d7efff;
+  font-weight: 700;
+  box-shadow:
+    inset 0 0 0 1px rgba(29, 155, 240, 0.1),
+    0 8px 18px rgba(29, 155, 240, 0.12);
+}
+
+.notification-count.all-clear {
+  background: rgba(0, 186, 124, 0.08);
+  border-color: rgba(0, 186, 124, 0.16);
+  color: #9fdec5;
+  box-shadow: inset 0 0 0 1px rgba(0, 186, 124, 0.06);
+}
+
 .activity-column .rail-card:first-child {
   max-height: calc(100vh - 32px);
 }
@@ -1673,6 +1789,7 @@ code {
 
   .timeline-feed-pill,
   .timeline-feed-context,
+  .timeline-feed-query,
   .timeline-feed-contract {
     min-height: 24px;
     padding: 3px 8px;

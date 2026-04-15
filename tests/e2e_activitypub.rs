@@ -87,6 +87,7 @@ async fn test_actor_endpoint() {
         json["featuredTags"],
         "https://test.example.com/users/testuser/collections/tags"
     );
+    assert_eq!(json["manuallyApprovesFollowers"], false);
     assert_eq!(json["discoverable"], true);
     assert_eq!(json["indexable"], true);
     assert_eq!(
@@ -471,6 +472,31 @@ async fn test_featured_tags_collection_is_empty_ordered_collection() {
 }
 
 #[tokio::test]
+async fn test_featured_tags_collection_returns_featured_hashtags() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    server.state.db.create_featured_tag("rust").await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser/collections/tags"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ordered_items = json["orderedItems"].as_array().unwrap();
+    assert!(ordered_items.iter().any(|item| {
+        item["type"] == "Hashtag"
+            && item["name"] == "#rust"
+            && item["href"] == "https://test.example.com/users/testuser/tagged/rust"
+    }));
+}
+
+#[tokio::test]
 async fn test_tag_collection_resolves_both_tagged_and_tags_routes() {
     use chrono::Utc;
     use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
@@ -501,7 +527,11 @@ async fn test_tag_collection_resolves_both_tagged_and_tags_routes() {
         .await
         .unwrap();
 
-    for path in ["/tagged/breakfast", "/tags/breakfast"] {
+    for path in [
+        "/tagged/breakfast",
+        "/tags/breakfast",
+        "/users/testuser/tagged/breakfast",
+    ] {
         let response = server
             .client
             .get(server.url(path))

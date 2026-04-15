@@ -524,6 +524,9 @@ impl App {
                 app.render();
             }
         });
+        self.attach_dynamic_action("[data-focus-hashtag-query]", move |app, _element| {
+            app.focus_hashtag_query();
+        });
         self.attach_select_change("composer-visibility", {
             let app = self.clone();
             move |value| {
@@ -557,6 +560,12 @@ impl App {
                 return;
             };
             app.set_selected_notification(group_key);
+        });
+        self.attach_dynamic_action("[data-jump-status]", move |app, element| {
+            let Some(status_id) = element.get_attribute("data-jump-status") else {
+                return;
+            };
+            app.jump_to_timeline_status(status_id);
         });
         self.attach_dynamic_action("[data-reply-status]", move |app, element| {
             let Some(status_id) = element.get_attribute("data-reply-status") else {
@@ -806,9 +815,13 @@ impl App {
     }
 
     fn input_value(&self, id: &str) -> Option<String> {
-        let element = self.document.get_element_by_id(id)?;
-        let input: HtmlInputElement = element.dyn_into().ok()?;
+        let input = self.input(id)?;
         Some(input.value())
+    }
+
+    fn input(&self, id: &str) -> Option<HtmlInputElement> {
+        let element = self.document.get_element_by_id(id)?;
+        element.dyn_into::<HtmlInputElement>().ok()
     }
 
     fn textarea(&self, id: &str) -> Option<HtmlTextAreaElement> {
@@ -917,6 +930,14 @@ impl App {
         if let Some(textarea) = self.textarea("composer-input") {
             let _ = textarea.focus();
         }
+    }
+
+    fn focus_hashtag_query(&self) {
+        let Some(input) = self.input("hashtag-query") else {
+            return;
+        };
+        let _ = input.focus();
+        input.select();
     }
 
     fn blur_active_element(&self) {
@@ -1033,6 +1054,13 @@ impl App {
 
         let target_index = next_selection_index(current_index, order.len(), delta);
         self.set_selected_status(order[target_index].clone());
+    }
+
+    fn jump_to_timeline_status(self: &Rc<Self>, status_id: String) {
+        if self.find_status(&status_id).is_none() {
+            return;
+        }
+        self.set_selected_status(status_id);
     }
 
     fn select_first_status(self: &Rc<Self>) {
@@ -2020,6 +2048,7 @@ fn render_app(model: &Model) -> String {
         <div class="timeline-identity">
           <span class="timeline-feed-pill">{feed_label}</span>
           <span class="timeline-feed-context">{feed_context}</span>
+          {feed_query_chip}
           <span class="timeline-feed-contract">Mastodon API</span>
         </div>
         <h2>{feed_label}</h2>
@@ -2061,7 +2090,7 @@ fn render_app(model: &Model) -> String {
           <p class="micro-label">Notifications</p>
           <h3 id="notifications-title">Signals</h3>
         </div>
-        <div class="notification-count">{notifications_unread} unread</div>
+        {notification_count}
       </div>
       <div class="filter-row" aria-label="Notification filters">
         {notification_filters}
@@ -2156,6 +2185,7 @@ fn render_app(model: &Model) -> String {
         profile_panel = render_profile_panel(model),
         feed_label = encode_text(model.feed_mode.label()),
         feed_context = encode_text(feed_context_label(model)),
+        feed_query_chip = render_feed_query_chip(model),
         feed_mode_class = feed_mode_class(model),
         feed_subtitle = encode_text(&feed_subtitle(model)),
         composer_panel = composer_panel,
@@ -2163,7 +2193,7 @@ fn render_app(model: &Model) -> String {
         detail_modal = detail_modal,
         flash_banner = render_flash(model),
         timeline_cards = render_timeline(model),
-        notifications_unread = model.notifications_unread,
+        notification_count = render_notification_count(model.notifications_unread),
         notification_filters = render_notification_filters(model),
         notifications = render_notifications(model),
     )
@@ -2804,6 +2834,19 @@ fn render_notifications(model: &Model) -> String {
         .map(|group| {
             let group_key = notification_group_selection_key(group);
             let kind_class = notification_kind_class(&group.notification_type);
+            let jump_button = group.status.as_ref().and_then(|status| {
+                let status_id = display_status(status).id.clone();
+                model
+                    .statuses
+                    .iter()
+                    .any(|candidate| display_status(candidate).id == status_id)
+                    .then(|| {
+                        format!(
+                            r#"<button class="ghost-button small" data-jump-status="{status_id}">Jump to post</button>"#,
+                            status_id = encode_attribute(&status_id),
+                        )
+                    })
+            }).unwrap_or_default();
             let preview = group
                 .status
                 .as_ref()
@@ -2853,6 +2896,7 @@ fn render_notifications(model: &Model) -> String {
   </div>
   <p class="notification-preview">{preview}</p>
   <div class="notification-actions">
+    {jump_button}
     {thread_button}
     <button class="ghost-button small" data-dismiss-notification="{notification_id}">Dismiss</button>
   </div>
@@ -2886,6 +2930,7 @@ fn render_notifications(model: &Model) -> String {
                 handle = actor_handle,
                 count_badge = count_badge,
                 preview = encode_text(&preview),
+                jump_button = jump_button,
                 thread_button = thread_button,
                 notification_id = dismiss_ids,
             )
@@ -3052,6 +3097,48 @@ fn feed_mode_class(model: &Model) -> &'static str {
         FeedMode::Profile => "feed-profile",
         FeedMode::Hashtags => "feed-hashtags",
     }
+}
+
+fn render_feed_query_chip(model: &Model) -> String {
+    if model.feed_mode != FeedMode::Hashtags {
+        return String::new();
+    }
+    let hashtags = parse_hashtag_query(&model.hashtag_query);
+    if hashtags.is_empty() {
+        return r#"<button type="button" class="timeline-feed-query empty" data-focus-hashtag-query="true">add hashtags</button>"#.to_string();
+    }
+    let preview = hashtags
+        .iter()
+        .take(3)
+        .map(|value| format!("#{value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if hashtags.len() > 3 {
+        format!(" +{}", hashtags.len() - 3)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<button type="button" class="timeline-feed-query" data-focus-hashtag-query="true" title="{full_query}">{preview}</button>"#,
+        full_query = encode_attribute(
+            &hashtags
+                .iter()
+                .map(|value| format!("#{value}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        preview = encode_text(&format!("{preview}{suffix}"))
+    )
+}
+
+fn render_notification_count(count: usize) -> String {
+    if count == 0 {
+        return r#"<div class="notification-count all-clear">All caught up</div>"#.to_string();
+    }
+    format!(
+        r#"<div class="notification-count has-unread">{} unread</div>"#,
+        count
+    )
 }
 
 fn composer_limit(model: &Model) -> usize {

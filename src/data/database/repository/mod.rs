@@ -2,6 +2,7 @@ mod account;
 mod conversations;
 mod delivery_jobs;
 mod domain_blocks;
+mod featured_tags;
 mod filters;
 mod follow;
 mod follow_requests;

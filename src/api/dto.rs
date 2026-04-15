@@ -117,6 +117,16 @@ pub struct RelationshipResponse {
     pub note: String,
 }
 
+/// Featured tag response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeaturedTagResponse {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub statuses_count: i64,
+    pub last_status_at: Option<String>,
+}
+
 /// Notification response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationResponse {

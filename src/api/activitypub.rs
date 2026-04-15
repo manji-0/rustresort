@@ -457,6 +457,7 @@ pub(crate) fn build_local_actor_document(
         "following": format!("{}/following", actor_url),
         "featured": format!("{}/collections/featured", actor_url),
         "featuredTags": format!("{}/collections/tags", actor_url),
+        "manuallyApprovesFollowers": false,
         "endpoints": {
             "sharedInbox": format!("{}/inbox", base_url)
         },
@@ -604,6 +605,10 @@ where
         )
         .route("/users/:username/collections/featured", get(featured))
         .route("/users/:username/collections/tags", get(featured_tags))
+        .route(
+            "/users/:username/tagged/:hashtag",
+            get(actor_tag_collection),
+        )
         .route("/users/:username/followers", get(followers))
         .route("/users/:username/following", get(following))
         .route("/tags/:hashtag", get(tag_collection))
@@ -925,12 +930,25 @@ async fn featured_tags(
     match account {
         Some(acc) if acc.username == username => {
             let actor_url = format!("{}/users/{}", state.config.server.base_url(), username);
+            let ordered_items = state
+                .db
+                .list_featured_tags()
+                .await?
+                .into_iter()
+                .map(|(_, name, _, _)| {
+                    serde_json::json!({
+                        "type": "Hashtag",
+                        "href": format!("{}/tagged/{}", actor_url, name),
+                        "name": format!("#{}", name),
+                    })
+                })
+                .collect::<Vec<_>>();
             Ok(activitypub_json_response(serde_json::json!({
                 "@context": activitypub_status_context(),
                 "type": "OrderedCollection",
                 "id": format!("{}/collections/tags", actor_url),
-                "totalItems": 0,
-                "orderedItems": Vec::<serde_json::Value>::new()
+                "totalItems": ordered_items.len(),
+                "orderedItems": ordered_items
             })))
         }
         _ => Err(AppError::NotFound),
@@ -941,6 +959,28 @@ async fn tag_collection(
     State(state): State<ActivityPubState>,
     Path(hashtag): Path<String>,
 ) -> Result<Response, AppError> {
+    build_tag_collection_response(&state, None, &hashtag).await
+}
+
+async fn actor_tag_collection(
+    State(state): State<ActivityPubState>,
+    Path((username, hashtag)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    build_tag_collection_response(&state, Some(&username), &hashtag).await
+}
+
+async fn build_tag_collection_response(
+    state: &ActivityPubState,
+    username: Option<&str>,
+    hashtag: &str,
+) -> Result<Response, AppError> {
+    if let Some(username) = username {
+        let account = state.db.get_account().await?;
+        match account {
+            Some(acc) if acc.username == username => {}
+            _ => return Err(AppError::NotFound),
+        }
+    }
     let normalized = hashtag.trim().trim_start_matches('#');
     let statuses = state
         .db
@@ -955,7 +995,9 @@ async fn tag_collection(
     Ok(activitypub_json_response(serde_json::json!({
         "@context": activitypub_status_context(),
         "type": "OrderedCollection",
-        "id": format!("{}/tagged/{}", base_url, normalized),
+        "id": username
+            .map(|username| format!("{}/users/{}/tagged/{}", base_url, username, normalized))
+            .unwrap_or_else(|| format!("{}/tagged/{}", base_url, normalized)),
         "totalItems": ordered_items.len(),
         "orderedItems": ordered_items
     })))

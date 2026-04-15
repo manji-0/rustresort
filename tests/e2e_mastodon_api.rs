@@ -191,6 +191,88 @@ async fn test_verify_credentials_returns_counts() {
 }
 
 #[tokio::test]
+async fn test_featured_tags_crud_and_suggestions() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "Posting about #rust",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let suggestions = server
+        .client
+        .get(server.url("/api/v1/featured_tags/suggestions"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(suggestions.status(), 200);
+    let suggestions_json: Value = suggestions.json().await.unwrap();
+    assert!(
+        suggestions_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["name"] == "rust")
+    );
+
+    let create = server
+        .client
+        .post(server.url("/api/v1/featured_tags"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[("name", "rust")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 200);
+    let create_json: Value = create.json().await.unwrap();
+    assert_eq!(create_json["name"], "rust");
+    assert!(
+        create_json["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/users/testuser/tagged/rust")
+    );
+    let featured_tag_id = create_json["id"].as_str().unwrap().to_string();
+
+    let list = server
+        .client
+        .get(server.url("/api/v1/featured_tags"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_json: Value = list.json().await.unwrap();
+    assert!(
+        list_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag["id"] == featured_tag_id && tag["name"] == "rust")
+    );
+
+    let delete = server
+        .client
+        .delete(server.url(&format!("/api/v1/featured_tags/{featured_tag_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 200);
+    assert_eq!(delete.json::<Value>().await.unwrap(), serde_json::json!({}));
+}
+
+#[tokio::test]
 async fn test_account_statuses_empty() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;

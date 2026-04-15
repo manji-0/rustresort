@@ -21,6 +21,7 @@ pub mod admin;
 pub mod apps;
 pub mod bookmarks;
 pub mod conversations;
+pub mod featured_tags;
 pub(crate) mod federation_delivery;
 pub mod filters;
 pub mod instance;
@@ -206,6 +207,22 @@ where
         .route(
             "/v1/accounts/search",
             scoped(get(accounts::search_accounts), READ_ACCOUNTS),
+        )
+        .route(
+            "/v1/featured_tags",
+            scoped(get(featured_tags::get_featured_tags), READ_ACCOUNTS),
+        )
+        .route(
+            "/v1/featured_tags",
+            scoped(post(featured_tags::feature_tag), WRITE_ACCOUNTS),
+        )
+        .route(
+            "/v1/featured_tags/:id",
+            scoped(delete(featured_tags::unfeature_tag), WRITE_ACCOUNTS),
+        )
+        .route(
+            "/v1/featured_tags/suggestions",
+            scoped(get(featured_tags::featured_tag_suggestions), READ_ACCOUNTS),
         )
         .route(
             "/v1/accounts/:id/lists",

@@ -1919,6 +1919,26 @@ pub async fn pin_status(
     )
     .await?;
 
+    if should_federate_to_followers(status.visibility) {
+        let follower_inboxes = state.db.get_follower_inboxes().await.unwrap_or_default();
+        if !follower_inboxes.is_empty() {
+            let state_for_delivery = state.clone();
+            let account_for_delivery = account.clone();
+            let status_uri = status.uri.clone();
+            spawn_best_effort_delivery("pin_status", async move {
+                let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+                delivery
+                    .queue_add_featured(
+                        state_for_delivery.db.as_ref(),
+                        &status_uri,
+                        follower_inboxes,
+                    )
+                    .await;
+                Ok(())
+            });
+        }
+    }
+
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
 
@@ -1954,6 +1974,26 @@ pub async fn unpin_status(
         ),
     )
     .await?;
+
+    if should_federate_to_followers(status.visibility) {
+        let follower_inboxes = state.db.get_follower_inboxes().await.unwrap_or_default();
+        if !follower_inboxes.is_empty() {
+            let state_for_delivery = state.clone();
+            let account_for_delivery = account.clone();
+            let status_uri = status.uri.clone();
+            spawn_best_effort_delivery("unpin_status", async move {
+                let delivery = build_delivery(&state_for_delivery, &account_for_delivery);
+                delivery
+                    .queue_remove_featured(
+                        state_for_delivery.db.as_ref(),
+                        &status_uri,
+                        follower_inboxes,
+                    )
+                    .await;
+                Ok(())
+            });
+        }
+    }
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
