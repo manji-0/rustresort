@@ -3,6 +3,7 @@
 mod common;
 
 use common::TestServer;
+use rustresort::data::CachedProfile;
 use serde_json::Value;
 
 #[tokio::test]
@@ -71,7 +72,21 @@ async fn test_update_credentials() {
 
     let update_data = serde_json::json!({
         "display_name": "Updated Name",
-        "note": "Updated bio"
+        "note": "Updated bio",
+        "fields_attributes": {
+            "0": {
+                "name": "Website",
+                "value": "https://example.com/@testuser"
+            },
+            "1": {
+                "name": "Project",
+                "value": "RustResort"
+            }
+        },
+        "locked": true,
+        "bot": true,
+        "discoverable": false,
+        "indexable": false
     });
 
     let response = server
@@ -87,7 +102,70 @@ async fn test_update_credentials() {
     if response.status().is_success() {
         let json: Value = response.json().await.unwrap();
         assert_eq!(json["display_name"], "Updated Name");
+        assert_eq!(json["locked"], true);
+        assert_eq!(json["bot"], true);
+        assert_eq!(json["discoverable"], false);
+        assert_eq!(json["indexable"], false);
+        assert_eq!(json["fields"][0]["name"], "Website");
+        assert_eq!(
+            json["fields"][0]["value"],
+            "<a href=\"https://example.com/@testuser\" rel=\"me nofollow noopener noreferrer\" target=\"_blank\">https://example.com/@testuser</a>"
+        );
+        assert_eq!(json["source"]["fields"][0]["value"], "https://example.com/@testuser");
+        assert_eq!(json["source"]["fields"][1]["value"], "RustResort");
     }
+}
+
+#[tokio::test]
+async fn test_remote_lookup_returns_cached_profile_fields() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let profile_fields_json = serde_json::to_string(&vec![serde_json::json!({
+        "name": "Website",
+        "value": "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>",
+        "verified_at": serde_json::Value::Null
+    })])
+    .unwrap();
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            note: Some("Remote".to_string()),
+            profile_fields_json: Some(profile_fields_json),
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----".to_string(),
+            inbox_uri: "https://remote.example/users/alice/inbox".to_string(),
+            outbox_uri: Some("https://remote.example/users/alice/outbox".to_string()),
+            followers_count: Some(3),
+            following_count: Some(4),
+            fetched_at: chrono::Utc::now(),
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/lookup"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("acct", "alice@remote.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["acct"], "alice@remote.example");
+    assert_eq!(json["fields"][0]["name"], "Website");
+    assert_eq!(
+        json["fields"][0]["value"],
+        "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>"
+    );
 }
 
 #[tokio::test]
@@ -723,6 +801,7 @@ async fn test_unfollow_account_uses_stored_actor_uri_alias_for_delivery() {
             uri: actor_uri.clone(),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -983,6 +1062,7 @@ async fn test_block_and_unblock_account_deliver_outbound_activities() {
             uri: format!("{}/users/alice", remote_base_url),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1119,6 +1199,7 @@ async fn test_block_and_unblock_use_stored_actor_uri_alias_for_delivery() {
             uri: actor_uri.clone(),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1219,6 +1300,7 @@ async fn test_block_account_when_already_blocked_skips_duplicate_outbound_delive
             uri: format!("{}/users/alice", remote_base_url),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
@@ -1318,6 +1400,7 @@ async fn test_unblock_account_without_existing_block_skips_outbound_undo_deliver
             uri: format!("{}/users/alice", remote_base_url),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"

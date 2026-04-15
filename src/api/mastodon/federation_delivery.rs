@@ -525,6 +525,11 @@ fn build_cached_profile(
             .or_else(|| actor_document.get("note"))
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        profile_fields_json: crate::profile_fields::serialize_profile_fields(
+            &crate::profile_fields::extract_profile_fields_from_actor(actor_document),
+        )
+        .ok()
+        .flatten(),
         avatar_url: actor_document.get("icon").and_then(extract_url),
         header_url: actor_document.get("image").and_then(extract_url),
         public_key_pem,

@@ -22,6 +22,11 @@ pub struct AccountCredentialsPatch {
     pub header_s3_key: Option<String>,
     pub display_name: Option<Option<String>>,
     pub note: Option<Option<String>>,
+    pub profile_fields_json: Option<Option<String>>,
+    pub locked: Option<bool>,
+    pub bot: Option<bool>,
+    pub discoverable: Option<bool>,
+    pub indexable: Option<bool>,
     pub updated_at: DateTime<Utc>,
 }
 

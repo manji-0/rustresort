@@ -26,15 +26,21 @@ impl Database {
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO account (
-                id, username, display_name, note, also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
+                id, username, display_name, note, profile_fields_json, locked, bot, discoverable, indexable,
+                also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
                 private_key_pem, public_key_pem, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&account.id)
         .bind(&account.username)
         .bind(&account.display_name)
         .bind(&account.note)
+        .bind(&account.profile_fields_json)
+        .bind(account.locked)
+        .bind(account.bot)
+        .bind(account.discoverable)
+        .bind(account.indexable)
         .bind(&account.also_known_as)
         .bind(&account.moved_to_uri)
         .bind(&account.avatar_s3_key)
@@ -60,10 +66,11 @@ impl Database {
         let result = sqlx::query(
             r#"
             INSERT INTO account (
-                id, username, display_name, note, also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
+                id, username, display_name, note, profile_fields_json, locked, bot, discoverable, indexable,
+                also_known_as, moved_to_uri, avatar_s3_key, header_s3_key,
                 private_key_pem, public_key_pem, created_at, updated_at
             )
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (SELECT 1 FROM account)
             "#,
         )
@@ -71,6 +78,11 @@ impl Database {
         .bind(&account.username)
         .bind(&account.display_name)
         .bind(&account.note)
+        .bind(&account.profile_fields_json)
+        .bind(account.locked)
+        .bind(account.bot)
+        .bind(account.discoverable)
+        .bind(account.indexable)
         .bind(&account.also_known_as)
         .bind(&account.moved_to_uri)
         .bind(&account.avatar_s3_key)
@@ -250,6 +262,11 @@ impl Database {
                 header_s3_key = ?,
                 display_name = CASE WHEN ? THEN ? ELSE display_name END,
                 note = CASE WHEN ? THEN ? ELSE note END,
+                profile_fields_json = CASE WHEN ? THEN ? ELSE profile_fields_json END,
+                locked = CASE WHEN ? THEN ? ELSE locked END,
+                bot = CASE WHEN ? THEN ? ELSE bot END,
+                discoverable = CASE WHEN ? THEN ? ELSE discoverable END,
+                indexable = CASE WHEN ? THEN ? ELSE indexable END,
                 updated_at = ?
             WHERE id = ?
               AND avatar_s3_key IS ?
@@ -267,6 +284,21 @@ impl Database {
         )
         .bind(patch.note.is_some())
         .bind(patch.note.as_ref().and_then(|value| value.as_deref()))
+        .bind(patch.profile_fields_json.is_some())
+        .bind(
+            patch
+                .profile_fields_json
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        )
+        .bind(patch.locked.is_some())
+        .bind(patch.locked.unwrap_or_default())
+        .bind(patch.bot.is_some())
+        .bind(patch.bot.unwrap_or_default())
+        .bind(patch.discoverable.is_some())
+        .bind(patch.discoverable.unwrap_or_default())
+        .bind(patch.indexable.is_some())
+        .bind(patch.indexable.unwrap_or_default())
         .bind(patch.updated_at)
         .bind(patch.account_id.as_str())
         .bind(patch.expected_current_avatar_s3_key.as_deref())

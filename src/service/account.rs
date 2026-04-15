@@ -104,6 +104,11 @@ impl AccountService {
             username: username.to_string(),
             display_name: Some(username.to_string()),
             note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             also_known_as: None,
             moved_to_uri: None,
             avatar_s3_key: None,
@@ -133,12 +138,24 @@ impl AccountService {
         &self,
         display_name: Option<String>,
         note: Option<String>,
+        profile_fields_json: Option<Option<String>>,
+        locked: Option<bool>,
+        bot: Option<bool>,
+        discoverable: Option<bool>,
+        indexable: Option<bool>,
     ) -> Result<Account, AppError> {
         let mut account = self.get_account().await?;
 
         let display_name_patch = display_name.map(normalize_optional_text);
         let note_patch = note.map(normalize_optional_text);
-        if display_name_patch.is_none() && note_patch.is_none() {
+        if display_name_patch.is_none()
+            && note_patch.is_none()
+            && profile_fields_json.is_none()
+            && locked.is_none()
+            && bot.is_none()
+            && discoverable.is_none()
+            && indexable.is_none()
+        {
             return Ok(account);
         }
 
@@ -146,12 +163,21 @@ impl AccountService {
 
         let updated = self
             .db
-            .patch_account_profile(
-                account.id.as_str(),
-                display_name_patch.as_ref().map(|value| value.as_deref()),
-                note_patch.as_ref().map(|value| value.as_deref()),
+            .patch_account_credentials_if_matches(&AccountCredentialsPatch {
+                account_id: account.id.clone(),
+                expected_current_avatar_s3_key: account.avatar_s3_key.clone(),
+                expected_current_header_s3_key: account.header_s3_key.clone(),
+                avatar_s3_key: account.avatar_s3_key.clone(),
+                header_s3_key: account.header_s3_key.clone(),
+                display_name: display_name_patch.clone(),
+                note: note_patch.clone(),
+                profile_fields_json: profile_fields_json.clone(),
+                locked,
+                bot,
+                discoverable,
+                indexable,
                 updated_at,
-            )
+            })
             .await?;
         if !updated {
             return Err(AppError::NotFound);
@@ -162,6 +188,21 @@ impl AccountService {
         }
         if let Some(note) = note_patch {
             account.note = note;
+        }
+        if let Some(profile_fields_json) = profile_fields_json {
+            account.profile_fields_json = profile_fields_json;
+        }
+        if let Some(locked) = locked {
+            account.locked = locked;
+        }
+        if let Some(bot) = bot {
+            account.bot = bot;
+        }
+        if let Some(discoverable) = discoverable {
+            account.discoverable = discoverable;
+        }
+        if let Some(indexable) = indexable {
+            account.indexable = indexable;
         }
         account.updated_at = updated_at;
         Ok(account)
@@ -182,11 +223,26 @@ impl AccountService {
         &self,
         display_name: Option<String>,
         note: Option<String>,
+        profile_fields_json: Option<Option<String>>,
+        locked: Option<bool>,
+        bot: Option<bool>,
+        discoverable: Option<bool>,
+        indexable: Option<bool>,
         avatar_image_data: Option<Vec<u8>>,
         header_image_data: Option<Vec<u8>>,
     ) -> Result<Account, AppError> {
         if avatar_image_data.is_none() && header_image_data.is_none() {
-            return self.update_profile(display_name, note).await;
+            return self
+                .update_profile(
+                    display_name,
+                    note,
+                    profile_fields_json,
+                    locked,
+                    bot,
+                    discoverable,
+                    indexable,
+                )
+                .await;
         }
 
         if avatar_image_data
@@ -258,6 +314,11 @@ impl AccountService {
                     .or_else(|| previous_header_key.clone()),
                 display_name: display_name_patch.clone(),
                 note: note_patch.clone(),
+                profile_fields_json: profile_fields_json.clone(),
+                locked,
+                bot,
+                discoverable,
+                indexable,
                 updated_at,
             })
             .await
@@ -578,6 +639,11 @@ mod tests {
             username: "admin".to_string(),
             display_name: Some("Admin".to_string()),
             note: Some("first".to_string()),
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             also_known_as: None,
             moved_to_uri: None,
             avatar_s3_key: None,
@@ -590,21 +656,45 @@ mod tests {
         db.upsert_account(&account).await.unwrap();
 
         let updated = service
-            .update_profile(Some("  Display  ".to_string()), Some("  bio  ".to_string()))
+            .update_profile(
+                Some("  Display  ".to_string()),
+                Some("  bio  ".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(updated.display_name, Some("Display".to_string()));
         assert_eq!(updated.note, Some("bio".to_string()));
 
         let note_only = service
-            .update_profile(None, Some("updated-note".to_string()))
+            .update_profile(
+                None,
+                Some("updated-note".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(note_only.display_name, Some("Display".to_string()));
         assert_eq!(note_only.note, Some("updated-note".to_string()));
 
         let display_only = service
-            .update_profile(Some("updated-display".to_string()), None)
+            .update_profile(
+                Some("updated-display".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -614,7 +704,15 @@ mod tests {
         assert_eq!(display_only.note, Some("updated-note".to_string()));
 
         let cleared = service
-            .update_profile(Some("   ".to_string()), Some("".to_string()))
+            .update_profile(
+                Some("   ".to_string()),
+                Some("".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(cleared.display_name, None);

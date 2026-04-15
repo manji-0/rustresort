@@ -81,6 +81,7 @@ async fn insert_remote_profile(
             uri: actor_uri.to_string(),
             display_name: Some("Remote User".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: common::test_public_key_pem().to_string(),
@@ -504,7 +505,17 @@ async fn test_account_update_delivers_actor_update_to_followers() {
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "display_name": "Updated Name",
-            "note": "Updated bio"
+            "note": "Updated bio",
+            "fields_attributes": {
+                "0": {
+                    "name": "Website",
+                    "value": "https://example.com/@testuser"
+                }
+            },
+            "locked": true,
+            "bot": true,
+            "discoverable": false,
+            "indexable": false
         }))
         .send()
         .await
@@ -521,5 +532,24 @@ async fn test_account_update_delivers_actor_update_to_followers() {
     assert_eq!(
         delivered.body["object"]["name"],
         serde_json::json!("Updated Name")
+    );
+    assert_eq!(delivered.body["object"]["summary"], serde_json::json!("Updated bio"));
+    assert_eq!(
+        delivered.body["object"]["manuallyApprovesFollowers"],
+        serde_json::json!(true)
+    );
+    assert_eq!(delivered.body["object"]["bot"], serde_json::json!(true));
+    assert_eq!(
+        delivered.body["object"]["discoverable"],
+        serde_json::json!(false)
+    );
+    assert_eq!(delivered.body["object"]["indexable"], serde_json::json!(false));
+    assert_eq!(
+        delivered.body["object"]["attachment"][0]["type"],
+        serde_json::json!("PropertyValue")
+    );
+    assert_eq!(
+        delivered.body["object"]["attachment"][0]["name"],
+        serde_json::json!("Website")
     );
 }

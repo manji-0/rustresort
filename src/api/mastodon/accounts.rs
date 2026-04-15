@@ -52,13 +52,17 @@ pub struct UpdateCredentialsRequest {
     pub note: Option<String>,
     pub avatar: Option<String>, // Base64 encoded image
     pub header: Option<String>, // Base64 encoded image
+    pub fields_attributes: Option<serde_json::Value>,
     pub moved_to_account_id: Option<String>,
     #[serde(rename = "locked")]
-    pub _locked: Option<bool>,
+    pub locked: Option<bool>,
     #[serde(rename = "bot")]
-    pub _bot: Option<bool>,
+    pub bot: Option<bool>,
     #[serde(rename = "discoverable")]
-    pub _discoverable: Option<bool>,
+    pub discoverable: Option<bool>,
+    pub indexable: Option<bool>,
+    #[serde(rename = "hide_collections")]
+    pub _hide_collections: Option<bool>,
 }
 
 /// Search query parameters
@@ -643,7 +647,9 @@ fn build_remote_account_response_with_profile(
         statuses_count,
         last_status_at: None,
         emojis: vec![],
-        fields: vec![],
+        fields: crate::profile_fields::profile_fields_for_response(
+            profile.profile_fields_json.as_deref(),
+        ),
         roles: vec![],
         moved: None,
         source: None,
@@ -1083,7 +1089,9 @@ async fn account_source_payload(
         .unwrap_or(0);
     serde_json::json!({
         "note": account.note.clone().unwrap_or_default(),
-        "fields": [],
+        "fields": crate::profile_fields::profile_fields_for_source(
+            account.profile_fields_json.as_deref(),
+        ),
         "privacy": "public",
         "sensitive": false,
         "language": serde_json::Value::Null,
@@ -1325,11 +1333,17 @@ pub async fn update_credentials(
         note,
         avatar,
         header,
+        fields_attributes,
         moved_to_account_id,
-        _locked: _,
-        _bot: _,
-        _discoverable: _,
+        locked,
+        bot,
+        discoverable,
+        indexable,
+        _hide_collections: _,
     } = req;
+
+    let profile_fields_json =
+        crate::profile_fields::normalize_profile_fields_request(fields_attributes.as_ref())?;
 
     let normalized_moved_to_uri = match moved_to_account_id.as_deref() {
         Some(value) => normalize_moved_to_account_uri(&state, value).await?,
@@ -1356,7 +1370,17 @@ pub async fn update_credentials(
     };
 
     let mut account = account_service
-        .update_credentials(display_name, note, avatar_bytes, header_bytes)
+        .update_credentials(
+            display_name,
+            note,
+            profile_fields_json,
+            locked,
+            bot,
+            discoverable,
+            indexable,
+            avatar_bytes,
+            header_bytes,
+        )
         .await?;
 
     if moved_to_account_id.is_some() {

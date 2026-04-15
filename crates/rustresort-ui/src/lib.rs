@@ -2349,7 +2349,10 @@ fn render_reply_banner(model: &Model) -> String {
 
     format!(
         r#"<div class="reply-banner">
-  <span>Replying to {label}</span>
+  <div class="composer-context-copy">
+    <span class="composer-context-title">Replying to</span>
+    <span class="composer-context-summary">{label}</span>
+  </div>
   <button id="composer-cancel-reply" class="ghost-button small">Cancel</button>
 </div>"#,
         label = encode_text(label),
@@ -2363,7 +2366,10 @@ fn render_quote_banner(model: &Model) -> String {
 
     format!(
         r#"<div class="reply-banner quote-banner">
-  <span>Quoting {label}</span>
+  <div class="composer-context-copy">
+    <span class="composer-context-title">Quoting</span>
+    <span class="composer-context-summary">{label}</span>
+  </div>
   <button id="composer-cancel-quote" class="ghost-button small">Cancel</button>
 </div>"#,
         label = encode_text(label),

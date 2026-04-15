@@ -42,6 +42,7 @@ pub mod data;
 pub mod error;
 pub mod federation;
 pub mod metrics;
+mod profile_fields;
 pub mod service;
 pub mod storage;
 pub mod ui;
@@ -704,6 +705,11 @@ impl AppState {
                 username: config.auth.username.clone(),
                 display_name: Some(config.admin.display_name.clone()),
                 note: config.admin.note.clone(),
+                profile_fields_json: None,
+                locked: false,
+                bot: false,
+                discoverable: true,
+                indexable: true,
                 also_known_as: None,
                 moved_to_uri: None,
                 avatar_s3_key: None,
@@ -934,6 +940,11 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: Some("Test account".to_string()),
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             also_known_as: None,
             moved_to_uri: None,
             avatar_s3_key: None,
@@ -951,6 +962,7 @@ mod tests {
             uri: "https://remote.example/users/bob".to_string(),
             display_name: Some("Bob".to_string()),
             note: Some("persisted".to_string()),
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "persisted-key".to_string(),

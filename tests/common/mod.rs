@@ -125,6 +125,11 @@ impl TestServer {
                 username: "testuser".to_string(),
                 display_name: Some("Test User".to_string()),
                 note: Some("Test account".to_string()),
+                profile_fields_json: None,
+                locked: false,
+                bot: false,
+                discoverable: true,
+                indexable: true,
                 also_known_as: None,
                 moved_to_uri: None,
                 avatar_s3_key: None,
@@ -255,6 +260,11 @@ impl TestServer {
             account.username = "testuser".to_string();
             account.display_name = Some("Test User".to_string());
             account.note = Some("Test bio".to_string());
+            account.profile_fields_json = None;
+            account.locked = false;
+            account.bot = false;
+            account.discoverable = true;
+            account.indexable = true;
             account.avatar_s3_key = None;
             account.header_s3_key = None;
             account.private_key_pem = TEST_PRIVATE_KEY_PEM.to_string();
@@ -267,6 +277,11 @@ impl TestServer {
                 username: "testuser".to_string(),
                 display_name: Some("Test User".to_string()),
                 note: Some("Test bio".to_string()),
+                profile_fields_json: None,
+                locked: false,
+                bot: false,
+                discoverable: true,
+                indexable: true,
                 also_known_as: None,
                 moved_to_uri: None,
                 avatar_s3_key: None,

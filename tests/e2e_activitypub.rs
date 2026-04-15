@@ -133,6 +133,55 @@ async fn test_actor_endpoint_exposes_account_migration_fields() {
 }
 
 #[tokio::test]
+async fn test_actor_endpoint_exposes_profile_fields_and_account_flags() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .patch(server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "fields_attributes": {
+                "0": {
+                    "name": "Website",
+                    "value": "https://example.com/@testuser"
+                }
+            },
+            "locked": true,
+            "bot": true,
+            "discoverable": false,
+            "indexable": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = server
+        .client
+        .get(server.url("/users/testuser"))
+        .header("Accept", "application/activity+json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["manuallyApprovesFollowers"], true);
+    assert_eq!(json["bot"], true);
+    assert_eq!(json["discoverable"], false);
+    assert_eq!(json["indexable"], false);
+    assert_eq!(json["attachment"][0]["type"], "PropertyValue");
+    assert_eq!(json["attachment"][0]["name"], "Website");
+    assert_eq!(
+        json["attachment"][0]["value"],
+        "<a href=\"https://example.com/@testuser\" rel=\"me nofollow noopener noreferrer\" target=\"_blank\">https://example.com/@testuser</a>"
+    );
+}
+
+#[tokio::test]
 async fn test_inbox_endpoint_rejects_unsigned_activity() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -1474,6 +1523,7 @@ async fn test_activitypub_status_object_for_local_poll_includes_question_and_men
             uri: REMOTE_ACTOR_ID.to_string(),
             display_name: Some("Alice".to_string()),
             note: None,
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: common::test_public_key_pem().to_string(),
@@ -2014,6 +2064,7 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
             uri: REMOTE_ACTOR_ID.to_string(),
             display_name: Some("Alice".to_string()),
             note: Some("before".to_string()),
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "old-key".to_string(),
@@ -2040,6 +2091,11 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
             },
             "icon": { "url": "https://cdn.remote.example/alice.png" },
             "image": { "url": "https://cdn.remote.example/alice-header.png" },
+            "attachment": [{
+                "type": "PropertyValue",
+                "name": "Website",
+                "value": "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>"
+            }],
             "inbox": "https://remote.example/inbox-new",
             "outbox": "https://remote.example/outbox-new",
             "followersCount": 10,
@@ -2061,6 +2117,14 @@ async fn test_signed_shared_inbox_update_profile_refreshes_profile_cache() {
     assert_eq!(updated.display_name.as_deref(), Some("Alice Updated"));
     assert_eq!(updated.note.as_deref(), Some("after"));
     assert_eq!(updated.public_key_pem, "new-key");
+    let fields: Vec<serde_json::Value> =
+        serde_json::from_str(updated.profile_fields_json.as_deref().unwrap()).unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["name"], "Website");
+    assert_eq!(
+        fields[0]["value"],
+        "<a href=\"https://alice.example\" rel=\"me\">alice.example</a>"
+    );
     assert_eq!(
         updated.avatar_url.as_deref(),
         Some("https://cdn.remote.example/alice.png")

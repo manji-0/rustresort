@@ -30,12 +30,27 @@ impl EntityId {
 /// The single admin account for this instance
 ///
 /// Only one account exists in the database.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileField {
+    pub name: String,
+    pub value: String,
+    pub verified_at: Option<DateTime<Utc>>,
+}
+
+/// The single admin account for this instance
+///
+/// Only one account exists in the database.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Account {
     pub id: String,
     pub username: String,
     pub display_name: Option<String>,
     pub note: Option<String>,
+    pub profile_fields_json: Option<String>,
+    pub locked: bool,
+    pub bot: bool,
+    pub discoverable: bool,
+    pub indexable: bool,
     pub also_known_as: Option<String>,
     pub moved_to_uri: Option<String>,
     /// S3 key for avatar image
@@ -136,6 +151,7 @@ pub struct RemoteProfile {
     pub uri: String,
     pub display_name: Option<String>,
     pub note: Option<String>,
+    pub profile_fields_json: Option<String>,
     pub avatar_url: Option<String>,
     pub header_url: Option<String>,
     pub public_key_pem: String,

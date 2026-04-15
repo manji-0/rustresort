@@ -1440,12 +1440,42 @@ impl ActivityProcessor {
         // Extract actor address from URI
         let actor_address = self.extract_actor_address(&canonical_actor_uri);
 
+        let local_account = self.db.get_account().await?.ok_or(AppError::NotFound)?;
+
         // Get the Follow activity ID
         let follow_activity_uri = activity
             .get("id")
             .and_then(|id| id.as_str())
             .unwrap_or(actor_uri)
             .to_string();
+
+        if local_account.locked {
+            self.db
+                .insert_follow_request_with_actor_uri(
+                    &actor_address,
+                    &inbox_uri,
+                    &follow_activity_uri,
+                    Some(&canonical_actor_uri),
+                )
+                .await?;
+
+            let notification = crate::data::Notification {
+                id: crate::data::EntityId::new_string(),
+                notification_type: NotificationType::FollowRequest,
+                origin_account_address: actor_address,
+                status_uri: None,
+                read: false,
+                created_at: chrono::Utc::now(),
+            };
+
+            self.insert_notification_and_publish(
+                &notification,
+                activity.get("id").and_then(|id| id.as_str()),
+            )
+            .await?;
+
+            return Ok(());
+        }
 
         // 3. Add to followers table
         let follower = crate::data::Follower {
@@ -3258,7 +3288,8 @@ mod tests {
         PersistenceDecision, extract_follow_target, is_local_follow_target, parse_question_poll,
     };
     use crate::data::{
-        CachedProfile, CachedStatus, Database, EntityId, Follow, Follower, NotificationType,
+        Account, CachedProfile, CachedStatus, Database, EntityId, Follow, Follower,
+        NotificationType,
         PersistedReason, ProfileCache, PushAlerts, PushPayload, PushSubscription, TimelineCache,
     };
     use crate::error::AppError;
@@ -3284,6 +3315,33 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("activity_processor_test.db");
         let db = Arc::new(Database::connect(&db_path).await.unwrap());
+        let username = local_address
+            .split('@')
+            .next()
+            .unwrap_or("local")
+            .to_string();
+        let now = Utc::now();
+        db.upsert_account(&Account {
+            id: EntityId::new_string(),
+            username: username.clone(),
+            display_name: Some(username),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: TEST_PRIVATE_KEY_PEM.to_string(),
+            public_key_pem: "public-key".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
         let timeline_cache = Arc::new(TimelineCache::new(16).await.unwrap());
         let profile_cache = Arc::new(ProfileCache::new(86400).await.unwrap());
 
@@ -3589,6 +3647,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_follow_when_locked_creates_follow_request_without_accept() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let mut account = db.get_account().await.unwrap().unwrap();
+        account.locked = true;
+        db.upsert_account(&account).await.unwrap();
+
+        let delivery = Arc::new(crate::federation::ActivityDelivery::new(
+            Arc::new(reqwest::Client::new()),
+            "https://example.com/users/alice".to_string(),
+            "https://example.com/users/alice#main-key".to_string(),
+            TEST_PRIVATE_KEY_PEM.to_string(),
+        ));
+        let processor = processor.with_delivery(delivery);
+
+        let actor_uri = "https://remote.example/users/bob".to_string();
+        let activity = json!({
+            "type": "Follow",
+            "id": format!("{actor_uri}/follows/1"),
+            "actor": {
+                "id": actor_uri,
+                "inbox": "https://remote.example/users/bob/inbox"
+            },
+            "object": "https://example.com/users/alice"
+        });
+
+        processor.handle_follow(activity, &actor_uri).await.unwrap();
+
+        assert!(db.has_follow_request("bob@remote.example").await.unwrap());
+        assert!(db.get_all_follower_addresses().await.unwrap().is_empty());
+        assert!(db.claim_pending_delivery_jobs(10).await.unwrap().is_empty());
+
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].notification_type,
+            NotificationType::FollowRequest
+        );
+    }
+
+    #[tokio::test]
     async fn handle_follow_sends_web_push_for_enabled_follow_alerts() {
         let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
         let sender = Arc::new(MockWebPushSender::default());
@@ -3737,6 +3835,7 @@ mod tests {
                 uri: actor_uri.to_string(),
                 display_name: Some("Bob".to_string()),
                 note: Some("before".to_string()),
+                profile_fields_json: None,
                 avatar_url: None,
                 header_url: None,
                 public_key_pem: "old-key".to_string(),

@@ -192,6 +192,9 @@ fn activitypub_actor_context() -> serde_json::Value {
         "https://www.w3.org/ns/activitystreams",
         "https://w3id.org/security/v1",
         {
+            "schema": "http://schema.org#",
+            "PropertyValue": "schema:PropertyValue",
+            "value": "schema:value",
             "featured": {
                 "@id": "http://joinmastodon.org/ns#featured",
                 "@type": "@id"
@@ -444,6 +447,8 @@ pub(crate) fn build_local_actor_document(
     account: &Account,
 ) -> serde_json::Value {
     let actor_url = format!("{}/users/{}", base_url, account.username);
+    let attachments =
+        crate::profile_fields::activitypub_profile_attachments(account.profile_fields_json.as_deref());
     let mut actor = serde_json::json!({
         "@context": activitypub_actor_context(),
         "type": "Person",
@@ -457,12 +462,13 @@ pub(crate) fn build_local_actor_document(
         "following": format!("{}/following", actor_url),
         "featured": format!("{}/collections/featured", actor_url),
         "featuredTags": format!("{}/collections/tags", actor_url),
-        "manuallyApprovesFollowers": false,
+        "manuallyApprovesFollowers": account.locked,
         "endpoints": {
             "sharedInbox": format!("{}/inbox", base_url)
         },
-        "discoverable": true,
-        "indexable": true,
+        "discoverable": account.discoverable,
+        "indexable": account.indexable,
+        "bot": account.bot,
         "url": actor_url.clone(),
         "publicKey": {
             "id": format!("{}#main-key", actor_url),
@@ -480,6 +486,10 @@ pub(crate) fn build_local_actor_document(
             "url": storage.get_public_url(key)
         }))
     });
+
+    if !attachments.is_empty() {
+        actor["attachment"] = serde_json::json!(attachments);
+    }
 
     if let Some(also_known_as) = account.also_known_as.as_deref() {
         actor["alsoKnownAs"] = serde_json::json!([also_known_as]);
@@ -1171,6 +1181,11 @@ mod tests {
             username: "testuser".to_string(),
             display_name: Some("Test User".to_string()),
             note: Some("Test account".to_string()),
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
             also_known_as: None,
             moved_to_uri: None,
             avatar_s3_key: None,

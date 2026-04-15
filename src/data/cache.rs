@@ -308,6 +308,12 @@ fn build_cached_profile_from_actor(
         return None;
     }
 
+    let profile_fields_json = crate::profile_fields::serialize_profile_fields(
+        &crate::profile_fields::extract_profile_fields_from_actor(actor_document),
+    )
+    .ok()
+    .flatten();
+
     Some(CachedProfile {
         address: address.to_string(),
         uri: canonical_actor_uri,
@@ -320,6 +326,7 @@ fn build_cached_profile_from_actor(
             .or_else(|| actor_document.get("note"))
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        profile_fields_json,
         avatar_url: actor_document.get("icon").and_then(extract_url),
         header_url: actor_document.get("image").and_then(extract_url),
         public_key_pem,
@@ -693,6 +700,7 @@ pub struct CachedProfile {
     pub uri: String,
     pub display_name: Option<String>,
     pub note: Option<String>,
+    pub profile_fields_json: Option<String>,
     pub avatar_url: Option<String>,
     pub header_url: Option<String>,
     /// RSA public key for signature verification
@@ -714,6 +722,7 @@ impl From<super::RemoteProfile> for CachedProfile {
             uri: value.uri,
             display_name: value.display_name,
             note: value.note,
+            profile_fields_json: value.profile_fields_json,
             avatar_url: value.avatar_url,
             header_url: value.header_url,
             public_key_pem: value.public_key_pem,
@@ -737,6 +746,7 @@ impl From<&CachedProfile> for super::RemoteProfile {
             uri: value.uri.clone(),
             display_name: value.display_name.clone(),
             note: value.note.clone(),
+            profile_fields_json: value.profile_fields_json.clone(),
             avatar_url: value.avatar_url.clone(),
             header_url: value.header_url.clone(),
             public_key_pem: value.public_key_pem.clone(),
@@ -1053,6 +1063,16 @@ impl ProfileCache {
                     .map(ToString::to_string);
             }
 
+            if actor_object.contains_key("attachment") {
+                updated.profile_fields_json = crate::profile_fields::serialize_profile_fields(
+                    &crate::profile_fields::extract_profile_fields_from_actor(
+                        &serde_json::Value::Object(actor_object.clone()),
+                    ),
+                )
+                .ok()
+                .flatten();
+            }
+
             if actor_object.contains_key("icon") {
                 updated.avatar_url = actor_object.get("icon").and_then(extract_url);
             }
@@ -1135,6 +1155,7 @@ mod tests {
             uri: format!("https://example.com/users/{address}"),
             display_name: Some("Alice".to_string()),
             note: Some("note".to_string()),
+            profile_fields_json: None,
             avatar_url: None,
             header_url: None,
             public_key_pem: "pem".to_string(),
