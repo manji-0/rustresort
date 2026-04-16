@@ -1985,6 +1985,118 @@ async fn test_signed_shared_inbox_update_note_creates_notification_for_reblogged
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_update_note_attachment_change_creates_notification_and_edit() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let status_uri = "https://remote.example/users/alice/statuses/edit-attachment-notify-http";
+    let status_id = EntityId::new_string();
+
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: status_id.clone(),
+            uri: status_uri.to_string(),
+            content: "<p>same</p>".to_string(),
+            content_warning: None,
+            visibility: StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Mentioned,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+    let reblog_response = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{status_id}/reblog")))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reblog_response.status(), reqwest::StatusCode::OK);
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/update-note-attachment-notify-http",
+        "type": "Update",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": status_uri,
+            "content": "<p>same</p>",
+            "published": "2026-01-03T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "attachment": [{
+                "type": "Document",
+                "mediaType": "image/png",
+                "url": "https://remote.example/media/updated.png",
+                "name": "updated attachment"
+            }]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let notifications = server
+        .state
+        .db
+        .get_notifications(10, None, false)
+        .await
+        .unwrap();
+    assert!(
+        notifications.iter().any(|notification| {
+            notification.notification_type == rustresort::data::NotificationType::Update
+                && notification.origin_account_address == REMOTE_ACTOR_ADDRESS
+                && notification.status_uri.as_deref() == Some(status_uri)
+        }),
+        "attachment-only edit of a reblogged remote status should create an update notification"
+    );
+
+    let updated = server
+        .state
+        .db
+        .get_status_by_uri(status_uri)
+        .await
+        .unwrap()
+        .expect("updated status should exist");
+    let edits = server
+        .state
+        .db
+        .get_status_edits(&updated.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(edits.len(), 1);
+
+    let attachments = server
+        .state
+        .db
+        .get_remote_status_attachments(&updated.id)
+        .await
+        .unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0].remote_url,
+        "https://remote.example/media/updated.png"
+    );
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_update_note_without_local_interaction_does_not_notify() {
     use chrono::Utc;
     use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
@@ -2360,6 +2472,48 @@ async fn test_signed_shared_inbox_like_creates_favourite_notification() {
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_like_accepts_object_wrapper() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "liked-status-object").await;
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/likes/http-object",
+        "type": "Like",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "id": local_status_uri
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["favourites_count"], 1);
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_announce_regular_creates_reblog_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2393,6 +2547,49 @@ async fn test_signed_shared_inbox_announce_regular_creates_reblog_notification()
         }),
         "Announce of a local status should create a reblog notification"
     );
+
+    let status = server
+        .state
+        .db
+        .get_status_by_uri(&local_status_uri)
+        .await
+        .unwrap()
+        .unwrap();
+    let status_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}", status.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), reqwest::StatusCode::OK);
+    let body = status_response.json::<Value>().await.unwrap();
+    assert_eq!(body["reblogs_count"], 1);
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_announce_regular_accepts_object_wrapper() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let key_id = register_default_remote_key(&server);
+    let local_status_uri = insert_local_status(&server, "boost-target-object").await;
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/announces/http-object",
+        "type": "Announce",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "id": local_status_uri,
+            "type": "Note"
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     let status = server
         .state

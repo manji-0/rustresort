@@ -194,7 +194,7 @@ fn extract_attachment_dimensions(value: &serde_json::Value) -> (Option<i32>, Opt
     (width, height)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedQuestionPoll {
     expires_at: String,
     expired: bool,
@@ -202,6 +202,17 @@ struct ParsedQuestionPoll {
     votes_count: i64,
     voters_count: i64,
     options: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentSnapshot {
+    remote_url: String,
+    preview_url: Option<String>,
+    content_type: String,
+    description: Option<String>,
+    blurhash: Option<String>,
+    width: Option<i32>,
+    height: Option<i32>,
 }
 
 fn parse_question_poll(object: &serde_json::Value) -> Option<ParsedQuestionPoll> {
@@ -451,6 +462,10 @@ fn status_changed(previous: Option<&Status>, current: &Status) -> bool {
         || previous.quote_of_uri != current.quote_of_uri
 }
 
+fn extract_activity_object_uri(value: Option<&serde_json::Value>) -> Option<&str> {
+    extract_activity_object_id(value)
+}
+
 fn extract_first_uri_reference(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(uri) if !uri.trim().is_empty() => Some(uri.to_string()),
@@ -466,6 +481,35 @@ fn extract_first_uri_reference(value: &serde_json::Value) -> Option<String> {
 
 fn normalize_actor_uri_for_compare(value: &str) -> &str {
     value.trim().trim_end_matches('/')
+}
+
+fn object_has_embedded_status_content(object: &serde_json::Value) -> bool {
+    object.as_object().is_some_and(|map| {
+        map.contains_key("content")
+            || map.contains_key("contentMap")
+            || map.contains_key("summary")
+            || map.contains_key("name")
+            || map.contains_key("attachment")
+            || map.contains_key("inReplyTo")
+            || map.contains_key("published")
+            || map.contains_key("updated")
+            || map.contains_key("attributedTo")
+            || map.contains_key("quoteUri")
+            || map.contains_key("quoteUrl")
+            || map.contains_key("_misskey_quote")
+            || map.contains_key("oneOf")
+            || map.contains_key("anyOf")
+    })
+}
+
+fn extract_regular_announce_object_uri(object: &serde_json::Value) -> Option<&str> {
+    if object.is_string() {
+        return object.as_str();
+    }
+
+    (!object_has_embedded_status_content(object))
+        .then(|| extract_activity_object_uri(Some(object)))
+        .flatten()
 }
 
 fn object_attributed_to_matches_actor(object: &serde_json::Value, actor_uri: &str) -> bool {
@@ -837,8 +881,14 @@ impl ActivityProcessor {
             Some(ActivityType::Announce) => {
                 // Check if it's a quote boost (has content) or regular boost
                 if let Some(object) = activity.get("object") {
-                    // Quote boost: Announce activity with embedded Note/Article
-                    if object.is_object() && object.get("type").is_some() {
+                    if let Some(object_uri) = extract_regular_announce_object_uri(object) {
+                        // Regular boost: URI reference or a minimal object wrapper.
+                        if self.is_local_status(object_uri) {
+                            // Boost of our status -> Persist (creates notification)
+                            return PersistenceDecision::Persist;
+                        }
+                    } else if object.is_object() && object.get("type").is_some() {
+                        // Quote boost: Announce activity with embedded Note/Article.
                         // Check if the quote mentions us or quotes one of our posts.
                         if self.mentions_local_user(object)
                             || self
@@ -847,13 +897,6 @@ impl ActivityProcessor {
                                 .is_some_and(|quote_uri| self.is_local_status(quote_uri))
                         {
                             // Quote boost mentioning us -> Persist
-                            return PersistenceDecision::Persist;
-                        }
-                    } else if let Some(object_uri) = object.as_str() {
-                        // Regular boost: just a URI reference
-                        // Check if it's our status being boosted
-                        if self.is_local_status(object_uri) {
-                            // Boost of our status -> Persist (creates notification)
                             return PersistenceDecision::Persist;
                         }
                     }
@@ -1826,9 +1869,7 @@ impl ActivityProcessor {
         actor_uri: &str,
     ) -> Result<(), AppError> {
         // 1. Check if liking our status
-        let object = activity
-            .get("object")
-            .and_then(|o| o.as_str())
+        let object = extract_activity_object_uri(activity.get("object"))
             .ok_or_else(|| AppError::Validation("Missing object in Like".to_string()))?;
 
         // Check if it's a local status
@@ -2075,7 +2116,7 @@ impl ActivityProcessor {
         match value {
             serde_json::Value::String(candidate) => {
                 let targets_local_actor =
-                    is_local_follow_target(candidate, &self.local_address, &self.local_protocol);
+                    is_local_follow_target(&self.local_address, &self.local_protocol, candidate);
                 let local_status_uri = self.is_local_status(candidate).then(|| candidate.clone());
                 (
                     targets_local_actor || local_status_uri.is_some(),
@@ -2193,8 +2234,58 @@ impl ActivityProcessor {
         // Extract actor address
         let actor_address = self.extract_actor_address(actor_uri);
 
-        // Check if it's a quote boost (embedded object) or regular boost (URI)
-        if object.is_object() {
+        // Check if it's a regular boost reference or a quote boost with embedded content.
+        if let Some(object_uri) = extract_regular_announce_object_uri(object) {
+            // Regular boost: URI reference or a minimal object wrapper around one.
+            if self.is_local_status(object_uri) {
+                let mut boosted_status = None;
+                if let Some(status) = self
+                    .db
+                    .get_status_by_uri(object_uri)
+                    .await?
+                    .filter(|status| status.is_local)
+                {
+                    self.db
+                        .upsert_remote_repost(
+                            &status.id,
+                            &actor_address,
+                            activity.get("id").and_then(|id| id.as_str()),
+                        )
+                        .await?;
+                    boosted_status = Some(status);
+                }
+                // Create reblog notification for boost of our status.
+                let notification = crate::data::Notification {
+                    id: crate::data::EntityId::new_string(),
+                    notification_type: NotificationType::Reblog,
+                    origin_account_address: actor_address,
+                    status_uri: Some(object_uri.to_string()),
+                    read: false,
+                    created_at: chrono::Utc::now(),
+                };
+
+                self.insert_notification_and_publish(
+                    &notification,
+                    activity.get("id").and_then(|id| id.as_str()),
+                )
+                .await?;
+                if let Some(status) = boosted_status.as_ref() {
+                    self.publish_local_status_update(status).await;
+                }
+            } else if matches!(persistence_decision, PersistenceDecision::Persist)
+                && actor_is_followee
+                && let Some(status) = self
+                    .upsert_remote_announce_status(
+                        &activity,
+                        actor_uri,
+                        object_uri,
+                        PersistedReason::Timeline,
+                    )
+                    .await?
+            {
+                self.publish_remote_status_update(&status, true).await;
+            }
+        } else if object.is_object() {
             // Quote boost: Announce with embedded Note/Article
             if !object_attributed_to_matches_actor(object, actor_uri) {
                 return Err(AppError::Unauthorized);
@@ -2259,57 +2350,6 @@ impl ActivityProcessor {
                 }
             }
             // Otherwise ignore non-relevant quote Announce objects.
-        } else if let Some(object_uri) = object.as_str() {
-            // Regular boost: just a URI reference
-            // Check if it's our status being boosted
-            if self.is_local_status(object_uri) {
-                let mut boosted_status = None;
-                if let Some(status) = self
-                    .db
-                    .get_status_by_uri(object_uri)
-                    .await?
-                    .filter(|status| status.is_local)
-                {
-                    self.db
-                        .upsert_remote_repost(
-                            &status.id,
-                            &actor_address,
-                            activity.get("id").and_then(|id| id.as_str()),
-                        )
-                        .await?;
-                    boosted_status = Some(status);
-                }
-                // Create reblog notification for boost of our status
-                let notification = crate::data::Notification {
-                    id: crate::data::EntityId::new_string(),
-                    notification_type: NotificationType::Reblog,
-                    origin_account_address: actor_address,
-                    status_uri: Some(object_uri.to_string()),
-                    read: false,
-                    created_at: chrono::Utc::now(),
-                };
-
-                self.insert_notification_and_publish(
-                    &notification,
-                    activity.get("id").and_then(|id| id.as_str()),
-                )
-                .await?;
-                if let Some(status) = boosted_status.as_ref() {
-                    self.publish_local_status_update(status).await;
-                }
-            } else if matches!(persistence_decision, PersistenceDecision::Persist)
-                && actor_is_followee
-                && let Some(status) = self
-                    .upsert_remote_announce_status(
-                        &activity,
-                        actor_uri,
-                        object_uri,
-                        PersistedReason::Timeline,
-                    )
-                    .await?
-            {
-                self.publish_remote_status_update(&status, true).await;
-            }
         }
 
         Ok(())
@@ -2444,6 +2484,9 @@ impl ActivityProcessor {
             status.created_at = existing.created_at;
             status.persisted_reason =
                 merge_persisted_reason(existing.persisted_reason, persisted_reason);
+            let metadata_changed = self
+                .remote_status_metadata_changed(&status.id, object, reject_media)
+                .await?;
             if capture_edit_snapshot
                 && (existing.content != status.content
                     || existing.content_warning != status.content_warning
@@ -2452,6 +2495,7 @@ impl ActivityProcessor {
                     || existing.in_reply_to_uri != status.in_reply_to_uri
                     || existing.boost_of_uri != status.boost_of_uri
                     || existing.quote_of_uri != status.quote_of_uri)
+                || capture_edit_snapshot && metadata_changed
             {
                 self.db
                     .update_status_with_edit_snapshot(&existing, &status)
@@ -2501,6 +2545,70 @@ impl ActivityProcessor {
             self.db.delete_poll_by_status_id(status_id).await?;
         }
         Ok(())
+    }
+
+    fn attachment_snapshot(attachment: &crate::data::RemoteStatusAttachment) -> AttachmentSnapshot {
+        AttachmentSnapshot {
+            remote_url: attachment.remote_url.clone(),
+            preview_url: attachment.preview_url.clone(),
+            content_type: attachment.content_type.clone(),
+            description: attachment.description.clone(),
+            blurhash: attachment.blurhash.clone(),
+            width: attachment.width,
+            height: attachment.height,
+        }
+    }
+
+    async fn current_poll_snapshot(
+        &self,
+        status_id: &str,
+    ) -> Result<Option<ParsedQuestionPoll>, AppError> {
+        let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
+            self.db.get_poll_by_status_id(status_id).await?
+        else {
+            return Ok(None);
+        };
+        let options = self
+            .db
+            .get_poll_options(&poll_id)
+            .await?
+            .into_iter()
+            .map(|(_, title, option_votes)| (title, option_votes))
+            .collect();
+
+        Ok(Some(ParsedQuestionPoll {
+            expires_at,
+            expired,
+            multiple,
+            votes_count,
+            voters_count,
+            options,
+        }))
+    }
+
+    async fn remote_status_metadata_changed(
+        &self,
+        status_id: &str,
+        object: &serde_json::Value,
+        reject_media: bool,
+    ) -> Result<bool, AppError> {
+        let existing_attachments = self
+            .db
+            .get_remote_status_attachments(status_id)
+            .await?
+            .into_iter()
+            .map(|attachment| Self::attachment_snapshot(&attachment))
+            .collect::<Vec<_>>();
+        let updated_attachments = self
+            .remote_status_attachments_from_object(status_id, object, reject_media)
+            .into_iter()
+            .map(|attachment| Self::attachment_snapshot(&attachment))
+            .collect::<Vec<_>>();
+        if existing_attachments != updated_attachments {
+            return Ok(true);
+        }
+
+        Ok(self.current_poll_snapshot(status_id).await? != parse_question_poll(object))
     }
 
     async fn cached_status_from_object(
@@ -3439,14 +3547,47 @@ impl ActivityProcessor {
 
     /// Check if status is by local user
     fn is_local_status(&self, status_uri: &str) -> bool {
-        // Check if URI contains local domain/address
-        status_uri.contains(&self.local_address)
-            || status_uri.contains("/users/")
-                && status_uri.split("://").nth(1).is_some_and(|s| {
-                    s.split('/')
-                        .next()
-                        .is_some_and(|domain| self.local_address.ends_with(domain))
-                })
+        let Some((local_username, local_domain)) = self.local_address.split_once('@') else {
+            return false;
+        };
+        let Some((local_host, local_port)) = parse_host_and_port(local_domain) else {
+            return false;
+        };
+        let Ok(parsed) = url::Url::parse(status_uri.trim()) else {
+            return false;
+        };
+        let local_scheme = if self.local_protocol.eq_ignore_ascii_case("http") {
+            "http"
+        } else if self.local_protocol.eq_ignore_ascii_case("https") {
+            "https"
+        } else {
+            return false;
+        };
+        if parsed.scheme() != local_scheme {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        if !host.eq_ignore_ascii_case(&local_host) {
+            return false;
+        }
+        let port_matches = match local_port {
+            Some(port) => parsed.port_or_known_default() == Some(port),
+            None => match parsed.port() {
+                Some(explicit_port) => {
+                    default_port_for_scheme(parsed.scheme()) == Some(explicit_port)
+                }
+                None => true,
+            },
+        };
+        if !port_matches {
+            return false;
+        }
+
+        let path = parsed.path().trim_end_matches('/');
+        path.starts_with(&format!("/users/{local_username}/statuses/"))
+            || path.starts_with(&format!("/@{local_username}/statuses/"))
     }
 }
 
@@ -3614,6 +3755,15 @@ mod tests {
             protocol,
             "https://example.com:443/users/alice"
         ));
+    }
+
+    #[tokio::test]
+    async fn is_local_status_rejects_local_actor_uri_without_status_path() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+
+        assert!(!processor.is_local_status("https://example.com/users/alice"));
+        assert!(!processor.is_local_status("https://example.com/@alice"));
+        assert!(processor.is_local_status("https://example.com/users/alice/statuses/1"));
     }
 
     #[test]
@@ -3994,6 +4144,7 @@ mod tests {
             notifications[0].origin_account_address,
             "bob@remote.example"
         );
+        assert_eq!(notifications[0].status_uri, None);
     }
 
     #[tokio::test]
