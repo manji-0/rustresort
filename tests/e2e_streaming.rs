@@ -880,3 +880,40 @@ async fn test_user_stream_receives_quoted_update_notification_with_local_quote_s
     assert_eq!(json["account"]["acct"], REMOTE_ACTOR_ADDRESS);
     assert_eq!(json["status"]["uri"], local_quote.uri);
 }
+
+#[tokio::test]
+async fn test_user_stream_receives_admin_report_notification_for_remote_flag() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/user"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let key_id = register_default_remote_key(&server);
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/reports/stream-flag-1",
+        "type": "Flag",
+        "actor": REMOTE_ACTOR_ID,
+        "content": "<p>remote report</p>",
+        "object": server.public_url("/users/testuser")
+    });
+
+    let send_future = server.post_signed_activity("/inbox", &activity, &key_id);
+    let read_future = read_sse_event(response);
+    let (send_response, (event_name, data)) = tokio::join!(send_future, read_future);
+
+    assert_eq!(send_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(event_name, "notification");
+
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["type"], "admin.report");
+    assert_eq!(json["account"]["acct"], REMOTE_ACTOR_ADDRESS);
+}

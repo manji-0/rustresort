@@ -3496,6 +3496,138 @@ async fn test_signed_shared_inbox_block_records_remote_block_and_filters_deliver
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_undo_follow_clears_pending_follow_request_and_notification() {
+    let server = TestServer::new().await;
+    let mut account = server.create_test_account().await;
+    account.locked = true;
+    server.state.db.upsert_account(&account).await.unwrap();
+    let key_id = register_default_remote_key(&server);
+
+    let follow_uri = "https://remote.example/follows/pending-undo-1";
+    let follow_activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": follow_uri,
+        "type": "Follow",
+        "actor": {
+            "id": REMOTE_ACTOR_ID,
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
+        "object": server.public_url("/users/testuser")
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &follow_activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        server
+            .state
+            .db
+            .has_follow_request(REMOTE_ACTOR_ADDRESS)
+            .await
+            .unwrap()
+    );
+
+    let undo_activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/undo-follow-pending-1",
+        "type": "Undo",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "id": follow_uri,
+            "type": "Follow",
+            "actor": REMOTE_ACTOR_ID,
+            "object": server.public_url("/users/testuser")
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &undo_activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        !server
+            .state
+            .db
+            .has_follow_request(REMOTE_ACTOR_ADDRESS)
+            .await
+            .unwrap()
+    );
+    assert!(
+        server
+            .state
+            .db
+            .get_notifications(10, None, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_signed_shared_inbox_block_clears_pending_follow_request_and_notification() {
+    let server = TestServer::new().await;
+    let mut account = server.create_test_account().await;
+    account.locked = true;
+    server.state.db.upsert_account(&account).await.unwrap();
+    let key_id = register_default_remote_key(&server);
+
+    let follow_activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/follows/pending-block-1",
+        "type": "Follow",
+        "actor": {
+            "id": REMOTE_ACTOR_ID,
+            "inbox": "https://remote.example/users/alice/inbox"
+        },
+        "object": server.public_url("/users/testuser")
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &follow_activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        server
+            .state
+            .db
+            .has_follow_request(REMOTE_ACTOR_ADDRESS)
+            .await
+            .unwrap()
+    );
+
+    let block_activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/blocks/pending-request-1",
+        "type": "Block",
+        "actor": REMOTE_ACTOR_ID,
+        "object": server.public_url("/users/testuser")
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &block_activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        !server
+            .state
+            .db
+            .has_follow_request(REMOTE_ACTOR_ADDRESS)
+            .await
+            .unwrap()
+    );
+    assert!(
+        server
+            .state
+            .db
+            .get_notifications(10, None, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_move_with_uri_target_requires_target_backlink() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow};

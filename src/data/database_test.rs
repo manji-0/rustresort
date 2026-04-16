@@ -3433,3 +3433,59 @@ async fn test_accept_follow_request_rolls_back_on_follower_insert_failure() {
         ))
     );
 }
+
+#[tokio::test]
+async fn test_delete_follow_request_with_default_port_matches_equivalent_requester_address() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.insert_follow_request(
+        "alice@remote.example",
+        "https://remote.example/inbox",
+        "https://remote.example/follows/1",
+    )
+    .await
+    .unwrap();
+
+    let deleted = db
+        .delete_follow_request_with_default_port("alice@remote.example:443", Some(443))
+        .await
+        .unwrap();
+    assert!(deleted);
+    assert!(!db.has_follow_request("alice@remote.example").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_delete_follow_request_by_address_and_uri_respects_follow_activity_uri() {
+    let (db, _temp_dir) = create_test_db().await;
+
+    db.insert_follow_request(
+        "alice@remote.example",
+        "https://remote.example/inbox",
+        "https://remote.example/follows/1",
+    )
+    .await
+    .unwrap();
+    let deleted = db
+        .delete_follow_request_by_address_and_uri(
+            "alice@remote.example:443",
+            "https://remote.example/follows/2",
+            Some(443),
+        )
+        .await
+        .unwrap();
+    assert!(!deleted);
+
+    assert!(db.has_follow_request("alice@remote.example").await.unwrap());
+
+    let deleted = db
+        .delete_follow_request_by_address_and_uri(
+            "alice@remote.example:443",
+            "https://remote.example/follows/1",
+            Some(443),
+        )
+        .await
+        .unwrap();
+    assert!(deleted);
+
+    assert!(!db.has_follow_request("alice@remote.example").await.unwrap());
+}

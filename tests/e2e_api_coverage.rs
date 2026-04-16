@@ -167,6 +167,12 @@ async fn test_instance_v2() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["stats"]["user_count"], 1);
+    assert!(body["stats"]["status_count"].is_number());
+    assert!(body["stats"]["domain_count"].is_number());
+    assert_eq!(body["usage"]["users"]["total"], 1);
+    assert!(body["usage"]["local_posts"].is_number());
 }
 
 #[tokio::test]

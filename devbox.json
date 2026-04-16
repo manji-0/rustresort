@@ -1,6 +1,7 @@
 {
   "packages": [
     "rustup@latest",
+    "cargo-nextest@latest",
     "nodejs@22",
     "sqlite@latest",
     "pkg-config@latest",
@@ -45,7 +46,7 @@
         "scripts/build-dev-server.sh"
       ],
       "test": [
-        "cargo test"
+        "scripts/run-nextest.sh"
       ],
       "test:ui": [
         "scripts/run-settings-ui-e2e.sh"

@@ -198,4 +198,60 @@ impl Database {
 
         Ok(result.rows_affected() > 0)
     }
+
+    /// Delete any follow requests matching the requester address, accounting for
+    /// default-port-equivalent address variants.
+    pub async fn delete_follow_request_with_default_port(
+        &self,
+        requester_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let candidates = equivalent_account_address_candidates(requester_address, default_port);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM follow_requests WHERE LOWER(requester_address) IN (",
+        );
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in candidates {
+                separated.push_bind(candidate.to_ascii_lowercase());
+            }
+        }
+        query_builder.push(")");
+
+        let result = query_builder.build().execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete the specific follow request activity for a requester address,
+    /// accounting for default-port-equivalent address variants.
+    pub async fn delete_follow_request_by_address_and_uri(
+        &self,
+        requester_address: &str,
+        uri: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let candidates = equivalent_account_address_candidates(requester_address, default_port);
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("DELETE FROM follow_requests WHERE uri = ");
+        query_builder.push_bind(uri);
+        query_builder.push(" AND LOWER(requester_address) IN (");
+        {
+            let mut separated = query_builder.separated(", ");
+            for candidate in candidates {
+                separated.push_bind(candidate.to_ascii_lowercase());
+            }
+        }
+        query_builder.push(")");
+
+        let result = query_builder.build().execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
 }

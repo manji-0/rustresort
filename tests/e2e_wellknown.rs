@@ -70,3 +70,35 @@ async fn test_webfinger_with_account() {
         assert!(json.get("links").is_some());
     }
 }
+
+#[tokio::test]
+async fn test_nodeinfo_reports_actual_local_post_count() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "nodeinfo local posts sample",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let response = server
+        .client
+        .get(server.url("/nodeinfo/2.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let json: Value = response.json().await.unwrap();
+    assert_eq!(json["usage"]["users"]["total"], 1);
+    assert_eq!(json["usage"]["localPosts"], 1);
+}

@@ -108,7 +108,8 @@ async fn nodeinfo_links(State(state): State<WellKnownState>) -> Json<serde_json:
 /// GET /nodeinfo/2.0
 ///
 /// Returns NodeInfo 2.0 document.
-async fn nodeinfo(State(_state): State<WellKnownState>) -> Json<serde_json::Value> {
+async fn nodeinfo(State(state): State<WellKnownState>) -> Json<serde_json::Value> {
+    let local_posts = state.db.count_local_statuses().await.unwrap_or(0);
     Json(serde_json::json!({
         "version": "2.0",
         "software": {
@@ -125,7 +126,7 @@ async fn nodeinfo(State(_state): State<WellKnownState>) -> Json<serde_json::Valu
             "users": {
                 "total": 1
             },
-            "localPosts": 0
+            "localPosts": local_posts
         },
         "metadata": {}
     }))

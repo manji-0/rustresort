@@ -174,6 +174,29 @@ async fn load_instance_rule_texts(state: &InstanceApiState) -> Vec<String> {
         .collect()
 }
 
+async fn load_instance_status_count(state: &InstanceApiState) -> i64 {
+    state.db.count_local_statuses().await.unwrap_or(0)
+}
+
+async fn load_instance_peer_domains(state: &InstanceApiState) -> Vec<String> {
+    let follow_addresses = state
+        .db
+        .get_all_follow_addresses()
+        .await
+        .unwrap_or_default();
+    let follower_addresses = state
+        .db
+        .get_all_follower_addresses()
+        .await
+        .unwrap_or_default();
+    compute_peer_domains(
+        &follow_addresses,
+        &follower_addresses,
+        &state.config.server.domain,
+        &state.config.server.protocol,
+    )
+}
+
 fn rules_to_json(rule_texts: &[String]) -> serde_json::Value {
     serde_json::Value::Array(
         rule_texts
@@ -216,28 +239,8 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
 
     // Get stats
     let user_count = 1; // Single-user instance
-    let status_count = state
-        .db
-        .get_local_statuses(1000, None)
-        .await
-        .map(|s| s.len() as i64)
-        .unwrap_or(0);
-    let follow_addresses = state
-        .db
-        .get_all_follow_addresses()
-        .await
-        .unwrap_or_default();
-    let follower_addresses = state
-        .db
-        .get_all_follower_addresses()
-        .await
-        .unwrap_or_default();
-    let peer_domains = compute_peer_domains(
-        &follow_addresses,
-        &follower_addresses,
-        &state.config.server.domain,
-        &state.config.server.protocol,
-    );
+    let status_count = load_instance_status_count(&state).await;
+    let peer_domains = load_instance_peer_domains(&state).await;
     let domain_count = peer_domains.len() as i64;
 
     let response = InstanceResponse {
@@ -297,22 +300,7 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
 ///
 /// List of federated instances this instance knows about.
 pub async fn instance_peers(State(_state): State<InstanceApiState>) -> Json<serde_json::Value> {
-    let follow_addresses = _state
-        .db
-        .get_all_follow_addresses()
-        .await
-        .unwrap_or_default();
-    let follower_addresses = _state
-        .db
-        .get_all_follower_addresses()
-        .await
-        .unwrap_or_default();
-    let peer_domains = compute_peer_domains(
-        &follow_addresses,
-        &follower_addresses,
-        &_state.config.server.domain,
-        &_state.config.server.protocol,
-    );
+    let peer_domains = load_instance_peer_domains(&_state).await;
     Json(serde_json::json!(peer_domains))
 }
 
@@ -383,29 +371,9 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
     };
 
     // Get stats
-    let _user_count = 1; // Single-user instance
-    let _status_count = state
-        .db
-        .get_local_statuses(1000, None)
-        .await
-        .map(|s| s.len() as i64)
-        .unwrap_or(0);
-    let follow_addresses = state
-        .db
-        .get_all_follow_addresses()
-        .await
-        .unwrap_or_default();
-    let follower_addresses = state
-        .db
-        .get_all_follower_addresses()
-        .await
-        .unwrap_or_default();
-    let peer_domains = compute_peer_domains(
-        &follow_addresses,
-        &follower_addresses,
-        &state.config.server.domain,
-        &state.config.server.protocol,
-    );
+    let user_count = 1; // Single-user instance
+    let status_count = load_instance_status_count(&state).await;
+    let peer_domains = load_instance_peer_domains(&state).await;
     let rules = load_instance_rule_texts(&state).await;
 
     Json(serde_json::json!({
@@ -416,8 +384,10 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "description": state.config.instance.description,
         "usage": {
             "users": {
-                "active_month": 1
-            }
+                "active_month": 1,
+                "total": user_count
+            },
+            "local_posts": status_count
         },
         "thumbnail": {
             "url": null,
@@ -472,6 +442,8 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         },
         "rules": rules_to_json(&rules),
         "stats": {
+            "user_count": user_count,
+            "status_count": status_count,
             "domain_count": peer_domains.len()
         }
     }))

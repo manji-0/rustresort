@@ -1638,6 +1638,21 @@ impl ActivityProcessor {
             .db
             .delete_follower(&actor_address, actor_default_port)
             .await;
+        if self
+            .db
+            .delete_follow_request_with_default_port(&actor_address, actor_default_port)
+            .await
+            .unwrap_or(false)
+        {
+            let _ = self
+                .db
+                .delete_notifications_by_identity(
+                    NotificationType::FollowRequest,
+                    &actor_address,
+                    None,
+                )
+                .await;
+        }
         tracing::info!(actor_uri, "Recorded remote block");
         Ok(())
     }
@@ -1766,7 +1781,7 @@ impl ActivityProcessor {
                         }
 
                         if let Some(follow_uri) = obj.get("id").and_then(|id| id.as_str()) {
-                            let removed = self
+                            let removed_follower = self
                                 .db
                                 .delete_follower_by_address_and_uri(
                                     &actor_address,
@@ -1774,7 +1789,30 @@ impl ActivityProcessor {
                                     actor_default_port,
                                 )
                                 .await?;
-                            if removed {
+                            let removed_follow_request = self
+                                .db
+                                .delete_follow_request_by_address_and_uri(
+                                    &actor_address,
+                                    follow_uri,
+                                    actor_default_port,
+                                )
+                                .await?;
+                            if removed_follow_request {
+                                let deleted = self
+                                    .db
+                                    .delete_notifications_by_activity_uri(follow_uri)
+                                    .await?;
+                                if deleted == 0 {
+                                    self.db
+                                        .delete_notifications_by_identity(
+                                            NotificationType::FollowRequest,
+                                            &actor_address,
+                                            None,
+                                        )
+                                        .await?;
+                                }
+                            }
+                            if removed_follower || removed_follow_request {
                                 tracing::info!(
                                     "Unfollowed by {} via Follow activity URI {}",
                                     actor_address,
@@ -1792,7 +1830,28 @@ impl ActivityProcessor {
                             self.db
                                 .delete_follower(&actor_address, actor_default_port)
                                 .await?;
-                            tracing::info!("Unfollowed by {} via address fallback", actor_address);
+                            let removed_follow_request = self
+                                .db
+                                .delete_follow_request_with_default_port(
+                                    &actor_address,
+                                    actor_default_port,
+                                )
+                                .await?;
+                            if removed_follow_request {
+                                self.db
+                                    .delete_notifications_by_identity(
+                                        NotificationType::FollowRequest,
+                                        &actor_address,
+                                        None,
+                                    )
+                                    .await?;
+                            }
+                            if removed_follow_request {
+                                tracing::info!(
+                                    "Unfollowed by {} via address fallback",
+                                    actor_address
+                                );
+                            }
                         }
                         Ok(())
                     }
@@ -1830,17 +1889,39 @@ impl ActivityProcessor {
                         actor_default_port,
                     )
                     .await?;
+                let removed_follow_request = self
+                    .db
+                    .delete_follow_request_by_address_and_uri(
+                        &actor_address,
+                        follow_uri,
+                        actor_default_port,
+                    )
+                    .await?;
                 let removed_interactions = self
                     .remove_remote_interaction_for_undo_activity_uri(follow_uri, &actor_address)
                     .await?;
-                let removed_notifications = if removed_follower || removed_interactions {
+                let removed_notifications =
+                    if removed_follower || removed_follow_request || removed_interactions {
+                        self.db
+                            .delete_notifications_by_activity_uri(follow_uri)
+                            .await?
+                    } else {
+                        0
+                    };
+                if removed_follow_request && removed_notifications == 0 {
                     self.db
-                        .delete_notifications_by_activity_uri(follow_uri)
-                        .await?
-                } else {
-                    0
-                };
-                if removed_follower || removed_interactions || removed_notifications > 0 {
+                        .delete_notifications_by_identity(
+                            NotificationType::FollowRequest,
+                            &actor_address,
+                            None,
+                        )
+                        .await?;
+                }
+                if removed_follower
+                    || removed_follow_request
+                    || removed_interactions
+                    || removed_notifications > 0
+                {
                     return Ok(());
                 }
 
@@ -2227,6 +2308,8 @@ impl ActivityProcessor {
                     updated_at: notification.created_at,
                 })
                 .await?;
+            self.publish_notification(&notification).await;
+            self.send_web_push_notification(&notification).await;
         }
 
         Ok(())
