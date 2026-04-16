@@ -161,6 +161,7 @@ struct Model {
     thread: ThreadView,
     composer: ComposerDraft,
     composer_popout: bool,
+    shortcut_help_open: bool,
     hashtag_query: String,
     active_pane: ActivePane,
     last_non_modal_pane: Pane,
@@ -182,7 +183,6 @@ struct App {
 
 #[derive(Clone, Deserialize)]
 struct Session {
-    username: String,
     auth_method: String,
 }
 
@@ -205,8 +205,6 @@ struct Account {
     display_name: String,
     #[serde(default)]
     avatar: String,
-    #[serde(default)]
-    header: String,
     followers_count: i64,
     following_count: i64,
     statuses_count: i64,
@@ -611,6 +609,15 @@ impl App {
             };
             app.set_notification_filter(filter);
         });
+        self.attach_dynamic_action("[data-open-shortcuts]", move |app, _element| {
+            app.open_shortcut_help();
+        });
+        self.attach_click("shortcut-help-close", {
+            let app = self.clone();
+            move || {
+                app.close_shortcut_help();
+            }
+        });
     }
 
     fn attach_click<F>(self: &Rc<Self>, id: &str, callback: F)
@@ -716,6 +723,10 @@ impl App {
                 }
                 let raw_key = event.key();
                 if raw_key == "Escape" {
+                    if app.close_shortcut_help() {
+                        event.prevent_default();
+                        return;
+                    }
                     app.close_detail_modal();
                     event.prevent_default();
                     return;
@@ -767,6 +778,10 @@ impl App {
                         }
                         "n" => {
                             app.open_composer_popout();
+                            true
+                        }
+                        "?" | "/" if event.shift_key() => {
+                            app.open_shortcut_help();
                             true
                         }
                         "f" => {
@@ -924,6 +939,30 @@ impl App {
         }
         self.render();
         self.focus_composer_input();
+    }
+
+    fn open_shortcut_help(self: &Rc<Self>) {
+        {
+            let mut model = self.model.borrow_mut();
+            model.shortcut_help_open = true;
+        }
+        self.render();
+    }
+
+    fn close_shortcut_help(self: &Rc<Self>) -> bool {
+        let should_render = {
+            let mut model = self.model.borrow_mut();
+            if model.shortcut_help_open {
+                model.shortcut_help_open = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_render {
+            self.render();
+        }
+        should_render
     }
 
     fn focus_composer_input(&self) {
@@ -2007,6 +2046,7 @@ fn render_app(model: &Model) -> String {
         String::new()
     };
     let detail_modal = render_detail_modal(model);
+    let shortcut_help = render_shortcut_help(model);
     let hashtag_query = encode_attribute(&model.hashtag_query);
 
     format!(
@@ -2022,23 +2062,26 @@ fn render_app(model: &Model) -> String {
       </div>
     </div>
     <nav class="sidebar-nav" aria-label="Primary feeds">
-      <button id="nav-home" class="sidebar-link {home_active}" aria-pressed="{home_pressed}">Home timeline</button>
-      <button id="nav-public" class="sidebar-link {public_active}" aria-pressed="{public_pressed}">Local timeline</button>
-      <button id="nav-profile" class="sidebar-link {profile_active}" aria-pressed="{profile_pressed}">My posts</button>
-      <button id="nav-hashtags" class="sidebar-link {hashtags_active}" aria-pressed="{hashtags_pressed}">Hashtag timeline</button>
+      <button id="nav-home" class="sidebar-link {home_active}" aria-pressed="{home_pressed}">Home</button>
+      <button id="nav-public" class="sidebar-link {public_active}" aria-pressed="{public_pressed}">Local</button>
+      <button id="nav-profile" class="sidebar-link {profile_active}" aria-pressed="{profile_pressed}">Posts</button>
+      <button id="nav-hashtags" class="sidebar-link {hashtags_active}" aria-pressed="{hashtags_pressed}">Hashtags</button>
       <label class="field sidebar-field">
         <span>Hashtags</span>
         <input id="hashtag-query" type="text" value="{hashtag_query}" placeholder="rust, wasm, activitypub" />
       </label>
-      <a class="sidebar-link" href="/settings">Legacy settings</a>
-      <a class="sidebar-link" href="/api/v1/accounts/verify_credentials">Raw Mastodon JSON</a>
-      <button id="logout-action" class="sidebar-link danger">Log out</button>
     </nav>
     {profile_panel}
-    <section class="sidebar-note">
-      <p class="micro-label">Contract</p>
-      <p>Social UI reads and writes only through Mastodon-style endpoints under <code>/api/v1</code>. RustResort-specific admin routes stay isolated in the operations rail.</p>
-    </section>
+    <details class="sidebar-more">
+      <summary>More</summary>
+      <div class="sidebar-more-links">
+        <button type="button" class="sidebar-link compact" data-open-shortcuts="true">Keyboard shortcuts</button>
+        <a class="sidebar-link compact" href="/settings">Admin / settings</a>
+        <a class="sidebar-link compact" href="/api/v1/accounts/verify_credentials">Raw Mastodon JSON</a>
+        <button id="logout-action" class="sidebar-link compact danger">Log out</button>
+      </div>
+      <p class="sidebar-more-note">Social UI stays on Mastodon-style endpoints under <code>/api/v1</code>. Admin flows live on the standalone settings page.</p>
+    </details>
   </aside>
 
   <main class="timeline-column {timeline_active} {feed_mode_class}" aria-label="Timeline pane">
@@ -2049,28 +2092,22 @@ fn render_app(model: &Model) -> String {
           <span class="timeline-feed-pill">{feed_label}</span>
           <span class="timeline-feed-context">{feed_context}</span>
           {feed_query_chip}
-          <span class="timeline-feed-contract">Mastodon API</span>
         </div>
         <h2>{feed_label}</h2>
         <div class="timeline-meta">
           <p class="subtle-line">{feed_subtitle}</p>
           <div class="shortcut-row">
-            <span class="shortcut-hint"><kbd>j</kbd>/<kbd>k</kbd> move</span>
-            <span class="shortcut-hint"><kbd>n</kbd> compose</span>
-            <span class="shortcut-hint"><kbd>N</kbd> mention</span>
-            <span class="shortcut-hint"><kbd>d</kbd> detail</span>
-            <span class="shortcut-hint"><kbd>f</kbd> like</span>
-            <span class="shortcut-hint"><kbd>r</kbd> boost</span>
-            <span class="shortcut-hint"><kbd>q</kbd> quote</span>
-            <span class="shortcut-hint"><kbd>g</kbd> top</span>
-            <span class="shortcut-hint"><kbd>Tab</kbd> notifications</span>
-            <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
+            <button type="button" class="shortcut-inline-link" data-open-shortcuts="true">
+              <kbd>?</kbd>
+              <span>Keyboard shortcuts</span>
+            </button>
           </div>
         </div>
       </div>
       <div class="timeline-actions">
-        <button id="composer-toggle-popout" class="ghost-button">Compose</button>
+        <button id="composer-toggle-popout" class="ghost-button">Post</button>
         <button id="refresh-feed" class="ghost-button">Refresh</button>
+        <button type="button" class="ghost-button shortcut-help-trigger" aria-label="Open keyboard shortcuts" data-open-shortcuts="true">?</button>
       </div>
     </header>
 
@@ -2102,23 +2139,11 @@ fn render_app(model: &Model) -> String {
         <button id="notifications-clear" class="ghost-button">Clear all</button>
       </div>
     </section>
-
-    <section class="rail-card admin-quiet">
-      <div class="rail-card-head">
-        <div>
-          <p class="micro-label">Workspace</p>
-          <h3>Admin</h3>
-        </div>
-      </div>
-      <p class="muted-copy">Administrative controls stay on their own page so the social client remains focused on Mastodon-compatible workflows.</p>
-      <div class="rail-links">
-        <a href="/settings">Open standalone admin/settings</a>
-      </div>
-    </section>
   </aside>
 </div>
 {detail_modal}
 {composer_popout}
+{shortcut_help}
 "#,
         active_pane = match model.active_pane {
             ActivePane::Timeline => "timeline",
@@ -2191,6 +2216,7 @@ fn render_app(model: &Model) -> String {
         composer_panel = composer_panel,
         composer_popout = composer_popout,
         detail_modal = detail_modal,
+        shortcut_help = shortcut_help,
         flash_banner = render_flash(model),
         timeline_cards = render_timeline(model),
         notification_count = render_notification_count(model.notifications_unread),
@@ -2202,7 +2228,14 @@ fn render_app(model: &Model) -> String {
 fn render_composer(model: &Model, popout: bool) -> String {
     let reply_banner = render_reply_banner(model);
     let quote_banner = render_quote_banner(model);
-    let shell_class = if popout { "composer-popout-shell" } else { "" };
+    let composer_count = model.composer.status.chars().count();
+    let max_characters = composer_limit(model);
+    let submit_disabled = composer_count == 0 || composer_count > max_characters;
+    let shell_class = if popout {
+        "composer-popout-shell"
+    } else {
+        "composer-inline-shell"
+    };
     let panel_class = if popout {
         "composer-panel composer-panel-popout"
     } else {
@@ -2213,6 +2246,26 @@ fn render_composer(model: &Model, popout: bool) -> String {
     } else {
         String::new()
     };
+    let composer_heading = if popout {
+        r#"<div>
+          <p class="micro-label">Compose</p>
+          <h3>New post</h3>
+          <p class="composer-note">Start with the post body. Visibility, spoiler text, and language are optional.</p>
+        </div>"#
+            .to_string()
+    } else {
+        r#"<div class="composer-inline-copy">
+          <p class="micro-label">Compose</p>
+          <h3>Write a post</h3>
+        </div>"#
+            .to_string()
+    };
+    let inline_shortcut_note = if popout {
+        r#"<span class="composer-shortcut-note"><kbd>n</kbd> compose <kbd>N</kbd> mention</span>"#
+            .to_string()
+    } else {
+        String::new()
+    };
 
     format!(
         r#"<section class="{shell_class}">
@@ -2220,11 +2273,7 @@ fn render_composer(model: &Model, popout: bool) -> String {
     <div class="composer-avatar">{composer_avatar}</div>
     <div class="composer-stack">
       <div class="composer-head">
-        <div>
-          <p class="micro-label">Compose</p>
-          <h3>New post</h3>
-          <p class="composer-note">Start with the body, then refine visibility, spoiler text, or language if needed.</p>
-        </div>
+        {composer_heading}
         {dismiss}
       </div>
       {reply_banner}
@@ -2232,7 +2281,7 @@ fn render_composer(model: &Model, popout: bool) -> String {
       <div class="composer-main-field">
         <div class="composer-main-head">
           <span class="composer-main-label">Post body</span>
-          <span class="composer-shortcut-note"><kbd>n</kbd> compose <kbd>N</kbd> mention</span>
+          {inline_shortcut_note}
         </div>
         <textarea id="composer-input" placeholder="What do you want to post?">{composer_text}</textarea>
       </div>
@@ -2253,8 +2302,8 @@ fn render_composer(model: &Model, popout: bool) -> String {
         </label>
       </div>
       <div class="composer-footer">
-        <span class="muted-copy">Character budget: {composer_count}/{max_characters}</span>
-        <button id="composer-submit" class="primary-button">Post</button>
+        {composer_budget}
+        <button id="composer-submit" class="primary-button {submit_state_class}" data-disabled-state="{submit_disabled}">Post</button>
       </div>
     </div>
   </section>
@@ -2262,22 +2311,28 @@ fn render_composer(model: &Model, popout: bool) -> String {
         shell_class = shell_class,
         panel_class = panel_class,
         composer_avatar = render_avatar_monogram(model),
+        composer_heading = composer_heading,
         dismiss = dismiss,
         reply_banner = reply_banner,
         quote_banner = quote_banner,
+        inline_shortcut_note = inline_shortcut_note,
         composer_text = encode_text(&model.composer.status),
         visibility_options = render_visibility_options(&model.composer.visibility),
         spoiler_text = encode_attribute(&model.composer.spoiler_text),
         language = encode_attribute(&model.composer.language),
-        composer_count = model.composer.status.chars().count(),
-        max_characters = composer_limit(model),
+        composer_budget = render_composer_budget(composer_count, max_characters),
+        submit_state_class = if submit_disabled {
+            "button-disabled"
+        } else {
+            ""
+        },
+        submit_disabled = if submit_disabled { "true" } else { "false" },
     )
 }
 
 fn render_profile_panel(model: &Model) -> String {
     let Some(account) = model.account.as_ref() else {
-        return r#"<section class="profile-panel"><p class="muted-copy">Loading account…</p></section>"#
-            .to_string();
+        return String::new();
     };
 
     let note = account
@@ -2285,7 +2340,7 @@ fn render_profile_panel(model: &Model) -> String {
         .as_ref()
         .map(|source| source.note.trim())
         .filter(|note| !note.is_empty())
-        .unwrap_or("Single-user ActivityPub node.");
+        .map(str::to_string);
 
     let follow_requests = account
         .source
@@ -2296,49 +2351,58 @@ fn render_profile_panel(model: &Model) -> String {
     let session_label = model
         .session
         .as_ref()
-        .map(|session| format!("{} via {}", session.username, session.auth_method))
-        .unwrap_or_else(|| "session loading".to_string());
+        .map(|session| format!("Signed in via {}", session.auth_method))
+        .unwrap_or_else(|| "Session loading".to_string());
+
+    let note_markup = note
+        .as_ref()
+        .map(|value| format!(r#"<p class="bio">{}</p>"#, encode_text(value)))
+        .unwrap_or_default();
+
+    let follow_request_chip = if follow_requests > 0 {
+        format!(r#"<span class="chip">{follow_requests} follow requests</span>"#)
+    } else {
+        String::new()
+    };
+    let chip_row = if follow_request_chip.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="chip-row">{follow_request_chip}</div>"#)
+    };
 
     format!(
-        r#"<section class="profile-panel">
-  <div class="profile-hero">
-    {header}
-  </div>
-  <div class="profile-body">
-    {avatar}
-    <div class="profile-text">
-      <h3>{name}</h3>
-      <p class="handle">@{acct}</p>
+        r#"<section class="profile-panel profile-panel-compact">
+  <div class="profile-body compact">
+    <div class="profile-summary">
+      {avatar}
+      <div class="profile-text">
+        <h3>{name}</h3>
+        <p class="handle">@{acct}</p>
+      </div>
     </div>
-    <p class="bio">{note}</p>
-    <div class="stat-grid">
+    <p class="profile-meta-line">{session}</p>
+    {note_markup}
+    <div class="stat-grid compact">
       <div><strong>{statuses}</strong><span>posts</span></div>
       <div><strong>{followers}</strong><span>followers</span></div>
       <div><strong>{following}</strong><span>following</span></div>
     </div>
-    <div class="chip-row">
-      <span class="chip">{session}</span>
-      <span class="chip">{follow_requests} follow requests</span>
-    </div>
+    {chip_row}
   </div>
 </section>"#,
-        header = if account.header.trim().is_empty() {
-            "<div class=\"profile-hero-fallback\"></div>".to_string()
-        } else {
-            format!(
-                "<img src=\"{}\" alt=\"{} header\" />",
-                encode_attribute(&account.header),
-                encode_attribute(&display_name(account))
-            )
-        },
-        avatar = avatar_markup("profile-avatar", &account.avatar, &display_name(account)),
+        avatar = avatar_markup(
+            "profile-avatar compact",
+            &account.avatar,
+            &display_name(account)
+        ),
         name = encode_text(&display_name(account)),
         acct = encode_text(&account.acct),
-        note = encode_text(note),
+        session = encode_text(&session_label),
+        note_markup = note_markup,
         statuses = account.statuses_count,
         followers = account.followers_count,
         following = account.following_count,
-        session = encode_text(&session_label),
+        chip_row = chip_row,
     )
 }
 
@@ -2346,16 +2410,26 @@ fn render_reply_banner(model: &Model) -> String {
     let Some(label) = model.composer.in_reply_to_label.as_ref() else {
         return String::new();
     };
+    let (author, summary) = split_composer_context_label(label);
 
     format!(
         r#"<div class="reply-banner">
   <div class="composer-context-copy">
     <span class="composer-context-title">Replying to</span>
-    <span class="composer-context-summary">{label}</span>
+    <div class="composer-context-line">
+      {author}
+      <span class="composer-context-summary">{summary}</span>
+    </div>
   </div>
   <button id="composer-cancel-reply" class="ghost-button small">Cancel</button>
 </div>"#,
-        label = encode_text(label),
+        author = author
+            .map(|value| format!(
+                r#"<span class="composer-context-author">{}</span>"#,
+                encode_text(value)
+            ))
+            .unwrap_or_default(),
+        summary = encode_text(summary),
     )
 }
 
@@ -2363,16 +2437,26 @@ fn render_quote_banner(model: &Model) -> String {
     let Some(label) = model.composer.quoted_status_label.as_ref() else {
         return String::new();
     };
+    let (author, summary) = split_composer_context_label(label);
 
     format!(
         r#"<div class="reply-banner quote-banner">
   <div class="composer-context-copy">
     <span class="composer-context-title">Quoting</span>
-    <span class="composer-context-summary">{label}</span>
+    <div class="composer-context-line">
+      {author}
+      <span class="composer-context-summary">{summary}</span>
+    </div>
   </div>
   <button id="composer-cancel-quote" class="ghost-button small">Cancel</button>
 </div>"#,
-        label = encode_text(label),
+        author = author
+            .map(|value| format!(
+                r#"<span class="composer-context-author">{}</span>"#,
+                encode_text(value)
+            ))
+            .unwrap_or_default(),
+        summary = encode_text(summary),
     )
 }
 
@@ -2406,6 +2490,57 @@ fn render_flash(model: &Model) -> String {
         tone = tone,
         text = encode_text(&flash.text),
     )
+}
+
+fn render_composer_budget(count: usize, max_characters: usize) -> String {
+    let remaining = max_characters as isize - count as isize;
+    let ratio = if max_characters == 0 {
+        0.0
+    } else {
+        count as f64 / max_characters as f64
+    };
+    let width = (ratio.clamp(0.0, 1.0) * 100.0).round();
+    let tone_class = if remaining < 0 {
+        "danger"
+    } else if remaining <= 40 || ratio >= 0.9 {
+        "warning"
+    } else {
+        "normal"
+    };
+    let remaining_label = if remaining < 0 {
+        format!("{} over", remaining.unsigned_abs())
+    } else {
+        format!("{remaining} left")
+    };
+
+    format!(
+        r#"<div class="composer-budget {tone_class}">
+  <div class="composer-budget-copy">
+    <strong>{count}/{max_characters}</strong>
+    <span>{remaining_label}</span>
+  </div>
+  <div class="composer-budget-track" aria-hidden="true">
+    <span class="composer-budget-fill" style="width: {width}%;"></span>
+  </div>
+</div>"#,
+        tone_class = tone_class,
+        count = count,
+        max_characters = max_characters,
+        remaining_label = encode_text(&remaining_label),
+        width = width,
+    )
+}
+
+fn split_composer_context_label(label: &str) -> (Option<&str>, &str) {
+    let trimmed = label.trim();
+    if let Some((author, summary)) = trimmed.split_once('·') {
+        let author = author.trim();
+        let summary = summary.trim();
+        if !author.is_empty() && !summary.is_empty() {
+            return (Some(author), summary);
+        }
+    }
+    (None, trimmed)
 }
 
 fn render_detail_modal(model: &Model) -> String {
@@ -2494,19 +2629,18 @@ fn render_detail_modal(model: &Model) -> String {
     <div class="thread-head">
       <div class="detail-title-group">
         <div class="detail-title-row">
-          <p class="micro-label">Detail</p>
+          <p class="micro-label">Conversation</p>
           {thread_badge}
         </div>
-        <h3 id="detail-modal-title">Selected thread</h3>
-        <p class="detail-caption">Focused thread inspector. Use <code>j</code>/<code>k</code> to move within the conversation.</p>
+        <h3 id="detail-modal-title">Thread</h3>
         <p class="detail-summary">{thread_summary}</p>
+        <p class="detail-note">Move with <kbd>j</kbd>/<kbd>k</kbd>. Press <kbd>Esc</kbd> to return.</p>
       </div>
       <div class="detail-actions">
-        <span class="shortcut-hint"><kbd>Esc</kbd> close</span>
         <button id="thread-close" class="ghost-button small detail-close">Close</button>
       </div>
     </div>
-    <div class="thread-panel" role="listbox" aria-label="Thread statuses">
+    <div class="thread-panel" role="listbox" aria-label="Conversation posts">
       {content}
     </div>
   </div>
@@ -2517,14 +2651,61 @@ fn render_detail_modal(model: &Model) -> String {
     )
 }
 
+fn render_shortcut_help(model: &Model) -> String {
+    if !model.shortcut_help_open {
+        return String::new();
+    }
+
+    r#"<section class="shortcut-modal-shell">
+  <div class="shortcut-modal" role="dialog" aria-modal="true" aria-labelledby="shortcut-modal-title">
+    <div class="shortcut-modal-head">
+      <div class="shortcut-modal-copy">
+        <p class="micro-label">Keyboard</p>
+        <h3 id="shortcut-modal-title">Shortcuts</h3>
+        <p class="shortcut-modal-note">Selection follows the active pane. Timeline and thread views share the same movement keys.</p>
+      </div>
+      <button id="shortcut-help-close" class="ghost-button small detail-close">Close</button>
+    </div>
+    <div class="shortcut-modal-grid">
+      <section class="shortcut-section">
+        <h4>Navigation</h4>
+        <div class="shortcut-list">
+          <div class="shortcut-entry"><span><kbd>j</kbd>/<kbd>k</kbd></span><span>Move selected post</span></div>
+          <div class="shortcut-entry"><span><kbd>Tab</kbd></span><span>Switch timeline and notifications</span></div>
+          <div class="shortcut-entry"><span><kbd>g</kbd></span><span>Jump to top and select first post</span></div>
+          <div class="shortcut-entry"><span><kbd>d</kbd></span><span>Open selected thread</span></div>
+          <div class="shortcut-entry"><span><kbd>Esc</kbd></span><span>Close dialog or popout</span></div>
+        </div>
+      </section>
+      <section class="shortcut-section">
+        <h4>Compose</h4>
+        <div class="shortcut-list">
+          <div class="shortcut-entry"><span><kbd>n</kbd></span><span>Open compose window</span></div>
+          <div class="shortcut-entry"><span><kbd>N</kbd></span><span>Mention selected post</span></div>
+          <div class="shortcut-entry"><span><kbd>q</kbd></span><span>Quote selected post</span></div>
+          <div class="shortcut-entry"><span><kbd>?</kbd></span><span>Open this help</span></div>
+        </div>
+      </section>
+      <section class="shortcut-section">
+        <h4>Actions</h4>
+        <div class="shortcut-list">
+          <div class="shortcut-entry"><span><kbd>f</kbd></span><span>Favourite selected post</span></div>
+          <div class="shortcut-entry"><span><kbd>r</kbd></span><span>Boost selected post</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>"#
+        .to_string()
+}
+
 fn render_timeline(model: &Model) -> String {
     if model.dashboard_loading && model.statuses.is_empty() {
-        return r#"<article class="status-card empty"><p>Loading timeline…</p></article>"#
-            .to_string();
+        return r#"<article class="status-card empty"><p>Loading posts…</p></article>"#.to_string();
     }
 
     if model.statuses.is_empty() {
-        return r#"<article class="status-card empty"><p>No posts available in this feed yet.</p></article>"#
+        return r#"<article class="status-card empty"><p>No posts in this feed yet.</p></article>"#
             .to_string();
     }
 
@@ -2848,7 +3029,7 @@ fn render_notifications(model: &Model) -> String {
                     .any(|candidate| display_status(candidate).id == status_id)
                     .then(|| {
                         format!(
-                            r#"<button class="ghost-button small" data-jump-status="{status_id}">Jump to post</button>"#,
+                            r#"<button class="ghost-button small notification-jump-button" data-jump-status="{status_id}">Show in timeline</button>"#,
                             status_id = encode_attribute(&status_id),
                         )
                     })
@@ -2864,7 +3045,7 @@ fn render_notifications(model: &Model) -> String {
                 .as_ref()
                 .map(|status| {
                     format!(
-                        r#"<button class="ghost-button small" data-select-status="{status_id}">Open thread</button>"#,
+                        r#"<button class="ghost-button small notification-thread-button" data-select-status="{status_id}">Open thread</button>"#,
                         status_id = encode_attribute(&display_status(status).id),
                     )
                 })
@@ -3066,22 +3247,26 @@ fn feed_subtitle(model: &Model) -> String {
     }
 
     match model.feed_mode {
-        FeedMode::Home => {
-            "Followed accounts and recent local activity from the Mastodon home feed.".to_string()
-        }
-        FeedMode::Public => {
-            "Local public timeline resolved through the Mastodon public timeline contract."
-                .to_string()
-        }
-        FeedMode::Profile => {
-            "Your account statuses from the account timeline endpoint.".to_string()
-        }
+        FeedMode::Home => "Posts from accounts you follow.".to_string(),
+        FeedMode::Public => "Recent local posts from the public timeline.".to_string(),
+        FeedMode::Profile => "Posts from your account timeline.".to_string(),
         FeedMode::Hashtags => {
             let hashtags = parse_hashtag_query(&model.hashtag_query);
             if hashtags.is_empty() {
-                "Combine multiple hashtags into one merged timeline.".to_string()
+                "Merge multiple hashtags into one timeline.".to_string()
             } else {
-                format!("Merged hashtag timeline for #{}.", hashtags.join(", #"))
+                let preview = hashtags
+                    .iter()
+                    .take(3)
+                    .map(|value| format!("#{value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let remaining = hashtags.len().saturating_sub(3);
+                if remaining > 0 {
+                    format!("Posts matching {preview} and {remaining} more.")
+                } else {
+                    format!("Posts matching {preview}.")
+                }
             }
         }
     }

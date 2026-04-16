@@ -36,7 +36,7 @@ env \
   RUSTRESORT__INSTANCE__TITLE="RustResort UI Test" \
   RUSTRESORT__INSTANCE__DESCRIPTION="UI test instance" \
   RUSTRESORT__INSTANCE__CONTACT_EMAIL=admin@example.com \
-  cargo run >"${LOG_PATH}" 2>&1 &
+  cargo run --bin rustresort >"${LOG_PATH}" 2>&1 &
 SERVER_PID=$!
 
 for _ in $(seq 1 "${HEALTH_TIMEOUT_SECONDS}"); do

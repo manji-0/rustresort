@@ -155,6 +155,12 @@ async function main() {
     await page.waitForFunction(() => !document.querySelector(".composer-panel-popout"));
     await page.fill("#composer-input", "");
 
+    await selectedTimelineCard(page).press("Shift+/");
+    await page.waitForSelector('.shortcut-modal[role="dialog"]');
+    await page.waitForSelector('.shortcut-modal[role="dialog"] #shortcut-modal-title');
+    await page.click("#shortcut-help-close");
+    await page.waitForFunction(() => !document.querySelector(".shortcut-modal"));
+
     await selectedTimelineCard(page).press("Shift+N");
     await page.waitForSelector(".composer-panel-popout");
     const mentionDraft = await page.inputValue("#composer-input");
