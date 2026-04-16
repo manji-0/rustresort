@@ -2947,6 +2947,102 @@ async fn test_signed_shared_inbox_update_note_creates_quoted_update_for_each_loc
 }
 
 #[tokio::test]
+async fn test_signed_shared_inbox_update_note_attachment_change_creates_quoted_update() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let key_id = register_default_remote_key(&server);
+    let remote_status_uri = "https://remote.example/users/alice/statuses/quoted-update-attachment";
+    let local_quote_uri = server.public_url("/users/testuser/statuses/local-quote-attachment");
+
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: EntityId::new_string(),
+            uri: remote_status_uri.to_string(),
+            content: "<p>before</p>".to_string(),
+            content_warning: None,
+            visibility: StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Mentioned,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        })
+        .await
+        .unwrap();
+
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: EntityId::new_string(),
+            uri: local_quote_uri.clone(),
+            content: "<p>local quote</p>".to_string(),
+            content_warning: None,
+            visibility: StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "testuser@test.example.com".to_string(),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: Some(remote_status_uri.to_string()),
+            persisted_reason: PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        })
+        .await
+        .unwrap();
+
+    let activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/update-quoted-attachment",
+        "type": "Update",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": remote_status_uri,
+            "content": "<p>before</p>",
+            "published": "2026-01-05T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "attachment": [{
+                "type": "Document",
+                "mediaType": "image/png",
+                "url": "https://remote.example/media/quoted-update.png"
+            }]
+        }
+    });
+
+    let response = server
+        .post_signed_activity("/inbox", &activity, &key_id)
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let notifications = server
+        .state
+        .db
+        .get_notifications(10, None, false)
+        .await
+        .unwrap();
+    assert!(
+        notifications.iter().any(|notification| {
+            notification.notification_type == rustresort::data::NotificationType::QuotedUpdate
+                && notification.origin_account_address == REMOTE_ACTOR_ADDRESS
+                && notification.status_uri.as_deref() == Some(local_quote_uri.as_str())
+        }),
+        "attachment-only edit of a quoted remote status should create a quoted update notification"
+    );
+}
+
+#[tokio::test]
 async fn test_signed_shared_inbox_undo_like_removes_favourite_notification() {
     let server = TestServer::new().await;
     server.create_test_account().await;

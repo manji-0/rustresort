@@ -1276,6 +1276,17 @@ impl ActivityProcessor {
             } else {
                 None
             };
+            let reject_media = self
+                .actor_domain_block(actor_uri)
+                .await?
+                .as_ref()
+                .is_some_and(|block| block.reject_media);
+            let metadata_changed = if let Some(existing_status) = existing_status.as_ref() {
+                self.remote_status_metadata_changed(&existing_status.id, object, reject_media)
+                    .await?
+            } else {
+                false
+            };
             let is_newly_persisted = existing_status.is_none();
             let known_in_db = existing_status.is_some();
             let known_in_cache = if let Some(status_uri) = status_uri {
@@ -1306,7 +1317,9 @@ impl ActivityProcessor {
                     .await?
                 {
                     let activity_uri = activity.get("id").and_then(|id| id.as_str());
-                    if status_changed(existing_status.as_ref(), &status)
+                    let content_or_metadata_changed =
+                        status_changed(existing_status.as_ref(), &status) || metadata_changed;
+                    if content_or_metadata_changed
                         && self.local_user_interacts_with_status(&status.id).await?
                     {
                         let notification = crate::data::Notification {
@@ -1320,7 +1333,7 @@ impl ActivityProcessor {
                         self.insert_notification_and_publish(&notification, activity_uri)
                             .await?;
                     }
-                    if status_changed(existing_status.as_ref(), &status) {
+                    if content_or_metadata_changed {
                         for quote_status in self
                             .db
                             .get_local_statuses_by_quote_of_uri(&status.uri)
@@ -3346,11 +3359,31 @@ impl ActivityProcessor {
                 })
                 .unwrap_or(false)
         };
+        let contains_followers_collection = |audience: &serde_json::Value| -> bool {
+            let is_followers_uri =
+                |value: &str| normalize_identity_candidate(value).ends_with("/followers");
+            if let Some(value) = audience.as_str() {
+                return is_followers_uri(value);
+            }
+            audience
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(is_followers_uri)
+                })
+                .unwrap_or(false)
+        };
 
         if object.get("to").is_some_and(contains_public) {
             "public".to_string()
         } else if object.get("cc").is_some_and(contains_public) {
             "unlisted".to_string()
+        } else if object.get("to").is_some_and(contains_followers_collection)
+            || object.get("cc").is_some_and(contains_followers_collection)
+        {
+            "private".to_string()
         } else if object.get("to").is_some_and(contains_local_identity)
             || object.get("cc").is_some_and(contains_local_identity)
         {
@@ -3764,6 +3797,29 @@ mod tests {
         assert!(!processor.is_local_status("https://example.com/users/alice"));
         assert!(!processor.is_local_status("https://example.com/@alice"));
         assert!(processor.is_local_status("https://example.com/users/alice/statuses/1"));
+    }
+
+    #[tokio::test]
+    async fn extract_visibility_treats_followers_collection_as_private() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "to": [
+                "https://remote.example/users/bob/followers",
+                "https://example.com/users/alice"
+            ]
+        });
+
+        assert_eq!(processor.extract_visibility(&object), "private");
+    }
+
+    #[tokio::test]
+    async fn extract_visibility_treats_local_actor_without_followers_collection_as_direct() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "to": ["https://example.com/users/alice"]
+        });
+
+        assert_eq!(processor.extract_visibility(&object), "direct");
     }
 
     #[test]
