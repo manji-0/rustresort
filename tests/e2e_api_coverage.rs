@@ -2734,6 +2734,121 @@ async fn test_admin_reports_return_reporting_account_and_status() {
 }
 
 #[tokio::test]
+async fn test_admin_reports_apply_filters_and_pagination() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+    persist_remote_profile(&server, "bob@remote.example", "Bob").await;
+
+    let base_time = Utc::now();
+    for (id, origin, offset_seconds) in [
+        ("report-001", "alice@remote.example", 1),
+        ("report-002", "bob@remote.example", 2),
+        ("report-003", "alice@remote.example", 3),
+    ] {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: id.to_string(),
+                notification_type: NotificationType::AdminReport,
+                origin_account_address: origin.to_string(),
+                status_uri: None,
+                read: false,
+                created_at: base_time + Duration::seconds(offset_seconds),
+            })
+            .await
+            .unwrap();
+    }
+
+    let first_page = server
+        .client
+        .get(server.url("/api/v1/admin/reports?limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(first_page.status(), 200);
+    let first_page: serde_json::Value = first_page.json().await.unwrap();
+    assert_eq!(first_page.as_array().unwrap().len(), 1);
+    assert_eq!(first_page[0]["id"], "report-003");
+
+    let max_id_page = server
+        .client
+        .get(server.url("/api/v1/admin/reports?max_id=report-003"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(max_id_page.status(), 200);
+    let max_id_page: serde_json::Value = max_id_page.json().await.unwrap();
+    let max_id_page = max_id_page.as_array().unwrap();
+    assert_eq!(max_id_page[0]["id"], "report-002");
+    assert_eq!(max_id_page[1]["id"], "report-001");
+
+    let since_id_page = server
+        .client
+        .get(server.url("/api/v1/admin/reports?since_id=report-002"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(since_id_page.status(), 200);
+    let since_id_page: serde_json::Value = since_id_page.json().await.unwrap();
+    let since_id_page = since_id_page.as_array().unwrap();
+    assert_eq!(since_id_page.len(), 1);
+    assert_eq!(since_id_page[0]["id"], "report-003");
+
+    let resolved_page = server
+        .client
+        .get(server.url("/api/v1/admin/reports?resolved=true"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_page.status(), 200);
+    let resolved_page: serde_json::Value = resolved_page.json().await.unwrap();
+    assert!(resolved_page.as_array().unwrap().is_empty());
+
+    let account_filtered_page = server
+        .client
+        .get(server.url("/api/v1/admin/reports?account_id=bob@remote.example"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(account_filtered_page.status(), 200);
+    let account_filtered_page: serde_json::Value = account_filtered_page.json().await.unwrap();
+    let account_filtered_page = account_filtered_page.as_array().unwrap();
+    assert_eq!(account_filtered_page.len(), 1);
+    assert_eq!(account_filtered_page[0]["id"], "report-002");
+
+    let target_filtered_page = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/admin/reports?target_account_id={}",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(target_filtered_page.status(), 200);
+    let target_filtered_page: serde_json::Value = target_filtered_page.json().await.unwrap();
+    assert_eq!(target_filtered_page.as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn test_admin_account_action_suspend_and_unsuspend_round_trip() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2952,6 +3067,67 @@ async fn test_admin_accounts_include_persisted_remote_profiles_and_apply_cursors
     assert_eq!(email_filter_response.status(), 200);
     let filtered: serde_json::Value = email_filter_response.json().await.unwrap();
     assert_eq!(filtered.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_admin_accounts_apply_active_and_pending_filters() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+    persist_remote_profile(&server, "bob@remote.example", "Bob").await;
+
+    let suspend_response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/action"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "action": "suspend" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(suspend_response.status(), 200);
+
+    let active_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false&active=true"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(active_response.status(), 200);
+    let active_accounts: serde_json::Value = active_response.json().await.unwrap();
+    let active_accounts = active_accounts.as_array().unwrap();
+    assert_eq!(active_accounts.len(), 1);
+    assert_eq!(active_accounts[0]["id"], "bob@remote.example");
+
+    let inactive_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false&active=false"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(inactive_response.status(), 200);
+    let inactive_accounts: serde_json::Value = inactive_response.json().await.unwrap();
+    let inactive_accounts = inactive_accounts.as_array().unwrap();
+    assert_eq!(inactive_accounts.len(), 1);
+    assert_eq!(inactive_accounts[0]["id"], "alice@remote.example");
+
+    let pending_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false&pending=true"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(pending_response.status(), 200);
+    let pending_accounts: serde_json::Value = pending_response.json().await.unwrap();
+    assert!(pending_accounts.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

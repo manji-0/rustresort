@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -185,6 +186,8 @@ fn admin_identity_key(identity: &str) -> Option<String> {
 
 fn admin_account_matches_filters(account: &AdminAccount, params: &AdminAccountParams) -> bool {
     let is_local = account.domain.is_none();
+    let is_pending = !account.approved || !account.confirmed;
+    let is_active = !is_pending && !account.disabled && !account.suspended;
 
     if let Some(local) = params.local
         && local != is_local
@@ -197,12 +200,12 @@ fn admin_account_matches_filters(account: &AdminAccount, params: &AdminAccountPa
         return false;
     }
     if let Some(active) = params.active
-        && !active
+        && active != is_active
     {
         return false;
     }
     if let Some(pending) = params.pending
-        && pending
+        && pending != is_pending
     {
         return false;
     }
@@ -364,8 +367,17 @@ async fn build_remote_admin_account(
 async fn collect_remote_admin_candidates(
     state: &AdminApiState,
 ) -> Result<Vec<AdminRemoteAccountCandidate>, AppError> {
-    let default_port = default_port_for_protocol(&state.config.server.protocol);
     let mut candidates = BTreeMap::<String, AdminRemoteAccountCandidate>::new();
+    let blocked_details = state.db.get_blocked_account_details(500).await?;
+    let muted_details = state.db.get_muted_account_details(500).await?;
+    let blocked_keys = blocked_details
+        .iter()
+        .filter_map(|(address, _, _)| admin_identity_key(address))
+        .collect::<HashSet<_>>();
+    let muted_keys = muted_details
+        .iter()
+        .filter_map(|(address, _)| admin_identity_key(address))
+        .collect::<HashSet<_>>();
 
     let mut insert_candidate = |identity: String, suspended: bool, silenced: bool| {
         let Some(key) = admin_identity_key(&identity) else {
@@ -384,33 +396,36 @@ async fn collect_remote_admin_candidates(
             });
     };
 
+    let moderation_state_for = |address: &str| {
+        let key = admin_identity_key(address);
+        let suspended = key
+            .as_ref()
+            .is_some_and(|normalized| blocked_keys.contains(normalized));
+        let silenced = key
+            .as_ref()
+            .is_some_and(|normalized| muted_keys.contains(normalized));
+        (suspended, silenced)
+    };
+
     for profile in state.db.list_remote_profiles().await? {
         let identity = if profile.uri.trim().is_empty() {
             profile.address.clone()
         } else {
             profile.uri.clone()
         };
-        let suspended = state
-            .db
-            .is_account_blocked(&profile.address, default_port)
-            .await?;
-        let silenced = state
-            .db
-            .is_account_muted(&profile.address, default_port)
-            .await?;
+        let (suspended, silenced) = moderation_state_for(&profile.address);
         insert_candidate(identity, suspended, silenced);
     }
 
-    for (address, actor_uri, _) in state.db.get_blocked_account_details(500).await? {
+    for (address, actor_uri, _) in blocked_details {
         insert_candidate(actor_uri.unwrap_or(address), true, false);
     }
-    for (address, actor_uri) in state.db.get_muted_account_details(500).await? {
+    for (address, actor_uri) in muted_details {
         insert_candidate(actor_uri.unwrap_or(address), false, true);
     }
     for (address, actor_uri) in state.db.get_follow_request_details(500).await? {
         let identity = actor_uri.unwrap_or(address.clone());
-        let suspended = state.db.is_account_blocked(&address, default_port).await?;
-        let silenced = state.db.is_account_muted(&address, default_port).await?;
+        let (suspended, silenced) = moderation_state_for(&address);
         insert_candidate(identity, suspended, silenced);
     }
 
@@ -436,14 +451,7 @@ async fn collect_remote_admin_candidates(
             if !seen_notification_ids.insert(notification.id.clone()) {
                 continue;
             }
-            let suspended = state
-                .db
-                .is_account_blocked(&notification.origin_account_address, default_port)
-                .await?;
-            let silenced = state
-                .db
-                .is_account_muted(&notification.origin_account_address, default_port)
-                .await?;
+            let (suspended, silenced) = moderation_state_for(&notification.origin_account_address);
             insert_candidate(notification.origin_account_address, suspended, silenced);
         }
 
@@ -453,6 +461,104 @@ async fn collect_remote_admin_candidates(
     }
 
     Ok(candidates.into_values().collect())
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AdminReportParams {
+    #[serde(rename = "resolved")]
+    resolved: Option<bool>,
+    #[serde(rename = "account_id")]
+    account_id: Option<String>,
+    #[serde(rename = "target_account_id")]
+    target_account_id: Option<String>,
+    #[serde(rename = "max_id")]
+    max_id: Option<String>,
+    #[serde(rename = "since_id")]
+    since_id: Option<String>,
+    #[serde(rename = "min_id")]
+    min_id: Option<String>,
+    #[serde(rename = "limit")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug)]
+struct AdminReportEntry {
+    report: AdminReport,
+    created_at: DateTime<Utc>,
+}
+
+fn admin_report_matches_filters(report: &AdminReport, params: &AdminReportParams) -> bool {
+    if let Some(resolved) = params.resolved
+        && resolved != report.action_taken
+    {
+        return false;
+    }
+
+    if let Some(account_id) = params.account_id.as_deref() {
+        let needle = normalize_admin_account_cursor(account_id);
+        let report_account_id = report.account["id"]
+            .as_str()
+            .map(normalize_admin_account_cursor)
+            .unwrap_or_default();
+        if report_account_id != needle {
+            return false;
+        }
+    }
+
+    if let Some(target_account_id) = params.target_account_id.as_deref() {
+        let needle = normalize_admin_account_cursor(target_account_id);
+        let report_target_account_id = report.target_account["id"]
+            .as_str()
+            .map(normalize_admin_account_cursor)
+            .unwrap_or_default();
+        if report_target_account_id != needle {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn admin_report_cursor_tuple(
+    state: &AdminApiState,
+    cursor_id: &str,
+) -> Result<Option<(DateTime<Utc>, String)>, AppError> {
+    Ok(state
+        .db
+        .get_notification(cursor_id)
+        .await?
+        .map(|notification| (notification.created_at, notification.id)))
+}
+
+async fn apply_admin_report_pagination(
+    state: &AdminApiState,
+    entries: Vec<AdminReportEntry>,
+    params: &AdminReportParams,
+) -> Result<Vec<AdminReport>, AppError> {
+    let max_cursor = match params.max_id.as_deref() {
+        Some(cursor_id) => admin_report_cursor_tuple(state, cursor_id).await?,
+        None => None,
+    };
+    let min_cursor = match params.min_id.as_deref().or(params.since_id.as_deref()) {
+        Some(cursor_id) => admin_report_cursor_tuple(state, cursor_id).await?,
+        None => None,
+    };
+
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            let cursor = (entry.created_at, entry.report.id.clone());
+            max_cursor
+                .as_ref()
+                .map(|value| cursor < *value)
+                .unwrap_or(true)
+                && min_cursor
+                    .as_ref()
+                    .map(|value| cursor > *value)
+                    .unwrap_or(true)
+        })
+        .map(|entry| entry.report)
+        .collect())
 }
 
 /// GET /api/v1/admin/accounts
@@ -629,6 +735,7 @@ async fn build_report_status_response(
 pub async fn list_reports(
     State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
+    Query(params): Query<AdminReportParams>,
 ) -> Result<Json<Vec<AdminReport>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
@@ -637,6 +744,7 @@ pub async fn list_reports(
     let local_account_value = serde_json::to_value(&local_account_response)
         .map_err(|error| AppError::serialization("admin local account response", error))?;
 
+    let limit = params.limit.unwrap_or(20).min(200);
     let mut reports = Vec::new();
     let mut cursor: Option<String> = None;
     const FETCH_LIMIT: usize = 200;
@@ -687,7 +795,7 @@ pub async fn list_reports(
                 );
             }
 
-            reports.push(AdminReport {
+            let report = AdminReport {
                 id: notification.id,
                 action_taken: false,
                 comment: String::new(),
@@ -698,7 +806,14 @@ pub async fn list_reports(
                 assigned_account: None,
                 action_taken_by_account: None,
                 statuses,
-            });
+            };
+
+            if admin_report_matches_filters(&report, &params) {
+                reports.push(AdminReportEntry {
+                    report,
+                    created_at: notification.created_at,
+                });
+            }
         }
 
         if reached_end {
@@ -706,7 +821,8 @@ pub async fn list_reports(
         }
     }
 
-    Ok(Json(reports))
+    let paginated = apply_admin_report_pagination(&state, reports, &params).await?;
+    Ok(Json(paginated.into_iter().take(limit).collect()))
 }
 
 #[derive(Debug, Serialize)]
