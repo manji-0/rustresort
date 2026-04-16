@@ -234,6 +234,67 @@ async fn test_home_timeline_includes_cached_remote_followee_status() {
 }
 
 #[tokio::test]
+async fn test_home_timeline_excludes_silenced_remote_followee_status() {
+    use chrono::Utc;
+    use rustresort::data::{CachedStatus, EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let actor_uri = "https://remote.example/users/alice";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: actor_uri.to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/alice-silenced".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .upsert_domain_block("remote.example", "silence", false, false, None, None, false)
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/cached-home-silenced";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Cached silenced followee post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/home"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(entries.iter().all(|item| item["uri"] != status_uri));
+}
+
+#[tokio::test]
 async fn test_public_timeline_includes_cached_remote_public_status() {
     use chrono::Utc;
     use rustresort::data::CachedStatus;
@@ -271,6 +332,51 @@ async fn test_public_timeline_includes_cached_remote_public_status() {
         entries.iter().any(|item| item["uri"] == status_uri),
         "public timeline should include cached remote public status"
     );
+}
+
+#[tokio::test]
+async fn test_public_timeline_excludes_silenced_remote_domain_statuses() {
+    use chrono::Utc;
+    use rustresort::data::CachedStatus;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    server
+        .state
+        .db
+        .upsert_domain_block("remote.example", "silence", false, false, None, None, false)
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/cached-public-silenced";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Cached public post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(entries.iter().all(|item| item["uri"] != status_uri));
 }
 
 #[tokio::test]

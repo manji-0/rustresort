@@ -2961,6 +2961,43 @@ async fn test_admin_report_mutation_endpoints_round_trip() {
 }
 
 #[tokio::test]
+async fn test_admin_report_update_rejects_unknown_rule_ids() {
+    use chrono::Utc;
+    use rustresort::data::{Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: "report-rule-validation-001".to_string(),
+            notification_type: NotificationType::AdminReport,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .put(server.url("/api/v1/admin/reports/report-rule-validation-001"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[("category", "violation"), ("rule_ids[]", "999")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "unknown rule_ids: 999");
+}
+
+#[tokio::test]
 async fn test_admin_account_action_suspend_and_unsuspend_round_trip() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -3077,6 +3114,86 @@ async fn test_admin_account_action_accepts_form_type_and_resolves_report() {
     let report: serde_json::Value = report_response.json().await.unwrap();
     assert_eq!(report["action_taken"], true);
     assert_eq!(report["action_taken_by_account"]["id"], local_account.id);
+}
+
+#[tokio::test]
+async fn test_admin_account_action_sensitive_and_unsensitive_toggle_status_response() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/alice/statuses/sensitive-1".to_string(),
+        content: "<p>remote media</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "alice@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let mark_response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/action"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[("type", "sensitive")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mark_response.status(), 200);
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let entry = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uri"] == status.uri)
+        .expect("remote status should be visible");
+    assert_eq!(entry["sensitive"], true);
+
+    let clear_response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/unsensitive"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clear_response.status(), 200);
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let entry = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["uri"] == status.uri)
+        .expect("remote status should remain visible");
+    assert_eq!(entry["sensitive"], false);
 }
 
 #[tokio::test]

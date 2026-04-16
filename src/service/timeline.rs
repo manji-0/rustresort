@@ -415,6 +415,8 @@ impl TimelineService {
         &self,
         statuses: Vec<Status>,
     ) -> Result<Vec<TimelineItem>, AppError> {
+        let silenced_domains = self.db.get_domains_by_severity("silence").await?;
+        let statuses = Self::filter_silenced_statuses(statuses, &silenced_domains);
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
@@ -562,6 +564,32 @@ impl TimelineService {
         addresses
     }
 
+    fn extract_account_domain(account_address: &str) -> Option<String> {
+        let (_, domain) = account_address.split_once('@')?;
+        let parsed = url::Url::parse(&format!("http://{}", domain.trim())).ok()?;
+        parsed.host_str().map(|host| host.to_ascii_lowercase())
+    }
+
+    fn filter_silenced_statuses(statuses: Vec<Status>, silenced_domains: &[String]) -> Vec<Status> {
+        if silenced_domains.is_empty() {
+            return statuses;
+        }
+
+        let silenced = silenced_domains
+            .iter()
+            .map(|domain| domain.trim().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        statuses
+            .into_iter()
+            .filter(|status| {
+                status.is_local
+                    || Self::extract_account_domain(&status.account_address)
+                        .map(|domain| !silenced.contains(&domain))
+                        .unwrap_or(true)
+            })
+            .collect()
+    }
+
     async fn merge_statuses(
         &self,
         db_statuses: Vec<Status>,
@@ -602,6 +630,8 @@ impl TimelineService {
                 .then_with(|| right.id.cmp(&left.id))
         });
 
+        let silenced_domains = self.db.get_domains_by_severity("silence").await?;
+        let merged = Self::filter_silenced_statuses(merged, &silenced_domains);
         let visible = self
             .filter_muted_threads_with_uris(merged, &self.db.get_muted_thread_uris().await?)
             .await?;
@@ -622,9 +652,11 @@ impl TimelineService {
             return Ok(Vec::new());
         }
 
+        let silenced_domains = self.db.get_domains_by_severity("silence").await?;
         let muted_thread_uris = self.db.get_muted_thread_uris().await?;
         if muted_thread_uris.is_empty() {
-            return fetch_page(limit, initial_max_id).await;
+            let statuses = fetch_page(limit, initial_max_id).await?;
+            return Ok(Self::filter_silenced_statuses(statuses, &silenced_domains));
         }
 
         let fetch_limit = limit
@@ -642,7 +674,7 @@ impl TimelineService {
 
             let fetched_count = statuses.len();
             cursor = statuses.last().map(|status| status.id.clone());
-
+            let statuses = Self::filter_silenced_statuses(statuses, &silenced_domains);
             let filtered = self
                 .filter_muted_threads_with_uris(statuses, &muted_thread_uris)
                 .await?;

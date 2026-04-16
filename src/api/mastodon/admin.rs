@@ -312,6 +312,26 @@ fn build_admin_report_rules(
         .collect()
 }
 
+fn validate_admin_report_rule_ids(
+    rule_ids: &[String],
+    rule_map: &BTreeMap<String, String>,
+) -> Result<Vec<String>, AppError> {
+    let normalized = parse_report_rule_ids(rule_ids);
+    let invalid = normalized
+        .iter()
+        .filter(|rule_id| !rule_map.contains_key(*rule_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if invalid.is_empty() {
+        Ok(normalized)
+    } else {
+        Err(AppError::Validation(format!(
+            "unknown rule_ids: {}",
+            invalid.join(", ")
+        )))
+    }
+}
+
 fn default_admin_report_state(report_id: &str, created_at: DateTime<Utc>) -> AdminReportState {
     AdminReportState {
         report_id: report_id.to_string(),
@@ -870,7 +890,23 @@ async fn apply_admin_account_action(
             "unsilence" => {
                 state.db.unmute_account(&address, default_port).await?;
             }
-            "none" | "sensitive" | "unsensitive" => {}
+            "sensitive" => {
+                state
+                    .db
+                    .mark_account_sensitive_with_actor_uri(
+                        &address,
+                        actor_uri.as_deref(),
+                        default_port,
+                    )
+                    .await?;
+            }
+            "unsensitive" => {
+                state
+                    .db
+                    .unmark_account_sensitive(&address, default_port)
+                    .await?;
+            }
+            "none" => {}
             _ => {
                 return Err(AppError::Validation(format!(
                     "unsupported admin account action `{}`",
@@ -1212,6 +1248,7 @@ pub async fn update_report(
 ) -> Result<Json<AdminReport>, AppError> {
     let req = parse_update_report_request(&headers, &body)?;
     let notification = get_admin_report_notification(&state, &id).await?;
+    let instance_rule_map = load_instance_rule_map(&state).await;
     let mut report_state = state
         .db
         .get_admin_report_state(&id)
@@ -1225,9 +1262,23 @@ pub async fn update_report(
         }
     }
 
-    if !req.rule_ids.is_empty() || report_state.category == "violation" {
-        let rule_ids = parse_report_rule_ids(&req.rule_ids);
+    if !req.rule_ids.is_empty() {
+        if report_state.category != "violation" {
+            return Err(AppError::Validation(
+                "rule_ids are only valid when category=violation".to_string(),
+            ));
+        }
+        let rule_ids = validate_admin_report_rule_ids(&req.rule_ids, &instance_rule_map)?;
         report_state.rule_ids_json = serialize_rule_ids(&rule_ids)?;
+    } else if report_state.category == "violation"
+        && report_state
+            .rule_ids_json
+            .as_deref()
+            .is_some_and(|raw| !deserialize_rule_ids(Some(raw)).is_empty())
+    {
+        let existing_rule_ids = deserialize_rule_ids(report_state.rule_ids_json.as_deref());
+        let validated = validate_admin_report_rule_ids(&existing_rule_ids, &instance_rule_map)?;
+        report_state.rule_ids_json = serialize_rule_ids(&validated)?;
     }
 
     report_state.updated_at = Utc::now();

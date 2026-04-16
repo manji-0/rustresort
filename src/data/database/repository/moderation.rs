@@ -318,4 +318,70 @@ impl Database {
 
         Ok(rows)
     }
+
+    /// Mark an account as sensitive for media/content warnings.
+    pub async fn mark_account_sensitive_with_actor_uri(
+        &self,
+        target_address: &str,
+        actor_uri: Option<&str>,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_sensitives")
+                .fetch_all(&self.pool)
+                .await?;
+        let stored_target_address =
+            find_matching_addresses(&existing, target_address, default_port)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| target_address.to_string());
+
+        let id = EntityId::new_string();
+        sqlx::query(
+            "INSERT OR REPLACE INTO account_sensitives (id, target_address, actor_uri, created_at) VALUES (?, ?, ?, datetime('now'))",
+        )
+        .bind(&id)
+        .bind(&stored_target_address)
+        .bind(actor_uri)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Remove sensitive marking from an account.
+    pub async fn unmark_account_sensitive(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<(), AppError> {
+        let existing =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_sensitives")
+                .fetch_all(&self.pool)
+                .await?;
+        let matches = find_matching_addresses(&existing, target_address, default_port);
+        for stored_target_address in matches {
+            sqlx::query("DELETE FROM account_sensitives WHERE target_address COLLATE NOCASE = ?")
+                .bind(stored_target_address)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Check if an account is marked sensitive.
+    pub async fn is_account_sensitive(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<bool, AppError> {
+        let existing =
+            sqlx::query_scalar::<_, String>("SELECT target_address FROM account_sensitives")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(existing
+            .iter()
+            .any(|stored| account_addresses_match(stored, target_address, default_port)))
+    }
 }

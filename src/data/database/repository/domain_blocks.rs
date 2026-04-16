@@ -26,6 +26,18 @@ impl Database {
         Ok(domains)
     }
 
+    /// Get all blocked domains for a specific severity.
+    pub async fn get_domains_by_severity(&self, severity: &str) -> Result<Vec<String>, AppError> {
+        let domains = sqlx::query_scalar::<_, String>(
+            "SELECT domain FROM domain_blocks WHERE severity = ? ORDER BY created_at DESC",
+        )
+        .bind(severity)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(domains)
+    }
+
     /// Block a domain
     pub async fn block_domain(&self, domain: &str) -> Result<(), AppError> {
         self.upsert_domain_block(domain, "suspend", true, true, None, None, false)

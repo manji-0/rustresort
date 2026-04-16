@@ -749,14 +749,16 @@ impl ActivityProcessor {
         };
 
         // 2. Check if domain is blocked
-        if self
-            .actor_domain_block(actor_uri)
-            .await?
+        let actor_domain_block = self.actor_domain_block(actor_uri).await?;
+        if actor_domain_block
             .as_ref()
             .is_some_and(|block| block.severity == "suspend")
         {
             return Err(AppError::Forbidden);
         }
+        let suppress_timeline_visibility = actor_domain_block
+            .as_ref()
+            .is_some_and(|block| block.severity == "silence");
 
         if self.is_actor_locally_blocked(actor_uri).await? {
             return Err(AppError::Forbidden);
@@ -772,7 +774,8 @@ impl ActivityProcessor {
         };
 
         // 3. Decide whether this activity should be handled at all.
-        let persistence_decision = self.decide_persistence(&activity, actor_is_followee);
+        let persistence_decision =
+            self.decide_persistence(&activity, actor_is_followee, suppress_timeline_visibility);
         if persistence_decision == PersistenceDecision::Ignore
             && activity_type != ActivityType::Update
         {
@@ -813,6 +816,7 @@ impl ActivityProcessor {
         &self,
         activity: &serde_json::Value,
         actor_is_followee: bool,
+        suppress_timeline_visibility: bool,
     ) -> PersistenceDecision {
         // Get activity type
         let activity_type = activity
@@ -854,7 +858,7 @@ impl ActivityProcessor {
                         }
                     }
                 }
-                if actor_is_followee {
+                if actor_is_followee && !suppress_timeline_visibility {
                     return PersistenceDecision::Persist;
                 }
                 // Boost of someone else's status -> Ignore
@@ -882,7 +886,7 @@ impl ActivityProcessor {
                         return PersistenceDecision::Persist;
                     }
                     // Create from followee -> Persist for durable timelines and restart safety.
-                    if actor_is_followee {
+                    if actor_is_followee && !suppress_timeline_visibility {
                         return PersistenceDecision::Persist;
                     }
                 }
@@ -910,10 +914,10 @@ impl ActivityProcessor {
                         {
                             return PersistenceDecision::Persist;
                         }
-                        if actor_is_followee {
+                        if actor_is_followee && !suppress_timeline_visibility {
                             return PersistenceDecision::Persist;
                         }
-                    } else {
+                    } else if !suppress_timeline_visibility {
                         // Profile-like updates should still refresh cache state.
                         return PersistenceDecision::CacheOnly;
                     }
@@ -4422,6 +4426,45 @@ mod tests {
             .unwrap()
             .expect("followee status should be persisted");
         assert_eq!(persisted.persisted_reason, PersistedReason::Timeline);
+    }
+
+    #[tokio::test]
+    async fn process_create_from_silenced_followee_does_not_persist_timeline_status() {
+        let (processor, db, timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let actor_uri = "https://remote.example/users/bob";
+        let status_uri = "https://remote.example/users/bob/statuses/silenced";
+
+        db.insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "bob@remote.example".to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://example.com/users/alice/follow/silenced".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        db.upsert_domain_block("remote.example", "silence", false, false, None, None, false)
+            .await
+            .unwrap();
+
+        let activity = json!({
+            "type": "Create",
+            "actor": actor_uri,
+            "object": {
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "id": status_uri,
+                "content": "<p>Hello from silenced followee</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            }
+        });
+
+        processor.process(activity, actor_uri).await.unwrap();
+
+        assert!(timeline_cache.get_by_uri(status_uri).await.is_none());
+        assert!(db.get_status_by_uri(status_uri).await.unwrap().is_none());
     }
 
     #[tokio::test]

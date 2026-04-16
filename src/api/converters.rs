@@ -20,6 +20,7 @@ pub struct RemoteAccountStats {
     pub followers_count: i32,
     pub following_count: i32,
     pub statuses_count: i32,
+    pub force_sensitive: bool,
     pub uri: Option<String>,
     pub display_name: Option<String>,
     pub note: Option<String>,
@@ -242,6 +243,9 @@ async fn load_remote_account_stats_for_status(
 
     Ok(Some(RemoteAccountStats {
         statuses_count: saturating_i32(statuses_count),
+        force_sensitive: db
+            .is_account_sensitive(account_address, default_port_for_protocol(local_protocol))
+            .await?,
         ..RemoteAccountStats::default()
     }))
 }
@@ -259,6 +263,10 @@ async fn build_quote_response_value(
     let media_attachment_responses =
         load_status_media_attachment_responses(db, &quote_status.id, config, &media_attachments)
             .await?;
+    let force_sensitive = remote_account_stats
+        .as_ref()
+        .map(|stats| stats.force_sensitive)
+        .unwrap_or(false);
     let mut response = status_to_response_with_media(
         quote_status,
         account,
@@ -266,6 +274,7 @@ async fn build_quote_response_value(
         account_stats,
         remote_account_stats,
         StatusInteractions::default(),
+        force_sensitive,
         &media_attachment_responses,
     );
     enrich_status_response(db, quote_status, &mut response).await?;
@@ -287,6 +296,10 @@ pub async fn build_status_response_with_media(
 ) -> Result<StatusResponse, AppError> {
     let media_attachment_responses =
         load_status_media_attachment_responses(db, &status.id, config, media_attachments).await?;
+    let force_sensitive = remote_account_stats
+        .as_ref()
+        .map(|stats| stats.force_sensitive)
+        .unwrap_or(false);
     let mut response = status_to_response_with_media(
         status,
         account,
@@ -294,6 +307,7 @@ pub async fn build_status_response_with_media(
         account_stats,
         remote_account_stats,
         interactions,
+        force_sensitive,
         &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
@@ -414,6 +428,9 @@ pub async fn load_remote_account_stats_map(
             .await?;
         let mut remote_stats = RemoteAccountStats {
             statuses_count: saturating_i32(statuses_count),
+            force_sensitive: db
+                .is_account_sensitive(account_address, default_port)
+                .await?,
             ..RemoteAccountStats::default()
         };
 
@@ -1028,6 +1045,10 @@ pub fn status_to_response_with_account_stats_and_remote_stats(
     remote_account_stats: Option<RemoteAccountStats>,
     interactions: StatusInteractions,
 ) -> StatusResponse {
+    let force_sensitive = remote_account_stats
+        .as_ref()
+        .map(|stats| stats.force_sensitive)
+        .unwrap_or(false);
     status_to_response_with_media(
         status,
         account,
@@ -1035,6 +1056,7 @@ pub fn status_to_response_with_account_stats_and_remote_stats(
         account_stats,
         remote_account_stats,
         interactions,
+        force_sensitive,
         &[],
     )
 }
@@ -1047,6 +1069,7 @@ pub fn status_to_response_with_media(
     account_stats: AccountStats,
     remote_account_stats: Option<RemoteAccountStats>,
     interactions: StatusInteractions,
+    force_sensitive: bool,
     media_attachments: &[MediaAttachmentResponse],
 ) -> StatusResponse {
     let base_url = config.server.base_url();
@@ -1067,7 +1090,7 @@ pub fn status_to_response_with_media(
             .as_ref()
             .map(|uri| local_status_id_from_uri(uri, config).unwrap_or_else(|| uri.clone())),
         in_reply_to_account_id: None,
-        sensitive: status.content_warning.is_some(),
+        sensitive: status.content_warning.is_some() || force_sensitive,
         spoiler_text: status.content_warning.clone().unwrap_or_default(),
         visibility: status.visibility.to_string(),
         language: status.language.clone(),
@@ -1389,6 +1412,7 @@ mod tests {
             followers_count: 7,
             following_count: 8,
             statuses_count: 9,
+            force_sensitive: false,
             uri: Some("https://remote.example/users/alice".to_string()),
             display_name: Some("Alice Remote".to_string()),
             note: Some("cached note".to_string()),
@@ -1480,6 +1504,7 @@ mod tests {
             followers_count: 42,
             following_count: 24,
             statuses_count: 12,
+            force_sensitive: false,
             uri: Some("https://remote.example/users/bob".to_string()),
             display_name: Some("Bob".to_string()),
             note: Some("wrapper".to_string()),
@@ -1971,6 +1996,7 @@ mod tests {
             AccountStats::default(),
             None,
             StatusInteractions::default(),
+            false,
             &[media_attachment_to_response(&media, &config)],
         );
 

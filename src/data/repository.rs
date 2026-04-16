@@ -214,6 +214,7 @@ pub trait TimelineRepository: Send + Sync {
         max_cursor: Option<&TimelineCursorKey>,
         min_cursor: Option<&TimelineCursorKey>,
     ) -> Result<Vec<Status>, AppError>;
+    async fn get_domains_by_severity(&self, severity: &str) -> Result<Vec<String>, AppError>;
     async fn get_statuses_by_account_address_in_window(
         &self,
         account_address: &str,
@@ -611,6 +612,10 @@ impl TimelineRepository for Database {
         min_cursor: Option<&TimelineCursorKey>,
     ) -> Result<Vec<Status>, AppError> {
         Database::get_public_statuses_in_window(self, limit, max_cursor, min_cursor).await
+    }
+
+    async fn get_domains_by_severity(&self, severity: &str) -> Result<Vec<String>, AppError> {
+        Database::get_domains_by_severity(self, severity).await
     }
 
     async fn get_statuses_by_account_address_in_window(
