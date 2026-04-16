@@ -147,6 +147,24 @@ impl Database {
         Ok(block)
     }
 
+    /// Resolve the first configured domain block matching any candidate domain.
+    pub async fn find_domain_block_for_candidates<I, S>(
+        &self,
+        domains: I,
+    ) -> Result<Option<DomainBlockRecord>, AppError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for domain in domains {
+            if let Some(block) = self.get_domain_block_by_domain(domain.as_ref()).await? {
+                return Ok(Some(block));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Delete a domain block by persisted ID.
     pub async fn delete_domain_block_by_id(&self, id: &str) -> Result<bool, AppError> {
         let result = sqlx::query("DELETE FROM domain_blocks WHERE id = ?")

@@ -561,8 +561,47 @@ where
             scoped(post(admin::account_action), SESSION_ONLY),
         )
         .route(
+            "/v1/admin/accounts/:id/enable",
+            scoped(post(admin::enable_account), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/accounts/:id/unsilence",
+            scoped(post(admin::unsilence_account), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/accounts/:id/unsuspend",
+            scoped(post(admin::unsuspend_account), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/accounts/:id/unsensitive",
+            scoped(post(admin::unsensitive_account), SESSION_ONLY),
+        )
+        .route(
             "/v1/admin/reports",
             scoped(get(admin::list_reports), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/reports/:id",
+            scoped(
+                get(admin::get_report).put(admin::update_report),
+                SESSION_ONLY,
+            ),
+        )
+        .route(
+            "/v1/admin/reports/:id/assign_to_self",
+            scoped(post(admin::assign_report_to_self), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/reports/:id/unassign",
+            scoped(post(admin::unassign_report), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/reports/:id/resolve",
+            scoped(post(admin::resolve_report), SESSION_ONLY),
+        )
+        .route(
+            "/v1/admin/reports/:id/reopen",
+            scoped(post(admin::reopen_report), SESSION_ONLY),
         )
         .route(
             "/v1/admin/domain_blocks",

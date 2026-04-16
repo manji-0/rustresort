@@ -128,7 +128,10 @@ async fn block_domain(
     Json(req): Json<BlockDomainRequest>,
 ) -> Result<(), AppError> {
     let domain = normalize_domain(&req.domain)?;
-    state.db.block_domain(&domain).await?;
+    state
+        .db
+        .upsert_domain_block(&domain, "suspend", true, true, None, None, false)
+        .await?;
     Ok(())
 }
 
@@ -148,7 +151,13 @@ async fn list_domain_blocks(
     State(state): State<SystemAdminState>,
     CurrentUser(_user): CurrentUser,
 ) -> Result<Json<Vec<String>>, AppError> {
-    let domains = state.db.get_blocked_domains().await?;
+    let domains = state
+        .db
+        .get_all_domain_blocks()
+        .await?
+        .into_iter()
+        .map(|block| block.domain)
+        .collect();
     Ok(Json(domains))
 }
 

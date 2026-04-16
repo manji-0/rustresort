@@ -2849,6 +2849,118 @@ async fn test_admin_reports_apply_filters_and_pagination() {
 }
 
 #[tokio::test]
+async fn test_admin_report_mutation_endpoints_round_trip() {
+    use chrono::Utc;
+    use rustresort::data::{Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    let local_account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: "report-mutation-001".to_string(),
+            notification_type: NotificationType::AdminReport,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let get_response = server
+        .client
+        .get(server.url("/api/v1/admin/reports/report-mutation-001"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(get_response.status(), 200);
+    let initial: serde_json::Value = get_response.json().await.unwrap();
+    assert_eq!(initial["category"], "other");
+    assert_eq!(initial["action_taken"], false);
+    assert_eq!(initial["account"]["id"], "alice@remote.example");
+    assert_eq!(initial["target_account"]["id"], local_account.id);
+
+    let update_response = server
+        .client
+        .put(server.url("/api/v1/admin/reports/report-mutation-001"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("category", "violation"),
+            ("rule_ids[]", "1"),
+            ("rule_ids[]", "2"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(update_response.status(), 200);
+    let updated: serde_json::Value = update_response.json().await.unwrap();
+    assert_eq!(updated["category"], "violation");
+    assert_eq!(updated["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(updated["rules"][0]["id"], "1");
+    assert_eq!(updated["rules"][1]["id"], "2");
+
+    let assign_response = server
+        .client
+        .post(server.url("/api/v1/admin/reports/report-mutation-001/assign_to_self"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(assign_response.status(), 200);
+    let assigned: serde_json::Value = assign_response.json().await.unwrap();
+    assert_eq!(assigned["assigned_account"]["id"], local_account.id);
+
+    let resolve_response = server
+        .client
+        .post(server.url("/api/v1/admin/reports/report-mutation-001/resolve"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resolve_response.status(), 200);
+    let resolved: serde_json::Value = resolve_response.json().await.unwrap();
+    assert_eq!(resolved["action_taken"], true);
+    assert_eq!(resolved["action_taken_by_account"]["id"], local_account.id);
+    assert!(resolved["action_taken_at"].is_string());
+
+    let reopen_response = server
+        .client
+        .post(server.url("/api/v1/admin/reports/report-mutation-001/reopen"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(reopen_response.status(), 200);
+    let reopened: serde_json::Value = reopen_response.json().await.unwrap();
+    assert_eq!(reopened["action_taken"], false);
+    assert!(reopened["action_taken_at"].is_null());
+    assert!(reopened["action_taken_by_account"].is_null());
+
+    let unassign_response = server
+        .client
+        .post(server.url("/api/v1/admin/reports/report-mutation-001/unassign"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(unassign_response.status(), 200);
+    let unassigned: serde_json::Value = unassign_response.json().await.unwrap();
+    assert!(unassigned["assigned_account"].is_null());
+}
+
+#[tokio::test]
 async fn test_admin_account_action_suspend_and_unsuspend_round_trip() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2912,6 +3024,59 @@ async fn test_admin_account_action_suspend_and_unsuspend_round_trip() {
             .iter()
             .all(|account| account["acct"] != "alice@remote.example")
     );
+}
+
+#[tokio::test]
+async fn test_admin_account_action_accepts_form_type_and_resolves_report() {
+    use chrono::Utc;
+    use rustresort::data::{Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    let local_account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: "report-action-001".to_string(),
+            notification_type: NotificationType::AdminReport,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/admin/accounts/alice@remote.example/action"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[("type", "sensitive"), ("report_id", "report-action-001")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        json!({})
+    );
+
+    let report_response = server
+        .client
+        .get(server.url("/api/v1/admin/reports/report-action-001"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(report_response.status(), 200);
+    let report: serde_json::Value = report_response.json().await.unwrap();
+    assert_eq!(report["action_taken"], true);
+    assert_eq!(report["action_taken_by_account"]["id"], local_account.id);
 }
 
 #[tokio::test]
@@ -3264,6 +3429,92 @@ async fn test_admin_domain_blocks_reject_invalid_severity() {
     assert_eq!(
         body["error"],
         "severity must be one of: noop, silence, suspend"
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_admin_domain_blocks_share_domain_block_store() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let (_, session_cookie) = server.login_password().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/admin/domain_blocks"))
+        .header("Cookie", &session_cookie)
+        .json(&serde_json::json!({ "domain": "Remote.Example" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(create_response.status(), 200);
+
+    let v1_list_response = server
+        .client
+        .get(server.url("/api/v1/admin/domain_blocks"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", server.create_test_token().await),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(v1_list_response.status(), 200);
+    let v1_blocks: serde_json::Value = v1_list_response.json().await.unwrap();
+    assert!(
+        v1_blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|block| { block["domain"] == "remote.example" && block["severity"] == "suspend" })
+    );
+
+    let legacy_list_response = server
+        .client
+        .get(server.url("/admin/domain_blocks"))
+        .header("Cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(legacy_list_response.status(), 200);
+    assert_eq!(
+        legacy_list_response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap(),
+        json!(["remote.example"])
+    );
+
+    let delete_response = server
+        .client
+        .delete(server.url("/admin/domain_blocks/remote.example"))
+        .header("Cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(delete_response.status(), 200);
+
+    let token = server.create_test_token().await;
+    let v1_list_response = server
+        .client
+        .get(server.url("/api/v1/admin/domain_blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(v1_list_response.status(), 200);
+    assert!(
+        v1_list_response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
 }
 

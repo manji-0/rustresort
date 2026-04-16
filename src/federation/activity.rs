@@ -7,8 +7,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::data::{
-    CachedAttachment, CachedStatus, Database, NotificationType, PersistedReason, ProfileCache,
-    PushAlerts, PushPayload, Status, StatusVisibility, TimelineCache,
+    AdminReportState, CachedAttachment, CachedStatus, Database, DomainBlockRecord,
+    NotificationType, PersistedReason, ProfileCache, PushAlerts, PushPayload, Status,
+    StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
 use crate::service::{StreamEvent, StreamTarget, StreamingEventBus, WebPushSender};
@@ -168,6 +169,17 @@ fn follow_addresses_match(
 
 fn sanitize_remote_html(content: &str) -> String {
     ammonia::clean(content)
+}
+
+fn extract_flag_comment(activity: &serde_json::Value) -> String {
+    sanitize_remote_html(
+        activity
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| activity.get("summary").and_then(serde_json::Value::as_str))
+            .or_else(|| activity.get("name").and_then(serde_json::Value::as_str))
+            .unwrap_or_default(),
+    )
 }
 
 fn extract_attachment_dimensions(value: &serde_json::Value) -> (Option<i32>, Option<i32>) {
@@ -672,6 +684,15 @@ impl ActivityProcessor {
         self
     }
 
+    async fn actor_domain_block(
+        &self,
+        actor_uri: &str,
+    ) -> Result<Option<DomainBlockRecord>, AppError> {
+        self.db
+            .find_domain_block_for_candidates(actor_domains_for_blocklist(actor_uri))
+            .await
+    }
+
     /// Set activity delivery service
     ///
     /// This allows the processor to send activities (like Accept) in response to incoming activities.
@@ -728,14 +749,12 @@ impl ActivityProcessor {
         };
 
         // 2. Check if domain is blocked
-        let mut actor_is_blocked = false;
-        for candidate in actor_domains_for_blocklist(actor_uri) {
-            if self.db.is_domain_blocked(&candidate).await? {
-                actor_is_blocked = true;
-                break;
-            }
-        }
-        if actor_is_blocked {
+        if self
+            .actor_domain_block(actor_uri)
+            .await?
+            .as_ref()
+            .is_some_and(|block| block.severity == "suspend")
+        {
             return Err(AppError::Forbidden);
         }
 
@@ -2097,6 +2116,19 @@ impl ActivityProcessor {
         activity: serde_json::Value,
         actor_uri: &str,
     ) -> Result<(), AppError> {
+        if self
+            .actor_domain_block(actor_uri)
+            .await?
+            .as_ref()
+            .is_some_and(|block| block.reject_reports)
+        {
+            tracing::debug!(
+                actor_uri,
+                "Ignoring Flag due to reject_reports domain block"
+            );
+            return Ok(());
+        }
+
         let object = activity
             .get("object")
             .ok_or_else(|| AppError::Validation("Missing object in Flag".to_string()))?;
@@ -2118,9 +2150,26 @@ impl ActivityProcessor {
             created_at: Utc::now(),
         };
         let activity_uri = activity.get("id").and_then(serde_json::Value::as_str);
-        self.db
+        let inserted = self
+            .db
             .insert_notification_if_new(&notification, activity_uri)
             .await?;
+        if inserted {
+            self.db
+                .save_admin_report_state(&AdminReportState {
+                    report_id: notification.id.clone(),
+                    category: "other".to_string(),
+                    comment: extract_flag_comment(&activity),
+                    forwarded: false,
+                    rule_ids_json: None,
+                    assigned_account_id: None,
+                    action_taken: false,
+                    action_taken_at: None,
+                    action_taken_by_account_id: None,
+                    updated_at: notification.created_at,
+                })
+                .await?;
+        }
 
         Ok(())
     }
@@ -2341,7 +2390,14 @@ impl ActivityProcessor {
             return Ok(None);
         };
 
-        let cached = self.cached_status_from_object(object, actor_uri)?;
+        let reject_media = self
+            .actor_domain_block(actor_uri)
+            .await?
+            .as_ref()
+            .is_some_and(|block| block.reject_media);
+        let cached = self
+            .cached_status_from_object(object, actor_uri, reject_media)
+            .await?;
         self.timeline_cache.insert(cached.clone()).await;
         let quote_of_uri = self.extract_quote_uri_from_object(object);
 
@@ -2399,7 +2455,8 @@ impl ActivityProcessor {
             } else {
                 self.db.update_status(&status).await?;
             }
-            let attachments = self.remote_status_attachments_from_object(&status.id, object);
+            let attachments =
+                self.remote_status_attachments_from_object(&status.id, object, reject_media);
             self.db
                 .replace_remote_status_attachments(&status.id, &attachments)
                 .await?;
@@ -2409,7 +2466,8 @@ impl ActivityProcessor {
         }
 
         self.db.insert_status(&status).await?;
-        let attachments = self.remote_status_attachments_from_object(&status.id, object);
+        let attachments =
+            self.remote_status_attachments_from_object(&status.id, object, reject_media);
         self.db
             .replace_remote_status_attachments(&status.id, &attachments)
             .await?;
@@ -2441,10 +2499,11 @@ impl ActivityProcessor {
         Ok(())
     }
 
-    fn cached_status_from_object(
+    async fn cached_status_from_object(
         &self,
         object: &serde_json::Value,
         actor_uri: &str,
+        reject_media: bool,
     ) -> Result<CachedStatus, AppError> {
         let status_uri = object
             .get("id")
@@ -2471,7 +2530,7 @@ impl ActivityProcessor {
             account_address: self.extract_actor_address(actor_uri),
             created_at,
             visibility: self.extract_visibility(object),
-            attachments: self.extract_cached_attachments(object),
+            attachments: self.extract_cached_attachments(object, reject_media),
             reply_to_uri: object
                 .get("inReplyTo")
                 .and_then(|reply| reply.as_str())
@@ -2486,7 +2545,16 @@ impl ActivityProcessor {
         object: &serde_json::Value,
         actor_uri: &str,
     ) -> Option<CachedStatus> {
-        let cached_status = self.cached_status_from_object(object, actor_uri).ok()?;
+        let reject_media = self
+            .actor_domain_block(actor_uri)
+            .await
+            .ok()?
+            .as_ref()
+            .is_some_and(|block| block.reject_media);
+        let cached_status = self
+            .cached_status_from_object(object, actor_uri, reject_media)
+            .await
+            .ok()?;
         self.timeline_cache.insert(cached_status.clone()).await;
         Some(cached_status)
     }
@@ -2501,7 +2569,12 @@ impl ActivityProcessor {
         &self,
         status_id: &str,
         object: &serde_json::Value,
+        reject_media: bool,
     ) -> Vec<crate::data::RemoteStatusAttachment> {
+        if reject_media {
+            return Vec::new();
+        }
+
         let Some(values) = object
             .get("attachment")
             .and_then(serde_json::Value::as_array)
@@ -3175,8 +3248,15 @@ impl ActivityProcessor {
         }
     }
 
-    fn extract_cached_attachments(&self, object: &serde_json::Value) -> Vec<CachedAttachment> {
+    fn extract_cached_attachments(
+        &self,
+        object: &serde_json::Value,
+        reject_media: bool,
+    ) -> Vec<CachedAttachment> {
         let mut attachments = Vec::new();
+        if reject_media {
+            return attachments;
+        }
 
         let Some(values) = object
             .get("attachment")
@@ -3853,7 +3933,8 @@ mod tests {
             }]
         });
 
-        let attachments = processor.remote_status_attachments_from_object("status-1", &object);
+        let attachments =
+            processor.remote_status_attachments_from_object("status-1", &object, false);
         assert_eq!(attachments.len(), 1);
         assert_eq!(
             attachments[0].remote_url,
@@ -3909,6 +3990,84 @@ mod tests {
             notifications[0].origin_account_address,
             "bob@remote.example"
         );
+    }
+
+    #[tokio::test]
+    async fn process_ignores_flag_when_domain_block_rejects_reports() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        db.upsert_domain_block("remote.example", "silence", false, true, None, None, false)
+            .await
+            .unwrap();
+
+        let activity = json!({
+            "type": "Flag",
+            "id": "https://remote.example/activities/flag-2",
+            "actor": "https://remote.example/users/bob",
+            "content": "<p>report me</p>",
+            "object": "https://example.com/users/alice"
+        });
+
+        processor
+            .process(activity, "https://remote.example/users/bob")
+            .await
+            .unwrap();
+
+        let notifications = db.get_notifications(10, None, false).await.unwrap();
+        assert!(notifications.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_rejects_activity_for_suspended_domain_block() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        db.upsert_domain_block("remote.example", "suspend", false, false, None, None, false)
+            .await
+            .unwrap();
+
+        let activity = json!({
+            "type": "Flag",
+            "id": "https://remote.example/activities/flag-3",
+            "actor": "https://remote.example/users/bob",
+            "object": "https://example.com/users/alice"
+        });
+
+        let result = processor
+            .process(activity, "https://remote.example/users/bob")
+            .await;
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn upsert_remote_status_from_object_skips_attachments_when_domain_block_rejects_media() {
+        let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        db.upsert_domain_block("remote.example", "silence", true, false, None, None, false)
+            .await
+            .unwrap();
+
+        let object = json!({
+            "id": "https://remote.example/notes/1",
+            "type": "Note",
+            "content": "<p>Hello</p>",
+            "published": "2024-01-01T00:00:00Z",
+            "attachment": [{
+                "type": "Document",
+                "mediaType": "image/jpeg",
+                "url": "https://remote.example/media/original.jpg"
+            }]
+        });
+
+        let status = processor
+            .upsert_remote_status_from_object(
+                &object,
+                "https://remote.example/users/bob",
+                PersistedReason::Timeline,
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("status should persist");
+
+        let attachments = db.get_remote_status_attachments(&status.id).await.unwrap();
+        assert!(attachments.is_empty());
     }
 
     #[tokio::test]

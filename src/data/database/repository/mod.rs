@@ -1,4 +1,5 @@
 mod account;
+mod admin_reports;
 mod conversations;
 mod delivery_jobs;
 mod domain_blocks;

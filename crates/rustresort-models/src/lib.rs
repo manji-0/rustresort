@@ -145,6 +145,21 @@ pub struct DomainBlockRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Persisted mutable state for an admin report notification.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AdminReportState {
+    pub report_id: String,
+    pub category: String,
+    pub comment: String,
+    pub forwarded: bool,
+    pub rule_ids_json: Option<String>,
+    pub assigned_account_id: Option<String>,
+    pub action_taken: bool,
+    pub action_taken_at: Option<DateTime<Utc>>,
+    pub action_taken_by_account_id: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A stored Web Push subscription for the single local user.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PushSubscription {

@@ -1,7 +1,9 @@
 //! Mastodon-compatible Admin API endpoints
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::Json,
 };
 use chrono::{DateTime, Utc};
@@ -15,8 +17,14 @@ use super::accounts::{
 };
 use crate::AdminApiState;
 use crate::auth::CurrentUser;
-use crate::data::{NotificationType, Status};
+use crate::data::{AdminReportState, Notification, NotificationType, Status};
 use crate::error::AppError;
+
+const DEFAULT_INSTANCE_RULES: [&str; 3] = [
+    "Be respectful and civil in all interactions.",
+    "No spam, harassment, or illegal content.",
+    "Content warnings are required for sensitive material.",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct AdminAccountParams {
@@ -69,11 +77,24 @@ pub struct AdminAccount {
     pub account: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
 pub struct AdminActionRequest {
+    #[serde(default, rename = "type", alias = "action")]
     pub action: String,
+    pub report_id: Option<String>,
+    pub warning_preset_id: Option<String>,
+    pub text: Option<String>,
+    pub send_email_notification: Option<bool>,
     #[serde(rename = "reason")]
     pub _reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateReportRequest {
+    pub category: Option<String>,
+    #[serde(default, rename = "rule_ids[]", alias = "rule_ids")]
+    pub rule_ids: Vec<String>,
 }
 
 enum AdminActionTarget {
@@ -118,6 +139,191 @@ fn normalize_domain_block_severity(raw: Option<&str>) -> Result<String, AppError
         _ => Err(AppError::Validation(
             "severity must be one of: noop, silence, suspend".to_string(),
         )),
+    }
+}
+
+fn normalize_admin_report_category(raw: Option<&str>) -> Result<String, AppError> {
+    let category = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("other")
+        .to_ascii_lowercase();
+
+    match category.as_str() {
+        "spam" | "legal" | "violation" | "other" => Ok(category),
+        _ => Err(AppError::Validation(
+            "category must be one of: spam, legal, violation, other".to_string(),
+        )),
+    }
+}
+
+fn parse_admin_action_request_json(body: &[u8]) -> Result<AdminActionRequest, AppError> {
+    serde_json::from_slice(body).map_err(|error| {
+        AppError::Validation(format!("invalid admin action request body: {error}"))
+    })
+}
+
+fn parse_admin_action_request_form(body: &[u8]) -> Result<AdminActionRequest, AppError> {
+    serde_urlencoded::from_bytes(body)
+        .map_err(|error| AppError::Validation(format!("invalid admin action form body: {error}")))
+}
+
+fn parse_update_report_request_json(body: &[u8]) -> Result<UpdateReportRequest, AppError> {
+    serde_json::from_slice(body).map_err(|error| {
+        AppError::Validation(format!("invalid report update request body: {error}"))
+    })
+}
+
+fn parse_update_report_request_form(body: &[u8]) -> Result<UpdateReportRequest, AppError> {
+    let mut request = UpdateReportRequest::default();
+    for (key, value) in url::form_urlencoded::parse(body) {
+        match key.as_ref() {
+            "category" => request.category = Some(value.into_owned()),
+            "rule_ids" | "rule_ids[]" => request.rule_ids.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(request)
+}
+
+fn content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+fn parse_admin_action_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<AdminActionRequest, AppError> {
+    let content_type = content_type(headers);
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return parse_admin_action_request_form(body);
+    }
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return parse_admin_action_request_json(body);
+    }
+
+    parse_admin_action_request_json(body).or_else(|_| parse_admin_action_request_form(body))
+}
+
+fn parse_update_report_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<UpdateReportRequest, AppError> {
+    let content_type = content_type(headers);
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return parse_update_report_request_form(body);
+    }
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return parse_update_report_request_json(body);
+    }
+
+    parse_update_report_request_json(body).or_else(|_| parse_update_report_request_form(body))
+}
+
+fn parse_report_rule_ids(rule_ids: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for rule_id in rule_ids {
+        let rule_id = rule_id.trim();
+        if !rule_id.is_empty() && !normalized.iter().any(|existing| existing == rule_id) {
+            normalized.push(rule_id.to_string());
+        }
+    }
+    normalized
+}
+
+fn parse_instance_rule_texts(raw: &str) -> Option<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let items = parsed.as_array()?;
+    let mut rules = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(text) = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            rules.push(text.to_string());
+            continue;
+        }
+        if let Some(text) = item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            rules.push(text.to_string());
+        }
+    }
+    (!rules.is_empty()).then_some(rules)
+}
+
+async fn load_instance_rule_map(state: &AdminApiState) -> BTreeMap<String, String> {
+    let rule_texts = match state.db.get_setting("instance.rules").await {
+        Ok(Some(raw)) => parse_instance_rule_texts(&raw).unwrap_or_else(|| {
+            DEFAULT_INSTANCE_RULES
+                .iter()
+                .map(|rule| rule.to_string())
+                .collect()
+        }),
+        _ => DEFAULT_INSTANCE_RULES
+            .iter()
+            .map(|rule| rule.to_string())
+            .collect(),
+    };
+
+    rule_texts
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| ((index + 1).to_string(), text))
+        .collect()
+}
+
+fn serialize_rule_ids(rule_ids: &[String]) -> Result<Option<String>, AppError> {
+    if rule_ids.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::to_string(rule_ids)
+        .map(Some)
+        .map_err(|error| AppError::serialization("admin report rule ids", error))
+}
+
+fn deserialize_rule_ids(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn build_admin_report_rules(
+    rule_ids: &[String],
+    rule_map: &BTreeMap<String, String>,
+) -> Vec<serde_json::Value> {
+    rule_ids
+        .iter()
+        .filter_map(|rule_id| {
+            rule_map.get(rule_id).map(|text| {
+                serde_json::json!({
+                    "id": rule_id,
+                    "text": text
+                })
+            })
+        })
+        .collect()
+}
+
+fn default_admin_report_state(report_id: &str, created_at: DateTime<Utc>) -> AdminReportState {
+    AdminReportState {
+        report_id: report_id.to_string(),
+        category: "other".to_string(),
+        comment: String::new(),
+        forwarded: false,
+        rule_ids_json: None,
+        assigned_account_id: None,
+        action_taken: false,
+        action_taken_at: None,
+        action_taken_by_account_id: None,
+        updated_at: created_at,
     }
 }
 
@@ -614,15 +820,13 @@ pub async fn get_account(
     }
 }
 
-/// POST /api/v1/admin/accounts/:id/action
-pub async fn account_action(
-    State(state): State<AdminApiState>,
-    CurrentUser(_session): CurrentUser,
-    Path(id): Path<String>,
-    Json(req): Json<AdminActionRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let target = resolve_admin_action_target(&state, &id).await?;
-    let action = req.action.trim().to_ascii_lowercase();
+async fn apply_admin_account_action(
+    state: &AdminApiState,
+    id: &str,
+    action: &str,
+    report_id: Option<&str>,
+) -> Result<(), AppError> {
+    let target = resolve_admin_action_target(state, id).await?;
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
     match target {
@@ -636,7 +840,7 @@ pub async fn account_action(
             address,
             actor_uri,
             inbox_uri,
-        } => match action.as_str() {
+        } => match action {
             "suspend" | "disable" => {
                 state
                     .db
@@ -666,6 +870,7 @@ pub async fn account_action(
             "unsilence" => {
                 state.db.unmute_account(&address, default_port).await?;
             }
+            "none" | "sensitive" | "unsensitive" => {}
             _ => {
                 return Err(AppError::Validation(format!(
                     "unsupported admin account action `{}`",
@@ -675,18 +880,99 @@ pub async fn account_action(
         },
     }
 
-    Ok(Json(serde_json::json!({
-        "action": action,
-        "account_id": id,
-        "status": "completed"
-    })))
+    if let Some(report_id) = report_id {
+        let _ = set_report_resolution(state, report_id, true).await?;
+    }
+
+    Ok(())
+}
+
+/// POST /api/v1/admin/accounts/:id/action
+pub async fn account_action(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let req = parse_admin_action_request(&headers, &body)?;
+    let action = req.action.trim().to_ascii_lowercase();
+    if action.is_empty() {
+        return Err(AppError::Validation("type is required".to_string()));
+    }
+
+    apply_admin_account_action(&state, &id, &action, req.report_id.as_deref()).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+async fn admin_account_action_response(
+    state: &AdminApiState,
+    id: &str,
+    action: &str,
+) -> Result<AdminAccount, AppError> {
+    apply_admin_account_action(state, id, action, None).await?;
+    match resolve_admin_action_target(state, id).await? {
+        AdminActionTarget::Local(_) => build_local_admin_account(state).await,
+        AdminActionTarget::Remote {
+            address, actor_uri, ..
+        } => {
+            let default_port = default_port_for_protocol(&state.config.server.protocol);
+            let identity = actor_uri.unwrap_or(address.clone());
+            let suspended = state.db.is_account_blocked(&address, default_port).await?;
+            let silenced = state.db.is_account_muted(&address, default_port).await?;
+            build_remote_admin_account(state, &identity, suspended, silenced).await
+        }
+    }
+}
+
+pub async fn enable_account(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminAccount>, AppError> {
+    Ok(Json(
+        admin_account_action_response(&state, &id, "enable").await?,
+    ))
+}
+
+pub async fn unsilence_account(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminAccount>, AppError> {
+    Ok(Json(
+        admin_account_action_response(&state, &id, "unsilence").await?,
+    ))
+}
+
+pub async fn unsuspend_account(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminAccount>, AppError> {
+    Ok(Json(
+        admin_account_action_response(&state, &id, "unsuspend").await?,
+    ))
+}
+
+pub async fn unsensitive_account(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminAccount>, AppError> {
+    Ok(Json(
+        admin_account_action_response(&state, &id, "unsensitive").await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
 pub struct AdminReport {
     pub id: String,
     pub action_taken: bool,
+    pub action_taken_at: Option<String>,
+    pub category: String,
     pub comment: String,
+    pub forwarded: bool,
     pub created_at: String,
     pub updated_at: String,
     pub account: serde_json::Value,
@@ -694,6 +980,7 @@ pub struct AdminReport {
     pub assigned_account: Option<serde_json::Value>,
     pub action_taken_by_account: Option<serde_json::Value>,
     pub statuses: Vec<serde_json::Value>,
+    pub rules: Vec<serde_json::Value>,
 }
 
 async fn get_report_status(state: &AdminApiState, status_uri: &str) -> Option<Status> {
@@ -731,20 +1018,134 @@ async fn build_report_status_response(
         .map_err(|error| AppError::serialization("admin report status response", error))
 }
 
+async fn build_admin_report(
+    state: &AdminApiState,
+    notification: Notification,
+    local_account: &crate::data::Account,
+    local_account_stats: crate::api::AccountStats,
+    local_admin_account: &AdminAccount,
+    local_admin_account_value: &serde_json::Value,
+    instance_rule_map: &BTreeMap<String, String>,
+) -> Result<AdminReportEntry, AppError> {
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let suspended = state
+        .db
+        .is_account_blocked(&notification.origin_account_address, default_port)
+        .await?;
+    let silenced = state
+        .db
+        .is_account_muted(&notification.origin_account_address, default_port)
+        .await?;
+    let report_account = build_remote_admin_account(
+        state,
+        &notification.origin_account_address,
+        suspended,
+        silenced,
+    )
+    .await?;
+    let account_value = serde_json::to_value(&report_account)
+        .map_err(|error| AppError::serialization("admin report account response", error))?;
+
+    let mut statuses = Vec::new();
+    if let Some(status_uri) = notification.status_uri.as_deref()
+        && let Some(status) = get_report_status(state, status_uri).await
+    {
+        statuses.push(
+            build_report_status_response(state, local_account, local_account_stats, &status)
+                .await?,
+        );
+    }
+
+    let report_state = state
+        .db
+        .get_admin_report_state(&notification.id)
+        .await?
+        .unwrap_or_else(|| default_admin_report_state(&notification.id, notification.created_at));
+    let rule_ids = deserialize_rule_ids(report_state.rule_ids_json.as_deref());
+    let assigned_account = report_state
+        .assigned_account_id
+        .as_deref()
+        .filter(|account_id| *account_id == local_admin_account.id)
+        .map(|_| local_admin_account_value.clone());
+    let action_taken_by_account = report_state
+        .action_taken_by_account_id
+        .as_deref()
+        .filter(|account_id| *account_id == local_admin_account.id)
+        .map(|_| local_admin_account_value.clone());
+
+    Ok(AdminReportEntry {
+        created_at: notification.created_at,
+        report: AdminReport {
+            id: notification.id,
+            action_taken: report_state.action_taken,
+            action_taken_at: report_state.action_taken_at.map(|value| value.to_rfc3339()),
+            category: report_state.category,
+            comment: report_state.comment,
+            forwarded: report_state.forwarded,
+            created_at: notification.created_at.to_rfc3339(),
+            updated_at: report_state.updated_at.to_rfc3339(),
+            account: account_value,
+            target_account: serde_json::to_value(local_admin_account)
+                .map_err(|error| AppError::serialization("admin report target account", error))?,
+            assigned_account,
+            action_taken_by_account,
+            statuses,
+            rules: build_admin_report_rules(&rule_ids, instance_rule_map),
+        },
+    })
+}
+
+async fn get_admin_report_notification(
+    state: &AdminApiState,
+    id: &str,
+) -> Result<Notification, AppError> {
+    state
+        .db
+        .get_notification(id)
+        .await?
+        .filter(|notification| notification.notification_type == NotificationType::AdminReport)
+        .ok_or(AppError::NotFound)
+}
+
+async fn build_single_admin_report(
+    state: &AdminApiState,
+    id: &str,
+) -> Result<AdminReport, AppError> {
+    let notification = get_admin_report_notification(state, id).await?;
+    let local_account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let local_admin_account = build_local_admin_account(state).await?;
+    let local_admin_account_value = serde_json::to_value(&local_admin_account)
+        .map_err(|error| AppError::serialization("admin local account response", error))?;
+    let instance_rule_map = load_instance_rule_map(state).await;
+
+    Ok(build_admin_report(
+        state,
+        notification,
+        &local_account,
+        local_account_stats,
+        &local_admin_account,
+        &local_admin_account_value,
+        &instance_rule_map,
+    )
+    .await?
+    .report)
+}
+
 /// GET /api/v1/admin/reports
 pub async fn list_reports(
     State(state): State<AdminApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<AdminReportParams>,
 ) -> Result<Json<Vec<AdminReport>>, AppError> {
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let local_account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-    let local_account_response =
-        crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
-    let local_account_value = serde_json::to_value(&local_account_response)
+    let local_admin_account = build_local_admin_account(&state).await?;
+    let local_admin_account_value = serde_json::to_value(&local_admin_account)
         .map_err(|error| AppError::serialization("admin local account response", error))?;
+    let instance_rule_map = load_instance_rule_map(&state).await;
 
-    let limit = params.limit.unwrap_or(20).min(200);
+    let limit = params.limit.unwrap_or(100).min(200);
     let mut reports = Vec::new();
     let mut cursor: Option<String> = None;
     const FETCH_LIMIT: usize = 200;
@@ -767,52 +1168,19 @@ pub async fn list_reports(
             .into_iter()
             .filter(|notification| notification.notification_type == NotificationType::AdminReport)
         {
-            let report_account = resolve_account_response_for_identity(
-                state.config.as_ref(),
-                state.db.as_ref(),
-                state.profile_cache.as_ref(),
-                Some(state.federation_fetch_client.as_ref()),
-                &notification.origin_account_address,
+            let report = build_admin_report(
+                &state,
+                notification,
+                &local_account,
+                account_stats,
+                &local_admin_account,
+                &local_admin_account_value,
+                &instance_rule_map,
             )
-            .await
-            .or_else(|| {
-                build_remote_account_placeholder_response(
-                    &notification.origin_account_address,
-                    &state.config,
-                    0,
-                )
-            })
-            .unwrap_or_else(|| local_account_response.clone());
-            let account_value = serde_json::to_value(&report_account)
-                .map_err(|error| AppError::serialization("admin report account response", error))?;
+            .await?;
 
-            let mut statuses = Vec::new();
-            if let Some(status_uri) = notification.status_uri.as_deref()
-                && let Some(status) = get_report_status(&state, status_uri).await
-            {
-                statuses.push(
-                    build_report_status_response(&state, &account, account_stats, &status).await?,
-                );
-            }
-
-            let report = AdminReport {
-                id: notification.id,
-                action_taken: false,
-                comment: String::new(),
-                created_at: notification.created_at.to_rfc3339(),
-                updated_at: notification.created_at.to_rfc3339(),
-                account: account_value,
-                target_account: local_account_value.clone(),
-                assigned_account: None,
-                action_taken_by_account: None,
-                statuses,
-            };
-
-            if admin_report_matches_filters(&report, &params) {
-                reports.push(AdminReportEntry {
-                    report,
-                    created_at: notification.created_at,
-                });
+            if admin_report_matches_filters(&report.report, &params) {
+                reports.push(report);
             }
         }
 
@@ -823,6 +1191,124 @@ pub async fn list_reports(
 
     let paginated = apply_admin_report_pagination(&state, reports, &params).await?;
     Ok(Json(paginated.into_iter().take(limit).collect()))
+}
+
+/// GET /api/v1/admin/reports/:id
+pub async fn get_report(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminReport>, AppError> {
+    Ok(Json(build_single_admin_report(&state, &id).await?))
+}
+
+/// PUT /api/v1/admin/reports/:id
+pub async fn update_report(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AdminReport>, AppError> {
+    let req = parse_update_report_request(&headers, &body)?;
+    let notification = get_admin_report_notification(&state, &id).await?;
+    let mut report_state = state
+        .db
+        .get_admin_report_state(&id)
+        .await?
+        .unwrap_or_else(|| default_admin_report_state(&id, notification.created_at));
+
+    if let Some(category) = req.category.as_deref() {
+        report_state.category = normalize_admin_report_category(Some(category))?;
+        if report_state.category != "violation" {
+            report_state.rule_ids_json = None;
+        }
+    }
+
+    if !req.rule_ids.is_empty() || report_state.category == "violation" {
+        let rule_ids = parse_report_rule_ids(&req.rule_ids);
+        report_state.rule_ids_json = serialize_rule_ids(&rule_ids)?;
+    }
+
+    report_state.updated_at = Utc::now();
+    state.db.save_admin_report_state(&report_state).await?;
+    Ok(Json(build_single_admin_report(&state, &id).await?))
+}
+
+async fn set_report_assignment(
+    state: &AdminApiState,
+    id: &str,
+    assigned_account_id: Option<String>,
+) -> Result<AdminReport, AppError> {
+    let notification = get_admin_report_notification(state, id).await?;
+    let mut report_state = state
+        .db
+        .get_admin_report_state(id)
+        .await?
+        .unwrap_or_else(|| default_admin_report_state(id, notification.created_at));
+    report_state.assigned_account_id = assigned_account_id;
+    report_state.updated_at = Utc::now();
+    state.db.save_admin_report_state(&report_state).await?;
+    build_single_admin_report(state, id).await
+}
+
+async fn set_report_resolution(
+    state: &AdminApiState,
+    id: &str,
+    action_taken: bool,
+) -> Result<AdminReport, AppError> {
+    let notification = get_admin_report_notification(state, id).await?;
+    let local_account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let mut report_state = state
+        .db
+        .get_admin_report_state(id)
+        .await?
+        .unwrap_or_else(|| default_admin_report_state(id, notification.created_at));
+    report_state.action_taken = action_taken;
+    report_state.action_taken_at = action_taken.then_some(Utc::now());
+    report_state.action_taken_by_account_id = action_taken.then_some(local_account.id);
+    report_state.updated_at = Utc::now();
+    state.db.save_admin_report_state(&report_state).await?;
+    build_single_admin_report(state, id).await
+}
+
+/// POST /api/v1/admin/reports/:id/assign_to_self
+pub async fn assign_report_to_self(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminReport>, AppError> {
+    let local_account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    Ok(Json(
+        set_report_assignment(&state, &id, Some(local_account.id)).await?,
+    ))
+}
+
+/// POST /api/v1/admin/reports/:id/unassign
+pub async fn unassign_report(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminReport>, AppError> {
+    Ok(Json(set_report_assignment(&state, &id, None).await?))
+}
+
+/// POST /api/v1/admin/reports/:id/resolve
+pub async fn resolve_report(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminReport>, AppError> {
+    Ok(Json(set_report_resolution(&state, &id, true).await?))
+}
+
+/// POST /api/v1/admin/reports/:id/reopen
+pub async fn reopen_report(
+    State(state): State<AdminApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<AdminReport>, AppError> {
+    Ok(Json(set_report_resolution(&state, &id, false).await?))
 }
 
 #[derive(Debug, Serialize)]
