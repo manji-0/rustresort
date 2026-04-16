@@ -38,15 +38,15 @@ pub struct AdminAccountParams {
     #[serde(rename = "display_name")]
     display_name: Option<String>,
     #[serde(rename = "email")]
-    _email: Option<String>,
+    email: Option<String>,
     #[serde(rename = "ip")]
-    _ip: Option<String>,
+    ip: Option<String>,
     #[serde(rename = "max_id")]
-    _max_id: Option<String>,
+    max_id: Option<String>,
     #[serde(rename = "since_id")]
-    _since_id: Option<String>,
+    since_id: Option<String>,
     #[serde(rename = "min_id")]
-    _min_id: Option<String>,
+    min_id: Option<String>,
     #[serde(rename = "limit")]
     limit: Option<usize>,
 }
@@ -101,6 +101,21 @@ fn normalize_domain_block_domain(domain: &str) -> Result<String, AppError> {
         Ok(url::Host::Domain(valid_domain)) => Ok(valid_domain.to_owned()),
         _ => Err(AppError::Validation(
             "domain must be a valid DNS hostname".to_string(),
+        )),
+    }
+}
+
+fn normalize_domain_block_severity(raw: Option<&str>) -> Result<String, AppError> {
+    let severity = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("suspend")
+        .to_ascii_lowercase();
+
+    match severity.as_str() {
+        "noop" | "silence" | "suspend" => Ok(severity),
+        _ => Err(AppError::Validation(
+            "severity must be one of: noop, silence, suspend".to_string(),
         )),
     }
 }
@@ -222,8 +237,63 @@ fn admin_account_matches_filters(account: &AdminAccount, params: &AdminAccountPa
             return false;
         }
     }
+    if let Some(email) = params.email.as_deref() {
+        let needle = email.trim().to_ascii_lowercase();
+        let haystack = account
+            .email
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !needle.is_empty() && !haystack.contains(&needle) {
+            return false;
+        }
+    }
+    if let Some(ip) = params.ip.as_deref() {
+        let needle = ip.trim().to_ascii_lowercase();
+        let haystack = account
+            .ip
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !needle.is_empty() && !haystack.contains(&needle) {
+            return false;
+        }
+    }
 
     true
+}
+
+fn normalize_admin_account_cursor(raw: &str) -> String {
+    let trimmed = raw.trim();
+    normalize_account_address(trimmed)
+        .unwrap_or_else(|_| trimmed.trim_end_matches('/').to_ascii_lowercase())
+}
+
+fn admin_account_cursor(account: &AdminAccount) -> String {
+    normalize_admin_account_cursor(&account.id)
+}
+
+fn apply_admin_account_pagination(
+    mut accounts: Vec<AdminAccount>,
+    params: &AdminAccountParams,
+) -> Vec<AdminAccount> {
+    accounts.sort_by(|left, right| admin_account_cursor(right).cmp(&admin_account_cursor(left)));
+
+    let max_id = params.max_id.as_deref().map(normalize_admin_account_cursor);
+    let min_id = params
+        .min_id
+        .as_deref()
+        .or(params.since_id.as_deref())
+        .map(normalize_admin_account_cursor);
+
+    accounts
+        .into_iter()
+        .filter(|account| {
+            let cursor = admin_account_cursor(account);
+            max_id.as_ref().map(|value| cursor < *value).unwrap_or(true)
+                && min_id.as_ref().map(|value| cursor > *value).unwrap_or(true)
+        })
+        .collect()
 }
 
 async fn build_local_admin_account(state: &AdminApiState) -> Result<AdminAccount, AppError> {
@@ -314,6 +384,23 @@ async fn collect_remote_admin_candidates(
             });
     };
 
+    for profile in state.db.list_remote_profiles().await? {
+        let identity = if profile.uri.trim().is_empty() {
+            profile.address.clone()
+        } else {
+            profile.uri.clone()
+        };
+        let suspended = state
+            .db
+            .is_account_blocked(&profile.address, default_port)
+            .await?;
+        let silenced = state
+            .db
+            .is_account_muted(&profile.address, default_port)
+            .await?;
+        insert_candidate(identity, suspended, silenced);
+    }
+
     for (address, actor_uri, _) in state.db.get_blocked_account_details(500).await? {
         insert_candidate(actor_uri.unwrap_or(address), true, false);
     }
@@ -393,12 +480,10 @@ pub async fn list_accounts(
         if admin_account_matches_filters(&account, &params) {
             accounts.push(account);
         }
-        if accounts.len() == limit {
-            break;
-        }
     }
 
-    Ok(Json(accounts))
+    let paginated = apply_admin_account_pagination(accounts, &params);
+    Ok(Json(paginated.into_iter().take(limit).collect()))
 }
 
 /// GET /api/v1/admin/accounts/:id
@@ -680,13 +765,7 @@ pub async fn create_domain_block_v1(
     Json(req): Json<CreateDomainBlockRequest>,
 ) -> Result<Json<DomainBlock>, AppError> {
     let normalized_domain = normalize_domain_block_domain(&req.domain)?;
-    let severity = req
-        .severity
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("suspend")
-        .to_ascii_lowercase();
+    let severity = normalize_domain_block_severity(req.severity.as_deref())?;
     let block = state
         .db
         .upsert_domain_block(

@@ -39,6 +39,72 @@ async fn cache_remote_profile(server: &TestServer, address: &str) {
         .await;
 }
 
+async fn persist_remote_profile(server: &TestServer, address: &str, display_name: &str) {
+    use chrono::Utc;
+    use rustresort::data::{CachedProfile, RemoteProfile};
+
+    let now = Utc::now();
+    let (username, domain) = address
+        .split_once('@')
+        .expect("remote address must be user@domain");
+    let actor_uri = format!("https://{}/users/{}", domain, username);
+    let inbox_uri = format!("https://{}/inbox", domain);
+    let outbox_uri = format!("https://{}/users/{}/outbox", domain, username);
+    let avatar_url = format!("https://{}/media/{}-avatar.jpg", domain, username);
+    let header_url = format!("https://{}/media/{}-header.jpg", domain, username);
+
+    server
+        .state
+        .db
+        .upsert_remote_profile(&RemoteProfile {
+            address: address.to_string(),
+            uri: actor_uri.clone(),
+            display_name: Some(display_name.to_string()),
+            note: Some(format!("{display_name} note")),
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: Some(avatar_url.clone()),
+            header_url: Some(header_url.clone()),
+            public_key_pem: "test-public-key".to_string(),
+            inbox_uri: inbox_uri.clone(),
+            outbox_uri: Some(outbox_uri.clone()),
+            followers_count: Some(12),
+            following_count: Some(34),
+            fetched_at: now,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: address.to_string(),
+            uri: actor_uri,
+            display_name: Some(display_name.to_string()),
+            note: Some(format!("{display_name} note")),
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: Some(avatar_url),
+            header_url: Some(header_url),
+            public_key_pem: "test-public-key".to_string(),
+            inbox_uri,
+            outbox_uri: Some(outbox_uri),
+            followers_count: Some(12),
+            following_count: Some(34),
+            fetched_at: now,
+        })
+        .await;
+}
+
 async fn cache_remote_profile_alias_by_actor_uri(
     server: &TestServer,
     actor_uri: &str,
@@ -2787,6 +2853,108 @@ async fn test_admin_accounts_list_and_detail_include_remote_moderation_state() {
 }
 
 #[tokio::test]
+async fn test_admin_accounts_include_persisted_remote_profiles_and_apply_cursors() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    persist_remote_profile(&server, "alice@remote.example", "Alice").await;
+    persist_remote_profile(&server, "bob@remote.example", "Bob").await;
+    persist_remote_profile(&server, "zoe@remote.example", "Zoe").await;
+
+    let list_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), 200);
+    let accounts: serde_json::Value = list_response.json().await.unwrap();
+    let accounts = accounts.as_array().expect("accounts should be an array");
+    let account_ids: Vec<String> = accounts
+        .iter()
+        .map(|account| {
+            account["id"]
+                .as_str()
+                .expect("admin account id")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        account_ids,
+        vec![
+            "zoe@remote.example".to_string(),
+            "bob@remote.example".to_string(),
+            "alice@remote.example".to_string()
+        ]
+    );
+
+    let paged_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false&limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(paged_response.status(), 200);
+    let paged: serde_json::Value = paged_response.json().await.unwrap();
+    let first_id = paged[0]["id"].as_str().expect("first account id");
+    assert_eq!(first_id, "zoe@remote.example");
+
+    let max_id_response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/admin/accounts?remote=true&local=false&max_id={first_id}"
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(max_id_response.status(), 200);
+    let max_id_accounts: serde_json::Value = max_id_response.json().await.unwrap();
+    let max_id_accounts = max_id_accounts
+        .as_array()
+        .expect("max_id accounts should be array");
+    assert_eq!(max_id_accounts[0]["id"], "bob@remote.example");
+    assert_eq!(max_id_accounts[1]["id"], "alice@remote.example");
+
+    let since_id_response = server
+        .client
+        .get(
+            server
+                .url("/api/v1/admin/accounts?remote=true&local=false&since_id=bob@remote.example"),
+        )
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(since_id_response.status(), 200);
+    let since_id_accounts: serde_json::Value = since_id_response.json().await.unwrap();
+    let since_id_accounts = since_id_accounts
+        .as_array()
+        .expect("since_id accounts should be array");
+    assert_eq!(since_id_accounts.len(), 1);
+    assert_eq!(since_id_accounts[0]["id"], "zoe@remote.example");
+
+    let email_filter_response = server
+        .client
+        .get(server.url("/api/v1/admin/accounts?remote=true&local=false&email=admin@example.com"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(email_filter_response.status(), 200);
+    let filtered: serde_json::Value = email_filter_response.json().await.unwrap();
+    assert_eq!(filtered.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn test_admin_domain_blocks_round_trip_by_returned_id() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2894,6 +3062,32 @@ async fn test_admin_domain_blocks_round_trip_by_returned_id() {
             .unwrap()
             .iter()
             .all(|block| block["id"] != block_id)
+    );
+}
+
+#[tokio::test]
+async fn test_admin_domain_blocks_reject_invalid_severity() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/admin/domain_blocks"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "domain": "remote.example",
+            "severity": "drop"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["error"],
+        "severity must be one of: noop, silence, suspend"
     );
 }
 
