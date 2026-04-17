@@ -1,10 +1,13 @@
 //! Status endpoints
 
 use axum::{
+    body::to_bytes,
+    extract::Request,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::Json,
 };
+use axum_extra::extract::CookieJar;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -38,8 +41,9 @@ const IDEMPOTENCY_PENDING_RETRY_DELAY_MS: u64 = 50;
 const MAX_STATUS_CONTEXT_ANCESTORS: usize = 40;
 const MAX_STATUS_CONTEXT_DESCENDANTS: usize = 40;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateStatusPollRequest {
+    #[serde(default)]
     pub options: Vec<String>,
     pub expires_in: i64,
     #[serde(default)]
@@ -48,11 +52,20 @@ pub struct CreateStatusPollRequest {
     pub _hide_totals: bool,
 }
 
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct StatusMediaAttributeRequest {
+    pub id: Option<String>,
+    pub description: Option<String>,
+    pub focus: Option<String>,
+}
+
 /// Status creation request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateStatusRequest {
     pub status: Option<String>,
     pub media_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub media_attributes: Vec<StatusMediaAttributeRequest>,
     pub in_reply_to_id: Option<String>,
     pub quoted_status_id: Option<String>,
     pub poll: Option<CreateStatusPollRequest>,
@@ -67,6 +80,7 @@ pub struct CreateStatusRequest {
 #[derive(Debug, Default, Deserialize)]
 pub struct StatusActionParams {
     pub uri: Option<String>,
+    pub visibility: Option<String>,
 }
 
 fn resolve_action_uri<'a>(
@@ -112,6 +126,35 @@ fn ensure_public_visibility_for_public_endpoint(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+async fn request_is_authenticated(
+    state: &StatusApiState,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+) -> bool {
+    if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && state
+            .db
+            .get_oauth_token(token)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return true;
+    }
+
+    jar.get("session")
+        .map(|cookie| cookie.value())
+        .is_some_and(|token| {
+            crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+        })
 }
 
 fn normalize_visibility_input(
@@ -548,7 +591,7 @@ pub async fn create_status(
     State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     headers: HeaderMap,
-    Json(req): Json<CreateStatusRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::data::{EntityId, Status};
 
@@ -610,6 +653,16 @@ pub async fn create_status(
         }
     }
 
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 256 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        CreateStatusRequest::default()
+    } else {
+        parse_create_status_request(&parts.headers, &body)?
+    };
+
     let response_result: Result<serde_json::Value, AppError> = async {
         let account_service = build_account_service(&state);
         let status_service = build_status_service(&state);
@@ -627,6 +680,7 @@ pub async fn create_status(
         let CreateStatusRequest {
             status,
             media_ids,
+            media_attributes,
             in_reply_to_id,
             quoted_status_id,
             poll,
@@ -797,6 +851,7 @@ pub async fn create_status(
                     .map(|poll| (poll.options.as_slice(), poll.expires_in, poll.multiple)),
             )
             .await?;
+        apply_status_media_attributes(&state, &media_ids, &status.id, &media_attributes).await?;
         DB_QUERIES_TOTAL
             .with_label_values(&["INSERT", "statuses"])
             .inc();
@@ -979,6 +1034,7 @@ pub async fn delete_status(
     State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
+    Query(params): Query<DeleteStatusParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
@@ -1007,6 +1063,10 @@ pub async fn delete_status(
         .with_label_values(&["SELECT", "accounts"])
         .inc();
     db_timer.observe_duration();
+
+    if params.delete_media.unwrap_or(false) {
+        state.db.replace_status_media(&id, &[]).await?;
+    }
 
     // Delete the status
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -1118,13 +1178,18 @@ pub async fn delete_status(
 pub async fn get_status_context(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
+    jar: CookieJar,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::ContextResponse;
     let status_service = build_status_service(&state);
+    let is_authenticated = request_is_authenticated(&state, &headers, &jar).await;
 
     // Get the status to verify it exists
     let status = status_service.get(&id).await?;
-    ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    if !is_authenticated {
+        ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    }
 
     // Get account
     let account = build_account_service(&state).get_account().await?;
@@ -1144,7 +1209,7 @@ pub async fn get_status_context(
         let Some(parent_status) = status_service.find_by_uri(&parent_uri).await? else {
             break;
         };
-        if !should_federate_to_followers(parent_status.visibility) {
+        if !is_authenticated && !should_federate_to_followers(parent_status.visibility) {
             break;
         }
 
@@ -1171,7 +1236,7 @@ pub async fn get_status_context(
             if descendants.len() >= MAX_STATUS_CONTEXT_DESCENDANTS {
                 break 'descendant_scan;
             }
-            if !should_federate_to_followers(reply.visibility) {
+            if !is_authenticated && !should_federate_to_followers(reply.visibility) {
                 continue;
             }
             if !seen_descendants.insert(reply.uri.clone()) {
@@ -1509,8 +1574,14 @@ pub async fn reblog_status(
         (status, repost_uri)
     };
     let status_id = status.id.clone();
+    let announce_visibility = params
+        .visibility
+        .clone()
+        .map(|value| normalize_visibility_input(Some(value)))
+        .transpose()?
+        .unwrap_or(status.visibility);
 
-    let should_federate_reblog = should_federate_to_followers(status.visibility);
+    let should_federate_reblog = should_federate_to_followers(announce_visibility);
     if should_federate_reblog {
         match build_account_service(&state).get_follower_inboxes().await {
             Ok(follower_inboxes) if !follower_inboxes.is_empty() => {
@@ -1518,14 +1589,13 @@ pub async fn reblog_status(
                 let state_for_delivery = state.clone();
                 let announce_activity_uri = repost_uri.clone();
                 let announced_status_uri = status.uri.clone();
-                let announced_status_visibility = status.visibility;
                 spawn_best_effort_batch_delivery("reblog_status", async move {
                     delivery
                         .queue_announce_with_id(
                             state_for_delivery.db.as_ref(),
                             &announce_activity_uri,
                             &announced_status_uri,
-                            announced_status_visibility.as_str(),
+                            announce_visibility.as_str(),
                             follower_inboxes,
                         )
                         .await
@@ -1541,13 +1611,12 @@ pub async fn reblog_status(
         }
     } else if !should_federate_reblog {
         tracing::debug!(
-            visibility = %status.visibility,
+            visibility = %announce_visibility,
             "Skipping outbound Announce delivery for non-public visibility"
         );
     }
 
-    // Return the original status with reblogged=true
-    let response = crate::api::build_status_response_with_account_stats(
+    let mut reblogged_status = crate::api::build_status_response_with_account_stats(
         state.db.as_ref(),
         &status,
         &account,
@@ -1562,8 +1631,29 @@ pub async fn reblog_status(
         ),
     )
     .await?;
+    reblogged_status.reblogged = true;
 
-    Ok(Json(serde_json::to_value(response).unwrap()))
+    let mut wrapper = reblogged_status.clone();
+    wrapper.id = repost_uri.clone();
+    wrapper.uri = repost_uri.clone();
+    wrapper.url = repost_uri.clone();
+    wrapper.created_at = Utc::now();
+    wrapper.visibility = announce_visibility.to_string();
+    wrapper.account =
+        crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
+    wrapper.content.clear();
+    wrapper.text.clear();
+    wrapper.media_attachments.clear();
+    wrapper.mentions.clear();
+    wrapper.tags.clear();
+    wrapper.emojis.clear();
+    wrapper.poll = None;
+    wrapper.quote = None;
+    wrapper.quote_approval = None;
+    wrapper.card = None;
+    wrapper.reblog = Some(Box::new(reblogged_status));
+
+    Ok(Json(serde_json::to_value(wrapper).unwrap()))
 }
 
 /// POST /api/v1/statuses/:id/unreblog
@@ -1736,13 +1826,254 @@ pub async fn unbookmark_status(
 }
 
 /// Update status request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateStatusRequest {
     pub status: Option<String>,
     pub spoiler_text: Option<String>,
     #[serde(rename = "sensitive")]
     pub sensitive: Option<bool>,
     pub media_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub media_attributes: Vec<StatusMediaAttributeRequest>,
+    pub language: Option<String>,
+    pub poll: Option<CreateStatusPollRequest>,
+}
+
+fn parse_status_bool(field: &str, value: &str) -> Result<bool, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(AppError::Validation(format!(
+            "{field} must be a boolean value"
+        ))),
+    }
+}
+
+fn parse_indexed_media_attribute_key<'a>(key: &'a str) -> Option<(usize, &'a str)> {
+    let remainder = key.strip_prefix("media_attributes[")?;
+    let (index, remainder) = remainder.split_once(']')?;
+    let index = index.parse::<usize>().ok()?;
+    let field = remainder.strip_prefix('[')?.strip_suffix(']')?;
+    Some((index, field))
+}
+
+fn ensure_media_attribute_slot(
+    media_attributes: &mut Vec<StatusMediaAttributeRequest>,
+    index: usize,
+) -> &mut StatusMediaAttributeRequest {
+    while media_attributes.len() <= index {
+        media_attributes.push(StatusMediaAttributeRequest::default());
+    }
+    &mut media_attributes[index]
+}
+
+fn parse_create_status_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<CreateStatusRequest, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")));
+    }
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        let mut request = CreateStatusRequest::default();
+        for (key, value) in url::form_urlencoded::parse(body).into_owned() {
+            match key.as_str() {
+                "status" => request.status = Some(value),
+                "media_ids[]" | "media_ids" => {
+                    request.media_ids.get_or_insert_with(Vec::new).push(value);
+                }
+                key if key.starts_with("media_attributes[") => {
+                    if let Some((index, field)) = parse_indexed_media_attribute_key(key) {
+                        let attribute =
+                            ensure_media_attribute_slot(&mut request.media_attributes, index);
+                        match field {
+                            "id" => attribute.id = Some(value),
+                            "description" => attribute.description = Some(value),
+                            "focus" => attribute.focus = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                "in_reply_to_id" => request.in_reply_to_id = Some(value),
+                "quoted_status_id" => request.quoted_status_id = Some(value),
+                "scheduled_at" => request.scheduled_at = Some(value),
+                "sensitive" => request.sensitive = Some(parse_status_bool("sensitive", &value)?),
+                "spoiler_text" => request.spoiler_text = Some(value),
+                "visibility" => request.visibility = Some(value),
+                "language" => request.language = Some(value),
+                "poll[options][]" | "poll[options]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .options
+                        .push(value);
+                }
+                "poll[expires_in]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .expires_in = value.parse::<i64>().map_err(|_| {
+                        AppError::Validation("poll[expires_in] must be an integer".to_string())
+                    })?;
+                }
+                "poll[multiple]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .multiple = parse_status_bool("poll[multiple]", &value)?;
+                }
+                "poll[hide_totals]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        ._hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
+                }
+                _ => {}
+            }
+        }
+        return Ok(request);
+    }
+
+    Err(AppError::Validation(
+        "unsupported content type for status payload".to_string(),
+    ))
+}
+
+fn parse_update_status_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<UpdateStatusRequest, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")));
+    }
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        let mut request = UpdateStatusRequest::default();
+        for (key, value) in url::form_urlencoded::parse(body).into_owned() {
+            match key.as_str() {
+                "status" => request.status = Some(value),
+                "spoiler_text" => request.spoiler_text = Some(value),
+                "sensitive" => request.sensitive = Some(parse_status_bool("sensitive", &value)?),
+                "media_ids[]" | "media_ids" => {
+                    request.media_ids.get_or_insert_with(Vec::new).push(value);
+                }
+                key if key.starts_with("media_attributes[") => {
+                    if let Some((index, field)) = parse_indexed_media_attribute_key(key) {
+                        let attribute =
+                            ensure_media_attribute_slot(&mut request.media_attributes, index);
+                        match field {
+                            "id" => attribute.id = Some(value),
+                            "description" => attribute.description = Some(value),
+                            "focus" => attribute.focus = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                "language" => request.language = Some(value),
+                "poll[options][]" | "poll[options]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .options
+                        .push(value);
+                }
+                "poll[expires_in]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .expires_in = value.parse::<i64>().map_err(|_| {
+                        AppError::Validation("poll[expires_in] must be an integer".to_string())
+                    })?;
+                }
+                "poll[multiple]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        .multiple = parse_status_bool("poll[multiple]", &value)?;
+                }
+                "poll[hide_totals]" => {
+                    request
+                        .poll
+                        .get_or_insert_with(CreateStatusPollRequest::default)
+                        ._hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
+                }
+                _ => {}
+            }
+        }
+        return Ok(request);
+    }
+
+    Err(AppError::Validation(
+        "unsupported content type for status payload".to_string(),
+    ))
+}
+
+async fn apply_status_media_attributes(
+    state: &StatusApiState,
+    media_ids: &[String],
+    status_id: &str,
+    media_attributes: &[StatusMediaAttributeRequest],
+) -> Result<(), AppError> {
+    for (index, attribute) in media_attributes.iter().enumerate() {
+        let Some(media_id) = attribute
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| media_ids.get(index).cloned())
+        else {
+            continue;
+        };
+
+        let mut media = state.db.get_media(&media_id).await?.ok_or_else(|| {
+            AppError::Validation(format!(
+                "unknown media attachment in media_attributes: {media_id}"
+            ))
+        })?;
+        if media.status_id.as_deref() != Some(status_id) {
+            return Err(AppError::Validation(format!(
+                "media attachment `{media_id}` is not attached to status `{status_id}`"
+            )));
+        }
+
+        if let Some(description) = attribute.description.clone() {
+            media.description = Some(description);
+        }
+
+        if let Some(focus) = attribute.focus.as_deref() {
+            let trimmed = focus.trim();
+            if trimmed.is_empty() {
+                media.focus_x = None;
+                media.focus_y = None;
+            } else {
+                let (focus_x, focus_y) = crate::api::mastodon::media::parse_media_focus(trimmed)?;
+                media.focus_x = Some(focus_x);
+                media.focus_y = Some(focus_y);
+            }
+        }
+
+        state.db.update_media(&media).await?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteStatusParams {
+    pub delete_media: Option<bool>,
 }
 
 /// PUT /api/v1/statuses/:id
@@ -1752,9 +2083,27 @@ pub async fn update_status(
     State(state): State<StatusApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<UpdateStatusRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let status_service = build_status_service(&state);
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 256 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        UpdateStatusRequest::default()
+    } else {
+        parse_update_status_request(&parts.headers, &body)?
+    };
+    let UpdateStatusRequest {
+        status: requested_content,
+        spoiler_text,
+        sensitive,
+        media_ids: requested_media_ids,
+        media_attributes,
+        language,
+        poll,
+    } = req;
 
     // Get the status
     let mut status = status_service.get(&id).await?;
@@ -1772,10 +2121,17 @@ pub async fn update_status(
     // Update fields if provided
     let mut changed = false;
     let mut media_ids_to_replace: Option<Vec<String>> = None;
+    let mut media_ids_after_update = status_service
+        .get_media_by_status(&id)
+        .await?
+        .into_iter()
+        .map(|media| media.id)
+        .collect::<Vec<_>>();
+    let existing_poll = state.db.get_poll_by_status_id(&id).await?;
+    let mut poll_to_replace = None;
+    let mut delete_poll = false;
 
-    if let Some(content) = req.status
-        && !content.is_empty()
-    {
+    if let Some(content) = requested_content {
         let next_content = format!("<p>{}</p>", html_escape::encode_text(&content));
         if status.content != next_content {
             status.content = next_content;
@@ -1783,17 +2139,22 @@ pub async fn update_status(
         }
     }
 
-    let next_content_warning = normalize_content_warning(
-        req.spoiler_text,
-        req.sensitive,
-        status.content_warning.as_deref(),
-    );
+    let next_content_warning =
+        normalize_content_warning(spoiler_text, sensitive, status.content_warning.as_deref());
     if status.content_warning != next_content_warning {
         status.content_warning = next_content_warning;
         changed = true;
     }
 
-    if let Some(media_ids) = req.media_ids {
+    if let Some(language) = language {
+        let normalized_language = (!language.trim().is_empty()).then_some(language);
+        if status.language != normalized_language {
+            status.language = normalized_language;
+            changed = true;
+        }
+    }
+
+    if let Some(media_ids) = requested_media_ids {
         let mut normalized_media_ids = Vec::with_capacity(media_ids.len());
         let mut seen_media_ids = HashSet::new();
         for media_id in media_ids {
@@ -1808,17 +2169,34 @@ pub async fn update_status(
             }
         }
 
-        let current_media_ids = status_service
-            .get_media_by_status(&id)
-            .await?
-            .into_iter()
-            .map(|media| media.id)
+        let current_media_ids = media_ids_after_update
+            .iter()
+            .cloned()
             .collect::<HashSet<_>>();
         let requested_media_ids = normalized_media_ids.iter().cloned().collect::<HashSet<_>>();
         if current_media_ids != requested_media_ids {
+            media_ids_after_update = normalized_media_ids.clone();
             media_ids_to_replace = Some(normalized_media_ids);
             changed = true;
         }
+    }
+
+    if let Some(poll_request) = poll {
+        let normalized_poll = normalize_poll_input(Some(poll_request))?;
+        if !media_ids_after_update.is_empty() {
+            return Err(AppError::Unprocessable(
+                "poll and media_ids cannot be used together".to_string(),
+            ));
+        }
+        poll_to_replace = normalized_poll;
+        changed = true;
+    } else if !media_ids_after_update.is_empty() && existing_poll.is_some() {
+        delete_poll = true;
+        changed = true;
+    }
+
+    if !media_attributes.is_empty() {
+        changed = true;
     }
 
     if changed {
@@ -1829,6 +2207,37 @@ pub async fn update_status(
                 media_ids_to_replace.as_deref(),
             )
             .await?;
+        if let Some(poll) = poll_to_replace.as_ref() {
+            let expires_at = (Utc::now() + chrono::Duration::seconds(poll.expires_in)).to_rfc3339();
+            state
+                .db
+                .replace_poll_for_status(
+                    &status.id,
+                    &expires_at,
+                    false,
+                    poll.multiple,
+                    0,
+                    0,
+                    &poll
+                        .options
+                        .iter()
+                        .cloned()
+                        .map(|option| (option, 0))
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+        } else if delete_poll {
+            state.db.delete_poll_by_status_id(&status.id).await?;
+        }
+        if !media_attributes.is_empty() {
+            apply_status_media_attributes(
+                &state,
+                &media_ids_after_update,
+                &status.id,
+                &media_attributes,
+            )
+            .await?;
+        }
 
         let mut extra_addresses = Vec::new();
         if let Some(reply_target_account_address) = remote_account_address_for_status_uri(
@@ -1929,6 +2338,21 @@ pub async fn get_status_history(
     // Get account
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let current_response = crate::api::build_status_response_with_account_stats(
+        state.db.as_ref(),
+        &status,
+        &account,
+        &state.config,
+        account_stats,
+        crate::api::StatusInteractions::new(
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false),
+        ),
+    )
+    .await?;
 
     let edits = status_service.get_edit_history(&id, 40).await?;
     let current_revision_created_at = edits
@@ -1940,7 +2364,11 @@ pub async fn get_status_history(
         "spoiler_text": status.content_warning.clone().unwrap_or_default(),
         "sensitive": status.content_warning.is_some(),
         "created_at": current_revision_created_at.to_rfc3339(),
-        "account": crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
+        "account": current_response.account.clone(),
+        "media_attachments": current_response.media_attachments.clone(),
+        "emojis": current_response.emojis.clone(),
+        "poll": current_response.poll.clone(),
+        "quote": current_response.quote.clone(),
     });
 
     let mut history = vec![current_version];
@@ -1950,7 +2378,11 @@ pub async fn get_status_history(
             "spoiler_text": content_warning.clone().unwrap_or_default(),
             "sensitive": content_warning.is_some(),
             "created_at": created_at.to_rfc3339(),
-            "account": crate::api::account_to_response_with_stats(&account, &state.config, account_stats),
+            "account": current_response.account.clone(),
+            "media_attachments": current_response.media_attachments.clone(),
+            "emojis": current_response.emojis.clone(),
+            "poll": current_response.poll.clone(),
+            "quote": current_response.quote.clone(),
         }));
     }
 

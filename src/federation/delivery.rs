@@ -431,6 +431,10 @@ impl ActivityDelivery {
                 "quoteUrl".to_string(),
                 serde_json::Value::String(quote_of_uri.clone()),
             );
+            object_map.insert(
+                "_misskey_quote".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
         }
         Ok(object)
     }
@@ -612,6 +616,10 @@ impl ActivityDelivery {
             );
             note_object.insert(
                 "quoteUrl".to_string(),
+                serde_json::Value::String(quote_of_uri.clone()),
+            );
+            note_object.insert(
+                "_misskey_quote".to_string(),
                 serde_json::Value::String(quote_of_uri.clone()),
             );
         }
@@ -1689,6 +1697,42 @@ pub struct DeliveryResult {
 pub mod builder {
     use serde_json::Value;
 
+    fn status_context() -> Value {
+        serde_json::json!([
+            "https://www.w3.org/ns/activitystreams",
+            {
+                "quoteUri": {
+                    "@id": "https://fedibird.com/ns#quoteUri",
+                    "@type": "@id"
+                },
+                "quoteUrl": {
+                    "@id": "https://www.w3.org/ns/activitystreams#quoteUrl",
+                    "@type": "@id"
+                },
+                "_misskey_quote": {
+                    "@id": "https://misskey-hub.net/ns#_misskey_quote",
+                    "@type": "@id"
+                }
+            }
+        ])
+    }
+
+    fn context_for_object(object: &Value) -> Value {
+        let object_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(object_type, "Note" | "Article" | "Question")
+            || object.get("quoteUri").is_some()
+            || object.get("quoteUrl").is_some()
+            || object.get("_misskey_quote").is_some()
+        {
+            status_context()
+        } else {
+            serde_json::json!("https://www.w3.org/ns/activitystreams")
+        }
+    }
+
     /// Build a Follow activity
     ///
     /// # Arguments
@@ -1752,8 +1796,9 @@ pub mod builder {
     /// * `to` - Primary recipients (public timeline, followers, etc.)
     /// * `cc` - CC recipients (mentions, etc.)
     pub fn create(id: &str, actor: &str, object: Value, to: Vec<&str>, cc: Vec<&str>) -> Value {
+        let context = context_for_object(&object);
         serde_json::json!({
-            "@context": "https://www.w3.org/ns/activitystreams",
+            "@context": context,
             "type": "Create",
             "id": id,
             "actor": actor,
@@ -1787,8 +1832,9 @@ pub mod builder {
 
     /// Build an Update activity.
     pub fn update(id: &str, actor: &str, object: Value, to: Vec<&str>, cc: Vec<&str>) -> Value {
+        let context = context_for_object(&object);
         serde_json::json!({
-            "@context": "https://www.w3.org/ns/activitystreams",
+            "@context": context,
             "type": "Update",
             "id": id,
             "actor": actor,
@@ -2116,6 +2162,21 @@ mod tests {
         assert_eq!(
             activity["object"]["quoteUrl"],
             "https://remote.example/users/bob/statuses/quoted"
+        );
+        assert_eq!(
+            activity["object"]["_misskey_quote"],
+            "https://remote.example/users/bob/statuses/quoted"
+        );
+        assert!(
+            activity["@context"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| {
+                    entry
+                        .get("_misskey_quote")
+                        .and_then(|value| value.get("@id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("https://misskey-hub.net/ns#_misskey_quote")
+                }))
         );
     }
 }

@@ -17,6 +17,7 @@ pub enum StreamTarget {
     Public,
     PublicLocal,
     Hashtag { hashtag: String },
+    HashtagLocal { hashtag: String },
     List { list_id: String },
     Direct { account_id: String },
 }
@@ -127,6 +128,8 @@ pub trait StreamingEventBus: Send + Sync {
     async fn subscribe_public_local(&self) -> Result<EventReceiver, AppError>;
     /// Subscribe to a hashtag timeline.
     async fn subscribe_hashtag(&self, hashtag: &str) -> Result<EventReceiver, AppError>;
+    /// Subscribe to a local-only hashtag timeline.
+    async fn subscribe_hashtag_local(&self, hashtag: &str) -> Result<EventReceiver, AppError>;
     /// Subscribe to a user-defined list timeline.
     async fn subscribe_list(&self, list_id: &str) -> Result<EventReceiver, AppError>;
     /// Subscribe to the direct-message (conversation) stream.
@@ -141,6 +144,7 @@ enum StreamKey {
     Public,
     PublicLocal,
     Hashtag(String),
+    HashtagLocal(String),
     List(String),
     Direct(String),
 }
@@ -152,6 +156,7 @@ impl StreamKey {
             StreamTarget::Public => Self::Public,
             StreamTarget::PublicLocal => Self::PublicLocal,
             StreamTarget::Hashtag { hashtag } => Self::Hashtag(hashtag.clone()),
+            StreamTarget::HashtagLocal { hashtag } => Self::HashtagLocal(hashtag.clone()),
             StreamTarget::List { list_id } => Self::List(list_id.clone()),
             StreamTarget::Direct { account_id } => Self::Direct(account_id.clone()),
         }
@@ -220,6 +225,13 @@ impl StreamingEventBus for BroadcastEventBus {
 
     async fn subscribe_hashtag(&self, hashtag: &str) -> Result<EventReceiver, AppError> {
         self.subscribe_key(StreamKey::Hashtag(
+            hashtag.trim_start_matches('#').to_ascii_lowercase(),
+        ))
+        .await
+    }
+
+    async fn subscribe_hashtag_local(&self, hashtag: &str) -> Result<EventReceiver, AppError> {
+        self.subscribe_key(StreamKey::HashtagLocal(
             hashtag.trim_start_matches('#').to_ascii_lowercase(),
         ))
         .await

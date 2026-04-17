@@ -85,6 +85,14 @@ fn notification_is_included(
     !exclude_types.iter().any(|ty| *ty == notification_type)
 }
 
+fn notification_is_newer_than(
+    notification: &crate::data::Notification,
+    cursor: &(chrono::DateTime<chrono::Utc>, String),
+) -> bool {
+    notification.created_at > cursor.0
+        || (notification.created_at == cursor.0 && notification.id > cursor.1)
+}
+
 async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> Option<Status> {
     if let Ok(status) = state.db.get_status_by_uri(status_uri).await
         && status.is_some()
@@ -177,6 +185,20 @@ pub async fn get_notifications(
     let fetch_limit = limit.max(40);
     let mut notifications = Vec::new();
     let mut cursor = params.pagination.max_id.clone();
+    let min_cursor = if let Some(cursor_id) = params
+        .pagination
+        .min_id
+        .as_deref()
+        .or(params.pagination.since_id.as_deref())
+    {
+        state
+            .db
+            .get_notification(cursor_id)
+            .await?
+            .map(|notification| (notification.created_at, notification.id))
+    } else {
+        None
+    };
 
     while notifications.len() < limit {
         let batch = state
@@ -195,6 +217,12 @@ pub async fn get_notifications(
         cursor = batch.last().map(|notification| notification.id.clone());
 
         for notification in batch {
+            if min_cursor
+                .as_ref()
+                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
+            {
+                continue;
+            }
             if notification_is_included(
                 notification.notification_type,
                 &include_types,

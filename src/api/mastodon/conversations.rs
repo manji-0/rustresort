@@ -15,13 +15,13 @@ pub struct ConversationsParams {
     limit: Option<usize>,
     /// Return results older than this ID
     #[serde(rename = "max_id")]
-    _max_id: Option<String>,
+    max_id: Option<String>,
     /// Return results newer than this ID
     #[serde(rename = "since_id")]
-    _since_id: Option<String>,
+    since_id: Option<String>,
     /// Return results immediately newer than this ID
     #[serde(rename = "min_id")]
-    _min_id: Option<String>,
+    min_id: Option<String>,
 }
 
 async fn build_conversation_response(
@@ -56,7 +56,7 @@ async fn build_conversation_response(
         }
     }
 
-    if accounts.is_empty() {
+    if accounts.is_empty() && participant_addresses.len() <= 1 {
         accounts.push(
             serde_json::to_value(crate::api::account_to_response_with_stats(
                 account,
@@ -91,7 +91,20 @@ async fn build_conversation_response(
                         &state.config,
                         account_stats,
                         remote_stats,
-                        crate::api::StatusInteractions::default(),
+                        crate::api::StatusInteractions::new(
+                            Some(state.db.is_favourited(&status.id).await?),
+                            Some(state.db.is_reposted(&status.id).await?),
+                            Some(
+                                state
+                                    .db
+                                    .is_thread_muted(
+                                        &state.db.resolve_thread_root_uri(&status).await?,
+                                    )
+                                    .await?,
+                            ),
+                            Some(state.db.is_bookmarked(&status.id).await?),
+                            Some(state.db.is_status_pinned(&status.id).await?),
+                        ),
                     )
                     .await?,
                 )
@@ -124,7 +137,14 @@ pub async fn get_conversations(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let conversations = state.db.get_conversations(limit).await?;
+    let conversations = state
+        .db
+        .get_conversations(
+            limit,
+            params.max_id.as_deref(),
+            params.min_id.as_deref().or(params.since_id.as_deref()),
+        )
+        .await?;
 
     let mut response = Vec::new();
     for (conversation_id, last_status_id, unread) in conversations {

@@ -312,6 +312,7 @@ pub async fn build_status_response_with_media(
     );
     enrich_status_response(db, status, &mut response).await?;
     response.poll = load_status_poll_response(db, &status.id, account, config).await?;
+    response.filtered = load_status_filtered(db, status).await?;
     if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
         && let Some(quote_status) = db.get_status_by_uri(quote_of_uri).await?
     {
@@ -320,6 +321,74 @@ pub async fn build_status_response_with_media(
         );
     }
     Ok(response)
+}
+
+fn phrase_matches_text(text: &str, phrase: &str, whole_word: bool) -> bool {
+    if phrase.is_empty() {
+        return false;
+    }
+    if !whole_word {
+        return text.contains(phrase);
+    }
+
+    let mut start = 0usize;
+    while let Some(relative_idx) = text[start..].find(phrase) {
+        let idx = start + relative_idx;
+        let before = text[..idx].chars().next_back();
+        let after = text[idx + phrase.len()..].chars().next();
+        let before_ok = before.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+        let after_ok = after.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + phrase.len();
+    }
+    false
+}
+
+async fn load_status_filtered(
+    db: &Database,
+    status: &Status,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let filters = db.get_all_filters().await?;
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let text = format!(
+        "{}\n{}",
+        status_content_to_source_text(&status.content),
+        status.content_warning.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let mut filtered = Vec::new();
+
+    for (id, phrase, context, expires_at, irreversible, whole_word) in filters {
+        let normalized_phrase = phrase.trim().to_ascii_lowercase();
+        if !phrase_matches_text(&text, &normalized_phrase, whole_word) {
+            continue;
+        }
+
+        let contexts = context
+            .split(',')
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        filtered.push(serde_json::json!({
+            "filter": {
+                "id": id,
+                "title": phrase,
+                "context": contexts,
+                "expires_at": expires_at,
+                "filter_action": if irreversible { "hide" } else { "warn" },
+            },
+            "keyword_matches": [phrase],
+            "status_matches": [],
+        }));
+    }
+
+    Ok(filtered)
 }
 
 pub async fn build_status_response_with_account_stats_and_remote_stats(

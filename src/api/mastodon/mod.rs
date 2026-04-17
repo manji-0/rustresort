@@ -40,19 +40,34 @@ pub mod timelines;
 const SESSION_ONLY: &[&str] = &[];
 const READ_ACCOUNTS: &[&str] = &["read:accounts"];
 const WRITE_ACCOUNTS: &[&str] = &["write:accounts"];
-const FOLLOW: &[&str] = &["follow"];
+const PROFILE_READ_ACCOUNTS: &[&str] = &["profile", "read:accounts"];
+const READ_FOLLOWS: &[&str] = &["read:follows", "read:accounts"];
+const WRITE_FOLLOWS: &[&str] = &["write:follows", "follow"];
+const READ_BLOCKS: &[&str] = &["read:blocks", "read:accounts"];
+const WRITE_BLOCKS: &[&str] = &["write:blocks", "write:accounts"];
+const READ_MUTES: &[&str] = &["read:mutes", "read:accounts"];
 const READ_STATUSES: &[&str] = &["read:statuses"];
 const WRITE_STATUSES: &[&str] = &["write:statuses"];
+const WRITE_BOOKMARKS: &[&str] = &["write:bookmarks", "write:statuses"];
+const WRITE_MUTES: &[&str] = &["write:mutes", "write:statuses", "write:accounts"];
+const WRITE_ACCOUNTS_OR_STATUSES: &[&str] = &["write:accounts", "write:statuses"];
 const WRITE_FAVOURITES: &[&str] = &["write:favourites"];
 const READ_NOTIFICATIONS: &[&str] = &["read:notifications"];
 const READ_USER_STREAM: &[&str] = &["read:statuses", "read:notifications"];
 const WRITE_NOTIFICATIONS: &[&str] = &["write:notifications"];
 const WRITE_MEDIA: &[&str] = &["write:media"];
+const PUSH_SCOPE: &[&str] = &["push"];
 const READ_LISTS: &[&str] = &["read:lists"];
 const WRITE_LISTS: &[&str] = &["write:lists"];
 const READ_FILTERS: &[&str] = &["read:filters"];
 const WRITE_FILTERS: &[&str] = &["write:filters"];
 const READ_SEARCH: &[&str] = &["read:search"];
+const READ_ADMIN_ACCOUNTS: &[&str] = &["admin:read:accounts", "admin:read"];
+const WRITE_ADMIN_ACCOUNTS: &[&str] = &["admin:write:accounts", "admin:write"];
+const READ_ADMIN_REPORTS: &[&str] = &["admin:read:reports", "admin:read"];
+const WRITE_ADMIN_REPORTS: &[&str] = &["admin:write:reports", "admin:write"];
+const READ_ADMIN_DOMAIN_BLOCKS: &[&str] = &["admin:read:domain_blocks", "admin:read"];
+const WRITE_ADMIN_DOMAIN_BLOCKS: &[&str] = &["admin:write:domain_blocks", "admin:write"];
 
 /// Create Mastodon API router
 ///
@@ -136,7 +151,21 @@ where
         .route("/v1/instance/peers", get(instance::instance_peers))
         .route("/v1/instance/activity", get(instance::instance_activity))
         .route("/v1/instance/rules", get(instance::instance_rules))
+        .route(
+            "/v1/instance/privacy_policy",
+            get(instance::instance_privacy_policy),
+        )
+        .route(
+            "/v1/instance/translation_languages",
+            get(instance::instance_translation_languages),
+        )
         .route("/v2/instance", get(instance::instance_v2))
+        .route("/v1/trends", get(instance::trending_tags))
+        .route("/v1/trends/statuses", get(instance::trending_statuses))
+        .route("/v1/trends/tags", get(instance::trending_tags))
+        .route("/v1/trends/links", get(instance::trending_links))
+        .route("/v1/directory", get(instance::directory))
+        .route("/v1/announcements", get(instance::announcements))
         .route("/v1/apps", post(apps::create_app))
         .route("/v1/custom_emojis", get(instance::custom_emojis))
         // Public timelines
@@ -144,6 +173,14 @@ where
         // Public account and status views
         .route("/v1/accounts/:id", get(accounts::get_account))
         .route("/v1/accounts/:id/statuses", get(accounts::account_statuses))
+        .route(
+            "/v1/accounts/:id/followers",
+            get(accounts::get_account_followers),
+        )
+        .route(
+            "/v1/accounts/:id/following",
+            get(accounts::get_account_following),
+        )
         .route("/v1/statuses/:id", get(statuses::get_status))
         .route(
             "/v1/statuses/:id/context",
@@ -156,7 +193,8 @@ where
         .route(
             "/v1/statuses/:id/favourited_by",
             get(statuses::get_favourited_by),
-        );
+        )
+        .route("/v1/polls/:id", get(polls::get_poll));
 
     // Authenticated endpoints (require valid token)
     let authenticated_routes = Router::new()
@@ -167,11 +205,11 @@ where
         )
         .route(
             "/v1/accounts/verify_credentials",
-            scoped(get(accounts::verify_credentials), READ_ACCOUNTS),
+            scoped(get(accounts::verify_credentials), PROFILE_READ_ACCOUNTS),
         )
         .route(
             "/v1/preferences",
-            scoped(get(accounts::preferences), READ_ACCOUNTS),
+            scoped(get(accounts::preferences), PROFILE_READ_ACCOUNTS),
         )
         .route(
             "/v1/accounts/update_credentials",
@@ -185,24 +223,16 @@ where
             scoped(get(accounts::lookup_account), READ_ACCOUNTS),
         )
         .route(
-            "/v1/accounts/:id/followers",
-            scoped(get(accounts::get_account_followers), READ_ACCOUNTS),
-        )
-        .route(
-            "/v1/accounts/:id/following",
-            scoped(get(accounts::get_account_following), READ_ACCOUNTS),
-        )
-        .route(
             "/v1/accounts/:id/follow",
-            scoped(post(accounts::follow_account), FOLLOW),
+            scoped(post(accounts::follow_account), WRITE_FOLLOWS),
         )
         .route(
             "/v1/accounts/:id/unfollow",
-            scoped(post(accounts::unfollow_account), FOLLOW),
+            scoped(post(accounts::unfollow_account), WRITE_FOLLOWS),
         )
         .route(
             "/v1/accounts/relationships",
-            scoped(get(accounts::get_relationships), READ_ACCOUNTS),
+            scoped(get(accounts::get_relationships), READ_FOLLOWS),
         )
         .route(
             "/v1/accounts/search",
@@ -234,42 +264,39 @@ where
         )
         .route(
             "/v1/accounts/:id/block",
-            scoped(post(accounts::block_account), WRITE_ACCOUNTS),
+            scoped(post(accounts::block_account), WRITE_BLOCKS),
         )
         .route(
             "/v1/accounts/:id/unblock",
-            scoped(post(accounts::unblock_account), WRITE_ACCOUNTS),
+            scoped(post(accounts::unblock_account), WRITE_BLOCKS),
         )
         .route(
             "/v1/accounts/:id/mute",
-            scoped(post(accounts::mute_account), WRITE_ACCOUNTS),
+            scoped(post(accounts::mute_account), WRITE_MUTES),
         )
         .route(
             "/v1/accounts/:id/unmute",
-            scoped(post(accounts::unmute_account), WRITE_ACCOUNTS),
+            scoped(post(accounts::unmute_account), WRITE_MUTES),
         )
         // Blocks & Mutes
-        .route(
-            "/v1/blocks",
-            scoped(get(accounts::get_blocks), READ_ACCOUNTS),
-        )
-        .route("/v1/mutes", scoped(get(accounts::get_mutes), READ_ACCOUNTS))
+        .route("/v1/blocks", scoped(get(accounts::get_blocks), READ_BLOCKS))
+        .route("/v1/mutes", scoped(get(accounts::get_mutes), READ_MUTES))
         // Follow Requests
         .route(
             "/v1/follow_requests",
-            scoped(get(accounts::get_follow_requests), READ_ACCOUNTS),
+            scoped(get(accounts::get_follow_requests), READ_FOLLOWS),
         )
         .route(
             "/v1/follow_requests/:id",
-            scoped(get(accounts::get_follow_request), READ_ACCOUNTS),
+            scoped(get(accounts::get_follow_request), READ_FOLLOWS),
         )
         .route(
             "/v1/follow_requests/:id/authorize",
-            scoped(post(accounts::authorize_follow_request), FOLLOW),
+            scoped(post(accounts::authorize_follow_request), WRITE_FOLLOWS),
         )
         .route(
             "/v1/follow_requests/:id/reject",
-            scoped(post(accounts::reject_follow_request), FOLLOW),
+            scoped(post(accounts::reject_follow_request), WRITE_FOLLOWS),
         )
         // Statuses - write operations require auth
         .route(
@@ -302,11 +329,11 @@ where
         )
         .route(
             "/v1/statuses/:id/bookmark",
-            scoped(post(statuses::bookmark_status), WRITE_STATUSES),
+            scoped(post(statuses::bookmark_status), WRITE_BOOKMARKS),
         )
         .route(
             "/v1/statuses/:id/unbookmark",
-            scoped(post(statuses::unbookmark_status), WRITE_STATUSES),
+            scoped(post(statuses::unbookmark_status), WRITE_BOOKMARKS),
         )
         .route(
             "/v1/statuses/:id",
@@ -318,19 +345,19 @@ where
         )
         .route(
             "/v1/statuses/:id/pin",
-            scoped(post(statuses::pin_status), WRITE_STATUSES),
+            scoped(post(statuses::pin_status), WRITE_ACCOUNTS_OR_STATUSES),
         )
         .route(
             "/v1/statuses/:id/unpin",
-            scoped(post(statuses::unpin_status), WRITE_STATUSES),
+            scoped(post(statuses::unpin_status), WRITE_ACCOUNTS_OR_STATUSES),
         )
         .route(
             "/v1/statuses/:id/mute",
-            scoped(post(statuses::mute_status), WRITE_STATUSES),
+            scoped(post(statuses::mute_status), WRITE_MUTES),
         )
         .route(
             "/v1/statuses/:id/unmute",
-            scoped(post(statuses::unmute_status), WRITE_STATUSES),
+            scoped(post(statuses::unmute_status), WRITE_MUTES),
         )
         // Timelines - require auth (except public which is in public_routes)
         .route(
@@ -383,7 +410,7 @@ where
                     .post(push::create_subscription)
                     .put(push::update_subscription)
                     .delete(push::delete_subscription),
-                READ_NOTIFICATIONS,
+                PUSH_SCOPE,
             ),
         )
         .route(
@@ -457,6 +484,50 @@ where
             "/v2/filters",
             scoped(get(filters::get_filters_v2), READ_FILTERS),
         )
+        .route(
+            "/v2/filters/:id",
+            scoped(get(filters::get_filter_v2), READ_FILTERS),
+        )
+        .route(
+            "/v2/filters",
+            scoped(post(filters::create_filter_v2), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id",
+            scoped(put(filters::update_filter_v2), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id",
+            scoped(delete(filters::delete_filter), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id/keywords",
+            scoped(get(filters::get_filter_keywords), READ_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id/keywords",
+            scoped(post(filters::create_filter_keyword), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/keywords/:keyword_id",
+            scoped(put(filters::update_filter_keyword), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/keywords/:keyword_id",
+            scoped(delete(filters::delete_filter_keyword), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id/statuses",
+            scoped(get(filters::get_filter_statuses), READ_FILTERS),
+        )
+        .route(
+            "/v2/filters/:id/statuses",
+            scoped(post(filters::create_filter_status), WRITE_FILTERS),
+        )
+        .route(
+            "/v2/filters/statuses/:id",
+            scoped(delete(filters::delete_filter_status), WRITE_FILTERS),
+        )
         // Bookmarks / Favourites
         .route(
             "/v1/bookmarks",
@@ -470,7 +541,6 @@ where
         .route("/v1/search", scoped(get(search::search_v1), READ_SEARCH))
         .route("/v2/search", scoped(get(search::search_v2), READ_SEARCH))
         // Polls
-        .route("/v1/polls/:id", scoped(get(polls::get_poll), READ_STATUSES))
         .route(
             "/v1/polls/:id/votes",
             scoped(post(polls::vote_in_poll), WRITE_STATUSES),
@@ -515,10 +585,7 @@ where
             scoped(post(conversations::mark_conversation_read), WRITE_STATUSES),
         )
         // Streaming API
-        .route(
-            "/v1/streaming/health",
-            scoped(get(streaming::streaming_health), READ_STATUSES),
-        )
+        .route("/v1/streaming/health", get(streaming::streaming_health))
         .route(
             "/v1/streaming",
             scoped(get(streaming::stream_root), SESSION_ONLY),
@@ -550,70 +617,77 @@ where
         // Admin API
         .route(
             "/v1/admin/accounts",
-            scoped(get(admin::list_accounts), SESSION_ONLY),
+            scoped(get(admin::list_accounts), READ_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id",
-            scoped(get(admin::get_account), SESSION_ONLY),
+            scoped(get(admin::get_account), READ_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id/action",
-            scoped(post(admin::account_action), SESSION_ONLY),
+            scoped(post(admin::account_action), WRITE_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id/enable",
-            scoped(post(admin::enable_account), SESSION_ONLY),
+            scoped(post(admin::enable_account), WRITE_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id/unsilence",
-            scoped(post(admin::unsilence_account), SESSION_ONLY),
+            scoped(post(admin::unsilence_account), WRITE_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id/unsuspend",
-            scoped(post(admin::unsuspend_account), SESSION_ONLY),
+            scoped(post(admin::unsuspend_account), WRITE_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/accounts/:id/unsensitive",
-            scoped(post(admin::unsensitive_account), SESSION_ONLY),
+            scoped(post(admin::unsensitive_account), WRITE_ADMIN_ACCOUNTS),
         )
         .route(
             "/v1/admin/reports",
-            scoped(get(admin::list_reports), SESSION_ONLY),
+            scoped(get(admin::list_reports), READ_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/reports/:id",
-            scoped(
-                get(admin::get_report).put(admin::update_report),
-                SESSION_ONLY,
-            ),
+            scoped(get(admin::get_report), READ_ADMIN_REPORTS),
+        )
+        .route(
+            "/v1/admin/reports/:id",
+            scoped(put(admin::update_report), WRITE_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/reports/:id/assign_to_self",
-            scoped(post(admin::assign_report_to_self), SESSION_ONLY),
+            scoped(post(admin::assign_report_to_self), WRITE_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/reports/:id/unassign",
-            scoped(post(admin::unassign_report), SESSION_ONLY),
+            scoped(post(admin::unassign_report), WRITE_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/reports/:id/resolve",
-            scoped(post(admin::resolve_report), SESSION_ONLY),
+            scoped(post(admin::resolve_report), WRITE_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/reports/:id/reopen",
-            scoped(post(admin::reopen_report), SESSION_ONLY),
+            scoped(post(admin::reopen_report), WRITE_ADMIN_REPORTS),
         )
         .route(
             "/v1/admin/domain_blocks",
-            scoped(get(admin::list_domain_blocks_v1), SESSION_ONLY),
+            scoped(get(admin::list_domain_blocks_v1), READ_ADMIN_DOMAIN_BLOCKS),
         )
         .route(
             "/v1/admin/domain_blocks",
-            scoped(post(admin::create_domain_block_v1), SESSION_ONLY),
+            scoped(
+                post(admin::create_domain_block_v1),
+                WRITE_ADMIN_DOMAIN_BLOCKS,
+            ),
         )
         .route(
             "/v1/admin/domain_blocks/:id",
-            scoped(delete(admin::delete_domain_block_v1), SESSION_ONLY),
+            scoped(
+                delete(admin::delete_domain_block_v1),
+                WRITE_ADMIN_DOMAIN_BLOCKS,
+            ),
         );
 
     // Merge public and authenticated routes

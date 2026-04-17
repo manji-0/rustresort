@@ -1,7 +1,11 @@
 //! Instance endpoints
 
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Query, State},
+    response::Json,
+};
 use chrono::{Datelike, Timelike};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 
 use crate::InstanceApiState;
@@ -217,6 +221,98 @@ pub async fn custom_emojis() -> Json<serde_json::Value> {
     Json(serde_json::json!([]))
 }
 
+/// GET /api/v1/announcements
+pub async fn announcements() -> Json<serde_json::Value> {
+    Json(serde_json::json!([]))
+}
+
+/// GET /api/v1/trends and /api/v1/trends/statuses
+pub async fn trending_statuses() -> Json<serde_json::Value> {
+    Json(serde_json::json!([]))
+}
+
+/// GET /api/v1/trends/links
+pub async fn trending_links() -> Json<serde_json::Value> {
+    Json(serde_json::json!([]))
+}
+
+/// GET /api/v1/trends/tags
+pub async fn trending_tags(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let tags = state.db.get_trending_hashtags(10).await.unwrap_or_default();
+    Json(serde_json::Value::Array(
+        tags.into_iter()
+            .map(|(name, usage_count, _last_used)| {
+                serde_json::json!({
+                    "name": name,
+                    "url": format!("{}/tags/{}", state.config.server.base_url(), name),
+                    "history": [],
+                    "uses": usage_count,
+                })
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DirectoryParams {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub order: Option<String>,
+    pub local: Option<bool>,
+}
+
+/// GET /api/v1/directory
+pub async fn directory(
+    State(state): State<InstanceApiState>,
+    Query(params): Query<DirectoryParams>,
+) -> Json<serde_json::Value> {
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(40).min(80);
+    let _local_only = params.local.unwrap_or(false);
+    let _order = params.order.as_deref().unwrap_or("active");
+
+    let results = if offset > 0 || limit == 0 {
+        Vec::new()
+    } else if let Ok(Some(account)) = state.db.get_account().await {
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+            .await
+            .unwrap_or_default();
+        vec![
+            serde_json::to_value(crate::api::account_to_response_with_stats(
+                &account,
+                &state.config,
+                account_stats,
+            ))
+            .unwrap_or_default(),
+        ]
+    } else {
+        Vec::new()
+    };
+    Json(serde_json::Value::Array(results))
+}
+
+/// GET /api/v1/instance/privacy_policy
+pub async fn instance_privacy_policy(
+    State(state): State<InstanceApiState>,
+) -> Json<serde_json::Value> {
+    let content = state
+        .db
+        .get_setting("instance.privacy_policy")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| state.config.instance.description.clone());
+    Json(serde_json::json!({
+        "content": content
+    }))
+}
+
+/// GET /api/v1/instance/translation_languages
+pub async fn instance_translation_languages() -> Json<serde_json::Value> {
+    Json(serde_json::json!({}))
+}
+
 /// GET /api/v1/instance
 pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     use crate::api::dto::*;
@@ -242,6 +338,10 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
     let status_count = load_instance_status_count(&state).await;
     let peer_domains = load_instance_peer_domains(&state).await;
     let domain_count = peer_domains.len() as i64;
+    let rules = rules_to_json(&load_instance_rule_texts(&state).await)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     let response = InstanceResponse {
         uri: state.config.server.domain.clone(),
@@ -266,7 +366,12 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
                     "image/png".to_string(),
                     "image/gif".to_string(),
                     "image/webp".to_string(),
+                    "image/avif".to_string(),
+                    "image/heif".to_string(),
+                    "image/heic".to_string(),
                     "video/mp4".to_string(),
+                    "video/webm".to_string(),
+                    "video/quicktime".to_string(),
                 ],
                 image_size_limit: 10485760,   // 10MB
                 image_matrix_limit: 16777216, // 4096x4096
@@ -291,6 +396,7 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
         },
         thumbnail: None,
         contact_account,
+        rules,
     };
 
     Json(serde_json::to_value(response).unwrap())
@@ -413,7 +519,12 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
                     "image/png",
                     "image/gif",
                     "image/webp",
-                    "video/mp4"
+                    "image/avif",
+                    "image/heif",
+                    "image/heic",
+                    "video/mp4",
+                    "video/webm",
+                    "video/quicktime"
                 ],
                 "image_size_limit": 10485760,
                 "image_matrix_limit": 16777216,

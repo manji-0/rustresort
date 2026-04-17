@@ -143,9 +143,8 @@ pub async fn require_app_auth(
 fn scope_matches(granted: &str, required: &str) -> bool {
     granted == required
         || required
-            .split_once(':')
-            .map(|(prefix, _)| granted == prefix)
-            .unwrap_or(false)
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 fn oauth_scopes_satisfy(granted: &[String], required: &[&str], require_all: bool) -> bool {

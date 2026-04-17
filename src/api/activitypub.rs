@@ -182,7 +182,19 @@ fn activitypub_status_context() -> serde_json::Value {
         "https://www.w3.org/ns/activitystreams",
         {
             "Hashtag": "https://www.w3.org/ns/activitystreams#Hashtag",
-            "votersCount": "http://joinmastodon.org/ns#votersCount"
+            "votersCount": "http://joinmastodon.org/ns#votersCount",
+            "quoteUri": {
+                "@id": "https://fedibird.com/ns#quoteUri",
+                "@type": "@id"
+            },
+            "quoteUrl": {
+                "@id": "https://www.w3.org/ns/activitystreams#quoteUrl",
+                "@type": "@id"
+            },
+            "_misskey_quote": {
+                "@id": "https://misskey-hub.net/ns#_misskey_quote",
+                "@type": "@id"
+            }
         }
     ])
 }
@@ -383,6 +395,7 @@ async fn build_note_object(
     if let Some(quote_of_uri) = &status.quote_of_uri {
         note["quoteUri"] = serde_json::json!(quote_of_uri);
         note["quoteUrl"] = serde_json::json!(quote_of_uri);
+        note["_misskey_quote"] = serde_json::json!(quote_of_uri);
     }
 
     if let Some(language) = &status.language {

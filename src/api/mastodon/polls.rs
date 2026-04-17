@@ -1,9 +1,13 @@
 //! Polls endpoints
 
 use axum::{
+    body::to_bytes,
+    extract::Request,
     extract::{Path, State},
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::Json,
 };
+use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -30,26 +34,81 @@ pub struct VoteParams {
     choices: Vec<usize>,
 }
 
-/// GET /api/v1/polls/:id - Get a poll
-///
-/// View a poll attached to a status.
-pub async fn get_poll(
-    State(state): State<PollsApiState>,
-    CurrentUser(_session): CurrentUser,
-    Path(id): Path<String>,
+fn parse_vote_params(headers: &HeaderMap, body: &[u8]) -> Result<VoteParams, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")));
+    }
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        let mut choices = Vec::new();
+        for (key, value) in url::form_urlencoded::parse(body).into_owned() {
+            if matches!(key.as_str(), "choices[]" | "choices") {
+                choices.push(value.parse::<usize>().map_err(|_| {
+                    AppError::Validation("choices must be integer indices".to_string())
+                })?);
+            }
+        }
+        return Ok(VoteParams { choices });
+    }
+
+    Err(AppError::Validation(
+        "unsupported content type for poll vote payload".to_string(),
+    ))
+}
+
+async fn request_is_authenticated(
+    state: &PollsApiState,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+) -> bool {
+    if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && state
+            .db
+            .get_oauth_token(token)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return true;
+    }
+
+    jar.get("session")
+        .map(|cookie| cookie.value())
+        .is_some_and(|token| {
+            crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+        })
+}
+
+async fn render_poll(
+    state: &PollsApiState,
+    id: &str,
+    include_user_votes: bool,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Get poll details
-    let poll = state.db.get_poll(&id).await?.ok_or(AppError::NotFound)?;
+    let poll = state.db.get_poll(id).await?.ok_or(AppError::NotFound)?;
+    let options = state.db.get_poll_options(id).await?;
 
-    // Get poll options
-    let options = state.db.get_poll_options(&id).await?;
+    let user_votes = if include_user_votes {
+        let Some(account) = state.db.get_account().await? else {
+            return Err(AppError::NotFound);
+        };
+        let account_address = format!("{}@{}", account.username, state.config.server.domain);
+        state.db.get_user_poll_votes(id, &account_address).await?
+    } else {
+        Vec::new()
+    };
 
-    // Get user's votes if authenticated
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let account_address = format!("{}@{}", account.username, state.config.server.domain);
-    let user_votes = state.db.get_user_poll_votes(&id, &account_address).await?;
-
-    // Convert option IDs to indices
     let own_votes: Vec<usize> = user_votes
         .iter()
         .filter_map(|vote_option_id| {
@@ -83,6 +142,23 @@ pub async fn get_poll(
     })))
 }
 
+/// GET /api/v1/polls/:id - Get a poll
+///
+/// View a poll attached to a status.
+pub async fn get_poll(
+    State(state): State<PollsApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, AppError> {
+    render_poll(
+        &state,
+        &id,
+        request_is_authenticated(&state, &headers, &jar).await,
+    )
+    .await
+}
+
 /// POST /api/v1/polls/:id/votes - Vote in a poll
 ///
 /// Vote on a poll attached to a status.
@@ -90,8 +166,14 @@ pub async fn vote_in_poll(
     State(state): State<PollsApiState>,
     CurrentUser(session): CurrentUser,
     Path(id): Path<String>,
-    Json(params): Json<VoteParams>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let params = parse_vote_params(&parts.headers, &body)?;
+
     // Validate choices
     if params.choices.is_empty() {
         return Err(AppError::Validation(
@@ -173,5 +255,6 @@ pub async fn vote_in_poll(
         .await?;
 
     // Return updated poll
-    get_poll(State(state), CurrentUser(session), Path(id)).await
+    let _ = session;
+    render_poll(&state, &id, true).await
 }

@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::accounts::resolve_remote_account_response;
+use super::accounts::{resolve_account_response_for_identity, resolve_remote_account_response};
 use crate::{SearchApiState, auth::CurrentUser, error::AppError};
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +172,82 @@ pub async fn search_v2(
                 }
             }
         }
+
+        {
+            let mut candidate_addresses = state
+                .db
+                .list_remote_profiles()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|profile| {
+                    profile
+                        .address
+                        .to_ascii_lowercase()
+                        .contains(&query.to_ascii_lowercase())
+                        || profile.display_name.as_ref().is_some_and(|value| {
+                            value
+                                .to_ascii_lowercase()
+                                .contains(&query.to_ascii_lowercase())
+                        })
+                })
+                .map(|profile| profile.address)
+                .collect::<Vec<_>>();
+            candidate_addresses.extend(
+                state
+                    .db
+                    .get_all_follow_addresses()
+                    .await
+                    .unwrap_or_default(),
+            );
+            candidate_addresses.extend(
+                state
+                    .db
+                    .get_all_follower_addresses()
+                    .await
+                    .unwrap_or_default(),
+            );
+            candidate_addresses.sort();
+            candidate_addresses.dedup();
+
+            for address in candidate_addresses {
+                let address_matches = address
+                    .to_ascii_lowercase()
+                    .contains(&query.to_ascii_lowercase());
+                let display_name_matches = state
+                    .profile_cache
+                    .get(&address)
+                    .await
+                    .and_then(|profile| profile.display_name.clone())
+                    .is_some_and(|value| {
+                        value
+                            .to_ascii_lowercase()
+                            .contains(&query.to_ascii_lowercase())
+                    });
+                if !address_matches && !display_name_matches {
+                    continue;
+                }
+
+                if let Some(remote_account) = resolve_remote_account_response(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    state.federation_fetch_client.as_ref(),
+                    &address,
+                )
+                .await
+                {
+                    let remote_identity =
+                        canonical_account_identity(&remote_account.acct, &local_domain);
+                    let already_present = accounts.iter().any(|account| {
+                        canonical_account_identity(&account.acct, &local_domain) == remote_identity
+                    });
+                    if !already_present {
+                        accounts.push(remote_account);
+                    }
+                }
+            }
+        }
         if params.following {
             accounts.retain(|account| {
                 let identity = canonical_account_identity(&account.acct, &local_domain);
@@ -180,6 +256,8 @@ pub async fn search_v2(
                     .any(|candidate| candidate == &identity)
             });
         }
+        let account_offset = params.offset.unwrap_or(0);
+        accounts = accounts.into_iter().skip(account_offset).collect();
         accounts.truncate(account_limit);
     }
 
@@ -193,14 +271,32 @@ pub async fn search_v2(
                 // Get account for status responses
                 if let Ok(Some(account)) = state.db.get_account().await {
                     let filtered_statuses = if let Some(account_id) = params.account_id.as_deref() {
-                        if account.id == account_id {
-                            found_statuses
-                                .into_iter()
-                                .filter(|status| status.is_local)
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        }
+                        let target_account = resolve_account_response_for_identity(
+                            state.config.as_ref(),
+                            state.db.as_ref(),
+                            state.profile_cache.as_ref(),
+                            Some(state.federation_fetch_client.as_ref()),
+                            account_id,
+                        )
+                        .await;
+                        found_statuses
+                            .into_iter()
+                            .filter(|status| {
+                                if status.is_local {
+                                    target_account
+                                        .as_ref()
+                                        .is_some_and(|target| target.id == account.id)
+                                } else {
+                                    target_account.as_ref().is_some_and(|target| {
+                                        canonical_account_identity(
+                                            &status.account_address,
+                                            &local_domain,
+                                        ) == canonical_account_identity(&target.acct, &local_domain)
+                                            || target.uri == status.account_address
+                                    })
+                                }
+                            })
+                            .collect::<Vec<_>>()
                     } else {
                         found_statuses
                     };
@@ -269,10 +365,15 @@ pub async fn search_v2(
         let tag = query.trim_start_matches('#');
         if !tag.is_empty() {
             let limit = params.limit.unwrap_or(20).min(40);
+            let offset = params.offset.unwrap_or(0);
 
-            match state.db.search_hashtags(tag, limit).await {
+            match state
+                .db
+                .search_hashtags(tag, limit.saturating_add(offset))
+                .await
+            {
                 Ok(found_tags) => {
-                    for (name, usage_count, _last_used) in found_tags {
+                    for (name, usage_count, _last_used) in found_tags.into_iter().skip(offset) {
                         hashtags.push(serde_json::json!({
                             "name": name,
                             "url": format!("https://{}/tags/{}", state.config.server.domain, name),
@@ -289,8 +390,11 @@ pub async fn search_v2(
                 }
             }
 
-            // If no results found, still return the searched tag if it looks valid
-            if hashtags.is_empty() && tag.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            // Preserve Mastodon-style synthetic discovery only for the first page.
+            if offset == 0
+                && hashtags.is_empty()
+                && tag.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
                 hashtags.push(serde_json::json!({
                     "name": tag,
                     "url": format!("https://{}/tags/{}", state.config.server.domain, tag),

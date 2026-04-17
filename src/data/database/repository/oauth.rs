@@ -225,6 +225,26 @@ impl Database {
         Ok(())
     }
 
+    /// Revoke OAuth token for a specific OAuth app only.
+    pub async fn revoke_oauth_token_for_app(
+        &self,
+        app_id: &str,
+        token: &str,
+    ) -> Result<(), AppError> {
+        let access_token_hash = hash_oauth_access_token(token);
+        let refresh_token_hash = hash_oauth_token_secret(token);
+        sqlx::query(
+            "UPDATE oauth_tokens SET revoked = 1 WHERE app_id = ? AND (access_token = ? OR refresh_token = ?)",
+        )
+        .bind(app_id)
+        .bind(&access_token_hash)
+        .bind(&refresh_token_hash)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Get OAuth token by refresh token.
     pub async fn get_oauth_token_by_refresh_token(
         &self,

@@ -101,13 +101,96 @@ impl Database {
     pub async fn get_conversations(
         &self,
         limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<(String, Option<String>, bool)>, AppError> {
-        let conversations = sqlx::query_as::<_, (String, Option<String>, i64)>(
-            "SELECT id, last_status_id, unread FROM conversations ORDER BY updated_at DESC LIMIT ?",
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let conversations = match (max_id, min_id) {
+            (Some(max_id), Some(min_id)) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    r#"
+                    SELECT id, last_status_id, unread
+                    FROM conversations
+                    WHERE (
+                        updated_at < (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id < ?
+                        )
+                    )
+                    AND (
+                        updated_at > (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id > ?
+                        )
+                    )
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(max_id)
+                .bind(max_id)
+                .bind(min_id)
+                .bind(min_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    r#"
+                    SELECT id, last_status_id, unread
+                    FROM conversations
+                    WHERE
+                        updated_at < (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id < ?
+                        )
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(max_id)
+                .bind(max_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(min_id)) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    r#"
+                    SELECT id, last_status_id, unread
+                    FROM conversations
+                    WHERE
+                        updated_at > (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id > ?
+                        )
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_id)
+                .bind(min_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    "SELECT id, last_status_id, unread FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?",
+                )
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
 
         Ok(conversations
             .into_iter()

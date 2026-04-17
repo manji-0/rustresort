@@ -144,11 +144,12 @@ impl Database {
         sqlx::query(
             r#"
             UPDATE media_attachments 
-            SET description = ?, blurhash = ?, width = ?, height = ?, focus_x = ?, focus_y = ?
+            SET description = ?, thumbnail_s3_key = ?, blurhash = ?, width = ?, height = ?, focus_x = ?, focus_y = ?
             WHERE id = ?
             "#,
         )
         .bind(&media.description)
+        .bind(&media.thumbnail_s3_key)
         .bind(&media.blurhash)
         .bind(media.width)
         .bind(media.height)

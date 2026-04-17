@@ -60,12 +60,19 @@ impl Database {
         if let Some(row) = result {
             let media_ids = parse_json_value(row.get::<Option<String>, _>("media_ids"));
             let poll_options = parse_json_value(row.get::<Option<String>, _>("poll_options"));
+            let media_attachments = self
+                .load_scheduled_media_attachments(
+                    media_ids.as_ref().and_then(|value| value.as_array()),
+                )
+                .await?;
+            let sensitive = row.get::<Option<String>, _>("content_warning").is_some();
             Ok(Some(serde_json::json!({
                 "id": row.get::<String, _>("id"),
                 "scheduled_at": row.get::<String, _>("scheduled_at"),
                 "params": {
                     "text": row.get::<String, _>("status_text"),
                     "visibility": row.get::<String, _>("visibility"),
+                    "sensitive": sensitive,
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
                     "quoted_status_id": row.get::<Option<String>, _>("quoted_status_id"),
@@ -81,7 +88,7 @@ impl Database {
                         None
                     }
                 },
-                "media_attachments": [],
+                "media_attachments": media_attachments,
                 "error": row.get::<Option<String>, _>("error")
             })))
         } else {
@@ -113,12 +120,19 @@ impl Database {
         for row in rows {
             let media_ids = parse_json_value(row.get::<Option<String>, _>("media_ids"));
             let poll_options = parse_json_value(row.get::<Option<String>, _>("poll_options"));
+            let media_attachments = self
+                .load_scheduled_media_attachments(
+                    media_ids.as_ref().and_then(|value| value.as_array()),
+                )
+                .await?;
+            let sensitive = row.get::<Option<String>, _>("content_warning").is_some();
             results.push(serde_json::json!({
                 "id": row.get::<String, _>("id"),
                 "scheduled_at": row.get::<String, _>("scheduled_at"),
                 "params": {
                     "text": row.get::<String, _>("status_text"),
                     "visibility": row.get::<String, _>("visibility"),
+                    "sensitive": sensitive,
                     "spoiler_text": row.get::<Option<String>, _>("content_warning"),
                     "in_reply_to_id": row.get::<Option<String>, _>("in_reply_to_id"),
                     "quoted_status_id": row.get::<Option<String>, _>("quoted_status_id"),
@@ -134,7 +148,7 @@ impl Database {
                         None
                     }
                 },
-                "media_attachments": [],
+                "media_attachments": media_attachments,
                 "error": row.get::<Option<String>, _>("error")
             }));
         }
@@ -230,5 +244,34 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    async fn load_scheduled_media_attachments(
+        &self,
+        media_ids: Option<&Vec<serde_json::Value>>,
+    ) -> Result<Vec<serde_json::Value>, AppError> {
+        let Some(media_ids) = media_ids else {
+            return Ok(Vec::new());
+        };
+
+        let mut attachments = Vec::new();
+        for media_id in media_ids.iter().filter_map(|value| value.as_str()) {
+            if let Some(media) = self.get_media(media_id).await? {
+                attachments.push(serde_json::json!({
+                    "id": media.id,
+                    "type": if media.content_type.starts_with("image/") {
+                        "image"
+                    } else if media.content_type.starts_with("video/") {
+                        "video"
+                    } else {
+                        "unknown"
+                    },
+                    "description": media.description,
+                    "blurhash": media.blurhash,
+                }));
+            }
+        }
+
+        Ok(attachments)
     }
 }

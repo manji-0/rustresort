@@ -3,9 +3,11 @@
 mod common;
 
 use common::TestServer;
+use futures::StreamExt;
 use rustresort::data::{EntityId, Follow};
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
 const REMOTE_ACTOR_ID: &str = "https://remote.example/users/alice";
 const REMOTE_ACTOR_ADDRESS: &str = "alice@remote.example";
@@ -71,6 +73,16 @@ async fn expect_no_sse_event(mut response: reqwest::Response, duration: Duration
     assert!(result.is_err(), "unexpected SSE event was received");
 }
 
+fn websocket_url(http_url: String) -> String {
+    if let Some(rest) = http_url.strip_prefix("http://") {
+        return format!("ws://{rest}");
+    }
+    if let Some(rest) = http_url.strip_prefix("https://") {
+        return format!("wss://{rest}");
+    }
+    http_url
+}
+
 #[tokio::test]
 async fn test_user_stream_receives_remote_followee_public_status_updates() {
     let server = TestServer::new().await;
@@ -126,6 +138,72 @@ async fn test_user_stream_receives_remote_followee_public_status_updates() {
     let json: Value = serde_json::from_str(&data).unwrap();
     assert_eq!(json["uri"], status_uri);
     assert_eq!(json["account"]["acct"], REMOTE_ACTOR_ADDRESS);
+}
+
+#[tokio::test]
+async fn test_stream_root_supports_websocket_upgrade() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let mut request = websocket_url(server.url("/api/v1/streaming?stream=user"))
+        .into_client_request()
+        .expect("websocket request");
+    request.headers_mut().insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+
+    let (mut socket, response) = connect_async(request).await.expect("websocket connect");
+    assert_eq!(response.status(), 101);
+
+    let create_status = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "websocket root event",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_status.status(), 200);
+
+    let message = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("timed out waiting for websocket event")
+        .expect("websocket should stay open")
+        .expect("websocket frame");
+    let text = message.into_text().expect("text frame");
+    let payload: Value = serde_json::from_str(&text).expect("valid websocket JSON");
+    assert_eq!(payload["stream"][0], "user");
+    assert_eq!(payload["event"], "update");
+    assert!(payload["payload"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_streaming_sse_sets_event_stream_content_type() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/user"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
 }
 
 #[tokio::test]
@@ -359,6 +437,83 @@ async fn test_hashtag_stream_receives_remote_public_status_updates() {
     assert_eq!(event_name, "update");
     let json: Value = serde_json::from_str(&data).unwrap();
     assert_eq!(json["uri"], status_uri);
+}
+
+#[tokio::test]
+async fn test_local_hashtag_stream_excludes_remote_statuses_and_receives_local_statuses() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: REMOTE_ACTOR_ADDRESS.to_string(),
+            actor_uri: Some(REMOTE_ACTOR_ID.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/stream-hashtag-local".to_string(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/hashtag?tag=LocalTag&local=true"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let key_id = register_default_remote_key(&server);
+    let remote_activity = serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://remote.example/activities/hashtag-stream-local-1",
+        "type": "Create",
+        "actor": REMOTE_ACTOR_ID,
+        "object": {
+            "type": "Note",
+            "attributedTo": REMOTE_ACTOR_ID,
+            "id": "https://remote.example/users/alice/statuses/hashtag-stream-local-1",
+            "content": "<p>remote #LocalTag</p>",
+            "published": "2026-01-01T00:00:00Z",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        }
+    });
+    let remote_response = server
+        .post_signed_activity("/inbox", &remote_activity, &key_id)
+        .await;
+    assert_eq!(remote_response.status(), reqwest::StatusCode::OK);
+    expect_no_sse_event(response, Duration::from_millis(750)).await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/hashtag?tag=LocalTag&local=true"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let create_status = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "local #LocalTag",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_status.status(), 200);
+
+    let (event_name, data) = read_sse_event(response).await;
+    assert_eq!(event_name, "update");
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["account"]["acct"], "testuser");
 }
 
 #[tokio::test]

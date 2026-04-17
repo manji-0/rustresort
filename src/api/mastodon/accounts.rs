@@ -8,7 +8,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::stream::{self, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::HashSet, convert::Infallible};
 
 use super::federation_delivery::{
@@ -65,6 +65,20 @@ pub struct UpdateCredentialsRequest {
     pub indexable: Option<bool>,
     #[serde(rename = "hide_collections")]
     pub _hide_collections: Option<bool>,
+    pub source: Option<UpdateCredentialsSourceRequest>,
+    #[serde(rename = "source[privacy]")]
+    pub source_privacy: Option<String>,
+    #[serde(rename = "source[sensitive]")]
+    pub source_sensitive: Option<bool>,
+    #[serde(rename = "source[language]")]
+    pub source_language: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateCredentialsSourceRequest {
+    pub privacy: Option<String>,
+    pub sensitive: Option<bool>,
+    pub language: Option<String>,
 }
 
 #[derive(Debug)]
@@ -85,6 +99,9 @@ struct ParsedUpdateCredentialsRequest {
     bot: Option<bool>,
     discoverable: Option<bool>,
     indexable: Option<bool>,
+    source_privacy: Option<String>,
+    source_sensitive: Option<bool>,
+    source_language: Option<Option<String>>,
 }
 
 /// Search query parameters
@@ -94,6 +111,7 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     pub resolve: Option<bool>,
     pub following: Option<bool>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,9 +119,166 @@ pub struct LookupParams {
     pub acct: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct FollowAccountRequest {
+    pub reblogs: Option<bool>,
+    pub notify: Option<bool>,
+}
+
 const MAX_UPDATE_CREDENTIALS_BODY_BYTES: usize = 12 * 1024 * 1024;
 const MAX_PROFILE_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PROFILE_IMAGE_DECODED_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_POSTING_PRIVACY: &str = "public";
+const POSTING_DEFAULT_VISIBILITY_KEY: &str = "posting.default.visibility";
+const POSTING_DEFAULT_SENSITIVE_KEY: &str = "posting.default.sensitive";
+const POSTING_DEFAULT_LANGUAGE_KEY: &str = "posting.default.language";
+
+#[derive(Debug, Clone)]
+struct PostingPreferences {
+    privacy: String,
+    sensitive: bool,
+    language: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FollowPreferences {
+    reblogs: bool,
+    notify: bool,
+}
+
+fn normalize_follow_setting_key_suffix(address: &str) -> String {
+    address.trim().to_ascii_lowercase()
+}
+
+fn follow_reblogs_setting_key(address: &str) -> String {
+    format!(
+        "follow_preferences.{}.reblogs",
+        normalize_follow_setting_key_suffix(address)
+    )
+}
+
+fn follow_notify_setting_key(address: &str) -> String {
+    format!(
+        "follow_preferences.{}.notify",
+        normalize_follow_setting_key_suffix(address)
+    )
+}
+
+async fn load_posting_preferences(state: &AccountApiState) -> Result<PostingPreferences, AppError> {
+    let privacy = state
+        .db
+        .get_setting(POSTING_DEFAULT_VISIBILITY_KEY)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_POSTING_PRIVACY.to_string());
+    let sensitive = state
+        .db
+        .get_setting(POSTING_DEFAULT_SENSITIVE_KEY)
+        .await?
+        .map(|value| matches!(value.trim(), "1" | "true"))
+        .unwrap_or(false);
+    let language = state
+        .db
+        .get_setting(POSTING_DEFAULT_LANGUAGE_KEY)
+        .await?
+        .and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+
+    Ok(PostingPreferences {
+        privacy,
+        sensitive,
+        language,
+    })
+}
+
+async fn save_posting_preferences(
+    state: &AccountApiState,
+    privacy: Option<String>,
+    sensitive: Option<bool>,
+    language: Option<Option<String>>,
+) -> Result<(), AppError> {
+    if let Some(privacy) = privacy {
+        let trimmed = privacy.trim();
+        let normalized = match trimmed {
+            "public" | "unlisted" | "private" | "direct" => trimmed,
+            _ => {
+                return Err(AppError::Validation(
+                    "source[privacy] must be one of: public, unlisted, private, direct".to_string(),
+                ));
+            }
+        };
+        state
+            .db
+            .set_setting(POSTING_DEFAULT_VISIBILITY_KEY, normalized)
+            .await?;
+    }
+
+    if let Some(sensitive) = sensitive {
+        state
+            .db
+            .set_setting(
+                POSTING_DEFAULT_SENSITIVE_KEY,
+                if sensitive { "true" } else { "false" },
+            )
+            .await?;
+    }
+
+    if let Some(language) = language {
+        state
+            .db
+            .set_setting(
+                POSTING_DEFAULT_LANGUAGE_KEY,
+                language.as_deref().unwrap_or_default(),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn load_follow_preferences(
+    state: &AccountApiState,
+    target_address: &str,
+) -> Result<FollowPreferences, AppError> {
+    let reblogs = state
+        .db
+        .get_setting(&follow_reblogs_setting_key(target_address))
+        .await?
+        .map(|value| !matches!(value.trim(), "0" | "false"))
+        .unwrap_or(true);
+    let notify = state
+        .db
+        .get_setting(&follow_notify_setting_key(target_address))
+        .await?
+        .map(|value| matches!(value.trim(), "1" | "true"))
+        .unwrap_or(false);
+
+    Ok(FollowPreferences { reblogs, notify })
+}
+
+async fn save_follow_preferences(
+    state: &AccountApiState,
+    target_address: &str,
+    preferences: FollowPreferences,
+) -> Result<(), AppError> {
+    state
+        .db
+        .set_setting(
+            &follow_reblogs_setting_key(target_address),
+            if preferences.reblogs { "true" } else { "false" },
+        )
+        .await?;
+    state
+        .db
+        .set_setting(
+            &follow_notify_setting_key(target_address),
+            if preferences.notify { "true" } else { "false" },
+        )
+        .await?;
+    Ok(())
+}
 
 fn parse_update_credentials_bool(field: &str, value: &str) -> Result<bool, AppError> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -171,6 +346,14 @@ fn apply_update_credentials_pair(
         "indexable" => {
             request.indexable = Some(parse_update_credentials_bool("indexable", &value)?);
         }
+        "source[privacy]" | "source.privacy" => request.source_privacy = Some(value),
+        "source[sensitive]" | "source.sensitive" => {
+            request.source_sensitive =
+                Some(parse_update_credentials_bool("source[sensitive]", &value)?);
+        }
+        "source[language]" | "source.language" => {
+            request.source_language = Some((!value.trim().is_empty()).then_some(value));
+        }
         "fields_attributes" => {
             let parsed = if value.trim().is_empty() {
                 serde_json::Value::Null
@@ -204,6 +387,26 @@ fn parse_update_credentials_json(body: &[u8]) -> Result<ParsedUpdateCredentialsR
         bot: request.bot,
         discoverable: request.discoverable,
         indexable: request.indexable,
+        source_privacy: request
+            .source
+            .as_ref()
+            .and_then(|source| source.privacy.clone())
+            .or(request.source_privacy),
+        source_sensitive: request
+            .source
+            .as_ref()
+            .and_then(|source| source.sensitive)
+            .or(request.source_sensitive),
+        source_language: request
+            .source
+            .as_ref()
+            .and_then(|source| source.language.clone())
+            .map(|value| (!value.trim().is_empty()).then_some(value))
+            .or_else(|| {
+                request
+                    .source_language
+                    .map(|value| (!value.trim().is_empty()).then_some(value))
+            }),
     })
 }
 
@@ -331,6 +534,34 @@ fn decode_base64_image_field(field: &str, encoded: &str) -> Result<Vec<u8>, AppE
         .map_err(|_| AppError::Validation(format!("{field} image is not valid base64")))?;
 
     normalize_image_bytes_to_webp(field, decoded)
+}
+
+fn parse_json_or_form_body<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    let parse_json = || {
+        serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")))
+    };
+    let parse_form = || {
+        serde_urlencoded::from_bytes(body)
+            .map_err(|error| AppError::Validation(format!("invalid form body: {error}")))
+    };
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return parse_form();
+    }
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return parse_json();
+    }
+
+    parse_json().or_else(|_| parse_form())
 }
 
 fn normalize_image_bytes_to_webp(field: &str, bytes: Vec<u8>) -> Result<Vec<u8>, AppError> {
@@ -915,19 +1146,13 @@ pub(crate) fn build_remote_account_placeholder_response(
     statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
-    let (username, id, acct, url) =
+    let (username, acct, url) =
         if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
             let (username, _domain) = parsed_address.split_once('@')?;
-            (
-                username.to_string(),
-                trimmed.to_string(),
-                parsed_address,
-                trimmed.to_string(),
-            )
+            (username.to_string(), parsed_address, trimmed.to_string())
         } else if let Some((username, domain)) = trimmed.split_once('@') {
             (
                 username.to_ascii_lowercase(),
-                trimmed.to_string(),
                 trimmed.to_string(),
                 format!(
                     "https://{}/@{}",
@@ -943,7 +1168,7 @@ pub(crate) fn build_remote_account_placeholder_response(
     let header = format!("{}/default-header.png", media_url);
 
     Some(AccountResponse {
-        id,
+        id: acct.clone(),
         username: username.clone(),
         acct,
         uri: url.clone(),
@@ -1333,23 +1558,24 @@ async fn normalize_moved_to_account_uri(
 async fn account_source_payload(
     state: &AccountApiState,
     account: &crate::data::Account,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, AppError> {
     let follow_requests_count = state
         .db
         .get_follow_request_addresses(500)
         .await
         .map(|requests| requests.len())
         .unwrap_or(0);
-    serde_json::json!({
+    let preferences = load_posting_preferences(state).await?;
+    Ok(serde_json::json!({
         "note": account.note.clone().unwrap_or_default(),
         "fields": crate::profile_fields::profile_fields_for_source(
             account.profile_fields_json.as_deref(),
         ),
-        "privacy": "public",
-        "sensitive": false,
-        "language": serde_json::Value::Null,
+        "privacy": preferences.privacy,
+        "sensitive": preferences.sensitive,
+        "language": preferences.language,
         "follow_requests_count": follow_requests_count,
-    })
+    }))
 }
 
 async fn resolve_remote_actor_and_inbox_with_hint(
@@ -1427,6 +1653,26 @@ async fn resolve_target_address(state: &AccountApiState, id: &str) -> Result<Str
     Err(AppError::Validation(
         "Invalid account ID format".to_string(),
     ))
+}
+
+async fn resolve_relationship_id(state: &AccountApiState, requested_id: &str) -> String {
+    if let Some(response) = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        Some(state.federation_fetch_client.as_ref()),
+        requested_id,
+    )
+    .await
+    {
+        return response.id;
+    }
+
+    if let Ok(address) = resolve_target_address(state, requested_id).await {
+        return address;
+    }
+
+    requested_id.to_string()
 }
 
 fn build_remote_account_stub(
@@ -1625,7 +1871,7 @@ pub async fn verify_credentials(
         }
         obj.insert(
             "source".to_string(),
-            account_source_payload(&state, &account).await,
+            account_source_payload(&state, &account).await?,
         );
     }
     Ok(Json(value))
@@ -1633,14 +1879,21 @@ pub async fn verify_credentials(
 
 /// GET /api/v1/preferences
 pub async fn preferences(
+    State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let preferences = load_posting_preferences(&state).await?;
     Ok(Json(serde_json::json!({
-        "posting:default:visibility": "public",
-        "posting:default:sensitive": false,
-        "posting:default:language": serde_json::Value::Null,
+        "posting:default:visibility": preferences.privacy,
+        "posting:default:sensitive": preferences.sensitive,
+        "posting:default:language": preferences.language,
+        "posting:default:privacy": preferences.privacy,
+        "posting:default:media_sensitive": preferences.sensitive,
         "reading:expand:media": "default",
         "reading:expand:spoilers": false,
+        "reading:autoplay:gifs": true,
+        "reading:display:media": "default",
+        "web:theme": "default",
     })))
 }
 
@@ -1670,6 +1923,9 @@ pub async fn update_credentials(
         bot,
         discoverable,
         indexable,
+        source_privacy,
+        source_sensitive,
+        source_language,
     } = req;
 
     let profile_fields_json =
@@ -1679,6 +1935,7 @@ pub async fn update_credentials(
         Some(value) => normalize_moved_to_account_uri(&state, value).await?,
         None => None,
     };
+    save_posting_preferences(&state, source_privacy, source_sensitive, source_language).await?;
 
     let avatar_bytes = match avatar {
         Some(ProfileImageInput::Encoded(encoded)) => {
@@ -1815,7 +2072,7 @@ pub async fn update_credentials(
         }
         obj.insert(
             "source".to_string(),
-            account_source_payload(&state, &account).await,
+            account_source_payload(&state, &account).await?,
         );
     }
     Ok(Json(value))
@@ -1935,11 +2192,10 @@ pub async fn get_account_followers(
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-
-    if account.id.as_str() != id {
-        return Err(AppError::NotFound);
+    let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
+    if !local_requested {
+        return Ok(Json(Vec::new()));
     }
 
     let follower_entries = state.db.get_all_followers().await?;
@@ -2004,11 +2260,10 @@ pub async fn get_account_following(
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Get the account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-
-    if account.id.as_str() != id {
-        return Err(AppError::NotFound);
+    let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
+    if !local_requested {
+        return Ok(Json(Vec::new()));
     }
 
     let following_entries = state.db.get_all_follows().await?;
@@ -2072,6 +2327,7 @@ pub async fn follow_account(
     State(state): State<AccountApiState>,
     CurrentUser(_user): CurrentUser,
     Path(id): Path<String>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
     use crate::data::{EntityId, Follow};
@@ -2086,6 +2342,19 @@ pub async fn follow_account(
         "{}@{}",
         account.username, state.config.server.domain
     ))?;
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let follow_request = if body.is_empty() {
+        FollowAccountRequest::default()
+    } else {
+        parse_json_or_form_body::<FollowAccountRequest>(&parts.headers, &body)?
+    };
+    let follow_preferences = FollowPreferences {
+        reblogs: follow_request.reblogs.unwrap_or(true),
+        notify: follow_request.notify.unwrap_or(false),
+    };
 
     if is_same_local_account(
         &target_address,
@@ -2114,6 +2383,7 @@ pub async fn follow_account(
         .db
         .insert_follow_if_absent(&follow, default_port)
         .await?;
+    save_follow_preferences(&state, &target_address, follow_preferences).await?;
 
     if inserted {
         let state_for_delivery = state.clone();
@@ -2151,9 +2421,11 @@ pub async fn follow_account(
         });
     }
 
+    let relationship_id = resolve_relationship_id(&state, &id).await;
+
     // Return relationship response
     let relationship = RelationshipResponse {
-        id: id.clone(),
+        id: relationship_id,
         following: true, // We just followed
         followed_by: false,
         blocking: false,
@@ -2162,9 +2434,9 @@ pub async fn follow_account(
         muting_notifications: false,
         requested: false,
         domain_blocking: false,
-        showing_reblogs: true,
+        showing_reblogs: follow_preferences.reblogs,
         endorsed: false,
-        notifying: false,
+        notifying: follow_preferences.notify,
         note: String::new(),
     };
 
@@ -2248,7 +2520,7 @@ pub async fn unfollow_account(
 
     // Return relationship response
     let relationship = RelationshipResponse {
-        id: id.clone(),
+        id: resolve_relationship_id(&state, &id).await,
         following: false, // We just unfollowed
         followed_by: false,
         blocking: false,
@@ -2330,7 +2602,7 @@ pub async fn get_relationships(
             Ok(address) => address,
             Err(_) => {
                 let relationship = RelationshipResponse {
-                    id: id.clone(),
+                    id: resolve_relationship_id(&state, &id).await,
                     following: false,
                     followed_by: false,
                     blocking: false,
@@ -2385,9 +2657,10 @@ pub async fn get_relationships(
             .db
             .has_follow_request_with_default_port(&target_address, default_port)
             .await?;
+        let follow_preferences = load_follow_preferences(&state, &target_address).await?;
 
         let relationship = RelationshipResponse {
-            id: id.clone(),
+            id: resolve_relationship_id(&state, &id).await,
             following,
             followed_by,
             blocking,
@@ -2396,9 +2669,9 @@ pub async fn get_relationships(
             muting_notifications,
             requested,
             domain_blocking: false,
-            showing_reblogs: !blocking,
+            showing_reblogs: follow_preferences.reblogs,
             endorsed: false,
-            notifying: false,
+            notifying: follow_preferences.notify,
             note: String::new(),
         };
 
@@ -2432,6 +2705,7 @@ pub async fn search_accounts(
         .contains('@')
         .then(|| canonical_account_identity(&query, &local_domain));
     let mut matched_local_account = false;
+    let limit = params.limit.unwrap_or(40).min(80);
 
     // Check if query matches our username
     if account.username.to_lowercase().contains(&query)
@@ -2456,6 +2730,78 @@ pub async fn search_accounts(
         populate_local_account_compat_fields(&state, &account, &mut account_response).await;
         results.push(serde_json::to_value(account_response).unwrap());
         matched_local_account = true;
+    }
+
+    {
+        let mut candidate_addresses = state
+            .db
+            .list_remote_profiles()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|profile| {
+                profile.address.to_ascii_lowercase().contains(&query)
+                    || profile
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&query))
+            })
+            .map(|profile| profile.address)
+            .collect::<Vec<_>>();
+        candidate_addresses.extend(
+            state
+                .db
+                .get_all_follow_addresses()
+                .await
+                .unwrap_or_default(),
+        );
+        candidate_addresses.extend(
+            state
+                .db
+                .get_all_follower_addresses()
+                .await
+                .unwrap_or_default(),
+        );
+        candidate_addresses.sort();
+        candidate_addresses.dedup();
+
+        for address in candidate_addresses {
+            let address_matches = address.to_ascii_lowercase().contains(&query);
+            let display_name_matches = state
+                .profile_cache
+                .get(&address)
+                .await
+                .and_then(|profile| profile.display_name.clone())
+                .is_some_and(|value| value.to_ascii_lowercase().contains(&query));
+            if !address_matches && !display_name_matches {
+                continue;
+            }
+
+            if let Some(remote_account) = resolve_remote_account_response_for_list(
+                state.config.as_ref(),
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                state.federation_fetch_client.as_ref(),
+                &address,
+                default_port_for_protocol(&state.config.server.protocol),
+            )
+            .await
+            {
+                let remote_identity =
+                    canonical_account_identity(&remote_account.acct, &local_domain);
+                let already_present = results.iter().any(|entry| {
+                    entry
+                        .get("acct")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|acct| {
+                            canonical_account_identity(acct, &local_domain) == remote_identity
+                        })
+                });
+                if !already_present {
+                    results.push(serde_json::to_value(remote_account).unwrap());
+                }
+            }
+        }
     }
 
     // If resolve=true and query looks like an account address, resolve and return profile info.
@@ -2527,8 +2873,8 @@ pub async fn search_accounts(
         });
     }
 
-    // Apply limit
-    let limit = params.limit.unwrap_or(40).min(80);
+    let offset = params.offset.unwrap_or(0);
+    results = results.into_iter().skip(offset).collect();
     results.truncate(limit);
 
     Ok(Json(results))
@@ -2545,15 +2891,35 @@ pub async fn lookup_account(
         return Err(AppError::Validation("acct is required".to_string()));
     }
 
-    let response = resolve_account_response_for_identity(
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let response = if local_account_matches_identity(&account, state.config.as_ref(), identity) {
+        let stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+        let mut response =
+            crate::api::account_to_response_with_stats(&account, &state.config, stats);
+        populate_local_account_compat_fields(&state, &account, &mut response).await;
+        response
+    } else if let Some(response) = resolve_cached_remote_account_response(
         state.config.as_ref(),
         state.db.as_ref(),
         state.profile_cache.as_ref(),
-        Some(state.federation_fetch_client.as_ref()),
         identity,
     )
     .await
-    .ok_or(AppError::NotFound)?;
+    {
+        response
+    } else if let Some(response) = resolve_remote_account_response(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        identity,
+    )
+    .await
+    {
+        response
+    } else {
+        return Err(AppError::NotFound);
+    };
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }

@@ -2058,7 +2058,7 @@ fn render_app(model: &Model) -> String {
       <div class="brand-copy">
         <p class="micro-label">Rust/WASM</p>
         <h1>{brand_title}</h1>
-        <p class="lede">Integrated client tuned to Mastodon-compatible APIs first, with RustResort admin controls layered beside it.</p>
+        <p class="lede">Mastodon-compatible client for RustResort, with admin controls kept separate from the reading surface.</p>
       </div>
     </div>
     <nav class="sidebar-nav" aria-label="Primary feeds">
@@ -2124,8 +2124,8 @@ fn render_app(model: &Model) -> String {
     <section class="rail-card" aria-labelledby="notifications-title">
       <div class="rail-card-head">
         <div>
-          <p class="micro-label">Notifications</p>
-          <h3 id="notifications-title">Signals</h3>
+          <p class="micro-label">Activity</p>
+          <h3 id="notifications-title">Notifications</h3>
         </div>
         {notification_count}
       </div>
@@ -2784,6 +2784,13 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
         &primary.account.acct,
     );
     let content_markup = render_status_content(primary, expanded);
+    let thread_button = if expanded {
+        String::new()
+    } else {
+        format!(
+            r#"<button class="action-pill status-thread-link" data-select-status="{select_target}">Thread</button>"#
+        )
+    };
 
     let is_selected = model.selected_status_id.as_deref() == Some(primary.id.as_str());
 
@@ -2806,11 +2813,11 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
       </div>
     </div>
   </div>
-  <button class="status-thread-link" data-select-status="{select_target}">Open thread</button>
   {spoiler}
   <div class="status-content">{content}</div>
   {media}
   <div class="status-actions">
+    {thread_button}
     <button class="action-pill" data-reply-status="{action_target}" data-reply-label="{reply_label}">Reply {replies}</button>
     <button class="action-pill {favourite_active}" data-status-action="{favourite_action}" data-status-id="{action_target}">Like {favourites}</button>
     <button class="action-pill {reblog_active}" data-status-action="{reblog_action}" data-status-id="{action_target}">Boost {reblogs}</button>
@@ -2844,6 +2851,7 @@ fn render_status_card(status: &Status, model: &Model, compact: bool, expanded: b
         spoiler = spoiler,
         content = content_markup,
         media = media,
+        thread_button = thread_button,
         action_target = action_target,
         reply_label = encode_attribute(&reply_label),
         replies = primary.replies_count,

@@ -21,6 +21,8 @@ pub trait MediaStorageRepository: Send + Sync {
     ) -> Result<String, AppError>;
     async fn upload_avatar(&self, id: &str, data: Vec<u8>) -> Result<(String, String), AppError>;
     async fn upload_header(&self, id: &str, data: Vec<u8>) -> Result<(String, String), AppError>;
+    async fn upload_thumbnail(&self, id: &str, data: Vec<u8>)
+    -> Result<(String, String), AppError>;
     async fn delete(&self, key: &str) -> Result<(), AppError>;
     fn get_public_url(&self, key: &str) -> String;
 }
@@ -49,6 +51,14 @@ impl MediaStorageRepository for MediaStorage {
 
     async fn upload_header(&self, id: &str, data: Vec<u8>) -> Result<(String, String), AppError> {
         MediaStorage::upload_header(self, id, data).await
+    }
+
+    async fn upload_thumbnail(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> Result<(String, String), AppError> {
+        MediaStorage::upload_thumbnail(self, id, data).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), AppError> {

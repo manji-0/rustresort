@@ -7,7 +7,10 @@ use axum::{
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Digest;
@@ -51,8 +54,8 @@ pub struct TokenRequest {
     pub grant_type: String,
     pub code: Option<String>,
     pub code_verifier: Option<String>,
-    pub client_id: String,
-    pub client_secret: String,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub redirect_uri: Option<String>,
     pub refresh_token: Option<String>,
     pub scope: Option<String>,
@@ -71,8 +74,8 @@ pub struct AuthorizeRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeTokenRequest {
-    pub client_id: String,
-    pub client_secret: String,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub token: String,
 }
 
@@ -246,6 +249,58 @@ fn current_local_session(
     }
 
     None
+}
+
+fn parse_basic_client_auth(headers: &HeaderMap) -> Result<Option<(String, String)>, AppError> {
+    let Some(authorization) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Ok(None);
+    };
+
+    let Some(encoded) = authorization.strip_prefix("Basic ") else {
+        return Ok(None);
+    };
+
+    let decoded = BASE64_STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| AppError::Unauthorized)?;
+    let decoded = String::from_utf8(decoded).map_err(|_| AppError::Unauthorized)?;
+    let (client_id, client_secret) = decoded.split_once(':').ok_or(AppError::Unauthorized)?;
+
+    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(Some((
+        client_id.trim().to_string(),
+        client_secret.trim().to_string(),
+    )))
+}
+
+fn resolve_client_credentials(
+    headers: &HeaderMap,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<(String, String), AppError> {
+    if let Some((basic_client_id, basic_client_secret)) = parse_basic_client_auth(headers)? {
+        return Ok((basic_client_id, basic_client_secret));
+    }
+
+    let client_id = client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Validation("client_id is required".to_string()))?;
+    let client_secret = client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Validation("client_secret is required".to_string()))?;
+
+    Ok((client_id.to_string(), client_secret.to_string()))
 }
 
 async fn validate_authorize_request(
@@ -510,12 +565,15 @@ pub async fn create_token(
         return Err(AppError::Validation("invalid grant_type".to_string()));
     }
 
+    let (client_id, client_secret) =
+        resolve_client_credentials(&headers, req.client_id.clone(), req.client_secret.clone())?;
+
     let app = state
         .db
-        .get_oauth_app_by_client_id(&req.client_id)
+        .get_oauth_app_by_client_id(&client_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    if !verify_client_secret(&app.client_secret, &req.client_secret) {
+    if !verify_client_secret(&app.client_secret, &client_secret) {
         return Err(AppError::Unauthorized);
     }
 
@@ -662,15 +720,20 @@ pub async fn revoke_token(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let req: RevokeTokenRequest = parse_body(&headers, &body)?;
+    let (client_id, client_secret) =
+        resolve_client_credentials(&headers, req.client_id, req.client_secret)?;
     let app = state
         .db
-        .get_oauth_app_by_client_id(&req.client_id)
+        .get_oauth_app_by_client_id(&client_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    if !verify_client_secret(&app.client_secret, &req.client_secret) {
+    if !verify_client_secret(&app.client_secret, &client_secret) {
         return Err(AppError::Unauthorized);
     }
-    state.db.revoke_oauth_token(&req.token).await?;
+    state
+        .db
+        .revoke_oauth_token_for_app(&app.id, &req.token)
+        .await?;
     Ok(Json(serde_json::json!({})))
 }
 

@@ -502,6 +502,16 @@ fn object_has_embedded_status_content(object: &serde_json::Value) -> bool {
     })
 }
 
+fn object_is_misskey_talk(object: &serde_json::Value) -> bool {
+    [
+        "_misskey_talk",
+        "misskey:_misskey_talk",
+        "https://misskey-hub.net/ns#_misskey_talk",
+    ]
+    .into_iter()
+    .any(|key| object.get(key).and_then(serde_json::Value::as_bool) == Some(true))
+}
+
 fn extract_regular_announce_object_uri(object: &serde_json::Value) -> Option<&str> {
     if object.is_string() {
         return object.as_str();
@@ -928,6 +938,9 @@ impl ActivityProcessor {
                     {
                         return PersistenceDecision::Persist;
                     }
+                    if object_is_misskey_talk(object) {
+                        return PersistenceDecision::Ignore;
+                    }
                     // Create from followee -> Persist for durable timelines and restart safety.
                     if actor_is_followee && !suppress_timeline_visibility {
                         return PersistenceDecision::Persist;
@@ -956,6 +969,9 @@ impl ActivityProcessor {
                             .is_some_and(|quote_uri| self.is_local_status(quote_uri))
                         {
                             return PersistenceDecision::Persist;
+                        }
+                        if object_is_misskey_talk(object) {
+                            return PersistenceDecision::Ignore;
                         }
                         if actor_is_followee && !suppress_timeline_visibility {
                             return PersistenceDecision::Persist;
@@ -3278,7 +3294,10 @@ impl ActivityProcessor {
                 targets.insert(StreamTarget::Public);
                 targets.insert(StreamTarget::PublicLocal);
                 for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
-                    targets.insert(StreamTarget::Hashtag { hashtag });
+                    targets.insert(StreamTarget::Hashtag {
+                        hashtag: hashtag.clone(),
+                    });
+                    targets.insert(StreamTarget::HashtagLocal { hashtag });
                 }
             }
             StatusVisibility::Direct => {
@@ -3390,6 +3409,9 @@ impl ActivityProcessor {
 
     fn extract_visibility(&self, object: &serde_json::Value) -> String {
         const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
+        if object_is_misskey_talk(object) {
+            return "direct".to_string();
+        }
         let Some((local_username, local_domain)) = self.local_address.split_once('@') else {
             return "private".to_string();
         };
@@ -3903,6 +3925,56 @@ mod tests {
         });
 
         assert_eq!(processor.extract_visibility(&object), "direct");
+    }
+
+    #[tokio::test]
+    async fn extract_visibility_treats_misskey_talk_as_direct() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "type": "Note",
+            "_misskey_talk": true,
+            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        });
+
+        assert_eq!(processor.extract_visibility(&object), "direct");
+    }
+
+    #[tokio::test]
+    async fn decide_persistence_ignores_misskey_talk_from_followee_without_local_target() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let activity = json!({
+            "type": "Create",
+            "object": {
+                "type": "Note",
+                "_misskey_talk": true,
+                "content": "<p>chat</p>",
+                "to": ["https://remote.example/users/carol"]
+            }
+        });
+
+        assert_eq!(
+            processor.decide_persistence(&activity, true, false),
+            PersistenceDecision::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_persistence_persists_misskey_talk_when_addressed_to_local_actor() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let activity = json!({
+            "type": "Create",
+            "object": {
+                "type": "Note",
+                "_misskey_talk": true,
+                "content": "<p>chat</p>",
+                "to": ["https://example.com/users/alice"]
+            }
+        });
+
+        assert_eq!(
+            processor.decide_persistence(&activity, true, false),
+            PersistenceDecision::Persist
+        );
     }
 
     #[test]

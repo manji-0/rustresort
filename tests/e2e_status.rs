@@ -798,6 +798,56 @@ async fn test_delete_status() {
 }
 
 #[tokio::test]
+async fn test_create_status_applies_media_attributes_from_form_payload() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    use chrono::Utc;
+    use rustresort::data::{EntityId, MediaAttachment};
+
+    let media = MediaAttachment {
+        id: EntityId::new_string(),
+        status_id: None,
+        s3_key: "media/form-image.webp".to_string(),
+        thumbnail_s3_key: None,
+        content_type: "image/webp".to_string(),
+        file_size: 1234,
+        description: None,
+        blurhash: None,
+        width: Some(64),
+        height: Some(64),
+        focus_x: None,
+        focus_y: None,
+        created_at: Utc::now(),
+    };
+    server.state.db.insert_media(&media).await.unwrap();
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("status", "media attrs"),
+            ("media_ids[]", media.id.as_str()),
+            ("media_attributes[0][id]", media.id.as_str()),
+            ("media_attributes[0][description]", "alt text"),
+            ("media_attributes[0][focus]", "0.1,-0.2"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["media_attachments"][0]["description"], "alt text");
+    assert_eq!(
+        body["media_attachments"][0]["meta"]["original"]["focus"],
+        "0.100,-0.200"
+    );
+}
+
+#[tokio::test]
 async fn test_favourite_status() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -1357,6 +1407,72 @@ async fn test_status_context_limits_descendants() {
 }
 
 #[tokio::test]
+async fn test_private_status_context_is_hidden_without_auth_and_visible_with_auth() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let root = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/private-root".to_string(),
+        content: "<p>Private root</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Private,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    let reply = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/private-reply".to_string(),
+        content: "<p>Private reply</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Private,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(root.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&root).await.unwrap();
+    server.state.db.insert_status(&reply).await.unwrap();
+
+    let hidden = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/context", root.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), 404);
+
+    let visible = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{}/context", root.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(visible.status(), 200);
+    let body: Value = visible.json().await.unwrap();
+    let descendants = body["descendants"].as_array().unwrap();
+    assert_eq!(descendants.len(), 1);
+    assert_eq!(descendants[0]["id"], reply.id);
+}
+
+#[tokio::test]
 async fn test_status_source_returns_plain_text() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -1449,6 +1565,58 @@ async fn test_status_history_contains_previous_version_after_edit() {
         first_created_at >= second_created_at,
         "history should be returned in non-increasing revision timestamp order"
     );
+    assert!(items[0]["media_attachments"].is_array());
+    assert!(items[0]["emojis"].is_array());
+    assert!(items[0].get("poll").is_some());
+    assert!(items[0].get("quote").is_some());
+}
+
+#[tokio::test]
+async fn test_update_status_can_change_language_and_poll() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "poll edit target",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600
+            },
+            "language": "en"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let update_response = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("language", "ja"),
+            ("poll[options][]", "maybe"),
+            ("poll[options][]", "later"),
+            ("poll[expires_in]", "1200"),
+            ("poll[multiple]", "true"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+    let updated: Value = update_response.json().await.unwrap();
+    assert_eq!(updated["language"], "ja");
+    assert_eq!(updated["poll"]["multiple"], true);
+    let options = updated["poll"]["options"].as_array().unwrap();
+    assert_eq!(options[0]["title"], "maybe");
+    assert_eq!(options[1]["title"], "later");
 }
 
 #[tokio::test]

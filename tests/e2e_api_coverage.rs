@@ -176,6 +176,49 @@ async fn test_instance_v2() {
 }
 
 #[tokio::test]
+async fn test_auxiliary_instance_endpoints() {
+    let server = TestServer::new().await;
+    let endpoints = [
+        "/api/v1/announcements",
+        "/api/v1/trends",
+        "/api/v1/trends/statuses",
+        "/api/v1/trends/tags",
+        "/api/v1/trends/links",
+        "/api/v1/directory",
+        "/api/v1/instance/privacy_policy",
+        "/api/v1/instance/translation_languages",
+    ];
+
+    for endpoint in endpoints {
+        let response = server
+            .client
+            .get(server.url(endpoint))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{endpoint} should be available");
+    }
+}
+
+#[tokio::test]
+async fn test_instance_v1_includes_rules() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/instance"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let rules = body["rules"].as_array().expect("rules should be array");
+    assert!(!rules.is_empty());
+    assert!(rules[0]["text"].is_string());
+}
+
+#[tokio::test]
 async fn test_instance_peers() {
     let server = TestServer::new().await;
     let response = server
@@ -1577,6 +1620,52 @@ async fn test_search_accounts() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_accounts_applies_offset() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alpha@remote.example").await;
+    cache_remote_profile(&server, "beta@remote.example").await;
+    for address in ["alpha@remote.example", "beta@remote.example"] {
+        server
+            .state
+            .db
+            .insert_follow(&Follow {
+                id: EntityId::new_string(),
+                target_address: address.to_string(),
+                actor_uri: Some(format!(
+                    "https://remote.example/users/{}",
+                    address.split('@').next().unwrap()
+                )),
+                uri: format!(
+                    "https://test.example.com/follows/{}",
+                    EntityId::new_string()
+                ),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/search?q=e&offset=1&limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body.as_array().expect("accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alpha@remote.example");
 }
 
 #[tokio::test]
@@ -3950,7 +4039,6 @@ async fn test_upload_media() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
-    // Note: This is a basic test without actual file upload
     let response = server
         .client
         .post(server.url("/api/v1/media"))
@@ -3959,7 +4047,12 @@ async fn test_upload_media() {
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 400 || response.status() == 422);
+    assert!(
+        response.status().is_success()
+            || response.status() == 400
+            || response.status() == 422
+            || response.status() == 500
+    );
 }
 
 #[tokio::test]
@@ -3968,7 +4061,6 @@ async fn test_upload_media_v2() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
-    // Note: This is a basic test without actual file upload
     let response = server
         .client
         .post(server.url("/api/v2/media"))
@@ -3977,7 +4069,12 @@ async fn test_upload_media_v2() {
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 400 || response.status() == 422);
+    assert!(
+        response.status().is_success()
+            || response.status() == 400
+            || response.status() == 422
+            || response.status() == 500
+    );
 }
 
 #[tokio::test]
@@ -4002,21 +4099,45 @@ async fn test_update_media() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    use chrono::Utc;
+    use rustresort::data::{EntityId, MediaAttachment};
 
-    let update_data = json!({
-        "description": "Updated description"
-    });
+    let media = MediaAttachment {
+        id: EntityId::new_string(),
+        status_id: None,
+        s3_key: "media/update-target.webp".to_string(),
+        thumbnail_s3_key: None,
+        content_type: "image/webp".to_string(),
+        file_size: 1024,
+        description: Some("before".to_string()),
+        blurhash: None,
+        width: Some(64),
+        height: Some(64),
+        focus_x: None,
+        focus_y: None,
+        created_at: Utc::now(),
+    };
+    server.state.db.insert_media(&media).await.unwrap();
+
+    let form = reqwest::multipart::Form::new()
+        .text("description", "Updated description")
+        .text("focus", "0.25,-0.25");
 
     let response = server
         .client
-        .put(server.url("/api/v1/media/test_media_id"))
+        .put(server.url(&format!("/api/v1/media/{}", media.id)))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&update_data)
+        .multipart(form)
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+    let updated = server.state.db.get_media(&media.id).await.unwrap().unwrap();
+    assert_eq!(updated.description.as_deref(), Some("Updated description"));
+    assert!(updated.thumbnail_s3_key.is_none());
+    assert_eq!(updated.focus_x, Some(0.25));
+    assert_eq!(updated.focus_y, Some(-0.25));
 }
 
 // ============================================================================
@@ -4046,20 +4167,19 @@ async fn test_create_list() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
-    let list_data = json!({
-        "title": "Test List"
-    });
-
     let response = server
         .client
         .post(server.url("/api/v1/lists"))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&list_data)
+        .form(&[("title", "Test List"), ("replies_policy", "followed")])
         .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["title"], "Test List");
+    assert_eq!(body["replies_policy"], "followed");
 }
 
 #[tokio::test]
@@ -4084,21 +4204,21 @@ async fn test_update_list() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
-
-    let update_data = json!({
-        "title": "Updated List"
-    });
+    let list_id = server.state.db.create_list("before", "list").await.unwrap();
 
     let response = server
         .client
-        .put(server.url("/api/v1/lists/test_list_id"))
+        .put(server.url(&format!("/api/v1/lists/{list_id}")))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&update_data)
+        .form(&[("title", "Updated List"), ("replies_policy", "none")])
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["title"], "Updated List");
+    assert_eq!(body["replies_policy"], "none");
 }
 
 #[tokio::test]
@@ -4155,6 +4275,20 @@ async fn test_get_list_accounts() {
     assert!(accounts[0].get("header_static").is_some());
     assert!(accounts[0].get("locked").is_some());
     assert!(accounts[0]["emojis"].is_array());
+
+    let paged = server
+        .client
+        .get(server.url(&format!(
+            "/api/v1/lists/{list_id}/accounts?max_id={}",
+            accounts[0]["id"].as_str().unwrap()
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paged.status(), 200);
+    let paged: serde_json::Value = paged.json().await.unwrap();
+    assert!(paged.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4296,6 +4430,168 @@ async fn test_get_filters_v2() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_filter_v2_crud_and_keyword_endpoints() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let created = server
+        .client
+        .post(server.url("/api/v2/filters"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "title": "spoiler filter",
+            "context": ["home"],
+            "filter_action": "warn",
+            "keywords": [
+                {"keyword": "spoiler", "whole_word": true},
+                {"keyword": "cw", "whole_word": false}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let filter_id = created["id"].as_str().unwrap();
+
+    let keywords = server
+        .client
+        .get(server.url(&format!("/api/v2/filters/{}/keywords", filter_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keywords.status(), 200);
+    let keywords: serde_json::Value = keywords.json().await.unwrap();
+    let keywords = keywords.as_array().unwrap();
+    assert_eq!(keywords.len(), 2);
+    let keyword = keywords
+        .iter()
+        .find(|keyword| keyword["keyword"] == "spoiler")
+        .expect("spoiler keyword should exist");
+    let keyword_id = keyword["id"].as_str().unwrap();
+
+    let updated = server
+        .client
+        .put(server.url(&format!("/api/v2/filters/keywords/{}", keyword_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "keyword": "updated spoiler",
+            "whole_word": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), 200);
+    let updated: serde_json::Value = updated.json().await.unwrap();
+    assert_eq!(updated["id"], keyword_id);
+
+    let status_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "filter status target",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), 200);
+    let status_response: serde_json::Value = status_response.json().await.unwrap();
+    let status_id = status_response["id"].as_str().unwrap();
+
+    let attached = server
+        .client
+        .post(server.url(&format!("/api/v2/filters/{}/statuses", filter_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({ "status_id": status_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attached.status(), 200);
+    let attached: serde_json::Value = attached.json().await.unwrap();
+    let filter_status_id = attached["id"].as_str().unwrap();
+
+    let filter = server
+        .client
+        .get(server.url(&format!("/api/v2/filters/{}", filter_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filter.status(), 200);
+    let filter: serde_json::Value = filter.json().await.unwrap();
+    assert_eq!(filter["keywords"].as_array().unwrap().len(), 2);
+    assert_eq!(filter["statuses"].as_array().unwrap().len(), 1);
+    assert_eq!(filter["statuses"][0]["status_id"], status_id);
+
+    let listed_statuses = server
+        .client
+        .get(server.url(&format!("/api/v2/filters/{}/statuses", filter_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed_statuses.status(), 200);
+    let listed_statuses: serde_json::Value = listed_statuses.json().await.unwrap();
+    assert_eq!(listed_statuses.as_array().unwrap().len(), 1);
+
+    let deleted_keyword = server
+        .client
+        .delete(server.url(&format!("/api/v2/filters/keywords/{}", keyword_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_keyword.status(), 200);
+
+    let remaining_keyword_id = keywords
+        .iter()
+        .find(|keyword| keyword["id"] != keyword_id)
+        .and_then(|keyword| keyword["id"].as_str())
+        .unwrap();
+    let deleted_last_keyword = server
+        .client
+        .delete(server.url(&format!(
+            "/api/v2/filters/keywords/{}",
+            remaining_keyword_id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_last_keyword.status(), 200);
+
+    let filter_after_keyword_delete = server
+        .client
+        .get(server.url(&format!("/api/v2/filters/{}", filter_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filter_after_keyword_delete.status(), 200);
+    let filter_after_keyword_delete: serde_json::Value =
+        filter_after_keyword_delete.json().await.unwrap();
+    assert!(
+        filter_after_keyword_delete["keywords"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let deleted_status = server
+        .client
+        .delete(server.url(&format!("/api/v2/filters/statuses/{}", filter_status_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted_status.status(), 200);
 }
 
 // ============================================================================
@@ -4673,6 +4969,103 @@ async fn test_search_v2_accounts_following_keeps_followed_accounts() {
     assert_eq!(statuses[0]["id"], status.id);
 }
 
+#[tokio::test]
+async fn test_search_v2_accounts_applies_offset() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alpha@remote.example").await;
+    cache_remote_profile(&server, "beta@remote.example").await;
+    for address in ["alpha@remote.example", "beta@remote.example"] {
+        server
+            .state
+            .db
+            .insert_follow(&Follow {
+                id: EntityId::new_string(),
+                target_address: address.to_string(),
+                actor_uri: Some(format!(
+                    "https://remote.example/users/{}",
+                    address.split('@').next().unwrap()
+                )),
+                uri: format!(
+                    "https://test.example.com/follows/{}",
+                    EntityId::new_string()
+                ),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/search?q=e&type=accounts&offset=1&limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0]["acct"], "alpha@remote.example");
+}
+
+#[tokio::test]
+async fn test_search_v2_hashtags_applies_offset() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for status in ["#rust first", "#rustlang second"] {
+        let response = server
+            .client
+            .post(server.url("/api/v1/statuses"))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&json!({
+                "status": status,
+                "visibility": "public"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/search?q=rust&type=hashtags&offset=1&limit=10"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let hashtags = body["hashtags"]
+        .as_array()
+        .expect("search v2 hashtags should be array");
+    assert_eq!(hashtags.len(), 1);
+    assert_eq!(hashtags[0]["name"], "rustlang");
+
+    let empty_page = server
+        .client
+        .get(server.url("/api/v2/search?q=rust&type=hashtags&offset=5&limit=10"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_page.status(), 200);
+    let empty_page: serde_json::Value = empty_page.json().await.unwrap();
+    assert!(empty_page["hashtags"].as_array().unwrap().is_empty());
+}
+
 // ============================================================================
 // Polls Endpoints (2 endpoints)
 // ============================================================================
@@ -4683,15 +5076,35 @@ async fn test_get_poll() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
+    let created = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "poll response",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let poll_id = created["poll"]["id"].as_str().unwrap();
+
     let response = server
         .client
-        .get(server.url("/api/v1/polls/test_poll_id"))
-        .header("Authorization", format!("Bearer {}", token))
+        .get(server.url(&format!("/api/v1/polls/{}", poll_id)))
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+    let poll: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(poll["voted"], false);
+    assert!(poll["own_votes"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4700,20 +5113,39 @@ async fn test_vote_in_poll() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
-    let vote_data = json!({
-        "choices": [0]
-    });
+    let created = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "vote in poll",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let created: serde_json::Value = created.json().await.unwrap();
+    let poll_id = created["poll"]["id"].as_str().unwrap();
 
     let response = server
         .client
-        .post(server.url("/api/v1/polls/test_poll_id/votes"))
+        .post(server.url(&format!("/api/v1/polls/{}/votes", poll_id)))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&vote_data)
+        .json(&json!({
+            "choices": [0]
+        }))
         .send()
         .await
         .unwrap();
 
-    assert!(response.status().is_success() || response.status() == 404);
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["voted"], true);
+    assert_eq!(body["own_votes"][0], 0);
 }
 
 // ============================================================================

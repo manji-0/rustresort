@@ -69,6 +69,107 @@ async fn test_public_timeline() {
 }
 
 #[tokio::test]
+async fn test_public_timeline_only_media_includes_remote_status_with_remote_attachment() {
+    use chrono::Utc;
+    use rustresort::data::{PersistedReason, RemoteStatusAttachment, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    server
+        .state
+        .profile_cache
+        .insert(rustresort::data::CachedProfile {
+            address: REMOTE_ACTOR_ADDRESS.to_string(),
+            uri: REMOTE_ACTOR_ID.to_string(),
+            display_name: Some("Alice Remote".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+                .to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            outbox_uri: None,
+            followers_count: Some(1),
+            following_count: Some(1),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let with_media = Status {
+        id: "remote-with-media".to_string(),
+        uri: "https://remote.example/users/alice/statuses/with-media".to_string(),
+        content: "<p>remote media post</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: REMOTE_ACTOR_ADDRESS.to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    let without_media = Status {
+        id: "remote-without-media".to_string(),
+        uri: "https://remote.example/users/alice/statuses/without-media".to_string(),
+        content: "<p>remote text post</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: REMOTE_ACTOR_ADDRESS.to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: Utc::now(),
+        fetched_at: Some(Utc::now()),
+    };
+    server.state.db.insert_status(&with_media).await.unwrap();
+    server.state.db.insert_status(&without_media).await.unwrap();
+    server
+        .state
+        .db
+        .replace_remote_status_attachments(
+            &with_media.id,
+            &[RemoteStatusAttachment {
+                id: "remote-attachment-1".to_string(),
+                status_id: with_media.id.clone(),
+                remote_url: "https://remote.example/media/1.webp".to_string(),
+                preview_url: Some("https://remote.example/media/1-preview.webp".to_string()),
+                content_type: "image/webp".to_string(),
+                description: Some("remote alt".to_string()),
+                blurhash: None,
+                width: Some(64),
+                height: Some(64),
+                created_at: Utc::now(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public?remote=true&only_media=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let statuses = body.as_array().unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["id"], with_media.id);
+}
+
+#[tokio::test]
 async fn test_public_timeline_honors_since_id_and_min_id() {
     use chrono::{Duration, Utc};
     use rustresort::data::{PersistedReason, Status, StatusVisibility};

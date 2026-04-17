@@ -1,6 +1,9 @@
 mod common;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use common::TestServer;
 use reqwest::StatusCode;
 use sha2::Digest;
@@ -301,4 +304,99 @@ async fn test_oauth_refresh_token_grant_rotates_tokens() {
         .await
         .unwrap();
     assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_oauth_token_supports_http_basic_client_auth() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let redirect_uri = "https://client.example/callback";
+    let app = server.create_oauth_app(redirect_uri, "read:accounts").await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+    let (_, session_cookie) = server.login_password().await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let authorize = client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", "read:accounts"),
+        ])
+        .header("Cookie", session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(authorize.status().is_redirection());
+    let redirect_location = authorize
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let redirect_url = url::Url::parse(redirect_location).unwrap();
+    let code = redirect_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+
+    let basic = BASE64_STANDARD.encode(format!("{client_id}:{client_secret}"));
+    let token = server
+        .client
+        .post(server.url("/oauth/token"))
+        .header("Authorization", format!("Basic {}", basic))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+            ("code", code.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(token.status(), StatusCode::OK);
+    let body = token.json::<serde_json::Value>().await.unwrap();
+    assert!(body["access_token"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_oauth_revoke_supports_http_basic_client_auth() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let redirect_uri = "https://client.example/callback";
+    let app = server
+        .create_oauth_app(redirect_uri, "read:accounts write:statuses")
+        .await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+    let access_token = server
+        .create_oauth_authorization_code_token("read:accounts write:statuses")
+        .await;
+
+    let basic = BASE64_STANDARD.encode(format!("{client_id}:{client_secret}"));
+    let revoke = server
+        .client
+        .post(server.url("/oauth/revoke"))
+        .header("Authorization", format!("Basic {}", basic))
+        .form(&[("token", access_token.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::OK);
+
+    let verify = server
+        .client
+        .get(server.url("/api/v1/accounts/verify_credentials"))
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::UNAUTHORIZED);
 }

@@ -1,10 +1,14 @@
 //! Lists endpoints
 
 use axum::{
+    body::to_bytes,
+    extract::Request,
     extract::{Path, Query, State},
+    http::{HeaderMap, header::CONTENT_TYPE},
     response::Json,
 };
 use futures::stream::{self, StreamExt};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::ListsApiState;
@@ -40,15 +44,43 @@ pub struct AddAccountsRequest {
     pub account_ids: Vec<String>,
 }
 
+fn parse_add_accounts_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<AddAccountsRequest, AppError> {
+    parse_json_or_form_body(headers, body)
+}
+
+fn parse_json_or_form_body<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return serde_json::from_slice(body)
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")));
+    }
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        return serde_urlencoded::from_bytes(body)
+            .map_err(|error| AppError::Validation(format!("invalid form body: {error}")));
+    }
+
+    Err(AppError::Validation(
+        "unsupported content type for list account payload".to_string(),
+    ))
+}
+
 /// Pagination parameters
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
-    #[serde(rename = "max_id")]
-    pub _max_id: Option<String>,
-    #[serde(rename = "min_id")]
-    pub _min_id: Option<String>,
-    #[serde(rename = "limit")]
-    pub _limit: Option<usize>,
+    pub max_id: Option<String>,
+    pub min_id: Option<String>,
+    pub limit: Option<usize>,
 }
 
 /// GET /api/v1/lists
@@ -92,8 +124,21 @@ pub async fn get_list(
 pub async fn create_list(
     State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
-    Json(req): Json<CreateListRequest>,
+    request: Request,
 ) -> Result<Json<ListResponse>, AppError> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        CreateListRequest {
+            title: String::new(),
+            replies_policy: None,
+        }
+    } else {
+        parse_json_or_form_body::<CreateListRequest>(&parts.headers, &body)?
+    };
+
     // Validate title
     if req.title.trim().is_empty() {
         return Err(AppError::Validation("Title cannot be empty".to_string()));
@@ -124,8 +169,21 @@ pub async fn update_list(
     State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<UpdateListRequest>,
+    request: Request,
 ) -> Result<Json<ListResponse>, AppError> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        UpdateListRequest {
+            title: None,
+            replies_policy: None,
+        }
+    } else {
+        parse_json_or_form_body::<UpdateListRequest>(&parts.headers, &body)?
+    };
+
     // Get existing list
     let existing = state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
 
@@ -183,17 +241,29 @@ pub async fn get_list_accounts(
 
     // Get account addresses in list
     let addresses = state.db.get_list_accounts(&id).await?;
-    let limit = params._limit.unwrap_or(40).min(80);
+    let limit = params.limit.unwrap_or(40).min(80);
     let default_port = match state.config.server.protocol.to_ascii_lowercase().as_str() {
         "http" => Some(80),
         "https" => Some(443),
         _ => None,
     };
 
-    let accounts = stream::iter(addresses.into_iter().take(limit))
+    let mut accounts = stream::iter(addresses)
         .map(|address| {
             let state = state.clone();
             async move {
+                if let Some(account) = super::accounts::resolve_account_response_for_identity(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    Some(state.federation_fetch_client.as_ref()),
+                    &address,
+                )
+                .await
+                {
+                    return serde_json::to_value(account).unwrap_or_default();
+                }
+
                 super::accounts::resolve_remote_account_value_for_list(
                     state.config.as_ref(),
                     state.db.as_ref(),
@@ -209,6 +279,24 @@ pub async fn get_list_accounts(
         .collect::<Vec<_>>()
         .await;
 
+    if let Some(max_id) = params.max_id.as_deref() {
+        accounts.retain(|account| {
+            account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value < max_id)
+        });
+    }
+    if let Some(min_id) = params.min_id.as_deref() {
+        accounts.retain(|account| {
+            account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value > min_id)
+        });
+    }
+    accounts.truncate(limit);
+
     Ok(Json(accounts))
 }
 
@@ -218,13 +306,38 @@ pub async fn add_list_accounts(
     State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<AddAccountsRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        AddAccountsRequest {
+            account_ids: Vec::new(),
+        }
+    } else {
+        parse_add_accounts_request(&parts.headers, &body)?
+    };
 
-    // For single-user instance, account_id is the account address
-    state.db.add_accounts_to_list(&id, &req.account_ids).await?;
+    let local_account = state.db.get_account().await?;
+    let normalized_ids = req
+        .account_ids
+        .into_iter()
+        .map(|account_id| {
+            let trimmed = account_id.trim().to_string();
+            if let Some(account) = local_account.as_ref()
+                && account.id == trimmed
+            {
+                return format!("{}@{}", account.username, state.config.server.domain);
+            }
+            trimmed
+        })
+        .collect::<Vec<_>>();
+
+    state.db.add_accounts_to_list(&id, &normalized_ids).await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -235,14 +348,40 @@ pub async fn delete_list_accounts(
     State(state): State<ListsApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<AddAccountsRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        AddAccountsRequest {
+            account_ids: Vec::new(),
+        }
+    } else {
+        parse_add_accounts_request(&parts.headers, &body)?
+    };
+
+    let local_account = state.db.get_account().await?;
+    let normalized_ids = req
+        .account_ids
+        .into_iter()
+        .map(|account_id| {
+            let trimmed = account_id.trim().to_string();
+            if let Some(account) = local_account.as_ref()
+                && account.id == trimmed
+            {
+                return format!("{}@{}", account.username, state.config.server.domain);
+            }
+            trimmed
+        })
+        .collect::<Vec<_>>();
 
     state
         .db
-        .remove_accounts_from_list(&id, &req.account_ids)
+        .remove_accounts_from_list(&id, &normalized_ids)
         .await?;
 
     Ok(Json(serde_json::json!({})))

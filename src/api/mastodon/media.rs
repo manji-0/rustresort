@@ -1,11 +1,15 @@
 //! Media endpoints
 
 use axum::{
+    body::to_bytes,
+    extract::Request,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Json},
 };
+use futures::stream;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 
 use crate::MediaApiState;
 use crate::auth::CurrentUser;
@@ -80,7 +84,7 @@ fn build_original_media_meta(
     })
 }
 
-fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
+pub(crate) fn parse_media_focus(raw: &str) -> Result<(f64, f64), AppError> {
     let (x_raw, y_raw) = raw
         .split_once(',')
         .ok_or_else(|| AppError::Validation("focus must be in `x,y` format".to_string()))?;
@@ -240,7 +244,12 @@ async fn upload_media_response_value(
         "image/png",
         "image/gif",
         "image/webp",
+        "image/avif",
+        "image/heif",
+        "image/heic",
         "video/mp4",
+        "video/webm",
+        "video/quicktime",
     ];
 
     if !supported_types.contains(&parsed.content_type.as_str()) {
@@ -329,8 +338,18 @@ pub async fn update_media(
     State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<UpdateMediaRequest>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, MAX_IMAGE_UPLOAD_BYTES + 256 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let (req, thumbnail_bytes) = if body.is_empty() {
+        (UpdateMediaRequest::default(), None)
+    } else {
+        parse_update_media_request(&parts.headers, body).await?
+    };
+
     // Get media from database
     let mut media = state.db.get_media(&id).await?.ok_or(AppError::NotFound)?;
 
@@ -351,6 +370,20 @@ pub async fn update_media(
         }
     }
 
+    if let Some(thumbnail_bytes) = thumbnail_bytes {
+        let (_, thumbnail_key) = state
+            .storage
+            .upload_thumbnail(&media.id, thumbnail_bytes)
+            .await?;
+        media.thumbnail_s3_key = Some(thumbnail_key);
+    } else if req
+        .thumbnail
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        media.thumbnail_s3_key = None;
+    }
+
     // Update in database
     state.db.update_media(&media).await?;
 
@@ -361,6 +394,106 @@ pub async fn update_media(
 pub struct UpdateMediaRequest {
     pub description: Option<String>,
     pub focus: Option<String>,
+    pub thumbnail: Option<String>,
+}
+
+impl Default for UpdateMediaRequest {
+    fn default() -> Self {
+        Self {
+            description: None,
+            focus: None,
+            thumbnail: None,
+        }
+    }
+}
+
+async fn parse_update_media_multipart(
+    body: axum::body::Bytes,
+    content_type: &str,
+) -> Result<(UpdateMediaRequest, Option<Vec<u8>>), AppError> {
+    let boundary = multer::parse_boundary(content_type)
+        .map_err(|error| AppError::Validation(format!("invalid multipart boundary: {error}")))?;
+    let stream = stream::once(async move { Ok::<_, Infallible>(body) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    let mut request = UpdateMediaRequest::default();
+    let mut thumbnail_bytes = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to parse multipart body: {error}")))?
+    {
+        let Some(name) = field.name().map(ToString::to_string) else {
+            continue;
+        };
+
+        if name == "thumbnail" && (field.file_name().is_some() || field.content_type().is_some()) {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(|error| {
+                AppError::Validation(format!(
+                    "failed to read multipart field `thumbnail`: {error}"
+                ))
+            })? {
+                if bytes.len() + chunk.len() > MAX_IMAGE_UPLOAD_BYTES {
+                    return Err(AppError::Validation(format!(
+                        "thumbnail exceeds {MAX_IMAGE_UPLOAD_BYTES} bytes"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            thumbnail_bytes = Some(bytes);
+            continue;
+        }
+
+        let value = field.text().await.map_err(|error| {
+            AppError::Validation(format!("failed to read multipart field `{name}`: {error}"))
+        })?;
+        match name.as_str() {
+            "description" => request.description = Some(value),
+            "focus" => request.focus = Some(value),
+            "thumbnail" => request.thumbnail = Some(value),
+            _ => {}
+        }
+    }
+
+    Ok((request, thumbnail_bytes))
+}
+
+async fn parse_update_media_request(
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<(UpdateMediaRequest, Option<Vec<u8>>), AppError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if content_type.starts_with("application/json") || content_type.is_empty() {
+        return serde_json::from_slice(&body)
+            .map(|request| (request, None))
+            .map_err(|error| AppError::Validation(format!("invalid JSON body: {error}")));
+    }
+
+    if content_type.starts_with("application/x-www-form-urlencoded") {
+        let mut request = UpdateMediaRequest::default();
+        for (key, value) in url::form_urlencoded::parse(&body).into_owned() {
+            match key.as_str() {
+                "description" => request.description = Some(value),
+                "focus" => request.focus = Some(value),
+                "thumbnail" => request.thumbnail = Some(value),
+                _ => {}
+            }
+        }
+        return Ok((request, None));
+    }
+
+    if content_type.starts_with("multipart/form-data") {
+        return parse_update_media_multipart(body, content_type).await;
+    }
+
+    Err(AppError::Validation(
+        "unsupported content type for media metadata payload".to_string(),
+    ))
 }
 
 #[cfg(test)]

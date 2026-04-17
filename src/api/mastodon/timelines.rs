@@ -5,6 +5,7 @@ use axum::{
     response::Json,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use super::accounts::PaginationParams;
 use crate::TimelineApiState;
@@ -21,6 +22,60 @@ pub struct PublicTimelineParams {
     #[serde(flatten)]
     pub pagination: PaginationParams,
     pub local: Option<bool>,
+    pub remote: Option<bool>,
+    pub only_media: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagTimelineParams {
+    #[serde(flatten)]
+    pub pagination: PaginationParams,
+    pub local: Option<bool>,
+    pub only_media: Option<bool>,
+    #[serde(default, rename = "any[]")]
+    pub any: Vec<String>,
+    #[serde(default, rename = "all[]")]
+    pub all: Vec<String>,
+    #[serde(default, rename = "none[]")]
+    pub none: Vec<String>,
+}
+
+async fn status_has_media(state: &TimelineApiState, status_id: &str) -> bool {
+    state
+        .db
+        .status_has_any_media(status_id)
+        .await
+        .unwrap_or(false)
+}
+
+fn normalize_tag_set(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim().trim_start_matches('#').to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+fn status_matches_tag_filters(
+    status: &crate::data::Status,
+    any: &[String],
+    all: &[String],
+    none: &[String],
+) -> bool {
+    let present = crate::data::extract_hashtags_from_content(&status.content)
+        .into_iter()
+        .map(|tag| tag.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+
+    if !any.is_empty() && !any.iter().any(|tag| present.contains(tag)) {
+        return false;
+    }
+    if !all.iter().all(|tag| present.contains(tag)) {
+        return false;
+    }
+    if none.iter().any(|tag| present.contains(tag)) {
+        return false;
+    }
+    true
 }
 
 /// GET /api/v1/timelines/home
@@ -130,6 +185,8 @@ pub async fn public_timeline(
 
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let local_only = params.local.unwrap_or(false);
+    let remote_only = params.remote.unwrap_or(false);
+    let only_media = params.only_media.unwrap_or(false);
     let effective_min_id = params
         .pagination
         .min_id
@@ -143,14 +200,50 @@ pub async fn public_timeline(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let timeline_items = timeline_service
-        .public_timeline(
-            local_only,
-            limit,
-            params.pagination.max_id.as_deref(),
-            effective_min_id,
-        )
-        .await?;
+    let fetch_limit = if only_media || remote_only {
+        limit.saturating_mul(3).min(120)
+    } else {
+        limit
+    };
+    let mut timeline_items = Vec::new();
+    let mut seen_status_ids = HashSet::new();
+    let mut next_max_id = params.pagination.max_id.clone();
+
+    loop {
+        let batch = timeline_service
+            .public_timeline(
+                local_only,
+                fetch_limit,
+                next_max_id.as_deref(),
+                effective_min_id,
+            )
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        next_max_id = batch.last().map(|item| item.status.id.clone());
+
+        for item in batch {
+            if !seen_status_ids.insert(item.status.id.clone()) {
+                continue;
+            }
+            if remote_only && item.status.is_local {
+                continue;
+            }
+            if only_media && !status_has_media(&state, &item.status.id).await {
+                continue;
+            }
+            timeline_items.push(item);
+            if timeline_items.len() >= limit {
+                break;
+            }
+        }
+
+        if timeline_items.len() >= limit || batch_len < fetch_limit || next_max_id.is_none() {
+            break;
+        }
+    }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -205,21 +298,79 @@ pub async fn public_timeline(
 pub async fn tag_timeline(
     State(state): State<TimelineApiState>,
     axum::extract::Path(hashtag): axum::extract::Path<String>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<TagTimelineParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let limit = params.limit.unwrap_or(20).min(40);
-    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
+    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let effective_min_id = params
+        .pagination
+        .min_id
+        .as_deref()
+        .or(params.pagination.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
-    let timeline_items = timeline_service
-        .tag_timeline(&hashtag, limit, params.max_id.as_deref(), effective_min_id)
-        .await?;
+    let fetch_limit = if params.local.unwrap_or(false)
+        || params.only_media.unwrap_or(false)
+        || !params.any.is_empty()
+        || !params.all.is_empty()
+        || !params.none.is_empty()
+    {
+        limit.saturating_mul(3).min(120)
+    } else {
+        limit
+    };
+    let any = normalize_tag_set(&params.any);
+    let all = normalize_tag_set(&params.all);
+    let none = normalize_tag_set(&params.none);
+    let mut timeline_items = Vec::new();
+    let mut seen_status_ids = HashSet::new();
+    let mut next_max_id = params.pagination.max_id.clone();
+    let local_only = params.local.unwrap_or(false);
+    let only_media = params.only_media.unwrap_or(false);
+
+    loop {
+        let batch = timeline_service
+            .tag_timeline(
+                &hashtag,
+                fetch_limit,
+                next_max_id.as_deref(),
+                effective_min_id,
+            )
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        next_max_id = batch.last().map(|item| item.status.id.clone());
+
+        for item in batch {
+            if !seen_status_ids.insert(item.status.id.clone()) {
+                continue;
+            }
+            if local_only && !item.status.is_local {
+                continue;
+            }
+            if only_media && !status_has_media(&state, &item.status.id).await {
+                continue;
+            }
+            if !status_matches_tag_filters(&item.status, &any, &all, &none) {
+                continue;
+            }
+            timeline_items.push(item);
+            if timeline_items.len() >= limit {
+                break;
+            }
+        }
+
+        if timeline_items.len() >= limit || batch_len < fetch_limit || next_max_id.is_none() {
+            break;
+        }
+    }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())

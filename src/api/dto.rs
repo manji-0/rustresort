@@ -163,6 +163,7 @@ pub struct InstanceResponse {
     pub stats: InstanceStats,
     pub thumbnail: Option<String>,
     pub contact_account: Option<AccountResponse>,
+    pub rules: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

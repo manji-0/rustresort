@@ -1,4 +1,7 @@
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Query, State},
+    response::Json,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::TimelineApiState;
@@ -7,6 +10,14 @@ use crate::error::AppError;
 
 const HOME_MARKER_KEY: &str = "markers.home.last_read_id";
 const NOTIFICATIONS_MARKER_KEY: &str = "markers.notifications.last_read_id";
+const HOME_MARKER_UPDATED_AT_KEY: &str = "markers.home.updated_at";
+const NOTIFICATIONS_MARKER_UPDATED_AT_KEY: &str = "markers.notifications.updated_at";
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GetMarkersParams {
+    #[serde(rename = "timeline[]", default)]
+    pub timelines: Vec<String>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SaveMarkersRequest {
@@ -36,10 +47,21 @@ async fn load_marker(state: &TimelineApiState, key: &str) -> Result<Option<Marke
     let Some(value) = state.db.get_setting(key).await? else {
         return Ok(None);
     };
+    let updated_at_key = match key {
+        HOME_MARKER_KEY => HOME_MARKER_UPDATED_AT_KEY,
+        NOTIFICATIONS_MARKER_KEY => NOTIFICATIONS_MARKER_UPDATED_AT_KEY,
+        _ => unreachable!("unknown marker key"),
+    };
+    let updated_at = state
+        .db
+        .get_setting(updated_at_key)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     Ok(Some(Marker {
         last_read_id: value,
         version: 1,
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        updated_at,
     }))
 }
 
@@ -56,20 +78,43 @@ async fn save_marker(
     }
 
     state.db.set_setting(key, last_read_id).await?;
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    let updated_at_key = match key {
+        HOME_MARKER_KEY => HOME_MARKER_UPDATED_AT_KEY,
+        NOTIFICATIONS_MARKER_KEY => NOTIFICATIONS_MARKER_UPDATED_AT_KEY,
+        _ => unreachable!("unknown marker key"),
+    };
+    state.db.set_setting(updated_at_key, &updated_at).await?;
     Ok(Marker {
         last_read_id: last_read_id.to_string(),
         version: 1,
-        updated_at: chrono::Utc::now().to_rfc3339(),
+        updated_at,
     })
 }
 
 pub async fn get_markers(
     State(state): State<TimelineApiState>,
+    Query(params): Query<GetMarkersParams>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let wants_home =
+        params.timelines.is_empty() || params.timelines.iter().any(|timeline| timeline == "home");
+    let wants_notifications = params.timelines.is_empty()
+        || params
+            .timelines
+            .iter()
+            .any(|timeline| timeline == "notifications");
     let envelope = MarkerEnvelope {
-        home: load_marker(&state, HOME_MARKER_KEY).await?,
-        notifications: load_marker(&state, NOTIFICATIONS_MARKER_KEY).await?,
+        home: if wants_home {
+            load_marker(&state, HOME_MARKER_KEY).await?
+        } else {
+            None
+        },
+        notifications: if wants_notifications {
+            load_marker(&state, NOTIFICATIONS_MARKER_KEY).await?
+        } else {
+            None
+        },
     };
     Ok(Json(serde_json::to_value(envelope).unwrap()))
 }

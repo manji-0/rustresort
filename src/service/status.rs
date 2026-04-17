@@ -819,7 +819,12 @@ impl StatusService {
 
         if matches!(status.visibility, StatusVisibility::Public) {
             for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
-                targets.insert(StreamTarget::Hashtag { hashtag });
+                targets.insert(StreamTarget::Hashtag {
+                    hashtag: hashtag.clone(),
+                });
+                if status.is_local {
+                    targets.insert(StreamTarget::HashtagLocal { hashtag });
+                }
             }
         }
 

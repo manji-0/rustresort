@@ -3,7 +3,10 @@
 //! Provides real-time updates via Server-Sent Events (SSE)
 
 use axum::{
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::HeaderMap,
     response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
@@ -26,6 +29,8 @@ pub struct StreamParams {
     stream: Option<String>,
     /// Only for hashtag stream
     tag: Option<String>,
+    /// Whether the hashtag stream should be restricted to local statuses.
+    local: Option<bool>,
     /// Only for list stream
     list: Option<String>,
 }
@@ -276,6 +281,34 @@ fn build_sse_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn forward_websocket_stream(
+    state: StreamingApiState,
+    mut socket: WebSocket,
+    receiver: EventReceiver,
+    stream_name: String,
+) {
+    let mut receiver = receiver.into_inner();
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let payload = serialize_stream_event_data(&state, &event).await;
+                let frame = serde_json::json!({
+                    "stream": [stream_name],
+                    "event": event.event_name(),
+                    "payload": payload,
+                });
+                if socket.send(Message::Text(frame.to_string())).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "streaming receiver lagged; dropping old messages");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// GET /api/v1/streaming/user
 /// Stream events for the authenticated user
 pub async fn stream_user(
@@ -316,7 +349,14 @@ pub async fn stream_hashtag(
         .tag
         .ok_or(AppError::Validation("tag parameter required".to_string()))?;
 
-    let receiver = state.streaming_event_bus.subscribe_hashtag(&tag).await?;
+    let receiver = if params.local.unwrap_or(false) {
+        state
+            .streaming_event_bus
+            .subscribe_hashtag_local(&tag)
+            .await?
+    } else {
+        state.streaming_event_bus.subscribe_hashtag(&tag).await?
+    };
     Ok(build_sse_stream(state, receiver))
 }
 
@@ -390,48 +430,129 @@ pub async fn stream_root(
     State(state): State<StreamingApiState>,
     session: CurrentUser,
     headers: HeaderMap,
+    ws: Option<WebSocketUpgrade>,
     Query(params): Query<StreamParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    match params.stream.as_deref().unwrap_or_default() {
+    let stream_name = params.stream.clone().unwrap_or_default();
+    match stream_name.as_str() {
         "user" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses", "read:notifications"])
                 .await?;
+            let account_id = state.config.auth.username.clone();
+            let receiver = state
+                .streaming_event_bus
+                .subscribe_user(account_id.as_str())
+                .await?;
+            if let Some(ws) = ws {
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, stream_name)
+                    })
+                    .into_response());
+            }
             stream_user(State(state), session)
                 .await
                 .map(IntoResponse::into_response)
         }
         "public" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            let receiver = state.streaming_event_bus.subscribe_public().await?;
+            if let Some(ws) = ws {
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, stream_name)
+                    })
+                    .into_response());
+            }
             stream_public(State(state), Query(params))
                 .await
                 .map(IntoResponse::into_response)
         }
         "public:local" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            let receiver = state.streaming_event_bus.subscribe_public_local().await?;
+            if let Some(ws) = ws {
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, stream_name)
+                    })
+                    .into_response());
+            }
             stream_public_local(State(state))
                 .await
                 .map(IntoResponse::into_response)
         }
-        "hashtag" => {
+        "hashtag" | "hashtag:local" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            let tag = params
+                .tag
+                .clone()
+                .ok_or(AppError::Validation("tag parameter required".to_string()))?;
+            let local_hashtag = stream_name == "hashtag:local" || params.local.unwrap_or(false);
+            let receiver = if local_hashtag {
+                state.streaming_event_bus.subscribe_hashtag_local(&tag).await?
+            } else {
+                state.streaming_event_bus.subscribe_hashtag(&tag).await?
+            };
+            if let Some(ws) = ws {
+                let ws_stream_name = if local_hashtag {
+                    "hashtag:local".to_string()
+                } else {
+                    stream_name.clone()
+                };
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, ws_stream_name)
+                    })
+                    .into_response());
+            }
             stream_hashtag(State(state), Query(params))
                 .await
                 .map(IntoResponse::into_response)
         }
         "list" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            let list_id = params
+                .list
+                .clone()
+                .ok_or(AppError::Validation("list parameter required".to_string()))?;
+            state
+                .db
+                .get_list(&list_id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            let receiver = state.streaming_event_bus.subscribe_list(&list_id).await?;
+            if let Some(ws) = ws {
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, stream_name)
+                    })
+                    .into_response());
+            }
             stream_list(State(state), session, Query(params))
                 .await
                 .map(IntoResponse::into_response)
         }
         "direct" => {
             enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            let account_id = state.config.auth.username.clone();
+            let receiver = state
+                .streaming_event_bus
+                .subscribe_direct(account_id.as_str())
+                .await?;
+            if let Some(ws) = ws {
+                return Ok(ws
+                    .on_upgrade(move |socket| {
+                        forward_websocket_stream(state, socket, receiver, stream_name)
+                    })
+                    .into_response());
+            }
             stream_direct(State(state), session)
                 .await
                 .map(IntoResponse::into_response)
         }
         _ => Err(AppError::Validation(
-            "stream parameter must be one of user, public, public:local, hashtag, list, direct"
+            "stream parameter must be one of user, public, public:local, hashtag, hashtag:local, list, direct"
                 .to_string(),
         )),
     }

@@ -153,6 +153,55 @@ async fn test_update_credentials_accepts_form_urlencoded() {
 }
 
 #[tokio::test]
+async fn test_update_credentials_persists_source_defaults_and_preferences() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .patch(server.url("/api/v1/accounts/update_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("source%5Bprivacy%5D=private&source%5Bsensitive%5D=true&source%5Blanguage%5D=ja")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let updated: Value = response.json().await.unwrap();
+    assert_eq!(updated["source"]["privacy"], "private");
+    assert_eq!(updated["source"]["sensitive"], true);
+    assert_eq!(updated["source"]["language"], "ja");
+
+    let verify = server
+        .client
+        .get(server.url("/api/v1/accounts/verify_credentials"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), 200);
+    let verify_json: Value = verify.json().await.unwrap();
+    assert_eq!(verify_json["source"]["privacy"], "private");
+    assert_eq!(verify_json["source"]["sensitive"], true);
+    assert_eq!(verify_json["source"]["language"], "ja");
+
+    let preferences = server
+        .client
+        .get(server.url("/api/v1/preferences"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preferences.status(), 200);
+    let preferences_json: Value = preferences.json().await.unwrap();
+    assert_eq!(preferences_json["posting:default:visibility"], "private");
+    assert_eq!(preferences_json["posting:default:sensitive"], true);
+    assert_eq!(preferences_json["posting:default:language"], "ja");
+}
+
+#[tokio::test]
 async fn test_update_credentials_accepts_multipart_form_data() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -578,6 +627,21 @@ async fn test_account_followers() {
 }
 
 #[tokio::test]
+async fn test_account_followers_is_public() {
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/followers", account.id)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
 async fn test_account_following() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;
@@ -594,6 +658,39 @@ async fn test_account_following() {
         let json: Value = response.json().await.unwrap();
         assert!(json.is_array());
     }
+}
+
+#[tokio::test]
+async fn test_account_following_is_public() {
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/following", account.id)))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_lookup_account_returns_not_found_for_unresolved_remote_account() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/lookup"))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("acct", "missing-user@missing.example")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]

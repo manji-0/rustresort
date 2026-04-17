@@ -795,6 +795,18 @@ async fn test_status_note_and_create_include_quote_fields() {
     let note_json: Value = note_response.json().await.unwrap();
     assert_eq!(note_json["quoteUri"], quote_target_uri);
     assert_eq!(note_json["quoteUrl"], quote_target_uri);
+    assert_eq!(note_json["_misskey_quote"], quote_target_uri);
+    assert!(
+        note_json["@context"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry
+                    .get("_misskey_quote")
+                    .and_then(|value| value.get("@id"))
+                    .and_then(Value::as_str)
+                    == Some("https://misskey-hub.net/ns#_misskey_quote")
+            }))
+    );
 
     let activity_response = server
         .client
@@ -809,6 +821,18 @@ async fn test_status_note_and_create_include_quote_fields() {
     assert!(activity_json.get("@context").is_some());
     assert_eq!(activity_json["object"]["quoteUri"], quote_target_uri);
     assert_eq!(activity_json["object"]["quoteUrl"], quote_target_uri);
+    assert_eq!(activity_json["object"]["_misskey_quote"], quote_target_uri);
+    assert!(
+        activity_json["@context"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry
+                    .get("_misskey_quote")
+                    .and_then(|value| value.get("@id"))
+                    .and_then(Value::as_str)
+                    == Some("https://misskey-hub.net/ns#_misskey_quote")
+            }))
+    );
 }
 
 #[tokio::test]
