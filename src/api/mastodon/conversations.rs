@@ -7,7 +7,9 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::accounts::resolve_account_response_for_identity;
+use super::accounts::{
+    build_remote_account_placeholder_response, resolve_account_response_for_identity,
+};
 use crate::{
     ConversationsApiState,
     auth::CurrentUser,
@@ -57,6 +59,10 @@ async fn build_conversation_response(
             address,
         )
         .await
+        {
+            accounts.push(serde_json::to_value(account_response).unwrap());
+        } else if let Some(account_response) =
+            build_remote_account_placeholder_response(address, state.config.as_ref(), 0)
         {
             accounts.push(serde_json::to_value(account_response).unwrap());
         }

@@ -145,6 +145,12 @@ async fn request_is_authenticated(
             .await
             .ok()
             .flatten()
+            .filter(|token| {
+                matches!(
+                    token.grant_type.as_str(),
+                    "authorization_code" | "refresh_token"
+                )
+            })
             .is_some()
     {
         return true;
@@ -1065,6 +1071,8 @@ pub async fn create_status(
 pub async fn get_status(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
+    jar: CookieJar,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
@@ -1082,7 +1090,10 @@ pub async fn get_status(
         .with_label_values(&["SELECT", "statuses"])
         .inc();
     db_timer.observe_duration();
-    ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    let is_authenticated = request_is_authenticated(&state, &headers, &jar).await;
+    if !is_authenticated {
+        ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    }
 
     // Get account
     let db_timer = DB_QUERY_DURATION_SECONDS
@@ -1096,8 +1107,11 @@ pub async fn get_status(
     db_timer.observe_duration();
 
     // Convert to API response
-    let response =
-        status_response_without_interaction_state(&state, &account, account_stats, &status).await?;
+    let response = if is_authenticated {
+        status_response_with_viewer_interactions(&state, &account, account_stats, &status).await?
+    } else {
+        status_response_without_interaction_state(&state, &account, account_stats, &status).await?
+    };
 
     // Record successful request
     HTTP_REQUESTS_TOTAL
@@ -1105,6 +1119,20 @@ pub async fn get_status(
         .inc();
 
     Ok(Json(serde_json::to_value(response).unwrap()))
+}
+
+/// GET /api/v1/statuses/:id/card
+pub async fn get_status_card(
+    State(state): State<StatusApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let status = build_status_service(&state).get(&id).await?;
+    if !request_is_authenticated(&state, &headers, &jar).await {
+        ensure_public_visibility_for_public_endpoint(status.visibility)?;
+    }
+    Ok(Json(serde_json::Value::Null))
 }
 
 /// DELETE /api/v1/statuses/:id
@@ -2431,9 +2459,6 @@ pub async fn get_status_history(
 
     // Get the status
     let status = status_service.get(&id).await?;
-    if !status.is_local {
-        return Err(AppError::Forbidden);
-    }
 
     // Get account
     let account = build_account_service(&state).get_account().await?;

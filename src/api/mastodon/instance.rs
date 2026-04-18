@@ -19,10 +19,7 @@ const DEFAULT_INSTANCE_RULES: [&str; 3] = [
 const MASTODON_COMPAT_VERSION: &str = "4.2.0";
 
 fn instance_version_string() -> String {
-    format!(
-        "{MASTODON_COMPAT_VERSION} (compatible; RustResort/{})",
-        env!("CARGO_PKG_VERSION")
-    )
+    MASTODON_COMPAT_VERSION.to_string()
 }
 
 fn streaming_base_url(base_url: &str) -> Option<String> {
@@ -241,12 +238,11 @@ pub async fn trending_tags(State(state): State<InstanceApiState>) -> Json<serde_
     let tags = state.db.get_trending_hashtags(10).await.unwrap_or_default();
     Json(serde_json::Value::Array(
         tags.into_iter()
-            .map(|(name, usage_count, _last_used)| {
+            .map(|(name, _usage_count, _last_used)| {
                 serde_json::json!({
                     "name": name,
                     "url": format!("{}/tags/{}", state.config.server.base_url(), name),
                     "history": [],
-                    "uses": usage_count,
                 })
             })
             .collect(),

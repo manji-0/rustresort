@@ -178,6 +178,7 @@ fn build_status_mentions(
     content: &str,
     base_url: &str,
     local_username: &str,
+    local_account_id: &str,
 ) -> Vec<serde_json::Value> {
     let text = status_content_to_source_text(content);
     extract_mentions_from_text(&text)
@@ -195,7 +196,7 @@ fn build_status_mentions(
                 )
             };
             let id = if acct == local_username {
-                format!("{}/users/{}", base_url, local_username)
+                local_account_id.to_string()
             } else if acct.contains('@') {
                 acct.clone()
             } else {
@@ -284,6 +285,40 @@ async fn build_quote_response_value(
         .map_err(|error| AppError::serialization("quoted status response serialization", error))
 }
 
+async fn build_reblogged_status_response(
+    db: &Database,
+    boosted_status: &Status,
+    account: &Account,
+    config: &AppConfig,
+    account_stats: AccountStats,
+) -> Result<StatusResponse, AppError> {
+    let remote_account_stats =
+        load_remote_account_stats_for_status(db, &config.server.protocol, boosted_status).await?;
+    let media_attachments = db.get_media_by_status(&boosted_status.id).await?;
+    let media_attachment_responses =
+        load_status_media_attachment_responses(db, &boosted_status.id, config, &media_attachments)
+            .await?;
+    let force_sensitive = remote_account_stats
+        .as_ref()
+        .map(|stats| stats.force_sensitive)
+        .unwrap_or(false);
+    let mut response = status_to_response_with_media(
+        boosted_status,
+        account,
+        config,
+        account_stats,
+        remote_account_stats,
+        StatusInteractions::default(),
+        force_sensitive,
+        &media_attachment_responses,
+    );
+    enrich_status_response(db, boosted_status, &mut response).await?;
+    response.poll = load_status_poll_response(db, &boosted_status.id, account, config).await?;
+    response.filtered = load_status_filtered(db, boosted_status).await?;
+    response.reblog = None;
+    Ok(response)
+}
+
 pub async fn build_status_response_with_media(
     db: &Database,
     status: &Status,
@@ -311,6 +346,26 @@ pub async fn build_status_response_with_media(
         &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
+    if let Some(in_reply_to_uri) = status.in_reply_to_uri.as_deref()
+        && let Some(parent_status) = db.get_status_by_uri(in_reply_to_uri).await?
+    {
+        response.in_reply_to_account_id = Some(
+            if parent_status.is_local || parent_status.account_address.trim().is_empty() {
+                account.id.clone()
+            } else {
+                parent_status.account_address.clone()
+            },
+        );
+    }
+    if let Some(boost_of_uri) = status.boost_of_uri.as_deref()
+        && boost_of_uri != status.uri
+        && let Some(boosted_status) = db.get_status_by_uri(boost_of_uri).await?
+    {
+        let boosted_response =
+            build_reblogged_status_response(db, &boosted_status, account, config, account_stats)
+                .await?;
+        response.reblog = Some(Box::new(boosted_response));
+    }
     response.poll = load_status_poll_response(db, &status.id, account, config).await?;
     response.filtered = load_status_filtered(db, status).await?;
     if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
@@ -1150,7 +1205,8 @@ pub fn status_to_response_with_media(
     };
     let text = status_content_to_source_text(&status.content);
     let tags = build_status_tags(&status.content, &base_url);
-    let mentions = build_status_mentions(&status.content, &base_url, &account.username);
+    let mentions =
+        build_status_mentions(&status.content, &base_url, &account.username, &account.id);
 
     StatusResponse {
         id: status.id.clone(),

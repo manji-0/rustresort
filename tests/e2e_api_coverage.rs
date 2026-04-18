@@ -315,7 +315,9 @@ async fn test_create_app_endpoint_works() {
     assert_eq!(response.status(), 200);
     let body = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["name"], "Test App");
-    assert_eq!(body["redirect_uris"], "urn:ietf:wg:oauth:2.0:oob");
+    assert_eq!(body["redirect_uri"], "urn:ietf:wg:oauth:2.0:oob");
+    assert_eq!(body["redirect_uris"], json!(["urn:ietf:wg:oauth:2.0:oob"]));
+    assert_eq!(body["scopes"], json!(["read", "write"]));
 }
 
 #[tokio::test]
@@ -969,7 +971,7 @@ async fn test_account_followers_keeps_actor_uri_addresses_as_placeholder_account
     let body: serde_json::Value = response.json().await.unwrap();
     let followers = body.as_array().expect("followers should be array");
     assert_eq!(followers.len(), 1);
-    assert_eq!(followers[0]["id"], actor_uri_address);
+    assert_eq!(followers[0]["id"], "12345@remote.example");
     assert_eq!(followers[0]["acct"], "12345@remote.example");
     assert_eq!(followers[0]["url"], actor_uri_address);
     assert!(followers[0].get("avatar_static").is_some());
@@ -1011,7 +1013,7 @@ async fn test_account_following_keeps_actor_uri_addresses_as_placeholder_account
     let body: serde_json::Value = response.json().await.unwrap();
     let following = body.as_array().expect("following should be array");
     assert_eq!(following.len(), 1);
-    assert_eq!(following[0]["id"], actor_uri_address);
+    assert_eq!(following[0]["id"], "12345@remote.example");
     assert_eq!(following[0]["acct"], "12345@remote.example");
     assert_eq!(following[0]["url"], actor_uri_address);
     assert!(following[0].get("avatar_static").is_some());
@@ -1960,6 +1962,25 @@ async fn test_get_account_identity_proofs() {
     assert_eq!(response.status(), 200);
 }
 
+#[tokio::test]
+async fn test_get_account_identity_proofs_for_remote_account_returns_empty_array() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@remote.example/identity_proofs"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+}
+
 // ============================================================================
 // Follow Requests Endpoints (4 endpoints)
 // ============================================================================
@@ -2359,6 +2380,176 @@ async fn test_get_status_returns_current_metadata() {
 
     let mentions = body["mentions"].as_array().expect("mentions array");
     assert!(mentions.iter().any(|mention| mention["acct"] == "alice"));
+}
+
+#[tokio::test]
+async fn test_get_status_allows_authenticated_private_status_and_preserves_interactions() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let created = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Private test",
+            "visibility": "private"
+        }))
+        .send()
+        .await
+        .expect("create private status");
+    assert_eq!(created.status(), 200);
+    let created_body: serde_json::Value = created.json().await.expect("created body");
+    let status_id = created_body["id"].as_str().expect("status id");
+
+    let favourite = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{status_id}/favourite")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("favourite status");
+    assert_eq!(favourite.status(), 200);
+
+    let authed = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("authed get status");
+    assert_eq!(authed.status(), 200);
+    let authed_body: serde_json::Value = authed.json().await.expect("authed status body");
+    assert_eq!(authed_body["favourited"], true);
+
+    let public = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .send()
+        .await
+        .expect("public get status");
+    assert_eq!(public.status(), 404);
+}
+
+#[tokio::test]
+async fn test_get_status_card_returns_null_for_visible_status() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let created = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Card test",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .expect("create status");
+    assert_eq!(created.status(), 200);
+    let created_body: serde_json::Value = created.json().await.expect("created body");
+    let status_id = created_body["id"].as_str().expect("status id");
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{status_id}/card")))
+        .send()
+        .await
+        .expect("get card");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn test_get_status_includes_reblog_payload_and_reply_account_id() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let parent = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Parent status",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .expect("create parent");
+    assert_eq!(parent.status(), 200);
+    let parent_body: serde_json::Value = parent.json().await.expect("parent body");
+    let parent_id = parent_body["id"].as_str().expect("parent id").to_string();
+    let parent_uri = parent_body["uri"].as_str().expect("parent uri").to_string();
+
+    let reply = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "Reply to parent",
+            "visibility": "public",
+            "in_reply_to_id": parent_id
+        }))
+        .send()
+        .await
+        .expect("create reply");
+    assert_eq!(reply.status(), 200);
+    let reply_body: serde_json::Value = reply.json().await.expect("reply body");
+    let reply_id = reply_body["id"].as_str().expect("reply id");
+
+    let reblog_id = EntityId::new_string();
+    server
+        .state
+        .db
+        .insert_status(&Status {
+            id: reblog_id.clone(),
+            uri: server.public_url(&format!("/users/{}/statuses/{}", account.username, reblog_id)),
+            content: "<p>boost wrapper</p>".to_string(),
+            content_warning: None,
+            visibility: StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: format!("{}@{}", account.username, server.state.config.server.domain),
+            is_local: true,
+            in_reply_to_uri: None,
+            boost_of_uri: Some(parent_uri.clone()),
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::Own,
+            created_at: Utc::now(),
+            fetched_at: None,
+        })
+        .await
+        .expect("insert reblog wrapper");
+
+    let reply_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{reply_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("get reply");
+    assert_eq!(reply_response.status(), 200);
+    let reply_value: serde_json::Value = reply_response.json().await.expect("reply json");
+    assert_eq!(reply_value["in_reply_to_account_id"], account.id);
+
+    let reblog_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{reblog_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("get reblog");
+    assert_eq!(reblog_response.status(), 200);
+    let reblog_value: serde_json::Value = reblog_response.json().await.expect("reblog json");
+    assert_eq!(reblog_value["reblog"]["id"], parent_id);
+    assert_eq!(reblog_value["reblog"]["uri"], parent_uri);
+    assert_eq!(reblog_value["reblog"]["content"], "<p>Parent status</p>");
 }
 
 #[tokio::test]
@@ -2782,9 +2973,27 @@ async fn test_get_notifications() {
 
 #[tokio::test]
 async fn test_get_notifications_v2() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+
+    server
+        .state
+        .db
+        .insert_notification(&Notification {
+            id: EntityId::new_string(),
+            notification_type: NotificationType::Mention,
+            origin_account_address: "alice@remote.example".to_string(),
+            status_uri: None,
+            read: false,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
 
     let response = server
         .client
@@ -2795,6 +3004,12 @@ async fn test_get_notifications_v2() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let groups = body.as_array().expect("notification groups should be array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["type"], "mention");
+    assert_eq!(groups[0]["notifications_count"], 1);
+    assert_eq!(groups[0]["sample_account_ids"], json!(["alice@remote.example"]));
 }
 
 #[tokio::test]

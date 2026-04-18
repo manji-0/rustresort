@@ -32,7 +32,9 @@ pub struct MarkerUpdateRequest {
 
 #[derive(Debug, Serialize)]
 pub struct MarkerEnvelope {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub home: Option<Marker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<Marker>,
 }
 
@@ -97,13 +99,18 @@ pub async fn get_markers(
     Query(params): Query<GetMarkersParams>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let wants_home =
-        params.timelines.is_empty() || params.timelines.iter().any(|timeline| timeline == "home");
-    let wants_notifications = params.timelines.is_empty()
-        || params
-            .timelines
+    let explicit_timelines = params
+        .timelines
+        .iter()
+        .map(|timeline| timeline.trim())
+        .filter(|timeline| !timeline.is_empty())
+        .collect::<Vec<_>>();
+    let wants_home = explicit_timelines.is_empty()
+        || explicit_timelines.iter().any(|timeline| *timeline == "home");
+    let wants_notifications = explicit_timelines.is_empty()
+        || explicit_timelines
             .iter()
-            .any(|timeline| timeline == "notifications");
+            .any(|timeline| *timeline == "notifications");
     let envelope = MarkerEnvelope {
         home: if wants_home {
             load_marker(&state, HOME_MARKER_KEY).await?

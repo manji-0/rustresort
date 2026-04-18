@@ -2,12 +2,15 @@
 
 use axum::{
     extract::{Path, RawQuery, State},
-    response::Json,
+    http::{HeaderMap, header::LINK},
+    response::{IntoResponse, Json},
 };
 use serde::Deserialize;
 
 use super::accounts::PaginationParams;
-use super::accounts::resolve_account_response_for_identity;
+use super::accounts::{
+    build_remote_account_placeholder_response, resolve_account_response_for_identity,
+};
 use crate::TimelineApiState;
 use crate::auth::CurrentUser;
 use crate::data::{NotificationType, PersistedReason, Status, StatusVisibility};
@@ -159,18 +162,55 @@ async fn build_notification_status_response(
     .await
 }
 
+async fn build_notification_account_response(
+    state: &TimelineApiState,
+    origin_account_address: &str,
+) -> Result<crate::api::dto::AccountResponse, AppError> {
+    if let Some(account) = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        None,
+        origin_account_address,
+    )
+    .await
+    {
+        return Ok(account);
+    }
+
+    build_remote_account_placeholder_response(origin_account_address, state.config.as_ref(), 0)
+        .ok_or(AppError::NotFound)
+}
+
+fn notification_link_header(
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+) -> Option<String> {
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "</api/v1/notifications?limit={limit}&max_id={}>; rel=\"next\"",
+            urlencoding::encode(last_id)
+        ));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "</api/v1/notifications?limit={limit}&min_id={}>; rel=\"prev\"",
+            urlencoding::encode(first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
+}
+
 /// GET /api/v1/notifications
 pub async fn get_notifications(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     raw_query: RawQuery,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     use crate::api::dto::NotificationResponse;
 
-    // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-    // Get notifications
     let (params, raw_include_types, raw_exclude_types) =
         parse_notification_query(raw_query.0.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(40);
@@ -261,17 +301,8 @@ pub async fn get_notifications(
             notification_type: notification.notification_type.to_string(),
             group_key: format!("ungrouped-{}", notification.id),
             created_at: notification.created_at,
-            account: resolve_account_response_for_identity(
-                state.config.as_ref(),
-                state.db.as_ref(),
-                state.profile_cache.as_ref(),
-                None,
-                &notification.origin_account_address,
-            )
-            .await
-            .unwrap_or_else(|| {
-                crate::api::account_to_response_with_stats(&account, &state.config, account_stats)
-            }),
+            account: build_notification_account_response(&state, &notification.origin_account_address)
+                .await?,
             status: status_response,
             report: None,
             event: None,
@@ -281,16 +312,149 @@ pub async fn get_notifications(
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = notification_link_header(limit, first_id, last_id) {
+        headers.insert(
+            LINK,
+            link.parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v2/notifications
 pub async fn get_notifications_v2(
-    state: State<TimelineApiState>,
-    session: CurrentUser,
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
     raw_query: RawQuery,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    get_notifications(state, session, raw_query).await
+) -> Result<impl IntoResponse, AppError> {
+    let (params, raw_include_types, raw_exclude_types) =
+        parse_notification_query(raw_query.0.as_deref())?;
+    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let include_types = raw_include_types
+        .iter()
+        .filter_map(|value| parse_notification_type_filter(value))
+        .collect::<Vec<_>>();
+    let exclude_types = raw_exclude_types
+        .iter()
+        .filter_map(|value| parse_notification_type_filter(value))
+        .collect::<Vec<_>>();
+    let fetch_limit = limit.max(40);
+    let mut notifications = Vec::new();
+    let mut cursor = params.pagination.max_id.clone();
+    let min_cursor = if let Some(cursor_id) = params
+        .pagination
+        .min_id
+        .as_deref()
+        .or(params.pagination.since_id.as_deref())
+    {
+        state
+            .db
+            .get_notification(cursor_id)
+            .await?
+            .map(|notification| (notification.created_at, notification.id))
+    } else {
+        None
+    };
+
+    while notifications.len() < limit {
+        let batch = state
+            .db
+            .get_notifications(fetch_limit, cursor.as_deref(), false)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        let reached_end = batch.len() < fetch_limit;
+        cursor = batch.last().map(|notification| notification.id.clone());
+
+        for notification in batch {
+            if min_cursor
+                .as_ref()
+                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
+            {
+                continue;
+            }
+            if notification_is_included(
+                notification.notification_type,
+                &include_types,
+                &exclude_types,
+            ) {
+                notifications.push(notification);
+                if notifications.len() == limit {
+                    break;
+                }
+            }
+        }
+
+        if reached_end {
+            break;
+        }
+    }
+
+    let mut groups = Vec::new();
+    for notification in notifications {
+        let account =
+            build_notification_account_response(&state, &notification.origin_account_address).await?;
+        let status = if let Some(status_uri) = &notification.status_uri {
+            if let Some(status) = get_notification_status(&state, status_uri).await {
+                Some(
+                    serde_json::to_value(build_notification_status_response(&state, &status).await?)
+                        .map_err(|error| {
+                            AppError::serialization("notification v2 status response", error)
+                        })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        groups.push(serde_json::json!({
+            "id": notification.id,
+            "group_key": format!("ungrouped-{}", notification.id),
+            "type": notification.notification_type.to_string(),
+            "latest_page_notification_at": notification.created_at,
+            "most_recent_notification_id": notification.id,
+            "page_min_id": notification.id,
+            "page_max_id": notification.id,
+            "notifications_count": 1,
+            "sample_account_ids": [account.id.clone()],
+            "sample_accounts": [account],
+            "status": status,
+        }));
+    }
+
+    let first_id = groups
+        .first()
+        .and_then(|value| value.get("most_recent_notification_id"))
+        .and_then(|value| value.as_str());
+    let last_id = groups
+        .last()
+        .and_then(|value| value.get("most_recent_notification_id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = notification_link_header(limit, first_id, last_id) {
+        headers.insert(
+            LINK,
+            link.replace("/api/v1/notifications", "/api/v2/notifications")
+                .parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(groups)))
 }
 
 /// POST /api/v1/notifications/:id/dismiss
@@ -325,10 +489,6 @@ pub async fn get_notification(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::NotificationResponse;
 
-    // Get account
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-
     let notification = state
         .db
         .get_notification(&id)
@@ -353,17 +513,8 @@ pub async fn get_notification(
         notification_type: notification.notification_type.to_string(),
         group_key: format!("ungrouped-{}", notification.id),
         created_at: notification.created_at,
-        account: resolve_account_response_for_identity(
-            state.config.as_ref(),
-            state.db.as_ref(),
-            state.profile_cache.as_ref(),
-            None,
-            &notification.origin_account_address,
-        )
-        .await
-        .unwrap_or_else(|| {
-            crate::api::account_to_response_with_stats(&account, &state.config, account_stats)
-        }),
+        account: build_notification_account_response(&state, &notification.origin_account_address)
+            .await?,
         status: status_response,
         report: None,
         event: None,

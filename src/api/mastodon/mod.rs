@@ -182,6 +182,7 @@ where
             get(accounts::get_account_following),
         )
         .route("/v1/statuses/:id", get(statuses::get_status))
+        .route("/v1/statuses/:id/card", get(statuses::get_status_card))
         .route(
             "/v1/statuses/:id/context",
             get(statuses::get_status_context),

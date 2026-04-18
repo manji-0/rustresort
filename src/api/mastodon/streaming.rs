@@ -17,7 +17,9 @@ use serde_json::Value;
 use std::convert::Infallible;
 use tokio::sync::broadcast;
 
-use super::accounts::resolve_account_response_for_identity;
+use super::accounts::{
+    build_remote_account_placeholder_response, resolve_account_response_for_identity,
+};
 use crate::StreamingApiState;
 use crate::auth::CurrentUser;
 use crate::data::{PersistedReason, Status, StatusVisibility};
@@ -178,9 +180,6 @@ async fn build_notification_response_value(
         return Ok(None);
     };
 
-    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-
     let status_response = if let Some(status_uri) = notification.status_uri.as_deref() {
         if let Some(status) = get_notification_status(state, status_uri).await {
             Some(build_status_response(state, &status).await?)
@@ -205,9 +204,14 @@ async fn build_notification_response_value(
             &notification.origin_account_address,
         )
         .await
-        .unwrap_or_else(|| {
-            crate::api::account_to_response_with_stats(&account, &state.config, account_stats)
-        }),
+        .or_else(|| {
+            build_remote_account_placeholder_response(
+                &notification.origin_account_address,
+                state.config.as_ref(),
+                0,
+            )
+        })
+        .ok_or(AppError::NotFound)?,
         status: status_response,
         report: None,
         event: None,

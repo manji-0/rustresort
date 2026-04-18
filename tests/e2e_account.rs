@@ -266,12 +266,12 @@ async fn test_follow_locked_remote_account_returns_requested_relationship() {
 }
 
 #[tokio::test]
-async fn test_remote_follow_collections_include_known_local_relationships() {
+async fn test_remote_follow_collections_do_not_inject_local_relationships() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow, Follower};
 
     let server = TestServer::new().await;
-    let account = server.create_test_account().await;
+    server.create_test_account().await;
 
     server
         .state
@@ -342,8 +342,7 @@ async fn test_remote_follow_collections_include_known_local_relationships() {
     assert_eq!(followers.status(), 200);
     let followers_json: Value = followers.json().await.unwrap();
     let follower_accounts = followers_json.as_array().unwrap();
-    assert_eq!(follower_accounts.len(), 1);
-    assert_eq!(follower_accounts[0]["id"], account.id.as_str());
+    assert!(follower_accounts.is_empty());
 
     let following = server
         .client
@@ -354,8 +353,7 @@ async fn test_remote_follow_collections_include_known_local_relationships() {
     assert_eq!(following.status(), 200);
     let following_json: Value = following.json().await.unwrap();
     let following_accounts = following_json.as_array().unwrap();
-    assert_eq!(following_accounts.len(), 1);
-    assert_eq!(following_accounts[0]["id"], account.id.as_str());
+    assert!(following_accounts.is_empty());
 }
 
 #[tokio::test]

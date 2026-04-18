@@ -3,7 +3,7 @@
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, OriginalUri, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
@@ -42,11 +42,11 @@ pub struct AppResponse {
     pub name: String,
     pub website: Option<String>,
     pub redirect_uri: String,
-    pub redirect_uris: String,
+    pub redirect_uris: Vec<String>,
     pub client_id: String,
     pub client_secret: String,
     pub vapid_key: Option<String>,
-    pub scopes: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +90,12 @@ pub struct TokenResponse {
     pub expires_in: i64,
 }
 
+#[derive(Debug, Serialize)]
+struct OAuthErrorResponse {
+    error: String,
+    error_description: String,
+}
+
 struct AuthorizeContext {
     app_id: String,
     app_name: String,
@@ -101,6 +107,44 @@ struct AuthorizeContext {
 
 fn normalize_scopes(scopes: &str) -> String {
     scopes.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn oauth_error_response(
+    status: StatusCode,
+    error: &str,
+    description: impl Into<String>,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!(OAuthErrorResponse {
+            error: error.to_string(),
+            error_description: description.into(),
+        })),
+    )
+        .into_response()
+}
+
+fn scopes_to_vec(scopes: &str) -> Vec<String> {
+    normalize_scopes(scopes)
+        .split_whitespace()
+        .map(|scope| scope.to_string())
+        .collect()
+}
+
+fn redirect_uris_to_vec(redirect_uris: &str) -> Vec<String> {
+    redirect_uris
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn primary_redirect_uri(redirect_uris: &str) -> String {
+    redirect_uris_to_vec(redirect_uris)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| OOB_REDIRECT_URI.to_string())
 }
 
 fn scope_matches(granted: &str, required: &str) -> bool {
@@ -484,12 +528,12 @@ pub async fn create_app(
         id: app.id,
         name: app.name,
         website: app.website,
-        redirect_uri: app.redirect_uri.clone(),
-        redirect_uris: app.redirect_uri,
+        redirect_uri: primary_redirect_uri(&app.redirect_uri),
+        redirect_uris: redirect_uris_to_vec(&app.redirect_uri),
         client_id: app.client_id,
         client_secret,
         vapid_key: app.vapid_key,
-        scopes,
+        scopes: scopes_to_vec(&scopes),
     })))
 }
 
@@ -541,11 +585,11 @@ pub async fn verify_app_credentials(
         "id": app.id,
         "name": app.name,
         "website": app.website,
-        "redirect_uri": app.redirect_uri,
-        "redirect_uris": app.redirect_uri,
+        "redirect_uri": primary_redirect_uri(&app.redirect_uri),
+        "redirect_uris": redirect_uris_to_vec(&app.redirect_uri),
         "client_id": app.client_id,
         "vapid_key": app.vapid_key,
-        "scopes": app.scopes,
+        "scopes": scopes_to_vec(&app.scopes),
     })))
 }
 
@@ -555,7 +599,7 @@ pub async fn create_token(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Response, AppError> {
     use crate::data::{EntityId, OAuthToken};
 
     let peer_addr = connect_info.as_ref().map(|ConnectInfo(addr)| *addr);
@@ -568,24 +612,62 @@ pub async fn create_token(
     )
     .await?;
 
-    let req: TokenRequest = parse_body(&headers, &body)?;
+    let req: TokenRequest = match parse_body(&headers, &body) {
+        Ok(req) => req,
+        Err(AppError::Validation(description)) => {
+            return Ok(oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                description,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     if req.grant_type != "client_credentials"
         && req.grant_type != "authorization_code"
         && req.grant_type != "refresh_token"
     {
-        return Err(AppError::Validation("invalid grant_type".to_string()));
+        return Ok(oauth_error_response(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "grant_type must be client_credentials, authorization_code, or refresh_token",
+        ));
     }
 
     let (client_id, client_secret) =
-        resolve_client_credentials(&headers, req.client_id.clone(), req.client_secret.clone())?;
+        match resolve_client_credentials(&headers, req.client_id.clone(), req.client_secret.clone())
+        {
+            Ok(credentials) => credentials,
+            Err(AppError::Validation(description)) => {
+                return Ok(oauth_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    description,
+                ));
+            }
+            Err(AppError::Unauthorized) => {
+                return Ok(oauth_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "client authentication failed",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
 
-    let app = state
-        .db
-        .get_oauth_app_by_client_id(&client_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+    let Some(app) = state.db.get_oauth_app_by_client_id(&client_id).await? else {
+        return Ok(oauth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client authentication failed",
+        ));
+    };
     if !verify_client_secret(&app.client_secret, &client_secret) {
-        return Err(AppError::Unauthorized);
+        return Ok(oauth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client authentication failed",
+        ));
     }
 
     let issued_at = Utc::now();
@@ -599,53 +681,73 @@ pub async fn create_token(
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| normalize_scopes(&app.scopes));
             if !scopes_are_subset(&requested_scopes, &app.scopes) {
-                return Err(AppError::Unauthorized);
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "requested scope exceeds the application's registered scopes",
+                ));
             }
             ("client_credentials".to_string(), requested_scopes, None)
         }
         "authorization_code" => {
-            let code = req
+            let Some(code) = req
                 .code
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::Validation(
-                        "code is required for authorization_code grant".to_string(),
-                    )
-                })?;
-            let redirect_uri = req
+            else {
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "code is required for authorization_code grant",
+                ));
+            };
+            let Some(redirect_uri) = req
                 .redirect_uri
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::Validation(
-                        "redirect_uri is required for authorization_code grant".to_string(),
-                    )
-                })?;
-            let authorization_code = state
+            else {
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "redirect_uri is required for authorization_code grant",
+                ));
+            };
+            let Some(authorization_code) = state
                 .db
                 .consume_oauth_authorization_code(code, &app.id, redirect_uri, Utc::now())
                 .await?
-                .ok_or(AppError::Unauthorized)?;
+            else {
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "authorization code is invalid, expired, or already used",
+                ));
+            };
             if let Some(code_challenge) = authorization_code.code_challenge.as_deref() {
-                let code_verifier = req
+                let Some(code_verifier) = req
                     .code_verifier
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        AppError::Validation(
-                            "code_verifier is required when PKCE is used".to_string(),
-                        )
-                    })?;
+                else {
+                    return Ok(oauth_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        "code_verifier is required when PKCE is used",
+                    ));
+                };
                 if !verify_pkce_code_verifier(
                     code_verifier,
                     code_challenge,
                     authorization_code.code_challenge_method.as_deref(),
                 ) {
-                    return Err(AppError::Unauthorized);
+                    return Ok(oauth_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "code_verifier does not match the authorization code challenge",
+                    ));
                 }
             }
             let requested_scopes = req
@@ -657,7 +759,11 @@ pub async fn create_token(
             if !scopes_are_subset(&requested_scopes, &authorization_code.scopes)
                 || !scopes_are_subset(&requested_scopes, &app.scopes)
             {
-                return Err(AppError::Unauthorized);
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "requested scope exceeds the authorization grant or application scopes",
+                ));
             }
             (
                 "authorization_code".to_string(),
@@ -666,29 +772,42 @@ pub async fn create_token(
             )
         }
         "refresh_token" => {
-            let refresh_token = req
+            let Some(refresh_token) = req
                 .refresh_token
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    AppError::Validation(
-                        "refresh_token is required for refresh_token grant".to_string(),
-                    )
-                })?;
-            let existing = state
-                .db
-                .get_oauth_token_by_refresh_token(refresh_token)
-                .await?
-                .ok_or(AppError::Unauthorized)?;
+            else {
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "refresh_token is required for refresh_token grant",
+                ));
+            };
+            let Some(existing) = state.db.get_oauth_token_by_refresh_token(refresh_token).await?
+            else {
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "refresh token is invalid or expired",
+                ));
+            };
             if existing.app_id != app.id {
-                return Err(AppError::Unauthorized);
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "refresh token does not belong to this client",
+                ));
             }
             if !matches!(
                 existing.grant_type.as_str(),
                 "authorization_code" | "refresh_token"
             ) {
-                return Err(AppError::Unauthorized);
+                return Ok(oauth_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "refresh token cannot be used for this grant type",
+                ));
             }
             state.db.revoke_oauth_token(refresh_token).await?;
             (
@@ -721,7 +840,8 @@ pub async fn create_token(
         scope: token.scopes,
         created_at: issued_at.timestamp(),
         expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-    })))
+    }))
+    .into_response())
 }
 
 /// POST /oauth/revoke

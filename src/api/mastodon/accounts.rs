@@ -951,7 +951,7 @@ pub(crate) fn normalize_account_address(raw: &str) -> Result<String, AppError> {
     ))
 }
 
-fn normalize_remote_lookup_account_address(raw: &str) -> Option<String> {
+pub(crate) fn normalize_remote_lookup_account_address(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -1147,18 +1147,16 @@ pub(crate) fn build_remote_account_placeholder_response(
     statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
-    let (id, username, acct, url) =
+    let (username, acct, url) =
         if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
             let (username, _domain) = parsed_address.split_once('@')?;
             (
-                trimmed.to_string(),
                 username.to_string(),
                 parsed_address,
                 trimmed.to_string(),
             )
         } else if let Some((username, domain)) = trimmed.split_once('@') {
             (
-                trimmed.to_string(),
                 username.to_ascii_lowercase(),
                 trimmed.to_string(),
                 format!(
@@ -1175,7 +1173,7 @@ pub(crate) fn build_remote_account_placeholder_response(
     let header = format!("{}/default-header.png", media_url);
 
     Some(AccountResponse {
-        id,
+        id: acct.clone(),
         username: username.clone(),
         acct,
         uri: url.clone(),
@@ -1358,6 +1356,53 @@ async fn follow_state_for_target(
     Ok((accepted, !accepted))
 }
 
+async fn relationship_response_for_target(
+    state: &AccountApiState,
+    requested_id: &str,
+    target_address: &str,
+) -> Result<crate::api::dto::RelationshipResponse, AppError> {
+    use crate::api::dto::RelationshipResponse;
+
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let relationship_id = resolve_relationship_id(state, requested_id).await;
+    let (following, requested) = follow_state_for_target(state, target_address).await?;
+    let followed_by = state
+        .db
+        .get_follower(target_address, default_port)
+        .await?
+        .is_some();
+    let blocking = state
+        .db
+        .is_account_blocked(target_address, default_port)
+        .await?;
+    let muting = state
+        .db
+        .is_account_muted(target_address, default_port)
+        .await?;
+    let muting_notifications = state
+        .db
+        .get_account_mute_notifications(target_address, default_port)
+        .await?
+        .unwrap_or(false);
+    let follow_preferences = load_follow_preferences(state, target_address).await?;
+
+    Ok(RelationshipResponse {
+        id: relationship_id,
+        following,
+        followed_by,
+        blocking,
+        blocked_by: false,
+        muting,
+        muting_notifications,
+        requested,
+        domain_blocking: false,
+        showing_reblogs: follow_preferences.reblogs,
+        endorsed: false,
+        notifying: follow_preferences.notify,
+        note: String::new(),
+    })
+}
+
 async fn resolve_follow_request_requester_address(
     state: &AccountApiState,
     identity: &str,
@@ -1468,108 +1513,27 @@ async fn resolve_remote_collection_accounts(
 ) -> Vec<serde_json::Value> {
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-
-    let mut identities =
-        fetch_remote_collection_identities(state, target_address, collection_key, 120).await;
-
-    let local_account = match state.db.get_account().await {
-        Ok(Some(account)) => account,
-        _ => return Vec::new(),
-    };
-    let local_response = serde_json::to_value(crate::api::account_to_response_with_stats(
-        &local_account,
-        &state.config,
-        crate::api::load_local_account_stats(state.db.as_ref())
-            .await
-            .unwrap_or_default(),
-    ))
-    .ok();
-
-    let local_address = format!("{}@{}", local_account.username, state.config.server.domain);
-    if collection_key == "followers"
-        && state
-            .db
-            .get_follow(target_address, default_port)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        && !identities.iter().any(|identity| {
-            account_addresses_match_with_default_port(identity, &local_address, default_port)
-                || identity.eq_ignore_ascii_case(&local_account.id)
-        })
-    {
-        identities.push(local_address.clone());
-    }
-    if collection_key == "following"
-        && state
-            .db
-            .get_follower(target_address, default_port)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        && !identities.iter().any(|identity| {
-            account_addresses_match_with_default_port(identity, &local_address, default_port)
-                || identity.eq_ignore_ascii_case(&local_account.id)
-        })
-    {
-        identities.push(local_address.clone());
-    }
+    let identities = fetch_remote_collection_identities(state, target_address, collection_key, 120)
+        .await;
 
     let mut resolved = Vec::new();
     for identity in identities {
-        let maybe_response =
-            if local_account_matches_identity(&local_account, state.config.as_ref(), &identity) {
-                local_response.clone()
-            } else {
-                resolve_remote_account_response_for_list(
-                    state.config.as_ref(),
-                    state.db.as_ref(),
-                    state.profile_cache.as_ref(),
-                    state.federation_fetch_client.as_ref(),
-                    &identity,
-                    default_port,
-                )
-                .await
-                .and_then(|response| serde_json::to_value(response).ok())
-            };
-
-        if let Some(response) = maybe_response {
+        if let Some(response) = resolve_remote_account_response_for_list(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            &identity,
+            default_port,
+        )
+        .await
+        .and_then(|response| serde_json::to_value(response).ok())
+        {
             resolved.push(response);
         }
     }
 
-    let max_id = normalized_cursor_id(params.max_id.as_deref());
-    let min_id = normalized_cursor_id(params.min_id.as_deref().or(params.since_id.as_deref()));
-    resolved.sort_by(|left, right| {
-        let left_id = left
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let right_id = right
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        right_id.cmp(left_id)
-    });
-    resolved.dedup_by(|left, right| {
-        left.get("id").and_then(|value| value.as_str())
-            == right.get("id").and_then(|value| value.as_str())
-    });
-    resolved
-        .into_iter()
-        .filter(|account| {
-            let id = account
-                .get("id")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            max_id.as_ref().map(|cursor| id < *cursor).unwrap_or(true)
-                && min_id.as_ref().map(|cursor| id > *cursor).unwrap_or(true)
-        })
-        .take(limit)
-        .collect()
+    paginate_account_response_values(resolved, params, limit)
 }
 
 async fn resolve_moved_account_response(
@@ -1741,37 +1705,45 @@ fn contains_equivalent_address(
         .any(|seen| account_addresses_match_with_default_port(seen, candidate, default_port))
 }
 
-fn normalized_cursor_id(value: Option<&str>) -> Option<String> {
-    let trimmed = value?.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(normalize_account_address(trimmed).unwrap_or_else(|_| trimmed.to_string()))
-}
-
-fn apply_account_address_pagination(
-    mut addresses: Vec<String>,
+fn paginate_account_response_values(
+    mut accounts: Vec<serde_json::Value>,
     params: &PaginationParams,
-) -> Vec<String> {
-    addresses.sort();
-    addresses.dedup();
-    addresses.reverse();
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let max_id = params.max_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let min_id = params
+        .min_id
+        .as_deref()
+        .or(params.since_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let max_id = normalized_cursor_id(params.max_id.as_deref());
-    let min_id = normalized_cursor_id(params.min_id.as_deref());
-
-    addresses
+    accounts.sort_by(|left, right| {
+        let left_id = left
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_id = right
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_id.cmp(left_id)
+    });
+    accounts.dedup_by(|left, right| {
+        left.get("id").and_then(|value| value.as_str())
+            == right.get("id").and_then(|value| value.as_str())
+    });
+    accounts
         .into_iter()
-        .filter(|address| {
-            max_id
-                .as_ref()
-                .map(|cursor| address < cursor)
-                .unwrap_or(true)
-                && min_id
-                    .as_ref()
-                    .map(|cursor| address > cursor)
-                    .unwrap_or(true)
+        .filter(|account| {
+            let id = account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            max_id.map(|cursor| id < cursor).unwrap_or(true)
+                && min_id.map(|cursor| id > cursor).unwrap_or(true)
         })
+        .take(limit)
         .collect()
 }
 
@@ -2365,15 +2337,35 @@ pub async fn get_account(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let response = resolve_account_response_for_identity(
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let response = if local_account_matches_identity(&account, state.config.as_ref(), &id) {
+        let stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+        let mut response =
+            crate::api::account_to_response_with_stats(&account, &state.config, stats);
+        populate_local_account_compat_fields(&state, &account, &mut response).await;
+        response
+    } else if let Some(response) = resolve_cached_remote_account_response(
         state.config.as_ref(),
         state.db.as_ref(),
         state.profile_cache.as_ref(),
-        Some(state.federation_fetch_client.as_ref()),
         &id,
     )
     .await
-    .ok_or(AppError::NotFound)?;
+    {
+        response
+    } else if let Some(response) = resolve_remote_account_response(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        &id,
+    )
+    .await
+    {
+        response
+    } else {
+        return Err(AppError::NotFound);
+    };
 
     Ok(Json(serde_json::to_value(response).unwrap()))
 }
@@ -2514,8 +2506,7 @@ pub async fn get_account_followers(
         identities.push(candidate);
     }
 
-    let paged_addresses = apply_account_address_pagination(identities, &params);
-    let resolved = stream::iter(paged_addresses.into_iter().take(limit))
+    let resolved = stream::iter(identities.into_iter())
         .map(|address| {
             let state = state.clone();
             async move {
@@ -2536,7 +2527,9 @@ pub async fn get_account_followers(
         .await;
     followers.extend(resolved.into_iter().flatten());
 
-    Ok(Json(followers))
+    Ok(Json(paginate_account_response_values(
+        followers, &params, limit,
+    )))
 }
 
 /// GET /api/v1/accounts/:id/following
@@ -2585,8 +2578,7 @@ pub async fn get_account_following(
         identities.push(candidate);
     }
 
-    let paged_addresses = apply_account_address_pagination(identities, &params);
-    let resolved = stream::iter(paged_addresses.into_iter().take(limit))
+    let resolved = stream::iter(identities.into_iter())
         .map(|address| {
             let state = state.clone();
             async move {
@@ -2607,7 +2599,9 @@ pub async fn get_account_following(
         .await;
     following.extend(resolved.into_iter().flatten());
 
-    Ok(Json(following))
+    Ok(Json(paginate_account_response_values(
+        following, &params, limit,
+    )))
 }
 
 /// POST /api/v1/accounts/:id/follow
@@ -2617,7 +2611,6 @@ pub async fn follow_account(
     Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
     use crate::data::{EntityId, Follow};
     use chrono::Utc;
 
@@ -2726,25 +2719,7 @@ pub async fn follow_account(
         });
     }
 
-    let relationship_id = resolve_relationship_id(&state, &id).await;
-    let (following, requested) = follow_state_for_target(&state, &target_address).await?;
-
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: relationship_id,
-        following,
-        followed_by: false,
-        blocking: false,
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested,
-        domain_blocking: false,
-        showing_reblogs: follow_preferences.reblogs,
-        endorsed: false,
-        notifying: follow_preferences.notify,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -2777,8 +2752,6 @@ pub async fn unfollow_account(
     CurrentUser(_user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
 
@@ -2824,22 +2797,7 @@ pub async fn unfollow_account(
         });
     }
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: resolve_relationship_id(&state, &id).await,
-        following: false, // We just unfollowed
-        followed_by: false,
-        blocking: false,
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3280,14 +3238,29 @@ pub async fn get_account_identity_proofs(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
-    // Verify account exists
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-
-    if account.id.as_str() != id {
+    let resolvable = local_account_matches_identity(&account, state.config.as_ref(), &id)
+        || resolve_cached_remote_account_response(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            &id,
+        )
+        .await
+        .is_some()
+        || resolve_remote_account_response(
+            state.config.as_ref(),
+            state.db.as_ref(),
+            state.profile_cache.as_ref(),
+            state.federation_fetch_client.as_ref(),
+            &id,
+        )
+        .await
+        .is_some();
+    if !resolvable {
         return Err(AppError::NotFound);
     }
 
-    // Identity proofs not supported, return empty array
     Ok(Json(vec![]))
 }
 
@@ -3305,8 +3278,6 @@ pub async fn block_account(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
     let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -3372,22 +3343,7 @@ pub async fn block_account(
         });
     }
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: false,
-        blocking: true, // Now blocking
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: false,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3399,8 +3355,6 @@ pub async fn unblock_account(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
     let account_for_delivery = state.db.get_account().await?.ok_or(AppError::NotFound)?;
@@ -3450,22 +3404,7 @@ pub async fn unblock_account(
         });
     }
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: false,
-        blocking: false, // No longer blocking
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3478,8 +3417,6 @@ pub async fn mute_account(
     Path(id): Path<String>,
     req: Option<Json<MuteAccountRequest>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
 
@@ -3516,22 +3453,7 @@ pub async fn mute_account(
         )
         .await?;
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: false,
-        blocking: false,
-        blocked_by: false,
-        muting: true, // Now muting
-        muting_notifications: mute_notifications,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3543,8 +3465,6 @@ pub async fn unmute_account(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
 
@@ -3555,22 +3475,7 @@ pub async fn unmute_account(
         .unmute_account(&target_address, default_port)
         .await?;
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: false,
-        blocking: false,
-        blocked_by: false,
-        muting: false, // No longer muting
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship = relationship_response_for_target(&state, &id, &target_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3690,8 +3595,6 @@ pub async fn authorize_follow_request(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     let requester_address = resolve_follow_request_requester_address(&state, &id).await?;
     let (inbox_uri, follow_activity_uri) = state
         .db
@@ -3706,28 +3609,15 @@ pub async fn authorize_follow_request(
     }
 
     let delivery = build_delivery(&state, &account_for_delivery);
+    let db = state.db.clone();
     spawn_best_effort_delivery("authorize_follow_request", async move {
         delivery
-            .queue_accept(state.db.as_ref(), &follow_activity_uri, &inbox_uri)
+            .queue_accept(db.as_ref(), &follow_activity_uri, &inbox_uri)
             .await
     });
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: true, // Now following us
-        blocking: false,
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship =
+        relationship_response_for_target(&state, &id, &requester_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3739,8 +3629,6 @@ pub async fn reject_follow_request(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::api::dto::RelationshipResponse;
-
     let requester_address = resolve_follow_request_requester_address(&state, &id).await?;
     let follow_request = state.db.get_follow_request(&requester_address).await?;
     let account_for_delivery = if follow_request.is_some() {
@@ -3758,29 +3646,16 @@ pub async fn reject_follow_request(
         (follow_request, account_for_delivery)
     {
         let delivery = build_delivery(&state, &account_for_delivery);
+        let db = state.db.clone();
         spawn_best_effort_delivery("reject_follow_request", async move {
             delivery
-                .queue_reject(state.db.as_ref(), &follow_activity_uri, &inbox_uri)
+                .queue_reject(db.as_ref(), &follow_activity_uri, &inbox_uri)
                 .await
         });
     }
 
-    // Return relationship response
-    let relationship = RelationshipResponse {
-        id: id.clone(),
-        following: false,
-        followed_by: false,
-        blocking: false,
-        blocked_by: false,
-        muting: false,
-        muting_notifications: false,
-        requested: false,
-        domain_blocking: false,
-        showing_reblogs: true,
-        endorsed: false,
-        notifying: false,
-        note: String::new(),
-    };
+    let relationship =
+        relationship_response_for_target(&state, &id, &requester_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
