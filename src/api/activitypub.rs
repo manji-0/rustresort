@@ -335,55 +335,63 @@ async fn build_note_object(
 ) -> Result<serde_json::Value, AppError> {
     let (to_audience, cc_audience) = activitypub_audience(followers_url, status.visibility);
     let poll = state.db.get_poll_by_status_id(&status.id).await?;
-    let mut note =
-        if let Some((poll_id, expires_at, expired, multiple, _votes_count, voters_count)) = poll {
-            let options = state
-                .db
-                .get_poll_options(&poll_id)
-                .await?
-                .into_iter()
-                .map(|(_, title, votes_count)| {
-                    serde_json::json!({
-                        "type": "Note",
-                        "name": title,
-                        "replies": {
-                            "type": "Collection",
-                            "totalItems": votes_count,
-                        }
-                    })
+    let mut note = if let Some((
+        poll_id,
+        expires_at,
+        expired,
+        multiple,
+        _hide_totals,
+        _votes_count,
+        voters_count,
+    )) = poll
+    {
+        let options = state
+            .db
+            .get_poll_options(&poll_id)
+            .await?
+            .into_iter()
+            .map(|(_, title, votes_count)| {
+                serde_json::json!({
+                    "type": "Note",
+                    "name": title,
+                    "replies": {
+                        "type": "Collection",
+                        "totalItems": votes_count,
+                    }
                 })
-                .collect::<Vec<_>>();
-            let mut object = serde_json::json!({
-                "type": "Question",
-                "id": status.uri.clone(),
-                "attributedTo": actor_url,
-                "content": status.content.clone(),
-                "published": status.created_at.to_rfc3339(),
-                "to": to_audience,
-                "cc": cc_audience,
-                "endTime": expires_at,
-                "votersCount": voters_count,
-            });
-            if expired {
-                object["closed"] = serde_json::json!(expires_at);
-            }
-            if multiple {
-                object["anyOf"] = serde_json::json!(options);
-            } else {
-                object["oneOf"] = serde_json::json!(options);
-            }
-            object
-        } else {
-            serde_json::json!({
-                "type": "Note",
-                "id": status.uri.clone(),
-                "attributedTo": actor_url,
-                "content": status.content.clone(),
-                "published": status.created_at.to_rfc3339(),
-                "to": to_audience,
-                "cc": cc_audience
             })
-        };
+            .collect::<Vec<_>>();
+        let mut object = serde_json::json!({
+            "type": "Question",
+            "id": status.uri.clone(),
+            "attributedTo": actor_url,
+            "content": status.content.clone(),
+            "published": status.created_at.to_rfc3339(),
+            "to": to_audience,
+            "cc": cc_audience,
+            "endTime": expires_at,
+            "votersCount": voters_count,
+        });
+        if expired {
+            object["closed"] = serde_json::json!(expires_at);
+        }
+        if multiple {
+            object["anyOf"] = serde_json::json!(options);
+        } else {
+            object["oneOf"] = serde_json::json!(options);
+        }
+        object
+    } else {
+        serde_json::json!({
+            "type": "Note",
+            "id": status.uri.clone(),
+            "attributedTo": actor_url,
+            "content": status.content.clone(),
+            "published": status.created_at.to_rfc3339(),
+            "to": to_audience,
+            "cc": cc_audience
+        })
+    };
 
     if let Some(summary) = &status.content_warning {
         note["summary"] = serde_json::json!(summary);

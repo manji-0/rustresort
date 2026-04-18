@@ -171,6 +171,7 @@ async fn publish_scheduled_status(
                 AppError::Validation("scheduled poll_expires_in is missing".to_string())
             })?,
             scheduled.poll_multiple,
+            false,
         ))
     };
 
@@ -263,9 +264,10 @@ async fn publish_scheduled_status(
         .persist_local_status_with_media_and_poll(
             &status,
             &media_ids,
-            poll.as_ref().map(|(options, expires_in, multiple)| {
-                (options.as_slice(), *expires_in, *multiple)
-            }),
+            poll.as_ref()
+                .map(|(options, expires_in, multiple, hide_totals)| {
+                    (options.as_slice(), *expires_in, *multiple, *hide_totals)
+                }),
         )
         .await?;
     POSTS_TOTAL.inc();

@@ -442,7 +442,7 @@ impl Database {
         &self,
         status: &Status,
         media_ids: &[String],
-        poll: Option<(&[String], i64, bool)>,
+        poll: Option<(&[String], i64, bool, bool)>,
     ) -> Result<(), AppError> {
         if media_ids.is_empty() && poll.is_none() {
             return self.insert_status(status).await;
@@ -498,19 +498,20 @@ impl Database {
                 }
             }
 
-            if let Some((poll_options, expires_in, multiple)) = poll {
+            if let Some((poll_options, expires_in, multiple, hide_totals)) = poll {
                 let poll_id = EntityId::new_string();
                 let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
                 sqlx::query(
                     r#"
-                    INSERT INTO polls (id, status_id, expires_at, expired, multiple, votes_count, voters_count, created_at)
-                    VALUES (?, ?, ?, 0, ?, 0, 0, datetime('now'))
+                    INSERT INTO polls (id, status_id, expires_at, expired, multiple, hide_totals, votes_count, voters_count, created_at)
+                    VALUES (?, ?, ?, 0, ?, ?, 0, 0, datetime('now'))
                     "#,
                 )
                 .bind(&poll_id)
                 .bind(&status.id)
                 .bind(expires_at.to_rfc3339())
                 .bind(multiple as i64)
+                .bind(hide_totals as i64)
                 .execute(&mut *conn)
                 .await?;
 
@@ -667,6 +668,9 @@ impl Database {
         previous: &Status,
         updated: &Status,
         media_ids: Option<&[String]>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<(), AppError> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -715,14 +719,20 @@ impl Database {
             let edit_id = EntityId::new_string();
             sqlx::query(
                 r#"
-                INSERT INTO status_edits (id, status_id, content, content_warning, created_at)
-                VALUES (?, ?, ?, ?, datetime('now'))
+                INSERT INTO status_edits (
+                    id, status_id, content, content_warning,
+                    media_attachments_json, poll_json, quote_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 "#,
             )
             .bind(edit_id)
             .bind(&previous.id)
             .bind(&previous.content)
             .bind(&previous.content_warning)
+            .bind(media_attachments_json)
+            .bind(poll_json)
+            .bind(quote_json)
             .execute(&mut *conn)
             .await?;
 
@@ -773,18 +783,27 @@ impl Database {
         status_id: &str,
         content: &str,
         content_warning: Option<&str>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<String, AppError> {
         let edit_id = EntityId::new_string();
         sqlx::query(
             r#"
-            INSERT INTO status_edits (id, status_id, content, content_warning, created_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
+            INSERT INTO status_edits (
+                id, status_id, content, content_warning,
+                media_attachments_json, poll_json, quote_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
             "#,
         )
         .bind(&edit_id)
         .bind(status_id)
         .bind(content)
         .bind(content_warning)
+        .bind(media_attachments_json)
+        .bind(poll_json)
+        .bind(quote_json)
         .execute(&self.pool)
         .await?;
 
@@ -796,10 +815,39 @@ impl Database {
         &self,
         status_id: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, Option<String>, DateTime<Utc>)>, AppError> {
-        let edits = sqlx::query_as::<_, (String, String, Option<String>, DateTime<Utc>)>(
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )>,
+        AppError,
+    > {
+        let edits = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                DateTime<Utc>,
+            ),
+        >(
             r#"
-            SELECT id, content, content_warning, created_at
+            SELECT
+                id,
+                content,
+                content_warning,
+                media_attachments_json,
+                poll_json,
+                quote_json,
+                created_at
             FROM status_edits
             WHERE status_id = ?
             ORDER BY created_at DESC, id DESC

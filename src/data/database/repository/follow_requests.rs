@@ -35,6 +35,49 @@ impl Database {
         Ok(rows)
     }
 
+    /// Resolve a follow-request path identity to the stored requester address.
+    ///
+    /// Accepts either the raw requester address or a stored canonical actor URI.
+    /// Default-port-equivalent address variants are treated as matches.
+    pub async fn resolve_follow_request_requester(
+        &self,
+        identity: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<String>, AppError> {
+        let trimmed = identity.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT requester_address, actor_uri FROM follow_requests ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (requester_address, actor_uri) in rows {
+            if requester_address.eq_ignore_ascii_case(trimmed)
+                || actor_uri
+                    .as_deref()
+                    .is_some_and(|stored| stored.eq_ignore_ascii_case(trimmed))
+            {
+                return Ok(Some(requester_address));
+            }
+
+            if account_addresses_match(&requester_address, trimmed, default_port) {
+                return Ok(Some(requester_address));
+            }
+
+            if let Some(actor_uri) = actor_uri.as_deref()
+                && account_addresses_match(actor_uri, trimmed, default_port)
+            {
+                return Ok(Some(requester_address));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Check if follow request exists
     pub async fn has_follow_request(&self, requester_address: &str) -> Result<bool, AppError> {
         let count: i64 =

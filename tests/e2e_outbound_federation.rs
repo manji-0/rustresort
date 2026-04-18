@@ -380,6 +380,7 @@ async fn test_remote_poll_vote_delivers_create_note_to_remote_inbox() {
             "2026-04-30T00:00:00Z",
             false,
             false,
+            false,
             0,
             0,
             &[("tea".to_string(), 0), ("coffee".to_string(), 0)],

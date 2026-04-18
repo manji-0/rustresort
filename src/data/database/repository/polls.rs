@@ -13,19 +13,33 @@ impl Database {
         expires_in: i64,
         multiple: bool,
     ) -> Result<String, AppError> {
+        self.create_poll_with_hide_totals(status_id, options, expires_in, multiple, false)
+            .await
+    }
+
+    /// Create a poll with explicit hidden-totals behavior.
+    pub async fn create_poll_with_hide_totals(
+        &self,
+        status_id: &str,
+        options: &[String],
+        expires_in: i64,
+        multiple: bool,
+        hide_totals: bool,
+    ) -> Result<String, AppError> {
         let poll_id = EntityId::new_string();
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
 
         sqlx::query(
             r#"
-            INSERT INTO polls (id, status_id, expires_at, expired, multiple, votes_count, voters_count, created_at)
-            VALUES (?, ?, ?, 0, ?, 0, 0, datetime('now'))
+            INSERT INTO polls (id, status_id, expires_at, expired, multiple, hide_totals, votes_count, voters_count, created_at)
+            VALUES (?, ?, ?, 0, ?, ?, 0, 0, datetime('now'))
             "#,
         )
         .bind(&poll_id)
         .bind(status_id)
         .bind(expires_at.to_rfc3339())
         .bind(multiple as i64)
+        .bind(hide_totals as i64)
         .execute(&self.pool)
         .await?;
 
@@ -53,21 +67,22 @@ impl Database {
     pub async fn get_poll(
         &self,
         poll_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
-        let result = sqlx::query_as::<_, (String, String, i64, i64, i64, i64)>(
-            "SELECT id, expires_at, expired, multiple, votes_count, voters_count FROM polls WHERE id = ?",
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError> {
+        let result = sqlx::query_as::<_, (String, String, i64, i64, i64, i64, i64)>(
+            "SELECT id, expires_at, expired, multiple, hide_totals, votes_count, voters_count FROM polls WHERE id = ?",
         )
         .bind(poll_id)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(result.map(
-            |(id, expires_at, expired, multiple, votes_count, voters_count)| {
+            |(id, expires_at, expired, multiple, hide_totals, votes_count, voters_count)| {
                 (
                     id,
                     expires_at.clone(),
                     poll_is_expired(&expires_at, expired),
                     multiple != 0,
+                    hide_totals != 0,
                     votes_count,
                     voters_count,
                 )
@@ -79,21 +94,22 @@ impl Database {
     pub async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
-        let result = sqlx::query_as::<_, (String, String, i64, i64, i64, i64)>(
-            "SELECT id, expires_at, expired, multiple, votes_count, voters_count FROM polls WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError> {
+        let result = sqlx::query_as::<_, (String, String, i64, i64, i64, i64, i64)>(
+            "SELECT id, expires_at, expired, multiple, hide_totals, votes_count, voters_count FROM polls WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(status_id)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(result.map(
-            |(id, expires_at, expired, multiple, votes_count, voters_count)| {
+            |(id, expires_at, expired, multiple, hide_totals, votes_count, voters_count)| {
                 (
                     id,
                     expires_at.clone(),
                     poll_is_expired(&expires_at, expired),
                     multiple != 0,
+                    hide_totals != 0,
                     votes_count,
                     voters_count,
                 )
@@ -167,6 +183,7 @@ impl Database {
         expires_at: &str,
         expired: bool,
         multiple: bool,
+        hide_totals: bool,
         votes_count: i64,
         voters_count: i64,
         options: &[(String, i64)],
@@ -219,13 +236,14 @@ impl Database {
                 sqlx::query(
                     r#"
                     UPDATE polls
-                    SET expires_at = ?, expired = ?, multiple = ?, votes_count = ?, voters_count = ?
+                    SET expires_at = ?, expired = ?, multiple = ?, hide_totals = ?, votes_count = ?, voters_count = ?
                     WHERE id = ?
                     "#,
                 )
                 .bind(expires_at)
                 .bind(expired as i64)
                 .bind(multiple as i64)
+                .bind(hide_totals as i64)
                 .bind(votes_count)
                 .bind(voters_count)
                 .bind(&poll_id)
@@ -234,8 +252,8 @@ impl Database {
             } else {
                 sqlx::query(
                     r#"
-                    INSERT INTO polls (id, status_id, expires_at, expired, multiple, votes_count, voters_count, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    INSERT INTO polls (id, status_id, expires_at, expired, multiple, hide_totals, votes_count, voters_count, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                     "#,
                 )
                 .bind(&poll_id)
@@ -243,6 +261,7 @@ impl Database {
                 .bind(expires_at)
                 .bind(expired as i64)
                 .bind(multiple as i64)
+                .bind(hide_totals as i64)
                 .bind(votes_count)
                 .bind(voters_count)
                 .execute(&mut *conn)

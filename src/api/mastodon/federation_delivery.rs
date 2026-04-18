@@ -172,6 +172,37 @@ async fn send_validated_get(
     )))
 }
 
+pub(crate) async fn fetch_remote_activity_json(
+    http_client: &reqwest::Client,
+    uri: &str,
+) -> Result<serde_json::Value, AppError> {
+    let parsed = url::Url::parse(uri).map_err(|error| {
+        AppError::Federation(format!("Invalid ActivityPub JSON URI {} ({})", uri, error))
+    })?;
+    let response = send_validated_get(
+        http_client,
+        &parsed,
+        "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+    )
+    .await
+    .map_err(|error| AppError::Federation(format!("Remote fetch failed for {}: {}", uri, error)))?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Federation(format!(
+            "Remote fetch failed for {}: HTTP {}",
+            uri,
+            response.status()
+        )));
+    }
+
+    response.json().await.map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to decode ActivityPub JSON {}: {}",
+            uri, error
+        ))
+    })
+}
+
 pub(crate) async fn validate_actor_and_inbox_urls(
     actor_uri: &str,
     inbox_uri: &str,
@@ -742,31 +773,7 @@ async fn fetch_actor_document(
     http_client: &reqwest::Client,
     actor_uri: &str,
 ) -> Result<serde_json::Value, AppError> {
-    let actor_url = url::Url::parse(actor_uri).map_err(|error| {
-        AppError::Federation(format!("Invalid actor URI {} ({})", actor_uri, error))
-    })?;
-    let response = send_validated_get(
-        http_client,
-        &actor_url,
-        "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
-    )
-    .await
-    .map_err(|error| AppError::Federation(format!("Actor fetch failed for {}: {}", actor_uri, error)))?;
-
-    if !response.status().is_success() {
-        return Err(AppError::Federation(format!(
-            "Actor fetch failed for {}: HTTP {}",
-            actor_uri,
-            response.status()
-        )));
-    }
-
-    response.json().await.map_err(|error| {
-        AppError::Federation(format!(
-            "Failed to decode actor document {}: {}",
-            actor_uri, error
-        ))
-    })
+    fetch_remote_activity_json(http_client, actor_uri).await
 }
 
 #[cfg(test)]

@@ -2,12 +2,18 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::Json,
+    http::{HeaderMap, header::LINK},
+    response::{IntoResponse, Json},
 };
 use serde::Deserialize;
 
 use super::accounts::resolve_account_response_for_identity;
-use crate::{ConversationsApiState, auth::CurrentUser, error::AppError};
+use crate::{
+    ConversationsApiState,
+    auth::CurrentUser,
+    error::AppError,
+    service::{StreamEvent, StreamTarget},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ConversationsParams {
@@ -125,6 +131,48 @@ async fn build_conversation_response(
     }))
 }
 
+fn conversation_link_header(
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+) -> Option<String> {
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "</api/v1/conversations?limit={limit}&max_id={}>; rel=\"next\"",
+            urlencoding::encode(last_id)
+        ));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "</api/v1/conversations?limit={limit}&min_id={}>; rel=\"prev\"",
+            urlencoding::encode(first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
+}
+
+async fn publish_conversation_event(
+    state: &ConversationsApiState,
+    payload: serde_json::Value,
+) -> Result<(), AppError> {
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    state
+        .streaming_event_bus
+        .publish(StreamEvent::Conversation {
+            payload,
+            targets: vec![
+                StreamTarget::Direct {
+                    account_id: account.username.clone(),
+                },
+                StreamTarget::User {
+                    account_id: account.username,
+                },
+            ],
+        })
+        .await
+}
+
 /// GET /api/v1/conversations - Get conversations
 ///
 /// View all conversations (direct message threads).
@@ -132,7 +180,7 @@ pub async fn get_conversations(
     State(state): State<ConversationsApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<ConversationsParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let limit = params.limit.unwrap_or(20).min(40);
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
@@ -161,7 +209,20 @@ pub async fn get_conversations(
         );
     }
 
-    Ok(Json(serde_json::json!(response)))
+    let first_id = response
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = response
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = conversation_link_header(limit, first_id, last_id) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(serde_json::json!(response))))
 }
 
 /// DELETE /api/v1/conversations/:id - Remove a conversation
@@ -177,6 +238,15 @@ pub async fn delete_conversation(
     if !deleted {
         return Err(AppError::NotFound);
     }
+
+    publish_conversation_event(
+        &state,
+        serde_json::json!({
+            "id": id,
+            "_deleted": true,
+        }),
+    )
+    .await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -211,6 +281,8 @@ pub async fn mark_conversation_read(
         unread,
     )
     .await?;
+
+    publish_conversation_event(&state, updated_conversation.clone()).await?;
 
     Ok(Json(updated_conversation))
 }

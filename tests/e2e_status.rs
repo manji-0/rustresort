@@ -1617,6 +1617,235 @@ async fn test_update_status_can_change_language_and_poll() {
     let options = updated["poll"]["options"].as_array().unwrap();
     assert_eq!(options[0]["title"], "maybe");
     assert_eq!(options[1]["title"], "later");
+    assert_eq!(updated["poll"]["hide_totals"], false);
+}
+
+#[tokio::test]
+async fn test_create_and_update_status_preserve_poll_hide_totals() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "hidden totals poll",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600,
+                "hide_totals": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+    assert_eq!(created["poll"]["hide_totals"], true);
+
+    let update_response = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("poll[options][]", "later"),
+            ("poll[options][]", "never"),
+            ("poll[expires_in]", "1200"),
+            ("poll[hide_totals]", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+    let updated: Value = update_response.json().await.unwrap();
+    assert_eq!(updated["poll"]["hide_totals"], false);
+}
+
+#[tokio::test]
+async fn test_update_status_rejects_poll_edit_after_votes_exist() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "poll edit target",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+    let poll_id = created["poll"]["id"].as_str().unwrap();
+
+    let vote_response = server
+        .client
+        .post(server.url(&format!("/api/v1/polls/{poll_id}/votes")))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({ "choices": [0] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vote_response.status(), 200);
+
+    let update_response = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("poll[options][]", "maybe"),
+            ("poll[options][]", "later"),
+            ("poll[expires_in]", "1200"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 422);
+}
+
+#[tokio::test]
+async fn test_status_history_preserves_previous_poll_snapshot() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let create_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "poll history",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 600,
+                "hide_totals": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), 200);
+    let created: Value = create_response.json().await.unwrap();
+    let status_id = created["id"].as_str().unwrap();
+
+    let update_response = server
+        .client
+        .put(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .form(&[
+            ("poll[options][]", "maybe"),
+            ("poll[options][]", "later"),
+            ("poll[expires_in]", "1200"),
+            ("poll[hide_totals]", "false"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update_response.status(), 200);
+
+    let history_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{status_id}/history")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), 200);
+    let history: Value = history_response.json().await.unwrap();
+    let items = history.as_array().unwrap();
+    assert!(items.iter().any(|item| {
+        item["poll"]["options"][0]["title"] == "yes"
+            && item["poll"]["options"][1]["title"] == "no"
+            && item["poll"]["hide_totals"] == true
+    }));
+    assert!(items.iter().any(|item| {
+        item["poll"]["options"][0]["title"] == "maybe"
+            && item["poll"]["options"][1]["title"] == "later"
+            && item["poll"]["hide_totals"] == false
+    }));
+}
+
+#[tokio::test]
+async fn test_status_context_includes_viewer_interaction_state() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let root_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "context root",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root_response.status(), 200);
+    let root: Value = root_response.json().await.unwrap();
+    let root_id = root["id"].as_str().unwrap();
+
+    let reply_response = server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "status": "context reply",
+            "visibility": "public",
+            "in_reply_to_id": root_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply_response.status(), 200);
+    let reply: Value = reply_response.json().await.unwrap();
+    let reply_id = reply["id"].as_str().unwrap();
+
+    for action in ["favourite", "bookmark", "pin"] {
+        let response = server
+            .client
+            .post(server.url(&format!("/api/v1/statuses/{root_id}/{action}")))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    let mute_response = server
+        .client
+        .post(server.url(&format!("/api/v1/statuses/{root_id}/mute")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mute_response.status(), 200);
+
+    let context_response = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{reply_id}/context")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(context_response.status(), 200);
+    let context: Value = context_response.json().await.unwrap();
+    let ancestor = &context["ancestors"][0];
+    assert_eq!(ancestor["favourited"], true);
+    assert_eq!(ancestor["bookmarked"], true);
+    assert_eq!(ancestor["pinned"], true);
+    assert_eq!(ancestor["muted"], true);
 }
 
 #[tokio::test]

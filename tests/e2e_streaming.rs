@@ -207,6 +207,88 @@ async fn test_streaming_sse_sets_event_stream_content_type() {
 }
 
 #[tokio::test]
+async fn test_direct_stream_receives_conversation_read_event() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let conversation_id = server
+        .state
+        .db
+        .get_or_create_conversation(&[
+            "testuser@test.example.com".to_string(),
+            "alice@remote.example".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/direct"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let send_future = server
+        .client
+        .post(server.url(&format!("/api/v1/conversations/{conversation_id}/read")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send();
+    let read_future = read_sse_event(response);
+    let (send_response, (event_name, data)) = tokio::join!(send_future, read_future);
+
+    assert_eq!(send_response.unwrap().status(), reqwest::StatusCode::OK);
+    assert_eq!(event_name, "conversation");
+
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["id"], conversation_id);
+    assert_eq!(json["unread"], false);
+}
+
+#[tokio::test]
+async fn test_direct_stream_receives_conversation_delete_event() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let conversation_id = server
+        .state
+        .db
+        .get_or_create_conversation(&[
+            "testuser@test.example.com".to_string(),
+            "alice@remote.example".to_string(),
+        ])
+        .await
+        .unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming/direct"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let send_future = server
+        .client
+        .delete(server.url(&format!("/api/v1/conversations/{conversation_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send();
+    let read_future = read_sse_event(response);
+    let (send_response, (event_name, data)) = tokio::join!(send_future, read_future);
+
+    assert_eq!(send_response.unwrap().status(), reqwest::StatusCode::OK);
+    assert_eq!(event_name, "conversation");
+
+    let json: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(json["id"], conversation_id);
+    assert_eq!(json["_deleted"], true);
+}
+
+#[tokio::test]
 async fn test_public_stream_receives_remote_public_status_and_delete_events() {
     let server = TestServer::new().await;
     server.create_test_account().await;

@@ -1199,8 +1199,15 @@ impl ActivityProcessor {
             return Err(AppError::Unauthorized);
         }
 
-        let Some((poll_id, _expires_at, _expired, _multiple, _votes_count, _voters_count)) =
-            self.db.get_poll_by_status_id(&status.id).await?
+        let Some((
+            poll_id,
+            _expires_at,
+            _expired,
+            _multiple,
+            _hide_totals,
+            _votes_count,
+            _voters_count,
+        )) = self.db.get_poll_by_status_id(&status.id).await?
         else {
             return Ok(false);
         };
@@ -2648,6 +2655,7 @@ impl ActivityProcessor {
                     &poll.expires_at,
                     poll.expired,
                     poll.multiple,
+                    false,
                     poll.votes_count,
                     poll.voters_count,
                     &poll.options,
@@ -2675,7 +2683,7 @@ impl ActivityProcessor {
         &self,
         status_id: &str,
     ) -> Result<Option<ParsedQuestionPoll>, AppError> {
-        let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
+        let Some((poll_id, expires_at, expired, multiple, _hide_totals, votes_count, voters_count)) =
             self.db.get_poll_by_status_id(status_id).await?
         else {
             return Ok(None);

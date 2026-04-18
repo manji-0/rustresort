@@ -1712,8 +1712,9 @@ async fn test_signed_shared_inbox_poll_vote_updates_local_poll() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 
     let poll = server.state.db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll.4, 1);
+    assert!(!poll.4);
     assert_eq!(poll.5, 1);
+    assert_eq!(poll.6, 1);
     let options = server.state.db.get_poll_options(&poll_id).await.unwrap();
     assert_eq!(options[0].2, 1);
     assert_eq!(options[1].2, 0);
@@ -1783,8 +1784,9 @@ async fn test_signed_shared_inbox_private_poll_vote_requires_follower() {
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let poll = server.state.db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll.4, 0);
+    assert!(!poll.4);
     assert_eq!(poll.5, 0);
+    assert_eq!(poll.6, 0);
 }
 
 #[tokio::test]
@@ -1851,8 +1853,9 @@ async fn test_signed_shared_inbox_direct_poll_vote_requires_mentioned_actor() {
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let poll = server.state.db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll.4, 0);
+    assert!(!poll.4);
     assert_eq!(poll.5, 0);
+    assert_eq!(poll.6, 0);
 }
 
 #[tokio::test]

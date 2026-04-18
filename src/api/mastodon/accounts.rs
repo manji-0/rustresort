@@ -12,7 +12,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::HashSet, convert::Infallible};
 
 use super::federation_delivery::{
-    resolve_remote_actor_and_inbox_with_dependencies, spawn_best_effort_delivery,
+    fetch_remote_activity_json, resolve_remote_actor_and_inbox_with_dependencies,
+    spawn_best_effort_delivery,
 };
 use crate::AccountApiState;
 use crate::api::dto::AccountResponse;
@@ -1146,12 +1147,18 @@ pub(crate) fn build_remote_account_placeholder_response(
     statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
-    let (username, acct, url) =
+    let (id, username, acct, url) =
         if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
             let (username, _domain) = parsed_address.split_once('@')?;
-            (username.to_string(), parsed_address, trimmed.to_string())
+            (
+                trimmed.to_string(),
+                username.to_string(),
+                parsed_address,
+                trimmed.to_string(),
+            )
         } else if let Some((username, domain)) = trimmed.split_once('@') {
             (
+                trimmed.to_string(),
                 username.to_ascii_lowercase(),
                 trimmed.to_string(),
                 format!(
@@ -1168,7 +1175,7 @@ pub(crate) fn build_remote_account_placeholder_response(
     let header = format!("{}/default-header.png", media_url);
 
     Some(AccountResponse {
-        id: acct.clone(),
+        id,
         username: username.clone(),
         acct,
         uri: url.clone(),
@@ -1296,6 +1303,273 @@ pub(crate) async fn resolve_remote_account_response_for_list(
 
     let statuses_count = observed_statuses_count_for_address(db, default_port, raw_address).await;
     build_remote_account_placeholder_response(raw_address, config, statuses_count)
+}
+
+async fn remote_profile_lock_state(
+    state: &AccountApiState,
+    target_address: &str,
+) -> Result<Option<(Option<String>, bool)>, AppError> {
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    if let Some(profile) = state.profile_cache.get(target_address).await {
+        return Ok(Some((Some(profile.uri.clone()), profile.locked)));
+    }
+
+    let resolved = resolve_remote_actor_and_inbox_with_dependencies(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        state.federation_fetch_client.as_ref(),
+        target_address,
+    )
+    .await;
+    if let Ok((actor_uri, _)) = resolved {
+        if let Some(profile) = state.profile_cache.get_by_uri(&actor_uri).await {
+            return Ok(Some((Some(actor_uri), profile.locked)));
+        }
+        return Ok(Some((Some(actor_uri), false)));
+    }
+
+    if let Some(normalized) = canonical_remote_account_address(target_address)
+        && let Some(follow) = state.db.get_follow(&normalized, default_port).await?
+    {
+        return Ok(Some((follow.actor_uri, false)));
+    }
+
+    Ok(None)
+}
+
+async fn follow_state_for_target(
+    state: &AccountApiState,
+    target_address: &str,
+) -> Result<(bool, bool), AppError> {
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    let has_follow = state
+        .db
+        .get_follow(target_address, default_port)
+        .await?
+        .is_some();
+    if !has_follow {
+        return Ok((false, false));
+    }
+
+    let accepted = state
+        .db
+        .is_follow_accepted(target_address, default_port)
+        .await?;
+    Ok((accepted, !accepted))
+}
+
+async fn resolve_follow_request_requester_address(
+    state: &AccountApiState,
+    identity: &str,
+) -> Result<String, AppError> {
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+    state
+        .db
+        .resolve_follow_request_requester(identity, default_port)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+fn extract_activity_collection_uri(
+    actor_document: &serde_json::Value,
+    key: &str,
+) -> Option<String> {
+    actor_document.get(key).and_then(|value| match value {
+        serde_json::Value::String(uri) => Some(uri.clone()),
+        serde_json::Value::Object(object) => object
+            .get("id")
+            .or_else(|| object.get("first"))
+            .and_then(|inner| inner.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    })
+}
+
+fn extract_activity_collection_items(collection: &serde_json::Value) -> Vec<String> {
+    fn extract_item_identity(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(uri) => Some(uri.clone()),
+            serde_json::Value::Object(object) => object
+                .get("id")
+                .or_else(|| object.get("url"))
+                .and_then(|inner| inner.as_str())
+                .map(ToString::to_string),
+            _ => None,
+        }
+    }
+
+    let items = collection
+        .get("orderedItems")
+        .or_else(|| collection.get("items"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(extract_item_identity)
+        .collect::<Vec<_>>()
+}
+
+async fn fetch_remote_collection_identities(
+    state: &AccountApiState,
+    target_address: &str,
+    collection_key: &str,
+    limit: usize,
+) -> Vec<String> {
+    let Ok(Some((actor_uri, _locked))) = remote_profile_lock_state(state, target_address).await
+    else {
+        return Vec::new();
+    };
+    let Some(actor_uri) = actor_uri else {
+        return Vec::new();
+    };
+
+    let Ok(actor_document) =
+        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &actor_uri).await
+    else {
+        return Vec::new();
+    };
+    let Some(collection_uri) = extract_activity_collection_uri(&actor_document, collection_key)
+    else {
+        return Vec::new();
+    };
+    let Ok(mut collection) =
+        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &collection_uri).await
+    else {
+        return Vec::new();
+    };
+
+    if extract_activity_collection_items(&collection).is_empty()
+        && let Some(first_uri) = collection.get("first").and_then(|value| match value {
+            serde_json::Value::String(uri) => Some(uri.clone()),
+            serde_json::Value::Object(object) => object
+                .get("id")
+                .and_then(|inner| inner.as_str())
+                .map(ToString::to_string),
+            _ => None,
+        })
+        && let Ok(first_page) =
+            fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &first_uri).await
+    {
+        collection = first_page;
+    }
+
+    extract_activity_collection_items(&collection)
+        .into_iter()
+        .take(limit)
+        .collect()
+}
+
+async fn resolve_remote_collection_accounts(
+    state: &AccountApiState,
+    target_address: &str,
+    params: &PaginationParams,
+    collection_key: &str,
+) -> Vec<serde_json::Value> {
+    let limit = params.limit.unwrap_or(40).min(80);
+    let default_port = default_port_for_protocol(&state.config.server.protocol);
+
+    let mut identities =
+        fetch_remote_collection_identities(state, target_address, collection_key, 120).await;
+
+    let local_account = match state.db.get_account().await {
+        Ok(Some(account)) => account,
+        _ => return Vec::new(),
+    };
+    let local_response = serde_json::to_value(crate::api::account_to_response_with_stats(
+        &local_account,
+        &state.config,
+        crate::api::load_local_account_stats(state.db.as_ref())
+            .await
+            .unwrap_or_default(),
+    ))
+    .ok();
+
+    let local_address = format!("{}@{}", local_account.username, state.config.server.domain);
+    if collection_key == "followers"
+        && state
+            .db
+            .get_follow(target_address, default_port)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        && !identities.iter().any(|identity| {
+            account_addresses_match_with_default_port(identity, &local_address, default_port)
+                || identity.eq_ignore_ascii_case(&local_account.id)
+        })
+    {
+        identities.push(local_address.clone());
+    }
+    if collection_key == "following"
+        && state
+            .db
+            .get_follower(target_address, default_port)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        && !identities.iter().any(|identity| {
+            account_addresses_match_with_default_port(identity, &local_address, default_port)
+                || identity.eq_ignore_ascii_case(&local_account.id)
+        })
+    {
+        identities.push(local_address.clone());
+    }
+
+    let mut resolved = Vec::new();
+    for identity in identities {
+        let maybe_response =
+            if local_account_matches_identity(&local_account, state.config.as_ref(), &identity) {
+                local_response.clone()
+            } else {
+                resolve_remote_account_response_for_list(
+                    state.config.as_ref(),
+                    state.db.as_ref(),
+                    state.profile_cache.as_ref(),
+                    state.federation_fetch_client.as_ref(),
+                    &identity,
+                    default_port,
+                )
+                .await
+                .and_then(|response| serde_json::to_value(response).ok())
+            };
+
+        if let Some(response) = maybe_response {
+            resolved.push(response);
+        }
+    }
+
+    let max_id = normalized_cursor_id(params.max_id.as_deref());
+    let min_id = normalized_cursor_id(params.min_id.as_deref().or(params.since_id.as_deref()));
+    resolved.sort_by(|left, right| {
+        let left_id = left
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_id = right
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_id.cmp(left_id)
+    });
+    resolved.dedup_by(|left, right| {
+        left.get("id").and_then(|value| value.as_str())
+            == right.get("id").and_then(|value| value.as_str())
+    });
+    resolved
+        .into_iter()
+        .filter(|account| {
+            let id = account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            max_id.as_ref().map(|cursor| id < *cursor).unwrap_or(true)
+                && min_id.as_ref().map(|cursor| id > *cursor).unwrap_or(true)
+        })
+        .take(limit)
+        .collect()
 }
 
 async fn resolve_moved_account_response(
@@ -1889,10 +2163,18 @@ pub async fn preferences(
         "posting:default:language": preferences.language,
         "posting:default:privacy": preferences.privacy,
         "posting:default:media_sensitive": preferences.sensitive,
+        "posting:default:content_type": "text/plain",
         "reading:expand:media": "default",
         "reading:expand:spoilers": false,
         "reading:autoplay:gifs": true,
         "reading:display:media": "default",
+        "reading:display:expand_media": "default",
+        "reading:display:expand_spoilers": false,
+        "notifications:follow": true,
+        "notifications:favourite": true,
+        "notifications:reblog": true,
+        "notifications:mention": true,
+        "notifications:poll": true,
         "web:theme": "default",
     })))
 }
@@ -2195,7 +2477,10 @@ pub async fn get_account_followers(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
-        return Ok(Json(Vec::new()));
+        let target_address = resolve_target_address(&state, &id).await?;
+        return Ok(Json(
+            resolve_remote_collection_accounts(&state, &target_address, &params, "followers").await,
+        ));
     }
 
     let follower_entries = state.db.get_all_followers().await?;
@@ -2263,7 +2548,10 @@ pub async fn get_account_following(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
-        return Ok(Json(Vec::new()));
+        let target_address = resolve_target_address(&state, &id).await?;
+        return Ok(Json(
+            resolve_remote_collection_accounts(&state, &target_address, &params, "following").await,
+        ));
     }
 
     let following_entries = state.db.get_all_follows().await?;
@@ -2364,12 +2652,21 @@ pub async fn follow_account(
         return Err(AppError::Validation("cannot follow yourself".to_string()));
     }
 
+    let remote_follow_state = remote_profile_lock_state(&state, &target_address).await?;
+    let target_actor_uri_hint = remote_follow_state
+        .as_ref()
+        .and_then(|(actor_uri, _)| actor_uri.clone());
+    let target_is_locked = remote_follow_state
+        .as_ref()
+        .map(|(_, locked)| *locked)
+        .unwrap_or(false);
+
     // Persist follow relationship if not already present.
     let follow_id = EntityId::new_string();
     let follow = Follow {
         id: follow_id.clone(),
         target_address: target_address.clone(),
-        actor_uri: None,
+        actor_uri: target_actor_uri_hint.clone(),
         uri: format!(
             "{}/users/{}/follow/{}",
             state.config.server.base_url(),
@@ -2384,6 +2681,14 @@ pub async fn follow_account(
         .insert_follow_if_absent(&follow, default_port)
         .await?;
     save_follow_preferences(&state, &target_address, follow_preferences).await?;
+
+    if !target_is_locked {
+        let accepted_actor_uri = target_actor_uri_hint.as_deref().unwrap_or(&target_address);
+        let _ = state
+            .db
+            .mark_follow_accepted(&target_address, accepted_actor_uri, default_port)
+            .await?;
+    }
 
     if inserted {
         let state_for_delivery = state.clone();
@@ -2422,17 +2727,18 @@ pub async fn follow_account(
     }
 
     let relationship_id = resolve_relationship_id(&state, &id).await;
+    let (following, requested) = follow_state_for_target(&state, &target_address).await?;
 
     // Return relationship response
     let relationship = RelationshipResponse {
         id: relationship_id,
-        following: true, // We just followed
+        following,
         followed_by: false,
         blocking: false,
         blocked_by: false,
         muting: false,
         muting_notifications: false,
-        requested: false,
+        requested,
         domain_blocking: false,
         showing_reblogs: follow_preferences.reblogs,
         endorsed: false,
@@ -2622,7 +2928,7 @@ pub async fn get_relationships(
         };
         let normalized_target = normalize_account_address(&target_address)
             .unwrap_or_else(|_| target_address.to_ascii_lowercase());
-        let following = following_actor_uri_set.contains(&id)
+        let stored_following = following_actor_uri_set.contains(&id)
             || following_set.contains(&normalized_target)
             || following_set.iter().any(|candidate| {
                 account_addresses_match_with_default_port(
@@ -2653,10 +2959,16 @@ pub async fn get_relationships(
             .get_account_mute_notifications(&target_address, default_port)
             .await?
             .unwrap_or(false);
-        let requested = state
+        let follow_is_accepted = state
+            .db
+            .is_follow_accepted(&target_address, default_port)
+            .await?;
+        let has_follow_request = state
             .db
             .has_follow_request_with_default_port(&target_address, default_port)
             .await?;
+        let following = stored_following && follow_is_accepted;
+        let requested = has_follow_request || (stored_following && !follow_is_accepted);
         let follow_preferences = load_follow_preferences(&state, &target_address).await?;
 
         let relationship = RelationshipResponse {
@@ -3348,13 +3660,9 @@ pub async fn get_follow_request(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let requester_address = id.clone();
+    let requester_address = resolve_follow_request_requester_address(&state, &id).await?;
 
     // Check if follow request exists
-    if !state.db.has_follow_request(&requester_address).await? {
-        return Err(AppError::NotFound);
-    }
-
     let default_port = default_port_for_protocol(&state.config.server.protocol);
     let actor_identity = state
         .db
@@ -3384,7 +3692,7 @@ pub async fn authorize_follow_request(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    let requester_address = id.clone();
+    let requester_address = resolve_follow_request_requester_address(&state, &id).await?;
     let (inbox_uri, follow_activity_uri) = state
         .db
         .get_follow_request(&requester_address)
@@ -3433,7 +3741,7 @@ pub async fn reject_follow_request(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::api::dto::RelationshipResponse;
 
-    let requester_address = id.clone();
+    let requester_address = resolve_follow_request_requester_address(&state, &id).await?;
     let follow_request = state.db.get_follow_request(&requester_address).await?;
     let account_for_delivery = if follow_request.is_some() {
         Some(state.db.get_account().await?.ok_or(AppError::NotFound)?)

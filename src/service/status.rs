@@ -248,7 +248,7 @@ impl StatusService {
         &self,
         status: &Status,
         media_ids: &[String],
-        poll: Option<(&[String], i64, bool)>,
+        poll: Option<(&[String], i64, bool, bool)>,
     ) -> Result<(), AppError> {
         self.db
             .insert_status_with_media_and_poll(status, media_ids, poll)
@@ -331,9 +331,19 @@ impl StatusService {
         previous: &Status,
         updated: &Status,
         media_ids: Option<&[String]>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<(), AppError> {
         self.db
-            .update_status_with_edit_snapshot_and_media(previous, updated, media_ids)
+            .update_status_with_edit_snapshot_and_media(
+                previous,
+                updated,
+                media_ids,
+                media_attachments_json,
+                poll_json,
+                quote_json,
+            )
             .await?;
         self.invalidate_cached_status(previous).await;
         self.invalidate_cached_status(updated).await;
@@ -362,7 +372,7 @@ impl StatusService {
     pub async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError> {
         self.db.get_poll_by_status_id(status_id).await
     }
 
@@ -407,6 +417,9 @@ impl StatusService {
                 &status.id,
                 &status.content,
                 status.content_warning.as_deref(),
+                None,
+                None,
+                None,
             )
             .await?;
         Ok(())
@@ -421,6 +434,9 @@ impl StatusService {
         Vec<(
             String,
             String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
             Option<String>,
             chrono::DateTime<chrono::Utc>,
         )>,

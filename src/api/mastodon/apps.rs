@@ -103,10 +103,21 @@ fn normalize_scopes(scopes: &str) -> String {
     scopes.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn scope_matches(granted: &str, required: &str) -> bool {
+    granted == required
+        || required
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
 fn scopes_are_subset(requested: &str, allowed: &str) -> bool {
     let requested_set: HashSet<&str> = requested.split_whitespace().collect();
-    let allowed_set: HashSet<&str> = allowed.split_whitespace().collect();
-    requested_set.is_subset(&allowed_set)
+    let allowed_set: Vec<&str> = allowed.split_whitespace().collect();
+    requested_set.iter().all(|requested_scope| {
+        allowed_set
+            .iter()
+            .any(|allowed_scope| scope_matches(allowed_scope, requested_scope))
+    })
 }
 
 fn is_registered_redirect_uri(registered_redirect_uris: &str, redirect_uri: &str) -> bool {

@@ -822,7 +822,7 @@ async fn load_status_poll_response(
     account: &Account,
     config: &AppConfig,
 ) -> Result<Option<serde_json::Value>, AppError> {
-    let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
+    let Some((poll_id, expires_at, expired, multiple, hide_totals, votes_count, voters_count)) =
         db.get_poll_by_status_id(status_id).await?
     else {
         return Ok(None);
@@ -854,6 +854,7 @@ async fn load_status_poll_response(
         "expires_at": expires_at,
         "expired": expired,
         "multiple": multiple,
+        "hide_totals": hide_totals,
         "votes_count": votes_count,
         "voters_count": voters_count,
         "voted": !own_votes.is_empty(),

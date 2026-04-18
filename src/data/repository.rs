@@ -96,7 +96,7 @@ pub trait StatusRepository: Send + Sync {
         &self,
         status: &Status,
         media_ids: &[String],
-        poll: Option<(&[String], i64, bool)>,
+        poll: Option<(&[String], i64, bool, bool)>,
     ) -> Result<(), AppError>;
     async fn get_status(&self, id: &str) -> Result<Option<Status>, AppError>;
     async fn get_status_by_uri(&self, uri: &str) -> Result<Option<Status>, AppError>;
@@ -111,6 +111,9 @@ pub trait StatusRepository: Send + Sync {
         previous: &Status,
         updated: &Status,
         media_ids: Option<&[String]>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<(), AppError>;
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
     async fn replace_status_media(
@@ -121,7 +124,7 @@ pub trait StatusRepository: Send + Sync {
     async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError>;
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError>;
     async fn get_poll_options(&self, poll_id: &str)
     -> Result<Vec<(String, String, i64)>, AppError>;
     async fn get_favourite_id(&self, status_id: &str) -> Result<Option<String>, AppError>;
@@ -137,12 +140,26 @@ pub trait StatusRepository: Send + Sync {
         status_id: &str,
         content: &str,
         content_warning: Option<&str>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<String, AppError>;
     async fn get_status_edits(
         &self,
         status_id: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, Option<String>, DateTime<Utc>)>, AppError>;
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )>,
+        AppError,
+    >;
     async fn get_idempotency_response(
         &self,
         endpoint: &str,
@@ -347,7 +364,7 @@ impl StatusRepository for Database {
         &self,
         status: &Status,
         media_ids: &[String],
-        poll: Option<(&[String], i64, bool)>,
+        poll: Option<(&[String], i64, bool, bool)>,
     ) -> Result<(), AppError> {
         Database::insert_status_with_media_and_poll(self, status, media_ids, poll).await
     }
@@ -377,9 +394,20 @@ impl StatusRepository for Database {
         previous: &Status,
         updated: &Status,
         media_ids: Option<&[String]>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<(), AppError> {
-        Database::update_status_with_edit_snapshot_and_media(self, previous, updated, media_ids)
-            .await
+        Database::update_status_with_edit_snapshot_and_media(
+            self,
+            previous,
+            updated,
+            media_ids,
+            media_attachments_json,
+            poll_json,
+            quote_json,
+        )
+        .await
     }
 
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
@@ -397,7 +425,7 @@ impl StatusRepository for Database {
     async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError> {
         Database::get_poll_by_status_id(self, status_id).await
     }
 
@@ -433,15 +461,38 @@ impl StatusRepository for Database {
         status_id: &str,
         content: &str,
         content_warning: Option<&str>,
+        media_attachments_json: Option<&str>,
+        poll_json: Option<&str>,
+        quote_json: Option<&str>,
     ) -> Result<String, AppError> {
-        Database::insert_status_edit(self, status_id, content, content_warning).await
+        Database::insert_status_edit(
+            self,
+            status_id,
+            content,
+            content_warning,
+            media_attachments_json,
+            poll_json,
+            quote_json,
+        )
+        .await
     }
 
     async fn get_status_edits(
         &self,
         status_id: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, Option<String>, DateTime<Utc>)>, AppError> {
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )>,
+        AppError,
+    > {
         Database::get_status_edits(self, status_id, limit).await
     }
 

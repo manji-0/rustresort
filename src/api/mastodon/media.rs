@@ -302,7 +302,7 @@ pub async fn upload_media(
     Ok(Json(response))
 }
 
-/// POST /api/v2/media (async upload)
+/// POST /api/v2/media
 pub async fn upload_media_v2(
     State(state): State<MediaApiState>,
     CurrentUser(_session): CurrentUser,
@@ -315,10 +315,10 @@ pub async fn upload_media_v2(
     let response = upload_media_response_value(&state, multipart).await?;
 
     HTTP_REQUESTS_TOTAL
-        .with_label_values(&["POST", "/api/v2/media", "202"])
+        .with_label_values(&["POST", "/api/v2/media", "200"])
         .inc();
 
-    Ok((StatusCode::ACCEPTED, Json(response)))
+    Ok((StatusCode::OK, Json(response)))
 }
 
 /// GET /api/v1/media/:id

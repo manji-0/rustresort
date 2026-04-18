@@ -2126,6 +2126,41 @@ async fn test_authorize_follow_request() {
 }
 
 #[tokio::test]
+async fn test_authorize_follow_request_accepts_actor_uri_identity() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follow_request_with_actor_uri(
+            "alice@remote.example",
+            "https://remote.example/inbox",
+            "https://remote.example/follows/1",
+            Some(actor_uri),
+        )
+        .await
+        .unwrap();
+
+    let encoded_actor_uri = urlencoding::encode(actor_uri);
+    let response = server
+        .client
+        .post(server.url(&format!(
+            "/api/v1/follow_requests/{encoded_actor_uri}/authorize"
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["followed_by"], true);
+}
+
+#[tokio::test]
 async fn test_reject_follow_request() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -2140,6 +2175,41 @@ async fn test_reject_follow_request() {
         .unwrap();
 
     assert!(response.status().is_success() || response.status() == 404);
+}
+
+#[tokio::test]
+async fn test_reject_follow_request_accepts_actor_uri_identity() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let actor_uri = "https://remote.example/users/alice";
+
+    server
+        .state
+        .db
+        .insert_follow_request_with_actor_uri(
+            "alice@remote.example",
+            "https://remote.example/inbox",
+            "https://remote.example/follows/2",
+            Some(actor_uri),
+        )
+        .await
+        .unwrap();
+
+    let encoded_actor_uri = urlencoding::encode(actor_uri);
+    let response = server
+        .client
+        .post(server.url(&format!(
+            "/api/v1/follow_requests/{encoded_actor_uri}/reject"
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["followed_by"], false);
 }
 
 // ============================================================================
@@ -4078,6 +4148,35 @@ async fn test_upload_media_v2() {
 }
 
 #[tokio::test]
+async fn test_upload_media_v2_success_returns_200() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(vec![0, 1, 2, 3])
+            .file_name("test.png")
+            .mime_str("image/png")
+            .unwrap(),
+    );
+
+    let response = server
+        .client
+        .post(server.url("/api/v2/media"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["id"].is_string());
+    assert_eq!(body["type"], "image");
+}
+
+#[tokio::test]
 async fn test_get_media() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -5245,6 +5344,44 @@ async fn test_get_conversations() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_conversations_emits_link_pagination_header() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    for index in 0..2 {
+        server
+            .state
+            .db
+            .get_or_create_conversation(&[
+                "testuser@test.example.com".to_string(),
+                format!("remote{index}@remote.example"),
+            ])
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/conversations?limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let link = response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(link.contains("/api/v1/conversations?limit=1"));
+    assert!(link.contains("rel=\"next\""));
+    assert!(link.contains("rel=\"prev\""));
 }
 
 #[tokio::test]

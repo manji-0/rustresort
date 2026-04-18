@@ -1,5 +1,84 @@
 use super::super::*;
 
+fn format_follow_authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+fn normalize_follow_account_address(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return None;
+    }
+
+    let (username, authority) = trimmed.split_once('@')?;
+    let parsed = url::Url::parse(&format!("http://{}", authority)).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let authority = match parsed.port() {
+        Some(port) => format!("{}:{}", format_follow_authority_host(&host), port),
+        None => format_follow_authority_host(&host),
+    };
+
+    Some(format!("{}@{}", username.to_ascii_lowercase(), authority))
+}
+
+fn canonical_follow_lookup_address(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(normalized) = normalize_follow_account_address(trimmed) {
+        return Some(normalized);
+    }
+
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let host = parsed.host_str()?.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+
+    let username = parsed
+        .path_segments()
+        .and_then(|segments| {
+            let collected = segments.collect::<Vec<_>>();
+            collected
+                .windows(2)
+                .find_map(|window| (window[0] == "users").then_some(window[1]))
+                .or_else(|| {
+                    collected
+                        .iter()
+                        .find_map(|segment| segment.strip_prefix('@'))
+                })
+                .or_else(|| {
+                    collected
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|segment| !segment.is_empty())
+                })
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    if username.is_empty() {
+        return None;
+    }
+
+    let domain = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+
+    normalize_follow_account_address(&format!("{username}@{domain}"))
+}
+
 impl Database {
     // =========================================================================
     // Follow relationships
@@ -144,12 +223,13 @@ impl Database {
     /// Insert new follow relationship
     pub async fn insert_follow(&self, follow: &Follow) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO follows (id, target_address, actor_uri, uri, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO follows (id, target_address, actor_uri, uri, created_at, accepted_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&follow.id)
         .bind(&follow.target_address)
         .bind(&follow.actor_uri)
         .bind(&follow.uri)
+        .bind(follow.created_at)
         .bind(follow.created_at)
         .execute(&self.pool)
         .await?;
@@ -338,7 +418,27 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
 
-        Ok(count > 0)
+        if count > 0 {
+            return Ok(true);
+        }
+
+        let normalized_target = match normalize_follow_account_address(target_address) {
+            Some(value) => value,
+            None => return Ok(false),
+        };
+        let accepted_follow_addresses = sqlx::query_scalar::<_, String>(
+            "SELECT target_address FROM follows WHERE accepted_at IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(accepted_follow_addresses.into_iter().any(|stored| {
+            canonical_follow_lookup_address(&stored)
+                .map(|canonical| {
+                    account_addresses_match(&canonical, &normalized_target, default_port)
+                })
+                .unwrap_or(false)
+        }))
     }
 
     /// Delete follow relationship

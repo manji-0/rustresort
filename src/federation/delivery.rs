@@ -34,7 +34,7 @@ pub trait DeliveryQueue: Send + Sync {
     async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError>;
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError>;
     async fn get_poll_options(&self, poll_id: &str)
     -> Result<Vec<(String, String, i64)>, AppError>;
 }
@@ -78,7 +78,7 @@ impl DeliveryQueue for crate::data::Database {
     async fn get_poll_by_status_id(
         &self,
         status_id: &str,
-    ) -> Result<Option<(String, String, bool, bool, i64, i64)>, AppError> {
+    ) -> Result<Option<(String, String, bool, bool, bool, i64, i64)>, AppError> {
         crate::data::Database::get_poll_by_status_id(self, status_id).await
     }
 
@@ -359,6 +359,7 @@ impl ActivityDelivery {
             expires_at,
             expired,
             multiple,
+            _hide_totals,
             _votes_count,
             voters_count,
         )) = poll

@@ -199,6 +199,163 @@ async fn test_update_credentials_persists_source_defaults_and_preferences() {
     assert_eq!(preferences_json["posting:default:visibility"], "private");
     assert_eq!(preferences_json["posting:default:sensitive"], true);
     assert_eq!(preferences_json["posting:default:language"], "ja");
+    assert_eq!(
+        preferences_json["posting:default:content_type"],
+        "text/plain"
+    );
+    assert_eq!(preferences_json["notifications:follow"], true);
+}
+
+#[tokio::test]
+async fn test_follow_locked_remote_account_returns_requested_relationship() {
+    use chrono::Utc;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: true,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: common::test_public_key_pem().to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            outbox_uri: None,
+            followers_count: Some(1),
+            following_count: Some(1),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/accounts/alice@remote.example/follow"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["following"], false);
+    assert_eq!(body["requested"], true);
+
+    let relationships = server
+        .client
+        .get(server.url("/api/v1/accounts/relationships?id[]=alice@remote.example"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relationships.status(), 200);
+    let relationships_json: Value = relationships.json().await.unwrap();
+    let relationship = relationships_json.as_array().unwrap().first().unwrap();
+    assert_eq!(relationship["following"], false);
+    assert_eq!(relationship["requested"], true);
+}
+
+#[tokio::test]
+async fn test_remote_follow_collections_include_known_local_relationships() {
+    use chrono::Utc;
+    use rustresort::data::{EntityId, Follow, Follower};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+
+    server
+        .state
+        .profile_cache
+        .insert(CachedProfile {
+            address: "alice@remote.example".to_string(),
+            uri: "https://remote.example/users/alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            avatar_url: None,
+            header_url: None,
+            public_key_pem: common::test_public_key_pem().to_string(),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            outbox_uri: None,
+            followers_count: Some(10),
+            following_count: Some(20),
+            fetched_at: Utc::now(),
+        })
+        .await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "alice@remote.example".to_string(),
+            actor_uri: Some("https://remote.example/users/alice".to_string()),
+            uri: "https://test.example.com/users/testuser/follow/known-remote".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .mark_follow_accepted(
+            "alice@remote.example",
+            "https://remote.example/users/alice",
+            Some(443),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .insert_follower(&Follower {
+            id: EntityId::new_string(),
+            follower_address: "alice@remote.example".to_string(),
+            actor_uri: Some("https://remote.example/users/alice".to_string()),
+            inbox_uri: "https://remote.example/inbox".to_string(),
+            uri: "https://remote.example/follows/local".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let followers = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@remote.example/followers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(followers.status(), 200);
+    let followers_json: Value = followers.json().await.unwrap();
+    let follower_accounts = followers_json.as_array().unwrap();
+    assert_eq!(follower_accounts.len(), 1);
+    assert_eq!(follower_accounts[0]["id"], account.id.as_str());
+
+    let following = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@remote.example/following"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(following.status(), 200);
+    let following_json: Value = following.json().await.unwrap();
+    let following_accounts = following_json.as_array().unwrap();
+    assert_eq!(following_accounts.len(), 1);
+    assert_eq!(following_accounts[0]["id"], account.id.as_str());
 }
 
 #[tokio::test]

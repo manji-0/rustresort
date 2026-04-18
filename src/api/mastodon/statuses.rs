@@ -49,7 +49,7 @@ pub struct CreateStatusPollRequest {
     #[serde(default)]
     pub multiple: bool,
     #[serde(default, rename = "hide_totals")]
-    pub _hide_totals: bool,
+    pub hide_totals: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -238,6 +238,7 @@ struct NormalizedCreatePoll {
     options: Vec<String>,
     expires_in: i64,
     multiple: bool,
+    hide_totals: bool,
 }
 
 fn normalize_poll_input(
@@ -289,6 +290,7 @@ fn normalize_poll_input(
         options,
         expires_in: poll.expires_in,
         multiple: poll.multiple,
+        hide_totals: poll.hide_totals,
     }))
 }
 
@@ -408,6 +410,68 @@ async fn status_response_without_interaction_state(
         crate::api::StatusInteractions::default(),
     )
     .await
+}
+
+async fn status_response_with_viewer_interactions(
+    state: &StatusApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    status: &crate::data::Status,
+) -> Result<crate::api::StatusResponse, AppError> {
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        std::slice::from_ref(status),
+    )
+    .await?
+    .get(status.account_address.trim())
+    .cloned();
+    let thread_uri = state.db.resolve_thread_root_uri(status).await?;
+
+    crate::api::build_status_response_with_account_stats_and_remote_stats(
+        state.db.as_ref(),
+        status,
+        account,
+        &state.config,
+        account_stats,
+        remote_account_stats,
+        crate::api::StatusInteractions::new(
+            Some(state.db.is_favourited(&status.id).await?),
+            Some(state.db.is_reposted(&status.id).await?),
+            Some(state.db.is_thread_muted(&thread_uri).await?),
+            Some(state.db.is_bookmarked(&status.id).await?),
+            Some(state.db.is_status_pinned(&status.id).await?),
+        ),
+    )
+    .await
+}
+
+async fn build_status_edit_snapshot_payload(
+    state: &StatusApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    status: &crate::data::Status,
+) -> Result<(Option<String>, Option<String>, Option<String>), AppError> {
+    let response =
+        status_response_with_viewer_interactions(state, account, account_stats, status).await?;
+    let media_json = Some(
+        serde_json::to_string(&response.media_attachments)
+            .map_err(|error| AppError::serialization("status edit media snapshot", error))?,
+    );
+    let poll_json = response
+        .poll
+        .as_ref()
+        .map(|value| serde_json::to_string(value))
+        .transpose()
+        .map_err(|error| AppError::serialization("status edit poll snapshot", error))?;
+    let quote_json = response
+        .quote
+        .as_ref()
+        .map(|value| serde_json::to_string(value))
+        .transpose()
+        .map_err(|error| AppError::serialization("status edit quote snapshot", error))?;
+    Ok((media_json, poll_json, quote_json))
 }
 
 async fn resolve_interaction_account_response(
@@ -847,8 +911,14 @@ pub async fn create_status(
             .persist_local_status_with_media_and_poll(
                 &status,
                 &media_ids,
-                poll.as_ref()
-                    .map(|poll| (poll.options.as_slice(), poll.expires_in, poll.multiple)),
+                poll.as_ref().map(|poll| {
+                    (
+                        poll.options.as_slice(),
+                        poll.expires_in,
+                        poll.multiple,
+                        poll.hide_totals,
+                    )
+                }),
             )
             .await?;
         apply_status_media_attributes(&state, &media_ids, &status.id, &media_attributes).await?;
@@ -896,8 +966,15 @@ pub async fn create_status(
         };
 
         let poll_value = if poll.is_some() {
-            if let Some((poll_id, expires_at, expired, multiple, votes_count, voters_count)) =
-                status_service.get_poll_by_status_id(&status.id).await?
+            if let Some((
+                poll_id,
+                expires_at,
+                expired,
+                multiple,
+                hide_totals,
+                votes_count,
+                voters_count,
+            )) = status_service.get_poll_by_status_id(&status.id).await?
             {
                 let options = status_service.get_poll_options(&poll_id).await?;
                 let options_response: Vec<serde_json::Value> = options
@@ -914,6 +991,7 @@ pub async fn create_status(
                     "expires_at": expires_at,
                     "expired": expired,
                     "multiple": multiple,
+                    "hide_totals": hide_totals,
                     "votes_count": votes_count,
                     "voters_count": voters_count,
                     "voted": false,
@@ -1250,7 +1328,7 @@ pub async fn get_status_context(
     let mut ancestor_responses = Vec::with_capacity(ancestors.len());
     for ancestor in &ancestors {
         ancestor_responses.push(
-            status_response_without_interaction_state(&state, &account, account_stats, ancestor)
+            status_response_with_viewer_interactions(&state, &account, account_stats, ancestor)
                 .await?,
         );
     }
@@ -1258,7 +1336,7 @@ pub async fn get_status_context(
     let mut descendant_responses = Vec::with_capacity(descendants.len());
     for descendant in &descendants {
         descendant_responses.push(
-            status_response_without_interaction_state(&state, &account, account_stats, descendant)
+            status_response_with_viewer_interactions(&state, &account, account_stats, descendant)
                 .await?,
         );
     }
@@ -1933,7 +2011,7 @@ fn parse_create_status_request(
                     request
                         .poll
                         .get_or_insert_with(CreateStatusPollRequest::default)
-                        ._hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
+                        .hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
                 }
                 _ => {}
             }
@@ -2008,7 +2086,7 @@ fn parse_update_status_request(
                     request
                         .poll
                         .get_or_insert_with(CreateStatusPollRequest::default)
-                        ._hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
+                        .hide_totals = parse_status_bool("poll[hide_totals]", &value)?;
                 }
                 _ => {}
             }
@@ -2188,6 +2266,21 @@ pub async fn update_status(
                 "poll and media_ids cannot be used together".to_string(),
             ));
         }
+        if let Some((poll_id, _expires_at, expired, _multiple, _hide_totals, votes_count, _)) =
+            existing_poll.as_ref()
+            && (*expired
+                || *votes_count > 0
+                || state
+                    .db
+                    .get_poll_options(poll_id)
+                    .await?
+                    .iter()
+                    .any(|(_, _, votes)| *votes > 0))
+        {
+            return Err(AppError::Validation(
+                "cannot edit a poll after voting has started or it has expired".to_string(),
+            ));
+        }
         poll_to_replace = normalized_poll;
         changed = true;
     } else if !media_ids_after_update.is_empty() && existing_poll.is_some() {
@@ -2200,11 +2293,17 @@ pub async fn update_status(
     }
 
     if changed {
+        let (snapshot_media_json, snapshot_poll_json, snapshot_quote_json) =
+            build_status_edit_snapshot_payload(&state, &account, account_stats, &previous_status)
+                .await?;
         status_service
             .update_with_edit_snapshot_and_media(
                 &previous_status,
                 &status,
                 media_ids_to_replace.as_deref(),
+                snapshot_media_json.as_deref(),
+                snapshot_poll_json.as_deref(),
+                snapshot_quote_json.as_deref(),
             )
             .await?;
         if let Some(poll) = poll_to_replace.as_ref() {
@@ -2216,6 +2315,7 @@ pub async fn update_status(
                     &expires_at,
                     false,
                     poll.multiple,
+                    poll.hide_totals,
                     0,
                     0,
                     &poll
@@ -2338,26 +2438,13 @@ pub async fn get_status_history(
     // Get account
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
-    let current_response = crate::api::build_status_response_with_account_stats(
-        state.db.as_ref(),
-        &status,
-        &account,
-        &state.config,
-        account_stats,
-        crate::api::StatusInteractions::new(
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(false),
-            Some(false),
-        ),
-    )
-    .await?;
+    let current_response =
+        status_response_with_viewer_interactions(&state, &account, account_stats, &status).await?;
 
     let edits = status_service.get_edit_history(&id, 40).await?;
     let current_revision_created_at = edits
         .first()
-        .map(|(_, _, _, created_at)| (*created_at).max(status.created_at))
+        .map(|(_, _, _, _, _, _, created_at)| (*created_at).max(status.created_at))
         .unwrap_or(status.created_at);
     let current_version = serde_json::json!({
         "content": status.content,
@@ -2372,17 +2459,47 @@ pub async fn get_status_history(
     });
 
     let mut history = vec![current_version];
-    for (_, content, content_warning, created_at) in edits {
+    for (_, content, content_warning, media_attachments_json, poll_json, quote_json, created_at) in
+        edits
+    {
+        let media_attachments = media_attachments_json
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| AppError::serialization("status history media snapshot", error))?
+            .unwrap_or_else(|| serde_json::json!(current_response.media_attachments.clone()));
+        let poll = poll_json
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| AppError::serialization("status history poll snapshot", error))?
+            .unwrap_or_else(|| {
+                current_response
+                    .poll
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null)
+            });
+        let quote = quote_json
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| AppError::serialization("status history quote snapshot", error))?
+            .unwrap_or_else(|| {
+                current_response
+                    .quote
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null)
+            });
         history.push(serde_json::json!({
             "content": content,
             "spoiler_text": content_warning.clone().unwrap_or_default(),
             "sensitive": content_warning.is_some(),
             "created_at": created_at.to_rfc3339(),
             "account": current_response.account.clone(),
-            "media_attachments": current_response.media_attachments.clone(),
+            "media_attachments": media_attachments,
             "emojis": current_response.emojis.clone(),
-            "poll": current_response.poll.clone(),
-            "quote": current_response.quote.clone(),
+            "poll": poll,
+            "quote": quote,
         }));
     }
 

@@ -2,7 +2,8 @@
 
 use axum::{
     extract::{Query, State},
-    response::Json,
+    http::{HeaderMap, header::LINK},
+    response::{IntoResponse, Json},
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -78,12 +79,53 @@ fn status_matches_tag_filters(
     true
 }
 
+fn timeline_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+    extra_params: &[(String, String)],
+) -> Option<String> {
+    fn build_query(
+        limit: usize,
+        cursor_key: &str,
+        cursor_value: &str,
+        extra_params: &[(String, String)],
+    ) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        for (key, value) in extra_params {
+            serializer.append_pair(key, value);
+        }
+        serializer.finish()
+    }
+
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "<{}?{}>; rel=\"next\"",
+            path,
+            build_query(limit, "max_id", last_id, extra_params)
+        ));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "<{}?{}>; rel=\"prev\"",
+            path,
+            build_query(limit, "min_id", first_id, extra_params)
+        ));
+    }
+
+    (!links.is_empty()).then(|| links.join(", "))
+}
+
 /// GET /api/v1/timelines/home
 pub async fn home_timeline(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&["GET", "/api/v1/timelines/home"])
@@ -113,6 +155,8 @@ pub async fn home_timeline(
     let timeline_items = timeline_service
         .home_timeline(limit, params.max_id.as_deref(), effective_min_id)
         .await?;
+    let first_id = timeline_items.first().map(|item| item.status.id.clone());
+    let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -159,14 +203,25 @@ pub async fn home_timeline(
         .with_label_values(&["GET", "/api/v1/timelines/home", "200"])
         .inc();
 
-    Ok(Json(responses))
+    let mut headers = HeaderMap::new();
+    if let Some(link) = timeline_link_header(
+        "/api/v1/timelines/home",
+        limit,
+        first_id.as_deref(),
+        last_id.as_deref(),
+        &[],
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/timelines/public
 pub async fn public_timeline(
     State(state): State<TimelineApiState>,
     Query(params): Query<PublicTimelineParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&["GET", "/api/v1/timelines/public"])
@@ -244,6 +299,8 @@ pub async fn public_timeline(
             break;
         }
     }
+    let first_id = timeline_items.first().map(|item| item.status.id.clone());
+    let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -290,7 +347,29 @@ pub async fn public_timeline(
         .with_label_values(&["GET", "/api/v1/timelines/public", "200"])
         .inc();
 
-    Ok(Json(responses))
+    let mut extra_params = Vec::new();
+    if local_only {
+        extra_params.push(("local".to_string(), "true".to_string()));
+    }
+    if remote_only {
+        extra_params.push(("remote".to_string(), "true".to_string()));
+    }
+    if only_media {
+        extra_params.push(("only_media".to_string(), "true".to_string()));
+    }
+
+    let mut headers = HeaderMap::new();
+    if let Some(link) = timeline_link_header(
+        "/api/v1/timelines/public",
+        limit,
+        first_id.as_deref(),
+        last_id.as_deref(),
+        &extra_params,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/timelines/tag/:hashtag
@@ -299,7 +378,7 @@ pub async fn tag_timeline(
     State(state): State<TimelineApiState>,
     axum::extract::Path(hashtag): axum::extract::Path<String>,
     Query(params): Query<TagTimelineParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
@@ -371,6 +450,8 @@ pub async fn tag_timeline(
             break;
         }
     }
+    let first_id = timeline_items.first().map(|item| item.status.id.clone());
+    let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -407,7 +488,39 @@ pub async fn tag_timeline(
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let mut extra_params = Vec::new();
+    if local_only {
+        extra_params.push(("local".to_string(), "true".to_string()));
+    }
+    if only_media {
+        extra_params.push(("only_media".to_string(), "true".to_string()));
+    }
+    for value in &params.any {
+        extra_params.push(("any[]".to_string(), value.clone()));
+    }
+    for value in &params.all {
+        extra_params.push(("all[]".to_string(), value.clone()));
+    }
+    for value in &params.none {
+        extra_params.push(("none[]".to_string(), value.clone()));
+    }
+
+    let mut headers = HeaderMap::new();
+    let path = format!(
+        "/api/v1/timelines/tag/{}",
+        urlencoding::encode(hashtag.trim())
+    );
+    if let Some(link) = timeline_link_header(
+        &path,
+        limit,
+        first_id.as_deref(),
+        last_id.as_deref(),
+        &extra_params,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/timelines/list/:list_id
@@ -417,7 +530,7 @@ pub async fn list_timeline(
     CurrentUser(_session): CurrentUser,
     axum::extract::Path(list_id): axum::extract::Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let list = state
         .db
         .get_list(&list_id)
@@ -489,6 +602,8 @@ pub async fn list_timeline(
         };
         timeline_service.list_timeline(&query).await?
     };
+    let first_id = timeline_items.first().map(|item| item.status.id.clone());
+    let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -525,5 +640,16 @@ pub async fn list_timeline(
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let mut headers = HeaderMap::new();
+    let path = format!(
+        "/api/v1/timelines/list/{}",
+        urlencoding::encode(list_id.trim())
+    );
+    if let Some(link) =
+        timeline_link_header(&path, limit, first_id.as_deref(), last_id.as_deref(), &[])
+    {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }

@@ -8,6 +8,15 @@ use serde_json::Value;
 const REMOTE_ACTOR_ID: &str = "https://remote.example/users/alice";
 const REMOTE_ACTOR_ADDRESS: &str = "alice@remote.example";
 
+fn response_link_header(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn register_default_remote_key(server: &TestServer) -> String {
     let key_id = format!("{REMOTE_ACTOR_ID}#main-key");
     server.register_inbound_public_key(&key_id, common::test_public_key_pem());
@@ -51,6 +60,54 @@ async fn test_home_timeline_with_auth() {
 }
 
 #[tokio::test]
+async fn test_home_timeline_emits_link_pagination_header() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    for (index, id) in ["home-link-1", "home-link-2"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: String::new(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds((2 - index) as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/home?limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let link = response_link_header(&response);
+    assert!(link.contains("/api/v1/timelines/home?"));
+    assert!(link.contains("rel=\"next\""));
+    assert!(link.contains("rel=\"prev\""));
+}
+
+#[tokio::test]
 async fn test_public_timeline() {
     let server = TestServer::new().await;
 
@@ -66,6 +123,52 @@ async fn test_public_timeline() {
         let json: Value = response.json().await.unwrap();
         assert!(json.is_array());
     }
+}
+
+#[tokio::test]
+async fn test_public_timeline_emits_link_header_preserving_filters() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let now = Utc::now();
+
+    for (index, id) in ["public-link-1", "public-link-2"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: String::new(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds((2 - index) as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/public?limit=1&local=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let link = response_link_header(&response);
+    assert!(link.contains("/api/v1/timelines/public?"));
+    assert!(link.contains("local=true"));
+    assert!(link.contains("rel=\"next\""));
 }
 
 #[tokio::test]
@@ -167,6 +270,57 @@ async fn test_public_timeline_only_media_includes_remote_status_with_remote_atta
     let statuses = body.as_array().unwrap();
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["id"], with_media.id);
+}
+
+#[tokio::test]
+async fn test_tag_timeline_emits_link_header_preserving_tag_filters() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let now = Utc::now();
+
+    for (index, id) in ["tag-link-1", "tag-link-2"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: "<p>#rust #timeline</p>".to_string(),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: String::new(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds((2 - index) as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/tag/rust?limit=1&local=true&any[]=timeline"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", server.create_test_token().await),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let link = response_link_header(&response);
+    assert!(link.contains("/api/v1/timelines/tag/rust?"));
+    assert!(link.contains("local=true"));
+    assert!(link.contains("any%5B%5D=timeline"));
+    assert!(link.contains("rel=\"next\""));
 }
 
 #[tokio::test]
@@ -1219,6 +1373,68 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
     assert!(ids.contains(&local_status.id));
     assert!(ids.contains(&remote_status.id));
     assert!(!ids.contains(&unrelated_status.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_emits_link_pagination_header() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Link list", "link-list")
+        .await
+        .unwrap();
+    let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
+    server
+        .state
+        .db
+        .add_accounts_to_list(&list_id, std::slice::from_ref(&local_address))
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    for (index, id) in ["list-link-1", "list-link-2"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: String::new(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds((2 - index) as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/timelines/list/{list_id}?limit=1")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let link = response_link_header(&response);
+    assert!(link.contains(&format!("/api/v1/timelines/list/{list_id}?")));
+    assert!(link.contains("rel=\"next\""));
+    assert!(link.contains("rel=\"prev\""));
 }
 
 #[tokio::test]

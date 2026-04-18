@@ -1808,10 +1808,10 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
     assert_eq!(limited_replies.len(), 1);
     assert_eq!(limited_replies[0].id, "child-a");
 
-    db.insert_status_edit(&parent.id, "<p>Parent v1</p>", None)
+    db.insert_status_edit(&parent.id, "<p>Parent v1</p>", None, None, None, None)
         .await
         .unwrap();
-    db.insert_status_edit(&parent.id, "<p>Parent v2</p>", Some("cw"))
+    db.insert_status_edit(&parent.id, "<p>Parent v2</p>", Some("cw"), None, None, None)
         .await
         .unwrap();
     let edits = db.get_status_edits(&parent.id, 10).await.unwrap();
@@ -1819,12 +1819,12 @@ async fn test_status_reply_lookup_and_edit_history_operations() {
     assert!(
         edits
             .iter()
-            .any(|(_, content, _, _)| content == "<p>Parent v1</p>")
+            .any(|(_, content, _, _, _, _, _)| content == "<p>Parent v1</p>")
     );
     assert!(
         edits
             .iter()
-            .any(|(_, content, _, _)| content == "<p>Parent v2</p>")
+            .any(|(_, content, _, _, _, _, _)| content == "<p>Parent v2</p>")
     );
 }
 
@@ -2715,7 +2715,7 @@ async fn test_insert_status_with_media_and_poll_persists_poll_atomically() {
     };
     let poll_options = vec!["yes".to_string(), "no".to_string()];
 
-    db.insert_status_with_media_and_poll(&status, &[], Some((&poll_options, 600, false)))
+    db.insert_status_with_media_and_poll(&status, &[], Some((&poll_options, 600, false, false)))
         .await
         .unwrap();
 
@@ -2756,7 +2756,7 @@ async fn test_insert_status_with_media_and_poll_rolls_back_when_media_missing() 
         .insert_status_with_media_and_poll(
             &status,
             &[EntityId::new_string()],
-            Some((&poll_options, 600, false)),
+            Some((&poll_options, 600, false, false)),
         )
         .await;
     assert!(result.is_err());
@@ -2811,8 +2811,9 @@ async fn test_vote_in_poll_rejects_duplicate_option_and_rolls_back_counts() {
     assert_eq!(options_after[0].2, 0);
     assert_eq!(options_after[1].2, 0);
     let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll_after.4, 0);
+    assert!(!poll_after.4);
     assert_eq!(poll_after.5, 0);
+    assert_eq!(poll_after.6, 0);
 }
 
 #[tokio::test]
@@ -2872,10 +2873,12 @@ async fn test_vote_in_poll_rejects_option_from_other_poll() {
 
     let poll_1_after = db.get_poll(&poll_1).await.unwrap().unwrap();
     let poll_2_after = db.get_poll(&poll_2).await.unwrap().unwrap();
-    assert_eq!(poll_1_after.4, 0);
+    assert!(!poll_1_after.4);
     assert_eq!(poll_1_after.5, 0);
-    assert_eq!(poll_2_after.4, 0);
+    assert_eq!(poll_1_after.6, 0);
+    assert!(!poll_2_after.4);
     assert_eq!(poll_2_after.5, 0);
+    assert_eq!(poll_2_after.6, 0);
 }
 
 #[tokio::test]
@@ -2929,8 +2932,9 @@ async fn test_vote_in_poll_rejects_second_ballot_for_multiple_poll() {
     assert_eq!(options_after[0].2, 1);
     assert_eq!(options_after[1].2, 0);
     let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll_after.4, 1);
+    assert!(!poll_after.4);
     assert_eq!(poll_after.5, 1);
+    assert_eq!(poll_after.6, 1);
 }
 
 #[tokio::test]
@@ -3034,6 +3038,7 @@ async fn test_replace_poll_for_status_preserves_poll_id_and_votes_for_matching_o
             "2099-01-10T00:00:00Z",
             false,
             false,
+            false,
             1,
             1,
             &[("tea".to_string(), 1), ("coffee".to_string(), 0)],
@@ -3056,6 +3061,7 @@ async fn test_replace_poll_for_status_preserves_poll_id_and_votes_for_matching_o
         .replace_poll_for_status(
             &status.id,
             "2099-01-11T00:00:00Z",
+            false,
             false,
             false,
             2,
@@ -3140,8 +3146,9 @@ async fn test_record_remote_poll_vote_allows_additional_choices_for_multiple_pol
     assert_eq!(options_after[0].2, 1);
     assert_eq!(options_after[1].2, 1);
     let poll_after = db.get_poll(&poll_id).await.unwrap().unwrap();
-    assert_eq!(poll_after.4, 2);
-    assert_eq!(poll_after.5, 1);
+    assert!(!poll_after.4);
+    assert_eq!(poll_after.5, 2);
+    assert_eq!(poll_after.6, 1);
 }
 
 #[tokio::test]
@@ -3341,6 +3348,9 @@ async fn test_update_status_with_edit_snapshot_and_media_rolls_back_on_missing_s
             &previous,
             &updated,
             Some(std::slice::from_ref(&media_id)),
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("missing status should fail");

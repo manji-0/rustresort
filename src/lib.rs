@@ -223,6 +223,7 @@ pub struct ConversationsApiState {
     pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
     pub profile_cache: Arc<data::ProfileCache>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for Mastodon poll endpoints.
@@ -384,6 +385,7 @@ impl_from_ref_state!(ConversationsApiState {
     config,
     db,
     profile_cache,
+    streaming_event_bus,
 });
 impl_from_ref_state!(PollsApiState {
     config,

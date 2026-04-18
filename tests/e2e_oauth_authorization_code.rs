@@ -209,6 +209,95 @@ async fn test_oauth_authorization_code_flow_supports_pkce_s256() {
 }
 
 #[tokio::test]
+async fn test_oauth_authorization_accepts_granular_scopes_when_app_has_broad_scopes() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let redirect_uri = "https://client.example/callback";
+    let app = server.create_oauth_app(redirect_uri, "read write").await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+    let (_, session_cookie) = server.login_password().await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let authorize = client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("scope", "read:accounts write:statuses"),
+            ("state", "umbrella-state"),
+        ])
+        .header("Cookie", session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(authorize.status().is_redirection());
+
+    let redirect_location = authorize
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let redirect_url = url::Url::parse(redirect_location).unwrap();
+    let code = redirect_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .unwrap();
+
+    let token = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", redirect_uri),
+            ("code", code.as_str()),
+            ("scope", "read:accounts write:statuses"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+    let body = token.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["scope"], "read:accounts write:statuses");
+}
+
+#[tokio::test]
+async fn test_oauth_client_credentials_accepts_granular_scope_from_broad_app_scope() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let app = server
+        .create_oauth_app("urn:ietf:wg:oauth:2.0:oob", "read write")
+        .await;
+    let client_id = app["client_id"].as_str().unwrap();
+    let client_secret = app["client_secret"].as_str().unwrap();
+
+    let token = server
+        .client
+        .post(server.url("/oauth/token"))
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("scope", "read:accounts"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+    let body = token.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["scope"], "read:accounts");
+}
+
+#[tokio::test]
 async fn test_oauth_refresh_token_grant_rotates_tokens() {
     let server = TestServer::new().await;
     server.create_test_account().await;
