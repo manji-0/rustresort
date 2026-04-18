@@ -360,9 +360,11 @@ pub async fn directory(
 
     if !local_only {
         for profile in state.db.list_remote_profiles().await.unwrap_or_default() {
-            if let Some(response) =
-                build_remote_account_placeholder_response(&profile.address, state.config.as_ref(), 0)
-                && let Ok(value) = serde_json::to_value(response)
+            if let Some(response) = build_remote_account_placeholder_response(
+                &profile.address,
+                state.config.as_ref(),
+                0,
+            ) && let Ok(value) = serde_json::to_value(response)
             {
                 results.push(value);
             }
@@ -375,7 +377,11 @@ pub async fn directory(
     let results = if offset >= results.len() || limit == 0 {
         Vec::new()
     } else {
-        results.into_iter().skip(offset).take(limit).collect::<Vec<_>>()
+        results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>()
     };
     Json(serde_json::Value::Array(results))
 }
@@ -392,8 +398,17 @@ pub async fn instance_privacy_policy(
         .flatten()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| state.config.instance.description.clone());
+    let updated_at = state
+        .db
+        .get_setting("instance.privacy_policy.updated_at")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     Json(serde_json::json!({
-        "content": content
+        "content": content,
+        "updated_at": updated_at
     }))
 }
 

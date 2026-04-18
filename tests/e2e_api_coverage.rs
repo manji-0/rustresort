@@ -1654,7 +1654,10 @@ async fn test_search_accounts_returns_empty_array_for_blank_query() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        json!([])
+    );
 }
 
 #[tokio::test]
@@ -1950,7 +1953,7 @@ async fn test_get_account_lists_matches_default_port_equivalent_members() {
     let list_id = server
         .state
         .db
-        .create_list("Port Equivalence", "list")
+        .create_list("Port Equivalence", "list", false)
         .await
         .unwrap();
     server
@@ -2011,7 +2014,10 @@ async fn test_get_account_identity_proofs_for_remote_account_returns_empty_array
         .unwrap();
 
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        json!([])
+    );
 }
 
 // ============================================================================
@@ -2545,7 +2551,10 @@ async fn test_get_status_includes_reblog_payload_and_reply_account_id() {
         .db
         .insert_status(&Status {
             id: reblog_id.clone(),
-            uri: server.public_url(&format!("/users/{}/statuses/{}", account.username, reblog_id)),
+            uri: server.public_url(&format!(
+                "/users/{}/statuses/{}",
+                account.username, reblog_id
+            )),
             content: "<p>boost wrapper</p>".to_string(),
             content_warning: None,
             visibility: StatusVisibility::Public,
@@ -3051,7 +3060,10 @@ async fn test_get_notifications_v2() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0]["type"], "mention");
     assert_eq!(groups[0]["notifications_count"], 1);
-    assert_eq!(groups[0]["sample_account_ids"], json!(["alice@remote.example"]));
+    assert_eq!(
+        groups[0]["sample_account_ids"],
+        json!(["alice@remote.example"])
+    );
 }
 
 #[tokio::test]
@@ -4527,7 +4539,11 @@ async fn test_create_list() {
         .client
         .post(server.url("/api/v1/lists"))
         .header("Authorization", format!("Bearer {}", token))
-        .form(&[("title", "Test List"), ("replies_policy", "followed")])
+        .form(&[
+            ("title", "Test List"),
+            ("replies_policy", "followed"),
+            ("exclusive", "true"),
+        ])
         .send()
         .await
         .unwrap();
@@ -4536,6 +4552,7 @@ async fn test_create_list() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["title"], "Test List");
     assert_eq!(body["replies_policy"], "followed");
+    assert_eq!(body["exclusive"], true);
 }
 
 #[tokio::test]
@@ -4560,13 +4577,22 @@ async fn test_update_list() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
-    let list_id = server.state.db.create_list("before", "list").await.unwrap();
+    let list_id = server
+        .state
+        .db
+        .create_list("before", "list", false)
+        .await
+        .unwrap();
 
     let response = server
         .client
         .put(server.url(&format!("/api/v1/lists/{list_id}")))
         .header("Authorization", format!("Bearer {}", token))
-        .form(&[("title", "Updated List"), ("replies_policy", "none")])
+        .form(&[
+            ("title", "Updated List"),
+            ("replies_policy", "none"),
+            ("exclusive", "true"),
+        ])
         .send()
         .await
         .unwrap();
@@ -4575,6 +4601,7 @@ async fn test_update_list() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["title"], "Updated List");
     assert_eq!(body["replies_policy"], "none");
+    assert_eq!(body["exclusive"], true);
 }
 
 #[tokio::test]
@@ -4602,7 +4629,7 @@ async fn test_get_list_accounts() {
     let list_id = server
         .state
         .db
-        .create_list("Remote list", "list")
+        .create_list("Remote list", "list", false)
         .await
         .unwrap();
     server
@@ -4615,13 +4642,19 @@ async fn test_get_list_accounts() {
 
     let response = server
         .client
-        .get(server.url(&format!("/api/v1/lists/{list_id}/accounts")))
+        .get(server.url(&format!("/api/v1/lists/{list_id}/accounts?limit=1")))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let link = response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let body: serde_json::Value = response.json().await.unwrap();
     let accounts = body.as_array().expect("list accounts should be array");
     assert_eq!(accounts.len(), 1);
@@ -4631,6 +4664,10 @@ async fn test_get_list_accounts() {
     assert!(accounts[0].get("header_static").is_some());
     assert!(accounts[0].get("locked").is_some());
     assert!(accounts[0]["emojis"].is_array());
+    assert!(
+        link.contains(&format!("/api/v1/lists/{list_id}/accounts")),
+        "Link header should reference the list accounts collection"
+    );
 
     let paged = server
         .client
@@ -4910,7 +4947,9 @@ async fn test_filter_v2_crud_and_keyword_endpoints() {
         .as_array()
         .expect("filtered array");
     assert!(
-        filtered.iter().any(|entry| entry["status_matches"] == json!([status_id])),
+        filtered
+            .iter()
+            .any(|entry| entry["status_matches"] == json!([status_id])),
         "status filter should be reflected in status serialization"
     );
 
@@ -5015,27 +5054,41 @@ async fn test_search_v1() {
     server.create_test_account().await;
     let token = server.create_test_token().await;
 
+    server
+        .client
+        .post(server.url("/api/v1/statuses"))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "status": "searchable hashtag #test",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .unwrap();
+
     let response = server
         .client
-        .get(server.url("/api/v1/search?q=test"))
-        .header("Authorization", format!("Bearer {}", token))
+        .get(server.url("/api/v1/search?q=%23test&type=hashtags"))
         .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let hashtags = body["hashtags"]
+        .as_array()
+        .expect("hashtags should be an array");
+    assert!(!hashtags.is_empty());
+    assert!(hashtags.iter().all(serde_json::Value::is_string));
 }
 
 #[tokio::test]
 async fn test_search_v2() {
     let server = TestServer::new().await;
-    server.create_test_account().await;
-    let token = server.create_test_token().await;
 
     let response = server
         .client
         .get(server.url("/api/v2/search?q=test"))
-        .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
         .unwrap();

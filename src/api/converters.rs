@@ -159,12 +159,12 @@ async fn resolve_in_reply_to_account_id(
         if parent_status.is_local || parent_status.account_address.trim().is_empty() {
             return Ok(Some(local_account_id.to_string()));
         }
-        let parent_author = if parent_status.is_local || parent_status.account_address.trim().is_empty()
-        {
-            "__local__".to_string()
-        } else {
-            parent_status.account_address.trim().to_ascii_lowercase()
-        };
+        let parent_author =
+            if parent_status.is_local || parent_status.account_address.trim().is_empty() {
+                "__local__".to_string()
+            } else {
+                parent_status.account_address.trim().to_ascii_lowercase()
+            };
         if parent_author != current_author {
             return Ok(Some(parent_status.account_address));
         }
@@ -377,19 +377,36 @@ async fn build_reblogged_status_response(
         .as_ref()
         .map(|stats| stats.force_sensitive)
         .unwrap_or(false);
+    let thread_uri = db.resolve_thread_root_uri(boosted_status).await?;
     let mut response = status_to_response_with_media(
         boosted_status,
         account,
         config,
         account_stats,
         remote_account_stats,
-        StatusInteractions::default(),
+        StatusInteractions::new(
+            Some(db.is_favourited(&boosted_status.id).await?),
+            Some(db.is_reposted(&boosted_status.id).await?),
+            Some(db.is_thread_muted(&thread_uri).await?),
+            Some(db.is_bookmarked(&boosted_status.id).await?),
+            Some(db.is_status_pinned(&boosted_status.id).await?),
+        ),
         force_sensitive,
         &media_attachment_responses,
     );
     enrich_status_response(db, boosted_status, &mut response).await?;
+    response.in_reply_to_account_id =
+        resolve_in_reply_to_account_id(db, boosted_status, &account.id).await?;
     response.poll = load_status_poll_response(db, &boosted_status.id, account, config).await?;
     response.filtered = load_status_filtered(db, boosted_status).await?;
+    response.card = build_status_card_value(boosted_status);
+    if let Some(quote_of_uri) = boosted_status.quote_of_uri.as_deref()
+        && let Some(quote_status) = db.get_status_by_uri(quote_of_uri).await?
+    {
+        response.quote = Some(
+            build_quote_response_value(db, &quote_status, account, config, account_stats).await?,
+        );
+    }
     response.reblog = None;
     Ok(response)
 }
@@ -421,7 +438,8 @@ pub async fn build_status_response_with_media(
         &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
-    response.in_reply_to_account_id = resolve_in_reply_to_account_id(db, status, &account.id).await?;
+    response.in_reply_to_account_id =
+        resolve_in_reply_to_account_id(db, status, &account.id).await?;
     if let Some(boost_of_uri) = status.boost_of_uri.as_deref()
         && boost_of_uri != status.uri
         && let Some(boosted_status) = db.get_status_by_uri(boost_of_uri).await?
@@ -513,7 +531,9 @@ async fn load_status_filtered(
 
         let status_matches = status_filters
             .into_iter()
-            .filter_map(|(_filter_status_id, status_id)| (status_id == status.id).then_some(status_id))
+            .filter_map(|(_filter_status_id, status_id)| {
+                (status_id == status.id).then_some(status_id)
+            })
             .collect::<Vec<_>>();
         if keyword_matches.is_empty() && status_matches.is_empty() {
             continue;

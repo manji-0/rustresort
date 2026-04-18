@@ -216,7 +216,9 @@ impl TestServer {
 
         // Initialize app state
         let mut state = AppState::new(config.clone()).await.unwrap();
-        state.storage = Arc::new(TestMediaStorage::new(config.storage.media.public_url.clone()));
+        state.storage = Arc::new(TestMediaStorage::new(
+            config.storage.media.public_url.clone(),
+        ));
 
         // Create HTTP client
         let client = reqwest::Client::builder()

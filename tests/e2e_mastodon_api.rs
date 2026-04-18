@@ -314,6 +314,27 @@ async fn test_markers_round_trip() {
     let saved: Value = save_response.json().await.unwrap();
     assert_eq!(saved["home"]["last_read_id"], "status-123");
     assert_eq!(saved["notifications"]["last_read_id"], "notif-456");
+    assert!(
+        saved["home"]["version"].as_i64().unwrap_or_default() >= 1,
+        "home marker version should be incremented"
+    );
+
+    let form_save_response = server
+        .client
+        .post(server.url("/api/v1/markers"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body("home[last_read_id]=status-789&notifications[last_read_id]=notif-999")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form_save_response.status(), 200);
+    let form_saved: Value = form_save_response.json().await.unwrap();
+    assert_eq!(form_saved["home"]["last_read_id"], "status-789");
+    assert_eq!(form_saved["notifications"]["last_read_id"], "notif-999");
 
     let get_response = server
         .client
@@ -325,8 +346,8 @@ async fn test_markers_round_trip() {
         .unwrap();
     assert_eq!(get_response.status(), 200);
     let loaded: Value = get_response.json().await.unwrap();
-    assert_eq!(loaded["home"]["last_read_id"], "status-123");
-    assert_eq!(loaded["notifications"]["last_read_id"], "notif-456");
+    assert_eq!(loaded["home"]["last_read_id"], "status-789");
+    assert_eq!(loaded["notifications"]["last_read_id"], "notif-999");
 
     let default_get_response = server
         .client

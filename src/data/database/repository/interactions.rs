@@ -458,6 +458,15 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Get a repost row by its local row ID.
+    pub async fn get_repost_by_id(&self, id: &str) -> Result<Option<Repost>, AppError> {
+        sqlx::query_as::<_, Repost>("SELECT * FROM reposts WHERE id = ? LIMIT 1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Get repost rows safe to expose in ActivityPub outbox.
     pub async fn get_local_outbox_reposts(&self, limit: usize) -> Result<Vec<Repost>, AppError> {
         sqlx::query_as::<_, Repost>(

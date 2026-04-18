@@ -1284,7 +1284,7 @@ async fn test_list_timeline_returns_statuses_for_list_accounts() {
     let list_id = server
         .state
         .db
-        .create_list("Test list", "list")
+        .create_list("Test list", "list", false)
         .await
         .unwrap();
     let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
@@ -1387,7 +1387,7 @@ async fn test_list_timeline_emits_link_pagination_header() {
     let list_id = server
         .state
         .db
-        .create_list("Link list", "link-list")
+        .create_list("Link list", "link-list", false)
         .await
         .unwrap();
     let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
@@ -1463,7 +1463,7 @@ async fn test_list_timeline_includes_persisted_remote_followee_status() {
     let list_id = server
         .state
         .db
-        .create_list("Remote persisted list", "list")
+        .create_list("Remote persisted list", "list", false)
         .await
         .unwrap();
     server
@@ -1524,7 +1524,7 @@ async fn test_list_timeline_excludes_direct_statuses_from_listed_accounts() {
     let list_id = server
         .state
         .db
-        .create_list("Direct exclusion list", "list")
+        .create_list("Direct exclusion list", "list", false)
         .await
         .unwrap();
     server
@@ -1583,7 +1583,7 @@ async fn test_list_timeline_matches_local_account_added_by_id() {
     let list_id = server
         .state
         .db
-        .create_list("Test list by id", "list")
+        .create_list("Test list by id", "list", false)
         .await
         .unwrap();
     let account_id = account.id.to_string();
@@ -1643,7 +1643,7 @@ async fn test_list_timeline_respects_none_replies_policy() {
     let list_id = server
         .state
         .db
-        .create_list("Replies none list", "none")
+        .create_list("Replies none list", "none", false)
         .await
         .unwrap();
     let local_address = format!("{}@{}", account.username, server.state.config.server.domain);
@@ -1721,7 +1721,7 @@ async fn test_list_timeline_none_policy_fetches_past_reply_only_page() {
     let list_id = server
         .state
         .db
-        .create_list("Replies none pagination", "none")
+        .create_list("Replies none pagination", "none", false)
         .await
         .unwrap();
     let local_address = format!("{}@{}", account.username, server.state.config.server.domain);

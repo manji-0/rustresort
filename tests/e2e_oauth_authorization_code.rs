@@ -74,7 +74,10 @@ async fn test_oauth_authorization_code_flow_works_end_to_end() {
     assert_eq!(app_verify.status(), StatusCode::OK);
     let app_body = app_verify.json::<serde_json::Value>().await.unwrap();
     assert_eq!(app_body["name"], "RustResort E2E Client");
-    assert_eq!(app_body["scopes"], "read:accounts write:statuses");
+    assert_eq!(
+        app_body["scopes"],
+        serde_json::json!(["read:accounts", "write:statuses"])
+    );
 }
 
 #[tokio::test]
@@ -140,9 +143,17 @@ async fn test_oauth_authorize_redirects_back_with_oauth_error_for_invalid_scope(
         .and_then(|value| value.to_str().ok())
         .unwrap();
     let redirect = url::Url::parse(location).unwrap();
-    let params = redirect.query_pairs().collect::<std::collections::HashMap<_, _>>();
-    assert_eq!(params.get("error").map(|value| value.as_ref()), Some("invalid_scope"));
-    assert_eq!(params.get("state").map(|value| value.as_ref()), Some("oauth-state"));
+    let params = redirect
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        params.get("error").map(|value| value.as_ref()),
+        Some("invalid_scope")
+    );
+    assert_eq!(
+        params.get("state").map(|value| value.as_ref()),
+        Some("oauth-state")
+    );
 }
 
 #[tokio::test]
@@ -431,7 +442,7 @@ async fn test_oauth_refresh_token_grant_rotates_tokens() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(reused.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

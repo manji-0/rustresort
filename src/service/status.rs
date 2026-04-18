@@ -1617,7 +1617,7 @@ mod tests {
     {
         let (db, _temp_dir) = create_test_db().await;
         seed_account(db.as_ref(), "testuser").await;
-        let list_id = db.create_list("friends", "list").await.unwrap();
+        let list_id = db.create_list("friends", "list", false).await.unwrap();
         db.add_account_to_list(&list_id, "alice@example.com:443")
             .await
             .unwrap();
@@ -1658,7 +1658,7 @@ mod tests {
         let (db, _temp_dir) = create_test_db().await;
         seed_account(db.as_ref(), "testuser").await;
         let account = db.get_account().await.unwrap().unwrap();
-        let list_id = db.create_list("local-posts", "list").await.unwrap();
+        let list_id = db.create_list("local-posts", "list", false).await.unwrap();
         db.add_account_to_list(&list_id, &account.id).await.unwrap();
 
         let bus = Arc::new(BroadcastEventBus::new(64));

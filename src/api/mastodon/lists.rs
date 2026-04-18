@@ -4,8 +4,11 @@ use axum::{
     body::to_bytes,
     extract::Request,
     extract::{Path, Query, State},
-    http::{HeaderMap, header::CONTENT_TYPE},
-    response::Json,
+    http::{
+        HeaderMap,
+        header::{CONTENT_TYPE, LINK},
+    },
+    response::{IntoResponse, Json},
 };
 use futures::stream::{self, StreamExt};
 use serde::de::DeserializeOwned;
@@ -21,6 +24,7 @@ pub struct ListResponse {
     pub id: String,
     pub title: String,
     pub replies_policy: String,
+    pub exclusive: bool,
 }
 
 /// Create list request
@@ -28,6 +32,7 @@ pub struct ListResponse {
 pub struct CreateListRequest {
     pub title: String,
     pub replies_policy: Option<String>, // "followed", "list", "none"
+    pub exclusive: Option<bool>,
 }
 
 /// Update list request
@@ -35,6 +40,7 @@ pub struct CreateListRequest {
 pub struct UpdateListRequest {
     pub title: Option<String>,
     pub replies_policy: Option<String>,
+    pub exclusive: Option<bool>,
 }
 
 /// Add accounts to list request
@@ -79,8 +85,35 @@ fn parse_json_or_form_body<T: DeserializeOwned>(
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
     pub max_id: Option<String>,
+    pub since_id: Option<String>,
     pub min_id: Option<String>,
     pub limit: Option<usize>,
+}
+
+fn list_collection_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+) -> Option<String> {
+    let build_path = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        format!("{path}?{}", serializer.finish())
+    };
+
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "<{}>; rel=\"prev\"",
+            build_path("min_id", first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
 }
 
 /// GET /api/v1/lists
@@ -93,10 +126,11 @@ pub async fn get_lists(
 
     let response: Vec<ListResponse> = lists
         .into_iter()
-        .map(|(id, title, replies_policy)| ListResponse {
+        .map(|(id, title, replies_policy, exclusive)| ListResponse {
             id,
             title,
             replies_policy,
+            exclusive,
         })
         .collect();
 
@@ -116,6 +150,7 @@ pub async fn get_list(
         id: list.0,
         title: list.1,
         replies_policy: list.2,
+        exclusive: list.3,
     }))
 }
 
@@ -134,6 +169,7 @@ pub async fn create_list(
         CreateListRequest {
             title: String::new(),
             replies_policy: None,
+            exclusive: None,
         }
     } else {
         parse_json_or_form_body::<CreateListRequest>(&parts.headers, &body)?
@@ -146,6 +182,7 @@ pub async fn create_list(
 
     // Default replies_policy to "list"
     let replies_policy = req.replies_policy.unwrap_or_else(|| "list".to_string());
+    let exclusive = req.exclusive.unwrap_or(false);
 
     // Validate replies_policy
     if !["followed", "list", "none"].contains(&replies_policy.as_str()) {
@@ -154,12 +191,16 @@ pub async fn create_list(
         ));
     }
 
-    let id = state.db.create_list(&req.title, &replies_policy).await?;
+    let id = state
+        .db
+        .create_list(&req.title, &replies_policy, exclusive)
+        .await?;
 
     Ok(Json(ListResponse {
         id,
         title: req.title,
         replies_policy,
+        exclusive,
     }))
 }
 
@@ -179,6 +220,7 @@ pub async fn update_list(
         UpdateListRequest {
             title: None,
             replies_policy: None,
+            exclusive: None,
         }
     } else {
         parse_json_or_form_body::<UpdateListRequest>(&parts.headers, &body)?
@@ -190,6 +232,7 @@ pub async fn update_list(
     // Use existing values if not provided
     let title = req.title.unwrap_or(existing.1.clone());
     let replies_policy = req.replies_policy.unwrap_or(existing.2.clone());
+    let exclusive = req.exclusive.unwrap_or(existing.3);
 
     // Validate title
     if title.trim().is_empty() {
@@ -203,12 +246,16 @@ pub async fn update_list(
         ));
     }
 
-    state.db.update_list(&id, &title, &replies_policy).await?;
+    state
+        .db
+        .update_list(&id, &title, &replies_policy, exclusive)
+        .await?;
 
     Ok(Json(ListResponse {
         id,
         title,
         replies_policy,
+        exclusive,
     }))
 }
 
@@ -235,7 +282,7 @@ pub async fn get_list_accounts(
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Verify list exists
     state.db.get_list(&id).await?.ok_or(AppError::NotFound)?;
 
@@ -294,10 +341,40 @@ pub async fn get_list_accounts(
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| value > min_id)
         });
+        accounts.reverse();
+    } else if let Some(since_id) = params.since_id.as_deref() {
+        accounts.retain(|account| {
+            account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value > since_id)
+        });
     }
     accounts.truncate(limit);
 
-    Ok(Json(accounts))
+    let first_id = accounts
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = accounts
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = list_collection_link_header(
+        &format!("/api/v1/lists/{id}/accounts"),
+        limit,
+        first_id,
+        last_id,
+    ) {
+        headers.insert(
+            LINK,
+            link.parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(accounts)))
 }
 
 /// POST /api/v1/lists/:id/accounts

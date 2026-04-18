@@ -60,7 +60,6 @@ const READ_LISTS: &[&str] = &["read:lists"];
 const WRITE_LISTS: &[&str] = &["write:lists"];
 const READ_FILTERS: &[&str] = &["read:filters"];
 const WRITE_FILTERS: &[&str] = &["write:filters"];
-const READ_SEARCH: &[&str] = &["read:search"];
 const READ_ADMIN_ACCOUNTS: &[&str] = &["admin:read:accounts", "admin:read"];
 const WRITE_ADMIN_ACCOUNTS: &[&str] = &["admin:write:accounts", "admin:write"];
 const READ_ADMIN_REPORTS: &[&str] = &["admin:read:reports", "admin:read"];
@@ -538,8 +537,8 @@ where
             scoped(get(bookmarks::get_favourites), READ_STATUSES),
         )
         // Search
-        .route("/v1/search", scoped(get(search::search_v1), READ_SEARCH))
-        .route("/v2/search", scoped(get(search::search_v2), READ_SEARCH))
+        .route("/v1/search", get(search::search_v1))
+        .route("/v2/search", get(search::search_v2))
         // Polls
         .route(
             "/v1/polls/:id/votes",
@@ -586,26 +585,17 @@ where
         )
         // Streaming API
         .route("/v1/streaming/health", get(streaming::streaming_health))
-        .route(
-            "/v1/streaming",
-            get(streaming::stream_root),
-        )
+        .route("/v1/streaming", get(streaming::stream_root))
         .route(
             "/v1/streaming/user",
             scoped_all(get(streaming::stream_user), READ_USER_STREAM),
         )
-        .route(
-            "/v1/streaming/public",
-            get(streaming::stream_public),
-        )
+        .route("/v1/streaming/public", get(streaming::stream_public))
         .route(
             "/v1/streaming/public/local",
             get(streaming::stream_public_local),
         )
-        .route(
-            "/v1/streaming/hashtag",
-            get(streaming::stream_hashtag),
-        )
+        .route("/v1/streaming/hashtag", get(streaming::stream_hashtag))
         .route(
             "/v1/streaming/list",
             scoped(get(streaming::stream_list), READ_STATUSES),

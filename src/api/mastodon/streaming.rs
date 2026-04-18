@@ -12,11 +12,15 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use axum_extra::extract::CookieJar;
-use futures::stream::{self, Stream};
+use futures::{
+    SinkExt, StreamExt,
+    stream::{self, Stream},
+};
 use serde::Deserialize;
 use serde_json::Value;
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 use tokio::sync::broadcast;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::accounts::{
     build_remote_account_placeholder_response, resolve_account_response_for_identity,
@@ -39,6 +43,23 @@ pub struct StreamParams {
     list: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WebSocketControlMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    stream: serde_json::Value,
+    tag: Option<String>,
+    list: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamSubscription {
+    stream_name: String,
+    tag: Option<String>,
+    list: Option<String>,
+    local: bool,
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -52,7 +73,12 @@ fn websocket_protocol_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("Sec-WebSocket-Protocol")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').map(str::trim).find(|value| !value.is_empty()))
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .find(|value| !value.is_empty())
+        })
 }
 
 #[derive(Clone)]
@@ -402,6 +428,244 @@ async fn forward_websocket_stream(
     }
 }
 
+async fn subscribe_stream(
+    state: &StreamingApiState,
+    auth: Option<&StreamAuth>,
+    subscription: &StreamSubscription,
+) -> Result<(EventReceiver, String), AppError> {
+    match subscription.stream_name.as_str() {
+        "user" => {
+            enforce_stream_auth(auth, &["read:statuses", "read:notifications"])?;
+            let account_id = state.config.auth.username.clone();
+            Ok((
+                state.streaming_event_bus.subscribe_user(account_id.as_str()).await?,
+                "user".to_string(),
+            ))
+        }
+        "public" => {
+            if let Some(auth) = auth {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
+            Ok((state.streaming_event_bus.subscribe_public().await?, "public".to_string()))
+        }
+        "public:local" => {
+            if let Some(auth) = auth {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
+            Ok((
+                state.streaming_event_bus.subscribe_public_local().await?,
+                "public:local".to_string(),
+            ))
+        }
+        "hashtag" | "hashtag:local" => {
+            if let Some(auth) = auth {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
+            let tag = subscription
+                .tag
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(AppError::Validation("tag parameter required".to_string()))?;
+            let local_hashtag = subscription.stream_name == "hashtag:local" || subscription.local;
+            let receiver = if local_hashtag {
+                state.streaming_event_bus.subscribe_hashtag_local(tag).await?
+            } else {
+                state.streaming_event_bus.subscribe_hashtag(tag).await?
+            };
+            Ok((
+                receiver,
+                if local_hashtag {
+                    "hashtag:local".to_string()
+                } else {
+                    "hashtag".to_string()
+                },
+            ))
+        }
+        "list" => {
+            enforce_stream_auth(auth, &["read:statuses"])?;
+            let list_id = subscription
+                .list
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(AppError::Validation("list parameter required".to_string()))?;
+            state.db.get_list(list_id).await?.ok_or(AppError::NotFound)?;
+            Ok((
+                state.streaming_event_bus.subscribe_list(list_id).await?,
+                "list".to_string(),
+            ))
+        }
+        "direct" => {
+            enforce_stream_auth(auth, &["read:statuses"])?;
+            let account_id = state.config.auth.username.clone();
+            Ok((
+                state
+                    .streaming_event_bus
+                    .subscribe_direct(account_id.as_str())
+                    .await?,
+                "direct".to_string(),
+            ))
+        }
+        _ => Err(AppError::Validation(
+            "stream parameter must be one of user, public, public:local, hashtag, hashtag:local, list, direct"
+                .to_string(),
+        )),
+    }
+}
+
+fn parse_ws_subscriptions(
+    message: WebSocketControlMessage,
+) -> Result<Vec<StreamSubscription>, AppError> {
+    let stream_names = match message.stream {
+        serde_json::Value::String(value) => vec![value],
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    if stream_names.is_empty() {
+        return Err(AppError::Validation(
+            "stream parameter required".to_string(),
+        ));
+    }
+    Ok(stream_names
+        .into_iter()
+        .map(|stream_name| StreamSubscription {
+            local: stream_name == "hashtag:local",
+            stream_name,
+            tag: message.tag.clone(),
+            list: message.list.clone(),
+        })
+        .collect())
+}
+
+fn subscription_key(subscription: &StreamSubscription) -> String {
+    match subscription.stream_name.as_str() {
+        "hashtag" | "hashtag:local" => format!(
+            "{}:{}",
+            subscription.stream_name,
+            subscription.tag.clone().unwrap_or_default()
+        ),
+        "list" => format!("list:{}", subscription.list.clone().unwrap_or_default()),
+        _ => subscription.stream_name.clone(),
+    }
+}
+
+async fn multiplex_websocket_stream(
+    state: StreamingApiState,
+    socket: WebSocket,
+    auth: Option<StreamAuth>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<String>();
+    let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let parsed: Result<WebSocketControlMessage, _> = serde_json::from_str(&text);
+                        let Ok(message) = parsed else {
+                            if sender.send(Message::Text("{\"error\":\"invalid_json\"}".to_string())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        };
+                        let action = message.message_type.trim().to_ascii_lowercase();
+                        let parsed_subscriptions = match parse_ws_subscriptions(message) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if sender.send(Message::Text(serde_json::json!({"error": error.to_string()}).to_string())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        match action.as_str() {
+                            "subscribe" => {
+                                for subscription in parsed_subscriptions {
+                                    let key = subscription_key(&subscription);
+                                    if subscriptions.contains_key(&key) {
+                                        continue;
+                                    }
+                                    let subscribe_result = subscribe_stream(&state, auth.as_ref(), &subscription).await;
+                                    let (event_receiver, stream_name) = match subscribe_result {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            if sender.send(Message::Text(serde_json::json!({"error": error.to_string()}).to_string())).await.is_err() {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    let tx = event_tx.clone();
+                                    let state_for_task = state.clone();
+                                    let handle = tokio::spawn(async move {
+                                        let mut event_receiver = event_receiver.into_inner();
+                                        loop {
+                                            match event_receiver.recv().await {
+                                                Ok(event) => {
+                                                    let payload = serialize_stream_event_data(&state_for_task, &event).await;
+                                                    let frame = serde_json::json!({
+                                                        "stream": [stream_name],
+                                                        "event": event.event_name(),
+                                                        "payload": payload,
+                                                    });
+                                                    if tx.send(frame.to_string()).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                                    tracing::warn!(skipped, "streaming receiver lagged; dropping old messages");
+                                                }
+                                                Err(broadcast::error::RecvError::Closed) => break,
+                                            }
+                                        }
+                                    });
+                                    subscriptions.insert(key, handle);
+                                }
+                            }
+                            "unsubscribe" => {
+                                for subscription in parsed_subscriptions {
+                                    let key = subscription_key(&subscription);
+                                    if let Some(handle) = subscriptions.remove(&key) {
+                                        handle.abort();
+                                    }
+                                }
+                            }
+                            _ => {
+                                if sender.send(Message::Text("{\"error\":\"unsupported_type\"}".to_string())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+            Some(frame) = event_rx.recv() => {
+                if sender.send(Message::Text(frame)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    for (_, handle) in subscriptions {
+        handle.abort();
+    }
+}
+
 /// GET /api/v1/streaming/user
 /// Stream events for the authenticated user
 pub async fn stream_user(
@@ -499,120 +763,30 @@ pub async fn stream_root(
 ) -> Result<impl IntoResponse, AppError> {
     let auth =
         authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
-    let stream_name = params.stream.clone().unwrap_or_default();
-    match stream_name.as_str() {
-        "user" => {
-            enforce_stream_auth(auth.as_ref(), &["read:statuses", "read:notifications"])?;
-            let account_id = state.config.auth.username.clone();
-            let receiver = state
-                .streaming_event_bus
-                .subscribe_user(account_id.as_str())
-                .await?;
-            if let Some(ws) = ws {
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
+    if params.stream.is_none() {
+        if let Some(ws) = ws {
+            return Ok(ws
+                .on_upgrade(move |socket| multiplex_websocket_stream(state, socket, auth))
+                .into_response());
         }
-        "public" => {
-            if let Some(auth) = auth.as_ref() {
-                enforce_stream_auth(Some(auth), &["read:statuses"])?;
-            }
-            let receiver = state.streaming_event_bus.subscribe_public().await?;
-            if let Some(ws) = ws {
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
-        }
-        "public:local" => {
-            if let Some(auth) = auth.as_ref() {
-                enforce_stream_auth(Some(auth), &["read:statuses"])?;
-            }
-            let receiver = state.streaming_event_bus.subscribe_public_local().await?;
-            if let Some(ws) = ws {
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
-        }
-        "hashtag" | "hashtag:local" => {
-            if let Some(auth) = auth.as_ref() {
-                enforce_stream_auth(Some(auth), &["read:statuses"])?;
-            }
-            let tag = params
-                .tag
-                .clone()
-                .ok_or(AppError::Validation("tag parameter required".to_string()))?;
-            let local_hashtag = stream_name == "hashtag:local" || params.local.unwrap_or(false);
-            let receiver = if local_hashtag {
-                state.streaming_event_bus.subscribe_hashtag_local(&tag).await?
-            } else {
-                state.streaming_event_bus.subscribe_hashtag(&tag).await?
-            };
-            if let Some(ws) = ws {
-                let ws_stream_name = if local_hashtag {
-                    "hashtag:local".to_string()
-                } else {
-                    stream_name.clone()
-                };
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, ws_stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
-        }
-        "list" => {
-            enforce_stream_auth(auth.as_ref(), &["read:statuses"])?;
-            let list_id = params
-                .list
-                .clone()
-                .ok_or(AppError::Validation("list parameter required".to_string()))?;
-            state
-                .db
-                .get_list(&list_id)
-                .await?
-                .ok_or(AppError::NotFound)?;
-            let receiver = state.streaming_event_bus.subscribe_list(&list_id).await?;
-            if let Some(ws) = ws {
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
-        }
-        "direct" => {
-            enforce_stream_auth(auth.as_ref(), &["read:statuses"])?;
-            let account_id = state.config.auth.username.clone();
-            let receiver = state
-                .streaming_event_bus
-                .subscribe_direct(account_id.as_str())
-                .await?;
-            if let Some(ws) = ws {
-                return Ok(ws
-                    .on_upgrade(move |socket| {
-                        forward_websocket_stream(state, socket, receiver, stream_name)
-                    })
-                    .into_response());
-            }
-            Ok(build_sse_stream(state, receiver).into_response())
-        }
-        _ => Err(AppError::Validation(
-            "stream parameter must be one of user, public, public:local, hashtag, hashtag:local, list, direct"
-                .to_string(),
-        )),
+        return Err(AppError::Validation(
+            "stream parameter required for SSE connections".to_string(),
+        ));
     }
+
+    let subscription = StreamSubscription {
+        stream_name: params.stream.clone().unwrap_or_default(),
+        tag: params.tag.clone(),
+        local: params.local.unwrap_or(false),
+        list: params.list.clone(),
+    };
+    let (receiver, stream_name) = subscribe_stream(&state, auth.as_ref(), &subscription).await?;
+    if let Some(ws) = ws {
+        return Ok(ws
+            .on_upgrade(move |socket| {
+                forward_websocket_stream(state, socket, receiver, stream_name)
+            })
+            .into_response());
+    }
+    Ok(build_sse_stream(state, receiver).into_response())
 }

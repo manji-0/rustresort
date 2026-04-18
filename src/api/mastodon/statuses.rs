@@ -453,6 +453,42 @@ async fn status_response_with_viewer_interactions(
     .await
 }
 
+async fn reblog_wrapper_response(
+    state: &StatusApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    status: &crate::data::Status,
+    repost_id: &str,
+    repost_uri: &str,
+    announce_created_at: chrono::DateTime<chrono::Utc>,
+    announce_visibility: crate::data::StatusVisibility,
+) -> Result<crate::api::StatusResponse, AppError> {
+    let mut reblogged_status =
+        status_response_with_viewer_interactions(state, account, account_stats, status).await?;
+    reblogged_status.reblogged = true;
+
+    let mut wrapper = reblogged_status.clone();
+    wrapper.id = repost_id.to_string();
+    wrapper.uri = repost_uri.to_string();
+    wrapper.url = repost_uri.to_string();
+    wrapper.created_at = announce_created_at;
+    wrapper.visibility = announce_visibility.to_string();
+    wrapper.account =
+        crate::api::account_to_response_with_stats(account, &state.config, account_stats);
+    wrapper.content.clear();
+    wrapper.text.clear();
+    wrapper.media_attachments.clear();
+    wrapper.mentions.clear();
+    wrapper.tags.clear();
+    wrapper.emojis.clear();
+    wrapper.poll = None;
+    wrapper.quote = None;
+    wrapper.quote_approval = None;
+    wrapper.card = None;
+    wrapper.reblog = Some(Box::new(reblogged_status));
+    Ok(wrapper)
+}
+
 async fn status_context_response(
     state: &StatusApiState,
     account: &crate::data::Account,
@@ -1094,17 +1130,41 @@ pub async fn get_status(
         .start_timer();
 
     let status_service = build_status_service(&state);
+    let is_authenticated = request_is_authenticated(&state, &headers, &jar).await;
 
     // Get status from database
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let status = status_service.get(&id).await?;
+    let status = if let Some(repost) = state.db.get_repost_by_id(&id).await? {
+        let boosted_status = status_service.get(&repost.status_id).await?;
+        if !is_authenticated {
+            ensure_public_visibility_for_public_endpoint(boosted_status.visibility)?;
+        }
+        let account = build_account_service(&state).get_account().await?;
+        let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+        let wrapper = reblog_wrapper_response(
+            &state,
+            &account,
+            account_stats,
+            &boosted_status,
+            &repost.id,
+            &repost.uri,
+            repost.created_at,
+            boosted_status.visibility,
+        )
+        .await?;
+        HTTP_REQUESTS_TOTAL
+            .with_label_values(&["GET", "/api/v1/statuses/:id", "200"])
+            .inc();
+        return Ok(Json(serde_json::to_value(wrapper).unwrap()));
+    } else {
+        status_service.get(&id).await?
+    };
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "statuses"])
         .inc();
     db_timer.observe_duration();
-    let is_authenticated = request_is_authenticated(&state, &headers, &jar).await;
     if !is_authenticated {
         ensure_public_visibility_for_public_endpoint(status.visibility)?;
     }
@@ -1380,8 +1440,14 @@ pub async fn get_status_context(
     let mut descendant_responses = Vec::with_capacity(descendants.len());
     for descendant in &descendants {
         descendant_responses.push(
-            status_context_response(&state, &account, account_stats, descendant, is_authenticated)
-                .await?,
+            status_context_response(
+                &state,
+                &account,
+                account_stats,
+                descendant,
+                is_authenticated,
+            )
+            .await?,
         );
     }
 
@@ -1566,7 +1632,7 @@ pub async fn favourite_status(
         account_stats,
         crate::api::StatusInteractions::new(
             Some(true),
-            Some(false),
+            status_service.is_reposted(&status_id).await.ok(),
             status_service.is_muted(&status_id).await.ok(),
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
@@ -1650,7 +1716,7 @@ pub async fn unfavourite_status(
         account_stats,
         crate::api::StatusInteractions::new(
             Some(false),
-            Some(false),
+            status_service.is_reposted(&status_id).await.ok(),
             status_service.is_muted(&status_id).await.ok(),
             status_service.is_bookmarked(&status_id).await.ok(),
             status_service.is_pinned(&status_id).await.ok(),
@@ -1685,13 +1751,9 @@ pub async fn reblog_status(
             .ok_or_else(|| {
                 AppError::internal("repost URI missing after creating repost activity".to_string())
             })?;
-        let repost_id = state
-            .db
-            .get_repost_id(&status.id)
-            .await?
-            .ok_or_else(|| {
-                AppError::internal("repost ID missing after creating repost activity".to_string())
-            })?;
+        let repost_id = state.db.get_repost_id(&status.id).await?.ok_or_else(|| {
+            AppError::internal("repost ID missing after creating repost activity".to_string())
+        })?;
         (status, repost_uri, repost_id)
     } else {
         // Create repost record
@@ -1710,7 +1772,6 @@ pub async fn reblog_status(
             .unwrap_or(repost_id);
         (status, repost_uri, persisted_repost_id)
     };
-    let status_id = status.id.clone();
     let announce_visibility = params
         .visibility
         .clone()
@@ -1753,47 +1814,27 @@ pub async fn reblog_status(
         );
     }
 
-    let mut reblogged_status = crate::api::build_status_response_with_account_stats(
-        state.db.as_ref(),
-        &status,
-        &account,
-        &state.config,
-        account_stats,
-        crate::api::StatusInteractions::new(
-            status_service.is_favourited(&status_id).await.ok(),
-            Some(true),
-            status_service.is_muted(&status_id).await.ok(),
-            status_service.is_bookmarked(&status_id).await.ok(),
-            status_service.is_pinned(&status_id).await.ok(),
-        ),
-    )
-    .await?;
-    reblogged_status.reblogged = true;
     if !status.is_local {
-        return Ok(Json(serde_json::to_value(reblogged_status).map_err(|error| {
-            AppError::serialization("reblogged status response serialization", error)
-        })?));
+        let mut reblogged_status =
+            status_response_with_viewer_interactions(&state, &account, account_stats, &status)
+                .await?;
+        reblogged_status.reblogged = true;
+        return Ok(Json(serde_json::to_value(reblogged_status).map_err(
+            |error| AppError::serialization("reblogged status response serialization", error),
+        )?));
     }
 
-    let mut wrapper = reblogged_status.clone();
-    wrapper.id = repost_id;
-    wrapper.uri = repost_uri.clone();
-    wrapper.url = repost_uri.clone();
-    wrapper.created_at = Utc::now();
-    wrapper.visibility = announce_visibility.to_string();
-    wrapper.account =
-        crate::api::account_to_response_with_stats(&account, &state.config, account_stats);
-    wrapper.content.clear();
-    wrapper.text.clear();
-    wrapper.media_attachments.clear();
-    wrapper.mentions.clear();
-    wrapper.tags.clear();
-    wrapper.emojis.clear();
-    wrapper.poll = None;
-    wrapper.quote = None;
-    wrapper.quote_approval = None;
-    wrapper.card = None;
-    wrapper.reblog = Some(Box::new(reblogged_status));
+    let wrapper = reblog_wrapper_response(
+        &state,
+        &account,
+        account_stats,
+        &status,
+        &repost_id,
+        &repost_uri,
+        Utc::now(),
+        announce_visibility,
+    )
+    .await?;
 
     Ok(Json(serde_json::to_value(wrapper).unwrap()))
 }
@@ -2252,10 +2293,6 @@ pub async fn update_status(
     let previous_status = status.clone();
 
     // Only allow editing local statuses
-    if !status.is_local {
-        return Err(AppError::Forbidden);
-    }
-
     // Get account
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
@@ -2495,9 +2532,6 @@ pub async fn get_status_history(
 
     // Get the status
     let status = status_service.get(&id).await?;
-    if !status.is_local {
-        return Err(AppError::Forbidden);
-    }
 
     // Get account
     let account = build_account_service(&state).get_account().await?;

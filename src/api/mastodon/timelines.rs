@@ -80,9 +80,7 @@ fn parse_public_timeline_params(raw_query: Option<&str>) -> Result<PublicTimelin
                 "limit" => params.pagination.limit = Some(parse_query_limit("limit", &value)?),
                 "local" => params.local = Some(parse_query_bool("local", &value)?),
                 "remote" => params.remote = Some(parse_query_bool("remote", &value)?),
-                "only_media" => {
-                    params.only_media = Some(parse_query_bool("only_media", &value)?)
-                }
+                "only_media" => params.only_media = Some(parse_query_bool("only_media", &value)?),
                 _ => {}
             }
         }
@@ -114,9 +112,7 @@ fn parse_tag_timeline_params(raw_query: Option<&str>) -> Result<TagTimelineParam
                 "min_id" => params.pagination.min_id = Some(value),
                 "limit" => params.pagination.limit = Some(parse_query_limit("limit", &value)?),
                 "local" => params.local = Some(parse_query_bool("local", &value)?),
-                "only_media" => {
-                    params.only_media = Some(parse_query_bool("only_media", &value)?)
-                }
+                "only_media" => params.only_media = Some(parse_query_bool("only_media", &value)?),
                 "any[]" | "any" => params.any.push(value),
                 "all[]" | "all" => params.all.push(value),
                 "none[]" | "none" => params.none.push(value),
@@ -230,7 +226,7 @@ pub async fn home_timeline(
     db_timer.observe_duration();
 
     let limit = params.limit.unwrap_or(20).min(40);
-    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
+    let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -239,9 +235,12 @@ pub async fn home_timeline(
     let db_timer = DB_QUERY_DURATION_SECONDS
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
-    let timeline_items = timeline_service
-        .home_timeline(limit, params.max_id.as_deref(), effective_min_id)
+    let mut timeline_items = timeline_service
+        .home_timeline(limit, params.max_id.as_deref(), lower_bound_id)
         .await?;
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
     let first_id = timeline_items.first().map(|item| item.status.id.clone());
     let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items
@@ -330,7 +329,7 @@ pub async fn public_timeline(
     let local_only = params.local.unwrap_or(false);
     let remote_only = params.remote.unwrap_or(false);
     let only_media = params.only_media.unwrap_or(false);
-    let effective_min_id = params
+    let lower_bound_id = params
         .pagination
         .min_id
         .as_deref()
@@ -358,7 +357,7 @@ pub async fn public_timeline(
                 local_only,
                 fetch_limit,
                 next_max_id.as_deref(),
-                effective_min_id,
+                lower_bound_id,
             )
             .await?;
         if batch.is_empty() {
@@ -386,6 +385,9 @@ pub async fn public_timeline(
         if timeline_items.len() >= limit || batch_len < fetch_limit || next_max_id.is_none() {
             break;
         }
+    }
+    if params.pagination.min_id.is_some() {
+        timeline_items.reverse();
     }
     let first_id = timeline_items.first().map(|item| item.status.id.clone());
     let last_id = timeline_items.last().map(|item| item.status.id.clone());
@@ -472,7 +474,7 @@ pub async fn tag_timeline(
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let limit = params.pagination.limit.unwrap_or(20).min(40);
-    let effective_min_id = params
+    let lower_bound_id = params
         .pagination
         .min_id
         .as_deref()
@@ -507,7 +509,7 @@ pub async fn tag_timeline(
                 &hashtag,
                 fetch_limit,
                 next_max_id.as_deref(),
-                effective_min_id,
+                lower_bound_id,
             )
             .await?;
         if batch.is_empty() {
@@ -538,6 +540,9 @@ pub async fn tag_timeline(
         if timeline_items.len() >= limit || batch_len < fetch_limit || next_max_id.is_none() {
             break;
         }
+    }
+    if params.pagination.min_id.is_some() {
+        timeline_items.reverse();
     }
     let first_id = timeline_items.first().map(|item| item.status.id.clone());
     let last_id = timeline_items.last().map(|item| item.status.id.clone());
@@ -636,7 +641,7 @@ pub async fn list_timeline(
     };
 
     let limit = params.limit.unwrap_or(20).min(40);
-    let effective_min_id = params.min_id.clone().or(params.since_id.clone());
+    let lower_bound_id = params.min_id.clone().or(params.since_id.clone());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
@@ -645,7 +650,7 @@ pub async fn list_timeline(
     let timeline_items = if list.2 == "none" {
         let mut collected = Vec::with_capacity(limit);
         let mut cursor = params.max_id.clone();
-        let min_id = effective_min_id.clone();
+        let min_id = lower_bound_id.clone();
 
         while collected.len() < limit {
             let query = ListTimelineQuery {
@@ -687,10 +692,14 @@ pub async fn list_timeline(
             default_port,
             limit,
             max_id: params.max_id.clone(),
-            min_id: effective_min_id,
+            min_id: lower_bound_id,
         };
         timeline_service.list_timeline(&query).await?
     };
+    let mut timeline_items = timeline_items;
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
     let first_id = timeline_items.first().map(|item| item.status.id.clone());
     let last_id = timeline_items.last().map(|item| item.status.id.clone());
     let timeline_statuses: Vec<_> = timeline_items

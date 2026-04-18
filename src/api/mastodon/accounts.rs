@@ -3,8 +3,11 @@
 use axum::{
     body::to_bytes,
     extract::{Path, Query, RawQuery, Request, State},
-    http::{HeaderMap, header::CONTENT_TYPE},
-    response::Json,
+    http::{
+        HeaderMap,
+        header::{CONTENT_TYPE, LINK},
+    },
+    response::{IntoResponse, Json},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::stream::{self, StreamExt};
@@ -1012,7 +1015,9 @@ fn actor_uri_placeholder_uses_uri_id(raw: &str) -> bool {
         return false;
     };
     let collected = segments.collect::<Vec<_>>();
-    collected.windows(2).any(|window| window[0].eq_ignore_ascii_case("users"))
+    collected
+        .windows(2)
+        .any(|window| window[0].eq_ignore_ascii_case("users"))
         || collected.iter().any(|segment| segment.starts_with('@'))
 }
 
@@ -1525,8 +1530,7 @@ async fn fetch_remote_collection_identities(
     };
 
     let actor_document =
-        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &actor_uri)
-            .await;
+        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &actor_uri).await;
     let Ok(actor_document) = actor_document else {
         return Ok(Vec::new());
     };
@@ -1793,11 +1797,19 @@ fn paginate_account_response_values(
     params: &PaginationParams,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let max_id = params.max_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let max_id = params
+        .max_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let min_id = params
         .min_id
         .as_deref()
-        .or(params.since_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let since_id = params
+        .since_id
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
@@ -1816,7 +1828,7 @@ fn paginate_account_response_values(
         left.get("id").and_then(|value| value.as_str())
             == right.get("id").and_then(|value| value.as_str())
     });
-    accounts
+    let mut accounts = accounts
         .into_iter()
         .filter(|account| {
             let id = account
@@ -1825,9 +1837,40 @@ fn paginate_account_response_values(
                 .unwrap_or_default();
             max_id.map(|cursor| id < cursor).unwrap_or(true)
                 && min_id.map(|cursor| id > cursor).unwrap_or(true)
+                && since_id.map(|cursor| id > cursor).unwrap_or(true)
         })
         .take(limit)
-        .collect()
+        .collect::<Vec<_>>();
+    if min_id.is_some() {
+        accounts.reverse();
+    }
+    accounts
+}
+
+fn account_collection_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+) -> Option<String> {
+    let build_path = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        format!("{path}?{}", serializer.finish())
+    };
+
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "<{}>; rel=\"prev\"",
+            build_path("min_id", first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
 }
 
 fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
@@ -2223,6 +2266,7 @@ pub async fn preferences(
         "posting:default:visibility": preferences.privacy,
         "posting:default:sensitive": preferences.sensitive,
         "posting:default:language": preferences.language,
+        "posting:default:quote_policy": "public",
         "posting:default:privacy": preferences.privacy,
         "posting:default:media_sensitive": preferences.sensitive,
         "posting:default:content_type": "text/plain",
@@ -2488,25 +2532,28 @@ pub async fn account_statuses(
     let exclude_reblogs = params.exclude_reblogs.unwrap_or(false);
     let exclude_replies = params.exclude_replies.unwrap_or(false);
     let only_media = params.only_media.unwrap_or(false);
-    let effective_min_id = params.min_id.as_deref().or(params.since_id.as_deref());
+    let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
-    let timeline_items = timeline_service
+    let mut timeline_items = timeline_service
         .account_timeline(
             requested_identity.as_deref(),
             default_port,
             limit,
             params.max_id.as_deref(),
-            effective_min_id,
+            lower_bound_id,
             only_media,
             exclude_replies,
             exclude_reblogs,
             only_pinned,
         )
         .await?;
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -2555,18 +2602,40 @@ pub async fn get_account_followers(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let limit = params.limit.unwrap_or(40).min(80);
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
-        return Ok(Json(
-            resolve_remote_collection_accounts(&state, &target_address, &params, "followers").await?,
-        ));
+        let followers =
+            resolve_remote_collection_accounts(&state, &target_address, &params, "followers")
+                .await?;
+        let first_id = followers
+            .first()
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str());
+        let last_id = followers
+            .last()
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str());
+        let mut headers = HeaderMap::new();
+        if let Some(link) = account_collection_link_header(
+            &format!("/api/v1/accounts/{id}/followers"),
+            limit,
+            first_id,
+            last_id,
+        ) {
+            headers.insert(
+                LINK,
+                link.parse()
+                    .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+            );
+        }
+        return Ok((headers, Json(followers)));
     }
 
     let follower_entries = state.db.get_all_followers().await?;
-    let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
     let mut unique_keys: Vec<String> = Vec::new();
     let mut identities: Vec<String> = Vec::new();
@@ -2617,9 +2686,30 @@ pub async fn get_account_followers(
         .await;
     followers.extend(resolved.into_iter().flatten());
 
-    Ok(Json(paginate_account_response_values(
-        followers, &params, limit,
-    )))
+    let followers = paginate_account_response_values(followers, &params, limit);
+    let first_id = followers
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = followers
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = account_collection_link_header(
+        &format!("/api/v1/accounts/{id}/followers"),
+        limit,
+        first_id,
+        last_id,
+    ) {
+        headers.insert(
+            LINK,
+            link.parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(followers)))
 }
 
 /// GET /api/v1/accounts/:id/following
@@ -2627,18 +2717,40 @@ pub async fn get_account_following(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let limit = params.limit.unwrap_or(40).min(80);
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
-        return Ok(Json(
-            resolve_remote_collection_accounts(&state, &target_address, &params, "following").await?,
-        ));
+        let following =
+            resolve_remote_collection_accounts(&state, &target_address, &params, "following")
+                .await?;
+        let first_id = following
+            .first()
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str());
+        let last_id = following
+            .last()
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str());
+        let mut headers = HeaderMap::new();
+        if let Some(link) = account_collection_link_header(
+            &format!("/api/v1/accounts/{id}/following"),
+            limit,
+            first_id,
+            last_id,
+        ) {
+            headers.insert(
+                LINK,
+                link.parse()
+                    .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+            );
+        }
+        return Ok((headers, Json(following)));
     }
 
     let following_entries = state.db.get_all_follows().await?;
-    let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
     let mut unique_keys: Vec<String> = Vec::new();
     let mut identities: Vec<String> = Vec::new();
@@ -2689,9 +2801,30 @@ pub async fn get_account_following(
         .await;
     following.extend(resolved.into_iter().flatten());
 
-    Ok(Json(paginate_account_response_values(
-        following, &params, limit,
-    )))
+    let following = paginate_account_response_values(following, &params, limit);
+    let first_id = following
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = following
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = account_collection_link_header(
+        &format!("/api/v1/accounts/{id}/following"),
+        limit,
+        first_id,
+        last_id,
+    ) {
+        headers.insert(
+            LINK,
+            link.parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(following)))
 }
 
 /// POST /api/v1/accounts/:id/follow
@@ -3300,7 +3433,7 @@ pub async fn get_account_lists(
     let all_lists = state.db.get_all_lists().await?;
     let mut matched_lists = Vec::new();
 
-    for (list_id, title, replies_policy) in all_lists {
+    for (list_id, title, replies_policy, exclusive) in all_lists {
         let accounts = state.db.get_list_accounts(&list_id).await?;
         let contains_target = accounts.into_iter().any(|address| {
             address == id
@@ -3315,6 +3448,7 @@ pub async fn get_account_lists(
                 "id": list_id,
                 "title": title,
                 "replies_policy": replies_policy,
+                "exclusive": exclusive,
             }));
         }
     }
@@ -3701,8 +3835,7 @@ pub async fn authorize_follow_request(
             .await
     });
 
-    let relationship =
-        relationship_response_for_target(&state, &id, &requester_address).await?;
+    let relationship = relationship_response_for_target(&state, &id, &requester_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }
@@ -3739,8 +3872,7 @@ pub async fn reject_follow_request(
         });
     }
 
-    let relationship =
-        relationship_response_for_target(&state, &id, &requester_address).await?;
+    let relationship = relationship_response_for_target(&state, &id, &requester_address).await?;
 
     Ok(Json(serde_json::to_value(relationship).unwrap()))
 }

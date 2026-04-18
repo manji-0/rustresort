@@ -266,9 +266,11 @@ fn authorize_error_parts(error: &AppError) -> (StatusCode, &'static str, String)
             "invalid_scope",
             description.clone(),
         ),
-        AppError::Validation(description) => {
-            (StatusCode::BAD_REQUEST, "invalid_request", description.clone())
-        }
+        AppError::Validation(description) => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            description.clone(),
+        ),
         _ => (
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -299,15 +301,13 @@ async fn authorize_error_response(
         && is_registered_redirect_uri(&app.redirect_uri, redirect_uri)
         && redirect_uri != OOB_REDIRECT_URI
     {
-        return Ok(
-            Redirect::to(&build_authorize_error_redirect_location(
-                redirect_uri,
-                code,
-                &description,
-                req.state.as_deref(),
-            ))
-            .into_response(),
-        );
+        return Ok(Redirect::to(&build_authorize_error_redirect_location(
+            redirect_uri,
+            code,
+            &description,
+            req.state.as_deref(),
+        ))
+        .into_response());
     }
 
     Ok(oauth_error_response(status, code, description))
@@ -686,7 +686,7 @@ pub async fn verify_app_credentials(
         "redirect_uris": redirect_uris_to_vec(&app.redirect_uri),
         "client_id": app.client_id,
         "vapid_key": app.vapid_key,
-        "scopes": normalize_scopes(&app.scopes),
+        "scopes": scopes_to_vec(&app.scopes),
     })))
 }
 
@@ -731,26 +731,28 @@ pub async fn create_token(
         ));
     }
 
-    let (client_id, client_secret) =
-        match resolve_client_credentials(&headers, req.client_id.clone(), req.client_secret.clone())
-        {
-            Ok(credentials) => credentials,
-            Err(AppError::Validation(description)) => {
-                return Ok(oauth_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_client",
-                    description,
-                ));
-            }
-            Err(AppError::Unauthorized) => {
-                return Ok(oauth_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_client",
-                    "client authentication failed",
-                ));
-            }
-            Err(error) => return Err(error),
-        };
+    let (client_id, client_secret) = match resolve_client_credentials(
+        &headers,
+        req.client_id.clone(),
+        req.client_secret.clone(),
+    ) {
+        Ok(credentials) => credentials,
+        Err(AppError::Validation(description)) => {
+            return Ok(oauth_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                description,
+            ));
+        }
+        Err(AppError::Unauthorized) => {
+            return Ok(oauth_error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "client authentication failed",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
 
     let Some(app) = state.db.get_oauth_app_by_client_id(&client_id).await? else {
         return Ok(oauth_error_response(
@@ -881,17 +883,20 @@ pub async fn create_token(
                     "refresh_token is required for refresh_token grant",
                 ));
             };
-            let Some(existing) = state.db.get_oauth_token_by_refresh_token(refresh_token).await?
+            let Some(existing) = state
+                .db
+                .get_oauth_token_by_refresh_token(refresh_token)
+                .await?
             else {
                 return Ok(oauth_error_response(
-                    StatusCode::UNAUTHORIZED,
+                    StatusCode::BAD_REQUEST,
                     "invalid_grant",
                     "refresh token is invalid or expired",
                 ));
             };
             if existing.app_id != app.id {
                 return Ok(oauth_error_response(
-                    StatusCode::UNAUTHORIZED,
+                    StatusCode::BAD_REQUEST,
                     "invalid_grant",
                     "refresh token does not belong to this client",
                 ));
@@ -901,7 +906,7 @@ pub async fn create_token(
                 "authorization_code" | "refresh_token"
             ) {
                 return Ok(oauth_error_response(
-                    StatusCode::UNAUTHORIZED,
+                    StatusCode::BAD_REQUEST,
                     "invalid_grant",
                     "refresh token cannot be used for this grant type",
                 ));

@@ -3,8 +3,11 @@
 mod common;
 
 use common::TestServer;
-use futures::StreamExt;
-use rustresort::data::{EntityId, Follow};
+use futures::{SinkExt, StreamExt};
+use rustresort::{
+    data::{EntityId, Follow, PersistedReason, Status, StatusVisibility},
+    service::{StreamEvent, StreamTarget},
+};
 use serde_json::Value;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
@@ -180,6 +183,73 @@ async fn test_stream_root_supports_websocket_upgrade() {
     assert_eq!(payload["stream"][0], "user");
     assert_eq!(payload["event"], "update");
     assert!(payload["payload"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_stream_root_websocket_accepts_subscribe_frames() {
+    use chrono::Utc;
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let request = websocket_url(server.url("/api/v1/streaming"))
+        .into_client_request()
+        .expect("websocket request");
+
+    let (mut socket, response) = connect_async(request).await.expect("websocket connect");
+    assert_eq!(response.status(), 101);
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "type": "subscribe",
+                "stream": "public"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("subscribe frame should send");
+
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/users/testuser/statuses/public-stream-subscribe".to_string(),
+        content: "<p>root subscribe public</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server
+        .state
+        .streaming_event_bus
+        .publish(StreamEvent::Update {
+            payload: serde_json::json!({ "id": status.id.clone() }),
+            targets: vec![StreamTarget::Public],
+        })
+        .await
+        .unwrap();
+
+    let message = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("timed out waiting for websocket event")
+        .expect("websocket should stay open")
+        .expect("websocket frame");
+    let text = message.into_text().expect("text frame");
+    let payload: Value = serde_json::from_str(&text).expect("valid websocket JSON");
+    assert_eq!(payload["stream"][0], "public");
+    assert_eq!(payload["event"], "update");
+    let status_payload: Value =
+        serde_json::from_str(payload["payload"].as_str().expect("payload string")).unwrap();
+    assert_eq!(status_payload["id"], status.id.to_string());
 }
 
 #[tokio::test]
@@ -651,7 +721,7 @@ async fn test_list_stream_receives_remote_followed_account_updates() {
     let list_id = server
         .state
         .db
-        .create_list("Streaming list", "list")
+        .create_list("Streaming list", "list", false)
         .await
         .unwrap();
     server
@@ -720,7 +790,7 @@ async fn test_list_stream_ignores_remote_direct_updates() {
     let list_id = server
         .state
         .db
-        .create_list("Streaming list direct exclusion", "list")
+        .create_list("Streaming list direct exclusion", "list", false)
         .await
         .unwrap();
     server

@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::accounts::{resolve_account_response_for_identity, resolve_remote_account_response};
-use crate::{SearchApiState, auth::CurrentUser, error::AppError};
+use crate::{SearchApiState, error::AppError};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -53,7 +53,6 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
 /// Search for accounts, hashtags, and statuses.
 pub async fn search_v2(
     State(state): State<SearchApiState>,
-    CurrentUser(_session): CurrentUser,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let query = params.q.trim();
@@ -416,9 +415,27 @@ pub async fn search_v2(
 ///
 /// Legacy search endpoint. Redirects to v2.
 pub async fn search_v1(
-    state: State<SearchApiState>,
-    user: CurrentUser,
+    State(state): State<SearchApiState>,
     params: Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    search_v2(state, user, params).await
+    let Json(mut response) = search_v2(State(state), params).await?;
+    if let Some(obj) = response.as_object_mut()
+        && let Some(hashtags) = obj
+            .get_mut("hashtags")
+            .and_then(|value| value.as_array_mut())
+    {
+        let hashtag_names = hashtags
+            .drain(..)
+            .filter_map(|value| match value {
+                serde_json::Value::String(name) => Some(serde_json::Value::String(name)),
+                serde_json::Value::Object(object) => object
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .map(|name| serde_json::Value::String(name.to_string())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        *hashtags = hashtag_names;
+    }
+    Ok(Json(response))
 }

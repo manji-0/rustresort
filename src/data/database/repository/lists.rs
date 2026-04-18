@@ -6,17 +6,23 @@ impl Database {
     // =========================================================================
 
     /// Create a new list
-    pub async fn create_list(&self, title: &str, replies_policy: &str) -> Result<String, AppError> {
+    pub async fn create_list(
+        &self,
+        title: &str,
+        replies_policy: &str,
+        exclusive: bool,
+    ) -> Result<String, AppError> {
         let id = EntityId::new_string();
         sqlx::query(
             r#"
-            INSERT INTO lists (id, title, replies_policy, created_at, updated_at)
-            VALUES (?, ?, ?, datetime('now'), datetime('now'))
+            INSERT INTO lists (id, title, replies_policy, exclusive, created_at, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
             "#,
         )
         .bind(&id)
         .bind(title)
         .bind(replies_policy)
+        .bind(exclusive)
         .execute(&self.pool)
         .await?;
 
@@ -24,9 +30,12 @@ impl Database {
     }
 
     /// Get list by ID
-    pub async fn get_list(&self, id: &str) -> Result<Option<(String, String, String)>, AppError> {
-        let result = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, title, replies_policy FROM lists WHERE id = ?",
+    pub async fn get_list(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, String, String, bool)>, AppError> {
+        let result = sqlx::query_as::<_, (String, String, String, bool)>(
+            "SELECT id, title, replies_policy, exclusive FROM lists WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -36,9 +45,9 @@ impl Database {
     }
 
     /// Get all lists
-    pub async fn get_all_lists(&self) -> Result<Vec<(String, String, String)>, AppError> {
-        let lists = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id, title, replies_policy FROM lists ORDER BY created_at DESC",
+    pub async fn get_all_lists(&self) -> Result<Vec<(String, String, String, bool)>, AppError> {
+        let lists = sqlx::query_as::<_, (String, String, String, bool)>(
+            "SELECT id, title, replies_policy, exclusive FROM lists ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -52,12 +61,14 @@ impl Database {
         id: &str,
         title: &str,
         replies_policy: &str,
+        exclusive: bool,
     ) -> Result<bool, AppError> {
         let result = sqlx::query(
-            "UPDATE lists SET title = ?, replies_policy = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE lists SET title = ?, replies_policy = ?, exclusive = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(title)
         .bind(replies_policy)
+        .bind(exclusive)
         .bind(id)
         .execute(&self.pool)
         .await?;

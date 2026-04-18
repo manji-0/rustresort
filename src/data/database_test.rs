@@ -2036,7 +2036,7 @@ async fn test_settings_operations() {
 async fn test_list_batch_add_and_remove_accounts() {
     let (db, _temp_dir) = create_test_db().await;
 
-    let list_id = db.create_list("Test List", "list").await.unwrap();
+    let list_id = db.create_list("Test List", "list", false).await.unwrap();
     let add_accounts = vec![
         "alice@example.com".to_string(),
         "bob@example.com".to_string(),
@@ -2352,7 +2352,10 @@ async fn test_update_status_refreshes_hashtag_index() {
 #[tokio::test]
 async fn test_list_timeline_query_matches_local_and_remote_accounts() {
     let (db, _temp_dir) = create_test_db().await;
-    let list_id = db.create_list("List timeline", "list").await.unwrap();
+    let list_id = db
+        .create_list("List timeline", "list", false)
+        .await
+        .unwrap();
     let local_address = "testuser@test.example.com".to_string();
     let local_account_id = "local-account-id".to_string();
     let remote_address = "alice@example.com".to_string();
@@ -2436,7 +2439,10 @@ async fn test_list_timeline_query_matches_local_and_remote_accounts() {
 #[tokio::test]
 async fn test_list_timeline_query_matches_local_account_id_entries() {
     let (db, _temp_dir) = create_test_db().await;
-    let list_id = db.create_list("List timeline by id", "list").await.unwrap();
+    let list_id = db
+        .create_list("List timeline by id", "list", false)
+        .await
+        .unwrap();
     let local_address = "testuser@test.example.com".to_string();
     let local_account_id = "01HLOCALACCOUNTID".to_string();
     db.add_accounts_to_list(&list_id, std::slice::from_ref(&local_account_id))
@@ -2481,7 +2487,7 @@ async fn test_list_timeline_query_matches_local_account_id_entries() {
 async fn test_list_timeline_query_matches_default_port_equivalent_remote_addresses() {
     let (db, _temp_dir) = create_test_db().await;
     let list_id = db
-        .create_list("List timeline default-port", "list")
+        .create_list("List timeline default-port", "list", false)
         .await
         .unwrap();
     let local_address = "testuser@test.example.com".to_string();

@@ -1849,7 +1849,7 @@ async fn test_status_context_includes_viewer_interaction_state() {
 }
 
 #[tokio::test]
-async fn test_status_history_rejects_remote_status() {
+async fn test_status_history_returns_remote_status_current_version() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Status};
 
@@ -1882,7 +1882,11 @@ async fn test_status_history_rejects_remote_status() {
         .send()
         .await
         .unwrap();
-    assert_eq!(history_response.status(), 403);
+    assert_eq!(history_response.status(), 200);
+    let history: Value = history_response.json().await.unwrap();
+    let items = history.as_array().expect("history should be an array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["content"], "<p>Remote status</p>");
 }
 
 #[tokio::test]
