@@ -466,7 +466,12 @@ async fn test_oauth_revoke_supports_http_basic_client_auth() {
     let client_id = app["client_id"].as_str().unwrap();
     let client_secret = app["client_secret"].as_str().unwrap();
     let access_token = server
-        .create_oauth_authorization_code_token("read:accounts write:statuses")
+        .create_oauth_authorization_code_token_for_app(
+            client_id,
+            client_secret,
+            redirect_uri,
+            "read:accounts write:statuses",
+        )
         .await;
 
     let basic = BASE64_STANDARD.encode(format!("{client_id}:{client_secret}"));

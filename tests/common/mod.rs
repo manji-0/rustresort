@@ -1,12 +1,84 @@
 //! Common test utilities for E2E tests
 
 use rustresort::{AppState, config};
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 const TEST_PRIVATE_KEY_PEM: &str = include_str!("../fixtures/test_private_key.pem");
 const TEST_PUBLIC_KEY_PEM: &str = include_str!("../fixtures/test_public_key.pem");
+
+#[derive(Debug)]
+struct TestMediaStorage {
+    public_url: String,
+    objects: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+impl TestMediaStorage {
+    fn new(public_url: String) -> Self {
+        Self {
+            public_url: public_url.trim_end_matches('/').to_string(),
+            objects: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn store(&self, key: &str, data: Vec<u8>) {
+        self.objects.write().await.insert(key.to_string(), data);
+    }
+}
+
+#[axum::async_trait]
+impl rustresort::storage::MediaStorageRepository for TestMediaStorage {
+    async fn upload(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        _content_type: &str,
+    ) -> Result<String, rustresort::error::AppError> {
+        self.store(key, data).await;
+        Ok(self.get_public_url(key))
+    }
+
+    async fn upload_avatar(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> Result<(String, String), rustresort::error::AppError> {
+        let key = format!("avatars/{}.webp", id);
+        self.store(&key, data).await;
+        Ok((key.clone(), self.get_public_url(&key)))
+    }
+
+    async fn upload_header(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> Result<(String, String), rustresort::error::AppError> {
+        let key = format!("headers/{}.webp", id);
+        self.store(&key, data).await;
+        Ok((key.clone(), self.get_public_url(&key)))
+    }
+
+    async fn upload_thumbnail(
+        &self,
+        id: &str,
+        data: Vec<u8>,
+    ) -> Result<(String, String), rustresort::error::AppError> {
+        let key = format!("thumbnails/{}.webp", id);
+        self.store(&key, data).await;
+        Ok((key.clone(), self.get_public_url(&key)))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), rustresort::error::AppError> {
+        self.objects.write().await.remove(key);
+        Ok(())
+    }
+
+    fn get_public_url(&self, key: &str) -> String {
+        format!("{}/{}", self.public_url, key.trim_start_matches('/'))
+    }
+}
 
 /// Test server instance
 #[allow(dead_code)]
@@ -143,7 +215,8 @@ impl TestServer {
         }
 
         // Initialize app state
-        let state = AppState::new(config.clone()).await.unwrap();
+        let mut state = AppState::new(config.clone()).await.unwrap();
+        state.storage = Arc::new(TestMediaStorage::new(config.storage.media.public_url.clone()));
 
         // Create HTTP client
         let client = reqwest::Client::builder()
@@ -449,6 +522,22 @@ impl TestServer {
         let app = self.create_oauth_app(redirect_uri, scopes).await;
         let client_id = app["client_id"].as_str().expect("client_id");
         let client_secret = app["client_secret"].as_str().expect("client_secret");
+        self.create_oauth_authorization_code_token_for_app(
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes,
+        )
+        .await
+    }
+
+    pub async fn create_oauth_authorization_code_token_for_app(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        scopes: &str,
+    ) -> String {
         let (_, session_cookie) = self.login_password().await;
 
         let no_redirect_client = reqwest::Client::builder()
