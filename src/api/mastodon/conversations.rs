@@ -151,7 +151,7 @@ fn conversation_link_header(
     }
     if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
-            "</api/v1/conversations?limit={limit}&min_id={}>; rel=\"prev\"",
+            "</api/v1/conversations?limit={limit}&since_id={}>; rel=\"prev\"",
             urlencoding::encode(first_id)
         ));
     }

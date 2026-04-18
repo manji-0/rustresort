@@ -369,14 +369,16 @@ impl TimelineService {
             .await?;
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
+        let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
 
         let mut items = Vec::with_capacity(statuses.len());
         for status in statuses {
+            let reblogged = reposted_ids.contains(&status.id);
             items.push(TimelineItem {
                 account: Self::timeline_account_from_status(&status),
                 favourited: favourited_ids.contains(&status.id),
                 status,
-                reblogged: false,
+                reblogged,
                 bookmarked: true,
             });
         }
@@ -420,15 +422,19 @@ impl TimelineService {
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
+        let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
 
         Ok(statuses
             .into_iter()
-            .map(|status| TimelineItem {
-                account: Self::timeline_account_from_status(&status),
-                favourited: favourited_ids.contains(&status.id),
-                bookmarked: bookmarked_ids.contains(&status.id),
-                status,
-                reblogged: false,
+            .map(|status| {
+                let reblogged = reposted_ids.contains(&status.id);
+                TimelineItem {
+                    account: Self::timeline_account_from_status(&status),
+                    favourited: favourited_ids.contains(&status.id),
+                    bookmarked: bookmarked_ids.contains(&status.id),
+                    status,
+                    reblogged,
+                }
             })
             .collect())
     }

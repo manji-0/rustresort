@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Query, State},
+    http::{HeaderMap, header},
     response::Json,
 };
 use serde::Deserialize;
@@ -53,10 +54,26 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
 /// Search for accounts, hashtags, and statuses.
 pub async fn search_v2(
     State(state): State<SearchApiState>,
+    headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let query = params.q.trim();
     let local_domain = state.config.server.domain.to_ascii_lowercase();
+    let viewer_authenticated = if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state
+            .db
+            .get_oauth_token(token)
+            .await?
+            .is_some_and(|oauth_token| oauth_token.grant_type != "client_credentials")
+    } else {
+        false
+    };
 
     if query.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -86,8 +103,8 @@ pub async fn search_v2(
     // Determine what to search based on type parameter
     let search_accounts =
         params.search_type.as_deref() == Some("accounts") || params.search_type.is_none();
-    let search_statuses =
-        params.search_type.as_deref() == Some("statuses") || params.search_type.is_none();
+    let search_statuses = viewer_authenticated
+        && (params.search_type.as_deref() == Some("statuses") || params.search_type.is_none());
     let search_hashtags =
         params.search_type.as_deref() == Some("hashtags") || params.search_type.is_none();
 
@@ -310,6 +327,19 @@ pub async fn search_v2(
                     )
                     .await
                     .unwrap_or_default();
+                    let status_ids = filtered_statuses
+                        .iter()
+                        .map(|status| status.id.clone())
+                        .collect::<Vec<_>>();
+                    let favourited_ids = state
+                        .db
+                        .get_favourited_status_ids_batch(&status_ids)
+                        .await?;
+                    let bookmarked_ids = state
+                        .db
+                        .get_bookmarked_status_ids_batch(&status_ids)
+                        .await?;
+                    let reposted_ids = state.db.get_reposted_status_ids_batch(&status_ids).await?;
                     for status in filtered_statuses {
                         let remote_stats = remote_account_stats
                             .get(status.account_address.trim())
@@ -323,10 +353,10 @@ pub async fn search_v2(
                                 account_stats,
                                 remote_stats.clone(),
                                 crate::api::StatusInteractions::new(
+                                    Some(favourited_ids.contains(&status.id)),
+                                    Some(reposted_ids.contains(&status.id)),
                                     Some(false),
-                                    Some(false),
-                                    Some(false),
-                                    Some(false),
+                                    Some(bookmarked_ids.contains(&status.id)),
                                     Some(false),
                                 ),
                             )
@@ -339,10 +369,10 @@ pub async fn search_v2(
                                     account_stats,
                                     remote_stats,
                                     crate::api::StatusInteractions::new(
+                                        Some(favourited_ids.contains(&status.id)),
+                                        Some(reposted_ids.contains(&status.id)),
                                         Some(false),
-                                        Some(false),
-                                        Some(false),
-                                        Some(false),
+                                        Some(bookmarked_ids.contains(&status.id)),
                                         Some(false),
                                     ),
                                 )
@@ -416,9 +446,10 @@ pub async fn search_v2(
 /// Legacy search endpoint. Redirects to v2.
 pub async fn search_v1(
     State(state): State<SearchApiState>,
+    headers: HeaderMap,
     params: Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let Json(mut response) = search_v2(State(state), params).await?;
+    let Json(mut response) = search_v2(State(state), headers, params).await?;
     if let Some(obj) = response.as_object_mut()
         && let Some(hashtags) = obj
             .get_mut("hashtags")

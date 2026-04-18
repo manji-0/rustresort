@@ -318,6 +318,42 @@ async fn test_create_app_endpoint_works() {
     assert_eq!(body["redirect_uri"], "urn:ietf:wg:oauth:2.0:oob");
     assert_eq!(body["redirect_uris"], json!(["urn:ietf:wg:oauth:2.0:oob"]));
     assert_eq!(body["scopes"], json!(["read", "write"]));
+    assert_eq!(body["client_secret_expires_at"], 0);
+}
+
+#[tokio::test]
+async fn test_create_app_endpoint_accepts_redirect_uri_arrays() {
+    let server = TestServer::new().await;
+    let app_data = json!({
+        "client_name": "Test App",
+        "redirect_uris": [
+            "https://app.example/callback",
+            "https://app.example/register"
+        ],
+        "scopes": "read write"
+    });
+
+    let response = server
+        .client
+        .post(server.url("/api/v1/apps"))
+        .json(&app_data)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(
+        body["redirect_uri"],
+        "https://app.example/callback\nhttps://app.example/register"
+    );
+    assert_eq!(
+        body["redirect_uris"],
+        json!([
+            "https://app.example/callback",
+            "https://app.example/register"
+        ])
+    );
 }
 
 #[tokio::test]
@@ -5094,6 +5130,45 @@ async fn test_search_v2() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_search_v2_unauthenticated_does_not_return_statuses() {
+    use chrono::Utc;
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let status = rustresort::data::Status {
+        id: "public-search-status".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/public-search-status".to_string(),
+        content: "<p>public search content</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: format!("{}@{}", account.username, server.state.config.server.domain),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/search?q=public"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let statuses = body["statuses"]
+        .as_array()
+        .expect("search v2 statuses should be an array");
+    assert!(statuses.is_empty());
 }
 
 #[tokio::test]

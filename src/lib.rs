@@ -770,6 +770,7 @@ pub fn build_router(state: AppState) -> axum::Router {
 
     let mut router = Router::new()
         .route("/health", axum::routing::get(health_check))
+        .route("/@:username", axum::routing::get(html_profile_page))
         .merge(auth::auth_router(config_state.clone()))
         .merge(api::oauth_router())
         .merge(api::wellknown_router())
@@ -872,6 +873,46 @@ async fn append_security_headers(
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+async fn html_profile_page(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<axum::response::Html<String>, error::AppError> {
+    let account = state
+        .db
+        .get_account()
+        .await?
+        .ok_or(error::AppError::NotFound)?;
+    if account.username != username {
+        return Err(error::AppError::NotFound);
+    }
+
+    let title = account
+        .display_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(account.username.as_str());
+    let note = account.note.as_deref().unwrap_or_default();
+    let base_url = state.config.server.base_url();
+    let actor_url = format!("{}/users/{}", base_url, account.username);
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title}</title></head><body><main><h1>{title}</h1><p>@{username}@{domain}</p><p>{note}</p><p><a href=\"{actor_url}\">ActivityPub actor</a></p></main></body></html>",
+        title = escape_html(title),
+        username = escape_html(&account.username),
+        domain = escape_html(&state.config.server.domain),
+        note = escape_html(note),
+        actor_url = escape_html(&actor_url),
+    );
+    Ok(axum::response::Html(html))
 }
 
 #[cfg(test)]

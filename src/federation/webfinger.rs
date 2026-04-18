@@ -468,6 +468,7 @@ pub fn generate_webfinger_response(
 ) -> WebFingerResponse {
     let subject = format!("acct:{}@{}", username, domain);
     let actor_url = format!("{}/users/{}", base_url.trim_end_matches('/'), username);
+    let profile_url = crate::api::local_profile_url(base_url, username);
 
     WebFingerResponse {
         subject,
@@ -482,7 +483,7 @@ pub fn generate_webfinger_response(
             WebFingerLink {
                 rel: "http://webfinger.net/rel/profile-page".to_string(),
                 link_type: Some("text/html".to_string()),
-                href: Some(actor_url),
+                href: Some(profile_url),
                 template: None,
             },
         ],

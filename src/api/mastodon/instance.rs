@@ -419,9 +419,13 @@ pub async fn instance_translation_languages() -> Json<serde_json::Value> {
 
 /// GET /api/v1/instance
 pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
-    use crate::api::dto::*;
-
-    let _base_url = state.config.server.base_url();
+    let base_url = state.config.server.base_url();
+    let vapid_public_key = state
+        .db
+        .get_setting("push.vapid.public_key")
+        .await
+        .ok()
+        .flatten();
 
     // Get account for contact
     let contact_account = if let Ok(Some(account)) = state.db.get_account().await {
@@ -446,64 +450,75 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
         .as_array()
         .cloned()
         .unwrap_or_default();
-
-    let response = InstanceResponse {
-        uri: state.config.server.domain.clone(),
-        title: state.config.instance.title.clone(),
-        short_description: state.config.instance.description.clone(),
-        description: state.config.instance.description.clone(),
-        email: state.config.instance.contact_email.clone(),
-        version: instance_version_string(),
-        languages: vec!["en".to_string()],
-        registrations: false, // Single-user instance
-        approval_required: false,
-        invites_enabled: false,
-        configuration: InstanceConfiguration {
-            statuses: StatusesConfiguration {
-                max_characters: 500,
-                max_media_attachments: 4,
-                characters_reserved_per_url: 23,
+    Json(serde_json::json!({
+        "uri": state.config.server.domain,
+        "title": state.config.instance.title,
+        "short_description": state.config.instance.description,
+        "description": state.config.instance.description,
+        "email": state.config.instance.contact_email,
+        "version": instance_version_string(),
+        "languages": ["en"],
+        "registrations": false,
+        "approval_required": false,
+        "invites_enabled": false,
+        "configuration": {
+            "urls": {
+                "streaming": streaming_endpoint_url(&state),
+                "status": format!("{}/@{}/{{id}}", base_url, state.config.auth.username),
+                "about": base_url,
+                "privacy_policy": format!("{}/api/v1/instance/privacy_policy", base_url),
+                "terms_of_service": base_url,
             },
-            media_attachments: MediaConfiguration {
-                supported_mime_types: vec![
-                    "image/jpeg".to_string(),
-                    "image/png".to_string(),
-                    "image/gif".to_string(),
-                    "image/webp".to_string(),
-                    "image/avif".to_string(),
-                    "image/heif".to_string(),
-                    "image/heic".to_string(),
-                    "video/mp4".to_string(),
-                    "video/webm".to_string(),
-                    "video/quicktime".to_string(),
+            "accounts": {
+                "max_featured_tags": 10,
+                "max_pinned_statuses": 10,
+            },
+            "statuses": {
+                "max_characters": 500,
+                "max_media_attachments": 4,
+                "characters_reserved_per_url": 23,
+            },
+            "media_attachments": {
+                "supported_mime_types": [
+                    "image/jpeg",
+                    "image/png",
+                    "image/gif",
+                    "image/webp",
+                    "image/avif",
+                    "image/heif",
+                    "image/heic",
+                    "video/mp4",
+                    "video/webm",
+                    "video/quicktime"
                 ],
-                image_size_limit: 10485760,   // 10MB
-                image_matrix_limit: 16777216, // 4096x4096
-                video_size_limit: 41943040,   // 40MB
-                video_frame_rate_limit: 60,
-                video_matrix_limit: 2304000, // 1920x1200
+                "image_size_limit": 10485760,
+                "image_matrix_limit": 16777216,
+                "video_size_limit": 41943040,
+                "video_frame_rate_limit": 60,
+                "video_matrix_limit": 2304000
             },
-            polls: PollsConfiguration {
-                max_options: 4,
-                max_characters_per_option: 50,
-                min_expiration: 300,     // 5 minutes
-                max_expiration: 2629746, // 1 month
+            "polls": {
+                "max_options": 4,
+                "max_characters_per_option": 50,
+                "min_expiration": 300,
+                "max_expiration": 2629746
             },
+            "vapid": {
+                "public_key": vapid_public_key
+            }
         },
-        urls: InstanceUrls {
-            streaming_api: streaming_endpoint_url(&state),
+        "urls": {
+            "streaming_api": streaming_endpoint_url(&state)
         },
-        stats: InstanceStats {
-            user_count,
-            status_count,
-            domain_count,
+        "stats": {
+            "user_count": user_count,
+            "status_count": status_count,
+            "domain_count": domain_count
         },
-        thumbnail: None,
-        contact_account,
-        rules,
-    };
-
-    Json(serde_json::to_value(response).unwrap())
+        "thumbnail": null,
+        "contact_account": contact_account,
+        "rules": rules
+    }))
 }
 
 /// GET /api/v1/instance/peers - Get instance peers
@@ -566,6 +581,13 @@ pub async fn instance_rules(State(state): State<InstanceApiState>) -> Json<serde
 ///
 /// Extended instance information with additional fields.
 pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let base_url = state.config.server.base_url();
+    let vapid_public_key = state
+        .db
+        .get_setting("push.vapid.public_key")
+        .await
+        .ok()
+        .flatten();
     // Get account for contact
     let contact_account = if let Ok(Some(account)) = state.db.get_account().await {
         let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
@@ -590,6 +612,9 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "domain": state.config.server.domain,
         "title": state.config.instance.title,
         "version": instance_version_string(),
+        "api_versions": {
+            "mastodon": 9
+        },
         "source_url": env!("CARGO_PKG_REPOSITORY"),
         "description": state.config.instance.description,
         "usage": {
@@ -607,10 +632,15 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "languages": ["en"],
         "configuration": {
             "urls": {
-                "streaming": streaming_endpoint_url(&state)
+                "streaming": streaming_endpoint_url(&state),
+                "status": format!("{}/@{}/{{id}}", base_url, state.config.auth.username),
+                "about": base_url,
+                "privacy_policy": format!("{}/api/v1/instance/privacy_policy", base_url),
+                "terms_of_service": base_url
             },
             "accounts": {
-                "max_featured_tags": 10
+                "max_featured_tags": 10,
+                "max_pinned_statuses": 10
             },
             "statuses": {
                 "max_characters": 500,
@@ -642,10 +672,14 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
                 "min_expiration": 300,
                 "max_expiration": 2629746
             },
+            "vapid": {
+                "public_key": vapid_public_key
+            },
             "translation": {
                 "enabled": false
             }
         },
+        "icon": null,
         "registrations": {
             "enabled": false,
             "approval_required": false,

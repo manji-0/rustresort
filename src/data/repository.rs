@@ -277,6 +277,10 @@ pub trait TimelineRepository: Send + Sync {
         &self,
         status_ids: &[String],
     ) -> Result<HashSet<String>, AppError>;
+    async fn get_reposted_status_ids_batch(
+        &self,
+        status_ids: &[String],
+    ) -> Result<HashSet<String>, AppError>;
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
     async fn get_remote_status_attachments(
         &self,
@@ -744,6 +748,13 @@ impl TimelineRepository for Database {
         status_ids: &[String],
     ) -> Result<HashSet<String>, AppError> {
         Database::get_bookmarked_status_ids_batch(self, status_ids).await
+    }
+
+    async fn get_reposted_status_ids_batch(
+        &self,
+        status_ids: &[String],
+    ) -> Result<HashSet<String>, AppError> {
+        Database::get_reposted_status_ids_batch(self, status_ids).await
     }
 
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {

@@ -68,7 +68,10 @@ pub struct UpdateCredentialsRequest {
     pub discoverable: Option<bool>,
     pub indexable: Option<bool>,
     #[serde(rename = "hide_collections")]
-    pub _hide_collections: Option<bool>,
+    pub hide_collections: Option<bool>,
+    pub show_media: Option<bool>,
+    pub show_media_replies: Option<bool>,
+    pub show_featured: Option<bool>,
     pub source: Option<UpdateCredentialsSourceRequest>,
     #[serde(rename = "source[privacy]")]
     pub source_privacy: Option<String>,
@@ -103,6 +106,10 @@ struct ParsedUpdateCredentialsRequest {
     bot: Option<bool>,
     discoverable: Option<bool>,
     indexable: Option<bool>,
+    hide_collections: Option<bool>,
+    show_media: Option<bool>,
+    show_media_replies: Option<bool>,
+    show_featured: Option<bool>,
     source_privacy: Option<String>,
     source_sensitive: Option<bool>,
     source_language: Option<Option<String>>,
@@ -136,6 +143,10 @@ const DEFAULT_POSTING_PRIVACY: &str = "public";
 const POSTING_DEFAULT_VISIBILITY_KEY: &str = "posting.default.visibility";
 const POSTING_DEFAULT_SENSITIVE_KEY: &str = "posting.default.sensitive";
 const POSTING_DEFAULT_LANGUAGE_KEY: &str = "posting.default.language";
+const PROFILE_HIDE_COLLECTIONS_KEY: &str = "profile.hide_collections";
+const PROFILE_SHOW_MEDIA_KEY: &str = "profile.show_media";
+const PROFILE_SHOW_MEDIA_REPLIES_KEY: &str = "profile.show_media_replies";
+const PROFILE_SHOW_FEATURED_KEY: &str = "profile.show_featured";
 
 #[derive(Debug, Clone)]
 struct PostingPreferences {
@@ -148,6 +159,20 @@ struct PostingPreferences {
 struct FollowPreferences {
     reblogs: bool,
     notify: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProfilePreferences {
+    hide_collections: bool,
+    show_media: bool,
+    show_media_replies: bool,
+    show_featured: bool,
+}
+
+fn parse_setting_bool(value: Option<String>, default: bool) -> bool {
+    value
+        .map(|raw| matches!(raw.trim(), "1" | "true"))
+        .unwrap_or(default)
 }
 
 fn normalize_follow_setting_key_suffix(address: &str) -> String {
@@ -240,6 +265,77 @@ async fn save_posting_preferences(
     }
 
     Ok(())
+}
+
+async fn load_profile_preferences(state: &AccountApiState) -> Result<ProfilePreferences, AppError> {
+    Ok(ProfilePreferences {
+        hide_collections: parse_setting_bool(
+            state.db.get_setting(PROFILE_HIDE_COLLECTIONS_KEY).await?,
+            false,
+        ),
+        show_media: parse_setting_bool(state.db.get_setting(PROFILE_SHOW_MEDIA_KEY).await?, true),
+        show_media_replies: parse_setting_bool(
+            state.db.get_setting(PROFILE_SHOW_MEDIA_REPLIES_KEY).await?,
+            true,
+        ),
+        show_featured: parse_setting_bool(
+            state.db.get_setting(PROFILE_SHOW_FEATURED_KEY).await?,
+            true,
+        ),
+    })
+}
+
+async fn save_profile_preferences(
+    state: &AccountApiState,
+    hide_collections: Option<bool>,
+    show_media: Option<bool>,
+    show_media_replies: Option<bool>,
+    show_featured: Option<bool>,
+) -> Result<(), AppError> {
+    if let Some(value) = hide_collections {
+        state
+            .db
+            .set_setting(
+                PROFILE_HIDE_COLLECTIONS_KEY,
+                if value { "true" } else { "false" },
+            )
+            .await?;
+    }
+    if let Some(value) = show_media {
+        state
+            .db
+            .set_setting(PROFILE_SHOW_MEDIA_KEY, if value { "true" } else { "false" })
+            .await?;
+    }
+    if let Some(value) = show_media_replies {
+        state
+            .db
+            .set_setting(
+                PROFILE_SHOW_MEDIA_REPLIES_KEY,
+                if value { "true" } else { "false" },
+            )
+            .await?;
+    }
+    if let Some(value) = show_featured {
+        state
+            .db
+            .set_setting(
+                PROFILE_SHOW_FEATURED_KEY,
+                if value { "true" } else { "false" },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn apply_local_profile_preferences(
+    response: &mut AccountResponse,
+    preferences: ProfilePreferences,
+) {
+    response.hide_collections = Some(preferences.hide_collections);
+    response.show_media = Some(preferences.show_media);
+    response.show_media_replies = Some(preferences.show_media_replies);
+    response.show_featured = Some(preferences.show_featured);
 }
 
 async fn load_follow_preferences(
@@ -350,6 +446,20 @@ fn apply_update_credentials_pair(
         "indexable" => {
             request.indexable = Some(parse_update_credentials_bool("indexable", &value)?);
         }
+        "hide_collections" => {
+            request.hide_collections =
+                Some(parse_update_credentials_bool("hide_collections", &value)?);
+        }
+        "show_media" => {
+            request.show_media = Some(parse_update_credentials_bool("show_media", &value)?);
+        }
+        "show_media_replies" => {
+            request.show_media_replies =
+                Some(parse_update_credentials_bool("show_media_replies", &value)?);
+        }
+        "show_featured" => {
+            request.show_featured = Some(parse_update_credentials_bool("show_featured", &value)?);
+        }
         "source[privacy]" | "source.privacy" => request.source_privacy = Some(value),
         "source[sensitive]" | "source.sensitive" => {
             request.source_sensitive =
@@ -391,6 +501,10 @@ fn parse_update_credentials_json(body: &[u8]) -> Result<ParsedUpdateCredentialsR
         bot: request.bot,
         discoverable: request.discoverable,
         indexable: request.indexable,
+        hide_collections: request.hide_collections,
+        show_media: request.show_media,
+        show_media_replies: request.show_media_replies,
+        show_featured: request.show_featured,
         source_privacy: request
             .source
             .as_ref()
@@ -1148,6 +1262,10 @@ fn build_remote_account_response_with_profile(
         following_count: saturating_count(profile.following_count),
         statuses_count,
         last_status_at: None,
+        hide_collections: None,
+        show_media: None,
+        show_media_replies: None,
+        show_featured: None,
         emojis: vec![],
         fields: crate::profile_fields::profile_fields_for_response(
             profile.profile_fields_json.as_deref(),
@@ -1217,6 +1335,10 @@ pub(crate) fn build_remote_account_placeholder_response(
         following_count: 0,
         statuses_count,
         last_status_at: None,
+        hide_collections: None,
+        show_media: None,
+        show_media_replies: None,
+        show_featured: None,
         emojis: vec![],
         fields: vec![],
         roles: vec![],
@@ -1430,20 +1552,31 @@ async fn relationship_response_for_target(
         .await?
         .unwrap_or(false);
     let follow_preferences = load_follow_preferences(state, target_address).await?;
+    let blocked_by = if requested_id.starts_with("http://") || requested_id.starts_with("https://")
+    {
+        state.db.is_blocked_by_remote(requested_id).await?
+    } else if let Some(profile) = state.profile_cache.get(target_address).await {
+        state.db.is_blocked_by_remote(&profile.uri).await?
+    } else {
+        false
+    };
 
     Ok(RelationshipResponse {
         id: relationship_id,
         following,
         followed_by,
         blocking,
-        blocked_by: false,
+        blocked_by,
         muting,
         muting_notifications,
         requested,
+        requested_by: false,
         domain_blocking: false,
         showing_reblogs: follow_preferences.reblogs,
         endorsed: false,
         notifying: follow_preferences.notify,
+        languages: Vec::new(),
+        muting_expires_at: None,
         note: String::new(),
     })
 }
@@ -1659,6 +1792,9 @@ async fn populate_local_account_compat_fields(
     account: &Account,
     response: &mut AccountResponse,
 ) {
+    if let Ok(profile_preferences) = load_profile_preferences(state).await {
+        apply_local_profile_preferences(response, profile_preferences);
+    }
     if let Some(moved_to_uri) = account
         .moved_to_uri
         .as_deref()
@@ -1867,7 +2003,7 @@ fn account_collection_link_header(
     if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}>; rel=\"prev\"",
-            build_path("min_id", first_id)
+            build_path("since_id", first_id)
         ));
     }
     (!links.is_empty()).then(|| links.join(", "))
@@ -1938,6 +2074,7 @@ async fn account_source_payload(
         .map(|requests| requests.len())
         .unwrap_or(0);
     let preferences = load_posting_preferences(state).await?;
+    let profile_preferences = load_profile_preferences(state).await?;
     Ok(serde_json::json!({
         "note": account.note.clone().unwrap_or_default(),
         "fields": crate::profile_fields::profile_fields_for_source(
@@ -1947,6 +2084,10 @@ async fn account_source_payload(
         "sensitive": preferences.sensitive,
         "language": preferences.language,
         "follow_requests_count": follow_requests_count,
+        "hide_collections": profile_preferences.hide_collections,
+        "discoverable": account.discoverable,
+        "indexable": account.indexable,
+        "quote_policy": "public",
     }))
 }
 
@@ -2249,6 +2390,16 @@ pub async fn verify_credentials(
             obj.insert("moved".to_string(), moved);
         }
         obj.insert(
+            "avatar_description".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        obj.insert(
+            "header_description".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        obj.insert("attribution_domains".to_string(), serde_json::json!([]));
+        obj.insert("featured_tags".to_string(), serde_json::json!([]));
+        obj.insert(
             "source".to_string(),
             account_source_payload(&state, &account).await?,
         );
@@ -2311,6 +2462,10 @@ pub async fn update_credentials(
         bot,
         discoverable,
         indexable,
+        hide_collections,
+        show_media,
+        show_media_replies,
+        show_featured,
         source_privacy,
         source_sensitive,
         source_language,
@@ -2324,6 +2479,14 @@ pub async fn update_credentials(
         None => None,
     };
     save_posting_preferences(&state, source_privacy, source_sensitive, source_language).await?;
+    save_profile_preferences(
+        &state,
+        hide_collections,
+        show_media,
+        show_media_replies,
+        show_featured,
+    )
+    .await?;
 
     let avatar_bytes = match avatar {
         Some(ProfileImageInput::Encoded(encoded)) => {
@@ -2459,6 +2622,16 @@ pub async fn update_credentials(
             obj.insert("moved".to_string(), moved);
         }
         obj.insert(
+            "avatar_description".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        obj.insert(
+            "header_description".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        obj.insert("attribution_domains".to_string(), serde_json::json!([]));
+        obj.insert("featured_tags".to_string(), serde_json::json!([]));
+        obj.insert(
             "source".to_string(),
             account_source_payload(&state, &account).await?,
         );
@@ -2583,10 +2756,10 @@ pub async fn account_statuses(
             account_stats,
             remote_stats,
             crate::api::StatusInteractions::new(
-                Some(item.favourited),
-                Some(item.reblogged),
+                Some(false),
+                Some(false),
                 None,
-                Some(item.bookmarked),
+                Some(false),
                 Some(is_pinned),
             ),
         )
@@ -3097,10 +3270,13 @@ pub async fn get_relationships(
                     muting: false,
                     muting_notifications: false,
                     requested: false,
+                    requested_by: false,
                     domain_blocking: false,
                     showing_reblogs: true,
                     endorsed: false,
                     notifying: false,
+                    languages: Vec::new(),
+                    muting_expires_at: None,
                     note: String::new(),
                 };
                 relationships.push(serde_json::to_value(relationship).unwrap());
@@ -3151,20 +3327,30 @@ pub async fn get_relationships(
         let following = stored_following && follow_is_accepted;
         let requested = has_follow_request || (stored_following && !follow_is_accepted);
         let follow_preferences = load_follow_preferences(&state, &target_address).await?;
+        let blocked_by = if id.starts_with("http://") || id.starts_with("https://") {
+            state.db.is_blocked_by_remote(&id).await?
+        } else if let Some(profile) = state.profile_cache.get(&target_address).await {
+            state.db.is_blocked_by_remote(&profile.uri).await?
+        } else {
+            false
+        };
 
         let relationship = RelationshipResponse {
             id: resolve_relationship_id(&state, &id).await,
             following,
             followed_by,
             blocking,
-            blocked_by: false,
+            blocked_by,
             muting,
             muting_notifications,
             requested,
+            requested_by: false,
             domain_blocking: false,
             showing_reblogs: follow_preferences.reblogs,
             endorsed: false,
             notifying: follow_preferences.notify,
+            languages: Vec::new(),
+            muting_expires_at: None,
             note: String::new(),
         };
 

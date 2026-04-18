@@ -163,7 +163,7 @@ async fn test_update_credentials_persists_source_defaults_and_preferences() {
         .patch(server.url("/api/v1/accounts/update_credentials"))
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("source%5Bprivacy%5D=private&source%5Bsensitive%5D=true&source%5Blanguage%5D=ja")
+        .body("source%5Bprivacy%5D=private&source%5Bsensitive%5D=true&source%5Blanguage%5D=ja&hide_collections=true&show_media=false&show_media_replies=false&show_featured=true")
         .send()
         .await
         .unwrap();
@@ -173,6 +173,10 @@ async fn test_update_credentials_persists_source_defaults_and_preferences() {
     assert_eq!(updated["source"]["privacy"], "private");
     assert_eq!(updated["source"]["sensitive"], true);
     assert_eq!(updated["source"]["language"], "ja");
+    assert_eq!(updated["hide_collections"], true);
+    assert_eq!(updated["show_media"], false);
+    assert_eq!(updated["show_media_replies"], false);
+    assert_eq!(updated["show_featured"], true);
 
     let verify = server
         .client
@@ -186,6 +190,27 @@ async fn test_update_credentials_persists_source_defaults_and_preferences() {
     assert_eq!(verify_json["source"]["privacy"], "private");
     assert_eq!(verify_json["source"]["sensitive"], true);
     assert_eq!(verify_json["source"]["language"], "ja");
+    assert_eq!(verify_json["source"]["hide_collections"], true);
+    assert_eq!(verify_json["hide_collections"], true);
+    assert_eq!(verify_json["show_media"], false);
+    assert_eq!(verify_json["show_media_replies"], false);
+    assert_eq!(verify_json["show_featured"], true);
+
+    let profile = server
+        .client
+        .get(server.url("/api/v1/profile"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(profile.status(), 200);
+    let profile_json: Value = profile.json().await.unwrap();
+    assert_eq!(profile_json["hide_collections"], true);
+    assert_eq!(profile_json["show_media"], false);
+    assert_eq!(profile_json["show_media_replies"], false);
+    assert_eq!(profile_json["show_featured"], true);
+    assert_eq!(profile_json["avatar_description"], "");
+    assert_eq!(profile_json["header_description"], "");
 
     let preferences = server
         .client

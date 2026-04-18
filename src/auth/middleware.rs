@@ -48,6 +48,7 @@ fn session_from_oauth_token(
     let now = Utc::now();
     let expires_at = token
         .expires_at
+        .unwrap_or(now + Duration::seconds(session_max_age.max(60)))
         .min(now + Duration::seconds(session_max_age.max(60)));
     Session {
         username: account.username,
@@ -104,7 +105,9 @@ async fn authenticate_user_oauth_bearer_token(
         return Err(AppError::Unauthorized);
     };
     if !oauth_grant_represents_user_session(&oauth_access.grant_type) {
-        return Err(AppError::Forbidden);
+        return Err(AppError::Unprocessable(
+            "This method requires an authenticated user".to_string(),
+        ));
     }
     Ok((session, Some(oauth_access)))
 }

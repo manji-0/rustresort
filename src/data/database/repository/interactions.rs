@@ -510,6 +510,33 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Get reposted status IDs among the provided IDs.
+    pub async fn get_reposted_status_ids_batch(
+        &self,
+        status_ids: &[String],
+    ) -> Result<HashSet<String>, AppError> {
+        if status_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT status_id FROM reposts WHERE status_id IN (");
+        {
+            let mut separated = query_builder.separated(", ");
+            for status_id in status_ids {
+                separated.push_bind(status_id);
+            }
+        }
+        query_builder.push(")");
+
+        let ids = query_builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(ids.into_iter().collect())
+    }
+
     /// Count reposts for a status.
     pub async fn count_reposts(&self, status_id: &str) -> Result<i64, AppError> {
         sqlx::query_scalar(

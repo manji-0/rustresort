@@ -4,8 +4,11 @@ use axum::{
     body::to_bytes,
     extract::Request,
     extract::{Path, Query, State},
-    http::{HeaderMap, header::CONTENT_TYPE},
-    response::Json,
+    http::{
+        HeaderMap,
+        header::{CONTENT_TYPE, LINK},
+    },
+    response::{IntoResponse, Json},
 };
 use axum_extra::extract::CookieJar;
 use chrono::Utc;
@@ -40,6 +43,89 @@ const IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS: u64 = 5_000;
 const IDEMPOTENCY_PENDING_RETRY_DELAY_MS: u64 = 50;
 const MAX_STATUS_CONTEXT_ANCESTORS: usize = 40;
 const MAX_STATUS_CONTEXT_DESCENDANTS: usize = 40;
+
+fn paginate_account_values(
+    mut accounts: Vec<serde_json::Value>,
+    params: &PaginationParams,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    accounts.sort_by(|left, right| {
+        let left_id = left
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_id = right
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_id.cmp(left_id)
+    });
+    accounts.dedup_by(|left, right| {
+        left.get("id").and_then(|value| value.as_str())
+            == right.get("id").and_then(|value| value.as_str())
+    });
+
+    let mut accounts = accounts
+        .into_iter()
+        .filter(|account| {
+            let id = account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            params
+                .max_id
+                .as_deref()
+                .map(|cursor| id < cursor)
+                .unwrap_or(true)
+                && params
+                    .min_id
+                    .as_deref()
+                    .map(|cursor| id > cursor)
+                    .unwrap_or(true)
+                && params
+                    .since_id
+                    .as_deref()
+                    .map(|cursor| id > cursor)
+                    .unwrap_or(true)
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    if params.min_id.is_some() {
+        accounts.reverse();
+    }
+    accounts
+}
+
+fn interaction_account_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+) -> Option<String> {
+    let build_path = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        format!("{path}?{}", serializer.finish())
+    };
+
+    let mut links = Vec::new();
+    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
+    }
+    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        let cursor_key = if first_id.is_empty() {
+            "min_id"
+        } else {
+            "since_id"
+        };
+        links.push(format!(
+            "<{}>; rel=\"prev\"",
+            build_path(cursor_key, first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateStatusPollRequest {
@@ -1464,7 +1550,7 @@ pub async fn get_reblogged_by(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let status_service = build_status_service(&state);
 
     // Get the status to verify it exists
@@ -1473,13 +1559,14 @@ pub async fn get_reblogged_by(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     let limit = params.limit.unwrap_or(40).min(80);
+    let fetch_limit = limit.max(120).min(400);
 
     let mut identities = Vec::new();
-    if state.db.is_reposted(&status.id).await? && identities.len() < limit {
+    if state.db.is_reposted(&status.id).await? && identities.len() < fetch_limit {
         identities.push(local_actor_uri(&state, &account.username));
     }
-    if identities.len() < limit {
-        let remaining = limit - identities.len();
+    if identities.len() < fetch_limit {
+        let remaining = fetch_limit - identities.len();
         identities.extend(
             state
                 .db
@@ -1497,7 +1584,26 @@ pub async fn get_reblogged_by(
         }
     }
 
-    Ok(Json(responses))
+    let responses = paginate_account_values(responses, &params, limit);
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = interaction_account_link_header(
+        &format!("/api/v1/statuses/{}/reblogged_by", urlencoding::encode(&id)),
+        limit,
+        first_id,
+        last_id,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/statuses/:id/favourited_by
@@ -1505,7 +1611,7 @@ pub async fn get_favourited_by(
     State(state): State<StatusApiState>,
     Path(id): Path<String>,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let status_service = build_status_service(&state);
 
     // Get the status to verify it exists
@@ -1514,13 +1620,14 @@ pub async fn get_favourited_by(
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     let limit = params.limit.unwrap_or(40).min(80);
+    let fetch_limit = limit.max(120).min(400);
 
     let mut identities = Vec::new();
-    if status_service.is_favourited(&status.id).await? && identities.len() < limit {
+    if status_service.is_favourited(&status.id).await? && identities.len() < fetch_limit {
         identities.push(local_actor_uri(&state, &account.username));
     }
-    if identities.len() < limit {
-        let remaining = limit - identities.len();
+    if identities.len() < fetch_limit {
+        let remaining = fetch_limit - identities.len();
         identities.extend(
             state
                 .db
@@ -1538,7 +1645,29 @@ pub async fn get_favourited_by(
         }
     }
 
-    Ok(Json(responses))
+    let responses = paginate_account_values(responses, &params, limit);
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = interaction_account_link_header(
+        &format!(
+            "/api/v1/statuses/{}/favourited_by",
+            urlencoding::encode(&id)
+        ),
+        limit,
+        first_id,
+        last_id,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/statuses/:id/source
@@ -1551,11 +1680,6 @@ pub async fn get_status_source(
 
     // Get the status
     let status = status_service.get(&id).await?;
-    if !status.is_local {
-        return Err(AppError::Forbidden);
-    }
-
-    // Only allow getting source for local statuses
     if !status.is_local {
         return Err(AppError::Forbidden);
     }

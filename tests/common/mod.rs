@@ -443,7 +443,7 @@ impl TestServer {
             grant_type: "authorization_code".to_string(),
             scopes: app.scopes.clone(),
             created_at: now,
-            expires_at: now + Duration::days(7),
+            expires_at: Some(now + Duration::days(7)),
             refresh_expires_at: None,
             revoked: false,
         };

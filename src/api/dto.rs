@@ -29,6 +29,14 @@ pub struct AccountResponse {
     pub following_count: i32,
     pub statuses_count: i32,
     pub last_status_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_collections: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_media: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_media_replies: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_featured: Option<bool>,
     pub emojis: Vec<serde_json::Value>,
     pub fields: Vec<serde_json::Value>,
     pub roles: Vec<serde_json::Value>,
@@ -112,8 +120,11 @@ pub struct RelationshipResponse {
     pub muting: bool,
     pub muting_notifications: bool,
     pub requested: bool,
+    pub requested_by: bool,
     pub domain_blocking: bool,
     pub endorsed: bool,
+    pub languages: Vec<String>,
+    pub muting_expires_at: Option<String>,
     pub note: String,
 }
 

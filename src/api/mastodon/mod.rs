@@ -207,11 +207,22 @@ where
             scoped(get(accounts::verify_credentials), PROFILE_READ_ACCOUNTS),
         )
         .route(
+            "/v1/profile",
+            scoped(get(accounts::verify_credentials), PROFILE_READ_ACCOUNTS),
+        )
+        .route(
             "/v1/preferences",
             scoped(get(accounts::preferences), PROFILE_READ_ACCOUNTS),
         )
         .route(
             "/v1/accounts/update_credentials",
+            scoped(
+                axum::routing::patch(accounts::update_credentials),
+                WRITE_ACCOUNTS,
+            ),
+        )
+        .route(
+            "/v1/profile",
             scoped(
                 axum::routing::patch(accounts::update_credentials),
                 WRITE_ACCOUNTS,

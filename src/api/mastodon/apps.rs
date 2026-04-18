@@ -23,15 +23,21 @@ use crate::AppsApiState;
 use crate::auth::verify_session_token;
 use crate::error::AppError;
 
-const OAUTH_ACCESS_TOKEN_TTL_SECONDS: i64 = 7_200;
 const OAUTH_REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
 const OAUTH_CLIENT_SECRET_HASH_PREFIX: &str = "sha256:";
 const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RedirectUrisField {
+    String(String),
+    Array(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
     pub client_name: String,
-    pub redirect_uris: String,
+    pub redirect_uris: RedirectUrisField,
     pub scopes: Option<String>,
     pub website: Option<String>,
 }
@@ -45,6 +51,7 @@ pub struct AppResponse {
     pub redirect_uris: Vec<String>,
     pub client_id: String,
     pub client_secret: String,
+    pub client_secret_expires_at: i64,
     pub vapid_key: Option<String>,
     pub scopes: Vec<String>,
 }
@@ -87,7 +94,8 @@ pub struct TokenResponse {
     pub token_type: String,
     pub scope: String,
     pub created_at: i64,
-    pub expires_in: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,11 +148,23 @@ fn redirect_uris_to_vec(redirect_uris: &str) -> Vec<String> {
         .collect()
 }
 
-fn primary_redirect_uri(redirect_uris: &str) -> String {
-    redirect_uris_to_vec(redirect_uris)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| OOB_REDIRECT_URI.to_string())
+fn normalize_redirect_uris_field(field: RedirectUrisField) -> Result<String, AppError> {
+    let values = match field {
+        RedirectUrisField::String(value) => redirect_uris_to_vec(&value),
+        RedirectUrisField::Array(values) => values
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
+    };
+
+    if values.is_empty() {
+        return Err(AppError::Validation(
+            "redirect_uris must contain at least one URI".to_string(),
+        ));
+    }
+
+    Ok(values.join("\n"))
 }
 
 fn scope_matches(granted: &str, required: &str) -> bool {
@@ -586,17 +606,18 @@ pub async fn create_app(
     use crate::data::{EntityId, OAuthApp};
 
     let req: CreateAppRequest = parse_body(&headers, &body)?;
-    if req.client_name.trim().is_empty() {
+    let CreateAppRequest {
+        client_name,
+        redirect_uris,
+        scopes,
+        website,
+    } = req;
+    if client_name.trim().is_empty() {
         return Err(AppError::Validation("client_name is required".to_string()));
     }
-    if req.redirect_uris.trim().is_empty() {
-        return Err(AppError::Validation(
-            "redirect_uris is required".to_string(),
-        ));
-    }
+    let redirect_uri = normalize_redirect_uris_field(redirect_uris)?;
 
-    let scopes = req
-        .scopes
+    let scopes = scopes
         .as_deref()
         .map(normalize_scopes)
         .filter(|value| !value.is_empty())
@@ -604,12 +625,12 @@ pub async fn create_app(
     let client_secret = EntityId::new_string();
     let app = OAuthApp {
         id: EntityId::new_string(),
-        name: req.client_name.trim().to_string(),
-        website: req.website.and_then(|value| {
+        name: client_name.trim().to_string(),
+        website: website.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }),
-        redirect_uri: req.redirect_uris.trim().to_string(),
+        redirect_uri,
         client_id: EntityId::new_string(),
         client_secret: hash_client_secret(&client_secret),
         vapid_key: Some(state.web_push_sender.server_key().await?),
@@ -622,10 +643,11 @@ pub async fn create_app(
         id: app.id,
         name: app.name,
         website: app.website,
-        redirect_uri: primary_redirect_uri(&app.redirect_uri),
+        redirect_uri: app.redirect_uri.clone(),
         redirect_uris: redirect_uris_to_vec(&app.redirect_uri),
         client_id: app.client_id,
         client_secret,
+        client_secret_expires_at: 0,
         vapid_key: app.vapid_key,
         scopes: scopes_to_vec(&scopes),
     })))
@@ -682,9 +704,10 @@ pub async fn verify_app_credentials(
         "id": app.id,
         "name": app.name,
         "website": app.website,
-        "redirect_uri": primary_redirect_uri(&app.redirect_uri),
+        "redirect_uri": app.redirect_uri.clone(),
         "redirect_uris": redirect_uris_to_vec(&app.redirect_uri),
         "client_id": app.client_id,
+        "client_secret_expires_at": 0,
         "vapid_key": app.vapid_key,
         "scopes": scopes_to_vec(&app.scopes),
     })))
@@ -849,24 +872,9 @@ pub async fn create_token(
                     ));
                 }
             }
-            let requested_scopes = req
-                .scope
-                .as_deref()
-                .map(normalize_scopes)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| normalize_scopes(&authorization_code.scopes));
-            if !scopes_are_subset(&requested_scopes, &authorization_code.scopes)
-                || !scopes_are_subset(&requested_scopes, &app.scopes)
-            {
-                return Ok(oauth_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_scope",
-                    "requested scope exceeds the authorization grant or application scopes",
-                ));
-            }
             (
                 "authorization_code".to_string(),
-                requested_scopes,
+                normalize_scopes(&authorization_code.scopes),
                 Some(EntityId::new_string()),
             )
         }
@@ -911,7 +919,7 @@ pub async fn create_token(
                     "refresh token cannot be used for this grant type",
                 ));
             }
-            state.db.revoke_oauth_token(refresh_token).await?;
+            let _ = state.db.revoke_oauth_token(refresh_token).await?;
             (
                 "refresh_token".to_string(),
                 existing.scopes,
@@ -929,7 +937,7 @@ pub async fn create_token(
         grant_type,
         scopes: scopes.clone(),
         created_at: issued_at,
-        expires_at: issued_at + chrono::Duration::seconds(OAUTH_ACCESS_TOKEN_TTL_SECONDS),
+        expires_at: None,
         refresh_expires_at: refresh_token.as_ref().map(|_| refresh_expires_at),
         revoked: false,
     };
@@ -941,7 +949,7 @@ pub async fn create_token(
         token_type: "Bearer".to_string(),
         scope: token.scopes,
         created_at: issued_at.timestamp(),
-        expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+        expires_in: None,
     }))
     .into_response())
 }
@@ -996,10 +1004,24 @@ pub async fn revoke_token(
             "client authentication failed",
         ));
     }
-    state
+    if req.token.trim().is_empty() {
+        return Ok(oauth_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "token is required",
+        ));
+    }
+    let revoked = state
         .db
         .revoke_oauth_token_for_app(&app.id, &req.token)
         .await?;
+    if !revoked {
+        return Ok(oauth_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "token does not belong to this application",
+        ));
+    }
     Ok(Json(serde_json::json!({})).into_response())
 }
 

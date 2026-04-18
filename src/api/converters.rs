@@ -718,6 +718,7 @@ pub fn account_to_response_with_stats(
 ) -> AccountResponse {
     let base_url = config.server.base_url();
     let media_url = &config.storage.media.public_url;
+    let profile_url = local_profile_url(&base_url, &account.username);
 
     AccountResponse {
         id: account.id.to_string(),
@@ -735,7 +736,7 @@ pub fn account_to_response_with_stats(
         indexable: account.indexable,
         created_at: account.created_at,
         note: account.note.clone().unwrap_or_default(),
-        url: format!("{}/users/{}", base_url, account.username),
+        url: profile_url,
         avatar: account
             .avatar_s3_key
             .as_ref()
@@ -760,6 +761,10 @@ pub fn account_to_response_with_stats(
         following_count: stats.following_count,
         statuses_count: stats.statuses_count,
         last_status_at: None,
+        hide_collections: None,
+        show_media: None,
+        show_media_replies: None,
+        show_featured: None,
         emojis: vec![],
         fields: crate::profile_fields::profile_fields_for_response(
             account.profile_fields_json.as_deref(),
@@ -768,6 +773,10 @@ pub fn account_to_response_with_stats(
         moved: None,
         source: None,
     }
+}
+
+pub fn local_profile_url(base_url: &str, username: &str) -> String {
+    format!("{}/@{}", base_url.trim_end_matches('/'), username)
 }
 
 fn remote_account_to_response(
@@ -828,6 +837,10 @@ fn remote_account_to_response(
         following_count: stats.following_count,
         statuses_count: stats.statuses_count,
         last_status_at: None,
+        hide_collections: None,
+        show_media: None,
+        show_media_replies: None,
+        show_featured: None,
         emojis: vec![],
         fields: crate::profile_fields::profile_fields_for_response(
             stats.profile_fields_json.as_deref(),
@@ -1114,6 +1127,10 @@ fn boost_stub_status(
             following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
             statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
             last_status_at: None,
+            hide_collections: None,
+            show_media: None,
+            show_media_replies: None,
+            show_featured: None,
             emojis: vec![],
             fields: vec![],
             roles: vec![],
@@ -1143,6 +1160,10 @@ fn boost_stub_status(
             following_count: remote_stats.map(|stats| stats.following_count).unwrap_or(0),
             statuses_count: remote_stats.map(|stats| stats.statuses_count).unwrap_or(0),
             last_status_at: None,
+            hide_collections: None,
+            show_media: None,
+            show_media_replies: None,
+            show_featured: None,
             emojis: vec![],
             fields: vec![],
             roles: vec![],
@@ -1214,6 +1235,16 @@ impl StatusInteractions {
             muted,
             bookmarked,
             pinned,
+        }
+    }
+
+    pub const fn public() -> Self {
+        Self {
+            favourited: Some(false),
+            reblogged: Some(false),
+            muted: Some(false),
+            bookmarked: Some(false),
+            pinned: Some(false),
         }
     }
 }

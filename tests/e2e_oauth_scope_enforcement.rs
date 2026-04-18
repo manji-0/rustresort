@@ -305,7 +305,7 @@ async fn test_client_credentials_token_can_verify_app_but_cannot_access_user_end
         .send()
         .await
         .unwrap();
-    assert_eq!(verify.status(), StatusCode::FORBIDDEN);
+    assert_eq!(verify.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let create_status = server
         .client
@@ -315,5 +315,5 @@ async fn test_client_credentials_token_can_verify_app_but_cannot_access_user_end
         .send()
         .await
         .unwrap();
-    assert_eq!(create_status.status(), StatusCode::FORBIDDEN);
+    assert_eq!(create_status.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

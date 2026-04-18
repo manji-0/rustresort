@@ -200,7 +200,13 @@ impl Database {
         let access_token_hash = hash_oauth_access_token(access_token);
         let now = Utc::now();
         let token = sqlx::query_as::<_, OAuthToken>(
-            "SELECT * FROM oauth_tokens WHERE access_token = ? AND revoked = 0 AND expires_at > ?",
+            r#"
+            SELECT *
+            FROM oauth_tokens
+            WHERE access_token = ?
+              AND revoked = 0
+              AND (expires_at IS NULL OR expires_at > ?)
+            "#,
         )
         .bind(&access_token_hash)
         .bind(now)
@@ -211,10 +217,10 @@ impl Database {
     }
 
     /// Revoke OAuth token
-    pub async fn revoke_oauth_token(&self, access_token: &str) -> Result<(), AppError> {
+    pub async fn revoke_oauth_token(&self, access_token: &str) -> Result<bool, AppError> {
         let access_token_hash = hash_oauth_access_token(access_token);
         let refresh_token_hash = hash_oauth_token_secret(access_token);
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE oauth_tokens SET revoked = 1 WHERE access_token = ? OR refresh_token = ?",
         )
         .bind(&access_token_hash)
@@ -222,7 +228,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Revoke OAuth token for a specific OAuth app only.
@@ -230,10 +236,10 @@ impl Database {
         &self,
         app_id: &str,
         token: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let access_token_hash = hash_oauth_access_token(token);
         let refresh_token_hash = hash_oauth_token_secret(token);
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE oauth_tokens SET revoked = 1 WHERE app_id = ? AND (access_token = ? OR refresh_token = ?)",
         )
         .bind(app_id)
@@ -242,7 +248,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Get OAuth token by refresh token.

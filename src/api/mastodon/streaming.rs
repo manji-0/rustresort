@@ -234,6 +234,7 @@ async fn load_stream_status(
 async fn build_status_response_value(
     state: &StreamingApiState,
     status: &Status,
+    viewer_scoped: bool,
 ) -> Result<Value, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
@@ -250,14 +251,18 @@ async fn build_status_response_value(
         .get(status.account_address.trim())
         .cloned();
 
-    let thread_uri = state.db.resolve_thread_root_uri(status).await?;
-    let interactions = crate::api::StatusInteractions::new(
-        Some(state.db.is_favourited(&status.id).await?),
-        Some(state.db.is_reposted(&status.id).await?),
-        Some(state.db.is_thread_muted(&thread_uri).await?),
-        Some(state.db.is_bookmarked(&status.id).await?),
-        Some(state.db.is_status_pinned(&status.id).await?),
-    );
+    let interactions = if viewer_scoped {
+        let thread_uri = state.db.resolve_thread_root_uri(status).await?;
+        crate::api::StatusInteractions::new(
+            Some(state.db.is_favourited(&status.id).await?),
+            Some(state.db.is_reposted(&status.id).await?),
+            Some(state.db.is_thread_muted(&thread_uri).await?),
+            Some(state.db.is_bookmarked(&status.id).await?),
+            Some(state.db.is_status_pinned(&status.id).await?),
+        )
+    } else {
+        crate::api::StatusInteractions::public()
+    };
 
     let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
@@ -277,8 +282,9 @@ async fn build_status_response_value(
 async fn build_status_response(
     state: &StreamingApiState,
     status: &Status,
+    viewer_scoped: bool,
 ) -> Result<crate::api::dto::StatusResponse, AppError> {
-    let value = build_status_response_value(state, status).await?;
+    let value = build_status_response_value(state, status, viewer_scoped).await?;
     serde_json::from_value(value)
         .map_err(|error| AppError::serialization("streaming status response decode", error))
 }
@@ -286,6 +292,7 @@ async fn build_status_response(
 async fn build_notification_response_value(
     state: &StreamingApiState,
     payload: &Value,
+    viewer_scoped: bool,
 ) -> Result<Option<Value>, AppError> {
     let Some(notification_id) = payload.get("id").and_then(Value::as_str) else {
         return Ok(None);
@@ -297,7 +304,7 @@ async fn build_notification_response_value(
 
     let status_response = if let Some(status_uri) = notification.status_uri.as_deref() {
         if let Some(status) = get_notification_status(state, status_uri).await {
-            Some(build_status_response(state, &status).await?)
+            Some(build_status_response(state, &status, viewer_scoped).await?)
         } else {
             None
         }
@@ -338,7 +345,11 @@ async fn build_notification_response_value(
         .map_err(|error| AppError::serialization("streaming notification payload", error))
 }
 
-async fn serialize_stream_event_data(state: &StreamingApiState, event: &StreamEvent) -> String {
+async fn serialize_stream_event_data(
+    state: &StreamingApiState,
+    event: &StreamEvent,
+    viewer_scoped: bool,
+) -> String {
     match event {
         StreamEvent::Delete { payload, .. } => payload
             .get("id")
@@ -346,13 +357,15 @@ async fn serialize_stream_event_data(state: &StreamingApiState, event: &StreamEv
             .map(ToString::to_string)
             .unwrap_or_else(|| json_value_to_string(payload)),
         StreamEvent::Update { payload, .. } => match load_stream_status(state, payload).await {
-            Ok(Some(status)) => match build_status_response_value(state, &status).await {
-                Ok(value) => json_value_to_string(&value),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to build streaming status payload");
-                    json_value_to_string(payload)
+            Ok(Some(status)) => {
+                match build_status_response_value(state, &status, viewer_scoped).await {
+                    Ok(value) => json_value_to_string(&value),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to build streaming status payload");
+                        json_value_to_string(payload)
+                    }
                 }
-            },
+            }
             Ok(None) => json_value_to_string(payload),
             Err(error) => {
                 tracing::warn!(%error, "failed to load status for streaming payload");
@@ -360,7 +373,7 @@ async fn serialize_stream_event_data(state: &StreamingApiState, event: &StreamEv
             }
         },
         StreamEvent::Notification { payload, .. } => {
-            match build_notification_response_value(state, payload).await {
+            match build_notification_response_value(state, payload, viewer_scoped).await {
                 Ok(Some(value)) => json_value_to_string(&value),
                 Ok(None) => json_value_to_string(payload),
                 Err(error) => {
@@ -376,14 +389,15 @@ async fn serialize_stream_event_data(state: &StreamingApiState, event: &StreamEv
 fn build_sse_stream(
     state: StreamingApiState,
     receiver: EventReceiver,
+    viewer_scoped: bool,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream::unfold(
         (state, receiver.into_inner()),
-        |(state, mut receiver)| async move {
+        move |(state, mut receiver)| async move {
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        let data = serialize_stream_event_data(&state, &event).await;
+                        let data = serialize_stream_event_data(&state, &event, viewer_scoped).await;
                         let sse_event = Event::default().event(event.event_name()).data(data);
                         return Some((Ok(sse_event), (state, receiver)));
                     }
@@ -405,12 +419,13 @@ async fn forward_websocket_stream(
     mut socket: WebSocket,
     receiver: EventReceiver,
     stream_name: String,
+    viewer_scoped: bool,
 ) {
     let mut receiver = receiver.into_inner();
     loop {
         match receiver.recv().await {
             Ok(event) => {
-                let payload = serialize_stream_event_data(&state, &event).await;
+                let payload = serialize_stream_event_data(&state, &event, viewer_scoped).await;
                 let frame = serde_json::json!({
                     "stream": [stream_name],
                     "event": event.event_name(),
@@ -603,12 +618,19 @@ async fn multiplex_websocket_stream(
                                     };
                                     let tx = event_tx.clone();
                                     let state_for_task = state.clone();
+                                    let viewer_scoped = auth.is_some()
+                                        || matches!(stream_name.as_str(), "user" | "list" | "direct");
                                     let handle = tokio::spawn(async move {
                                         let mut event_receiver = event_receiver.into_inner();
                                         loop {
                                             match event_receiver.recv().await {
                                                 Ok(event) => {
-                                                    let payload = serialize_stream_event_data(&state_for_task, &event).await;
+                                                    let payload = serialize_stream_event_data(
+                                                        &state_for_task,
+                                                        &event,
+                                                        viewer_scoped,
+                                                    )
+                                                    .await;
                                                     let frame = serde_json::json!({
                                                         "stream": [stream_name],
                                                         "event": event.event_name(),
@@ -674,7 +696,7 @@ pub async fn stream_user(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let account_id = state.config.auth.username.as_str();
     let receiver = state.streaming_event_bus.subscribe_user(account_id).await?;
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, true))
 }
 
 /// GET /api/v1/streaming/public
@@ -684,7 +706,7 @@ pub async fn stream_public(
     Query(_params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public().await?;
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, false))
 }
 
 /// GET /api/v1/streaming/public/local
@@ -693,7 +715,7 @@ pub async fn stream_public_local(
     State(state): State<StreamingApiState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public_local().await?;
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, false))
 }
 
 /// GET /api/v1/streaming/hashtag
@@ -714,7 +736,7 @@ pub async fn stream_hashtag(
     } else {
         state.streaming_event_bus.subscribe_hashtag(&tag).await?
     };
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, false))
 }
 
 /// GET /api/v1/streaming/list
@@ -735,7 +757,7 @@ pub async fn stream_list(
         .ok_or(AppError::NotFound)?;
 
     let receiver = state.streaming_event_bus.subscribe_list(&list_id).await?;
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, true))
 }
 
 /// GET /api/v1/streaming/direct
@@ -749,7 +771,7 @@ pub async fn stream_direct(
         .streaming_event_bus
         .subscribe_direct(account_id)
         .await?;
-    Ok(build_sse_stream(state, receiver))
+    Ok(build_sse_stream(state, receiver, true))
 }
 
 /// GET /api/v1/streaming
@@ -781,12 +803,14 @@ pub async fn stream_root(
         list: params.list.clone(),
     };
     let (receiver, stream_name) = subscribe_stream(&state, auth.as_ref(), &subscription).await?;
+    let viewer_scoped =
+        auth.is_some() || matches!(stream_name.as_str(), "user" | "list" | "direct");
     if let Some(ws) = ws {
         return Ok(ws
             .on_upgrade(move |socket| {
-                forward_websocket_stream(state, socket, receiver, stream_name)
+                forward_websocket_stream(state, socket, receiver, stream_name, viewer_scoped)
             })
             .into_response());
     }
-    Ok(build_sse_stream(state, receiver).into_response())
+    Ok(build_sse_stream(state, receiver, viewer_scoped).into_response())
 }

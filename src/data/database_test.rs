@@ -45,7 +45,7 @@ fn test_oauth_token(app_id: &str, access_token: &str) -> OAuthToken {
         grant_type: "authorization_code".to_string(),
         scopes: "read write".to_string(),
         created_at: Utc::now(),
-        expires_at: Utc::now() + chrono::Duration::hours(1),
+        expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
         refresh_expires_at: None,
         revoked: false,
     }
@@ -523,7 +523,7 @@ async fn test_oauth_token_lookup_rejects_expired_tokens() {
 
     let raw_access_token = "expired-token";
     let mut token = test_oauth_token(&app.id, raw_access_token);
-    token.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    token.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
     db.insert_oauth_token(&token).await.unwrap();
 
     assert!(

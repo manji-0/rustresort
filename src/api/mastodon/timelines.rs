@@ -272,13 +272,7 @@ pub async fn home_timeline(
             &state.config,
             account_stats,
             remote_stats,
-            crate::api::StatusInteractions::new(
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
-            ),
+            crate::api::StatusInteractions::public(),
         )
         .await?;
         responses.push(serde_json::to_value(response).unwrap());
@@ -420,13 +414,7 @@ pub async fn public_timeline(
             &state.config,
             account_stats,
             remote_stats,
-            crate::api::StatusInteractions::new(
-                Some(item.favourited),
-                Some(item.reblogged),
-                None,
-                Some(item.bookmarked),
-                None,
-            ),
+            crate::api::StatusInteractions::public(),
         )
         .await?;
         responses.push(serde_json::to_value(response).unwrap());
