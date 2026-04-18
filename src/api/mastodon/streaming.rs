@@ -11,6 +11,7 @@ use axum::{
     response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
 };
+use axum_extra::extract::CookieJar;
 use futures::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +30,7 @@ use crate::service::{EventReceiver, StreamEvent};
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
     stream: Option<String>,
+    access_token: Option<String>,
     /// Only for hashtag stream
     tag: Option<String>,
     /// Whether the hashtag stream should be restricted to local statuses.
@@ -44,6 +46,93 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn websocket_protocol_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').map(str::trim).find(|value| !value.is_empty()))
+}
+
+#[derive(Clone)]
+enum StreamAuth {
+    Session,
+    OAuth { scopes: Vec<String> },
+}
+
+fn scope_matches(granted: &str, required: &str) -> bool {
+    granted == required
+        || required
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn oauth_scopes_satisfy(granted: &[String], required: &[&str]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    required.iter().all(|required_scope| {
+        granted
+            .iter()
+            .any(|granted_scope| scope_matches(granted_scope, required_scope))
+    })
+}
+
+async fn authenticate_stream_request(
+    state: &StreamingApiState,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+    query_access_token: Option<&str>,
+) -> Result<Option<StreamAuth>, AppError> {
+    let token = bearer_token(headers)
+        .or(query_access_token)
+        .or_else(|| websocket_protocol_token(headers));
+    if let Some(token) = token {
+        if let Some(oauth_token) = state.db.get_oauth_token(token).await?
+            && matches!(
+                oauth_token.grant_type.as_str(),
+                "authorization_code" | "refresh_token"
+            )
+        {
+            let scopes = oauth_token
+                .scopes
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            return Ok(Some(StreamAuth::OAuth { scopes }));
+        }
+        if crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok() {
+            return Ok(Some(StreamAuth::Session));
+        }
+        return Err(AppError::Unauthorized);
+    }
+
+    if jar
+        .get("session")
+        .map(|cookie| cookie.value())
+        .is_some_and(|token| {
+            crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+        })
+    {
+        return Ok(Some(StreamAuth::Session));
+    }
+
+    Ok(None)
+}
+
+fn enforce_stream_auth(
+    auth: Option<&StreamAuth>,
+    required_scopes: &[&str],
+) -> Result<(), AppError> {
+    match auth {
+        Some(StreamAuth::Session) => Ok(()),
+        Some(StreamAuth::OAuth { scopes }) if oauth_scopes_satisfy(scopes, required_scopes) => {
+            Ok(())
+        }
+        Some(StreamAuth::OAuth { .. }) => Err(AppError::Forbidden),
+        None => Err(AppError::Unauthorized),
+    }
 }
 
 /// GET /api/v1/streaming/health
@@ -399,49 +488,21 @@ pub async fn stream_direct(
     Ok(build_sse_stream(state, receiver))
 }
 
-async fn enforce_root_stream_scopes(
-    state: &StreamingApiState,
-    headers: &HeaderMap,
-    required_scopes: &[&str],
-) -> Result<(), AppError> {
-    let Some(token) = bearer_token(headers) else {
-        return Ok(());
-    };
-    let oauth_token = state
-        .db
-        .get_oauth_token(token)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    let granted = oauth_token.scopes.split_whitespace().collect::<Vec<_>>();
-    let granted_matches = |required: &&str| {
-        granted.iter().any(|scope| {
-            scope == required
-                || required
-                    .split_once(':')
-                    .map(|(prefix, _)| scope == &prefix)
-                    .unwrap_or(false)
-        })
-    };
-    if required_scopes.iter().all(granted_matches) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden)
-}
-
 /// GET /api/v1/streaming
 /// Mastodon-compatible streaming multiplexer using the `stream` query parameter.
 pub async fn stream_root(
     State(state): State<StreamingApiState>,
-    session: CurrentUser,
     headers: HeaderMap,
+    jar: CookieJar,
     ws: Option<WebSocketUpgrade>,
     Query(params): Query<StreamParams>,
 ) -> Result<impl IntoResponse, AppError> {
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
     let stream_name = params.stream.clone().unwrap_or_default();
     match stream_name.as_str() {
         "user" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses", "read:notifications"])
-                .await?;
+            enforce_stream_auth(auth.as_ref(), &["read:statuses", "read:notifications"])?;
             let account_id = state.config.auth.username.clone();
             let receiver = state
                 .streaming_event_bus
@@ -454,12 +515,12 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_user(State(state), session)
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         "public" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            if let Some(auth) = auth.as_ref() {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
             let receiver = state.streaming_event_bus.subscribe_public().await?;
             if let Some(ws) = ws {
                 return Ok(ws
@@ -468,12 +529,12 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_public(State(state), Query(params))
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         "public:local" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            if let Some(auth) = auth.as_ref() {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
             let receiver = state.streaming_event_bus.subscribe_public_local().await?;
             if let Some(ws) = ws {
                 return Ok(ws
@@ -482,12 +543,12 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_public_local(State(state))
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         "hashtag" | "hashtag:local" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            if let Some(auth) = auth.as_ref() {
+                enforce_stream_auth(Some(auth), &["read:statuses"])?;
+            }
             let tag = params
                 .tag
                 .clone()
@@ -510,12 +571,10 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_hashtag(State(state), Query(params))
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         "list" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            enforce_stream_auth(auth.as_ref(), &["read:statuses"])?;
             let list_id = params
                 .list
                 .clone()
@@ -533,12 +592,10 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_list(State(state), session, Query(params))
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         "direct" => {
-            enforce_root_stream_scopes(&state, &headers, &["read:statuses"]).await?;
+            enforce_stream_auth(auth.as_ref(), &["read:statuses"])?;
             let account_id = state.config.auth.username.clone();
             let receiver = state
                 .streaming_event_bus
@@ -551,9 +608,7 @@ pub async fn stream_root(
                     })
                     .into_response());
             }
-            stream_direct(State(state), session)
-                .await
-                .map(IntoResponse::into_response)
+            Ok(build_sse_stream(state, receiver).into_response())
         }
         _ => Err(AppError::Validation(
             "stream parameter must be one of user, public, public:local, hashtag, hashtag:local, list, direct"

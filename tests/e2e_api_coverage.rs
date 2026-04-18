@@ -557,6 +557,21 @@ async fn test_account_followers() {
 }
 
 #[tokio::test]
+async fn test_remote_account_followers_returns_not_found_when_remote_actor_cannot_be_resolved() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/alice@missing.example/followers"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
 async fn test_account_following() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;
@@ -1625,6 +1640,24 @@ async fn test_search_accounts() {
 }
 
 #[tokio::test]
+async fn test_search_accounts_returns_empty_array_for_blank_query() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/search?q=%20%20"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test]
 async fn test_search_accounts_applies_offset() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Follow};
@@ -2433,7 +2466,7 @@ async fn test_get_status_allows_authenticated_private_status_and_preserves_inter
 }
 
 #[tokio::test]
-async fn test_get_status_card_returns_null_for_visible_status() {
+async fn test_get_status_card_returns_preview_for_visible_status_with_url() {
     let server = TestServer::new().await;
     server.create_test_account().await;
     let token = server.create_test_token().await;
@@ -2443,7 +2476,7 @@ async fn test_get_status_card_returns_null_for_visible_status() {
         .post(server.url("/api/v1/statuses"))
         .header("Authorization", format!("Bearer {}", token))
         .json(&json!({
-            "status": "Card test",
+            "status": "Card test https://example.com/article",
             "visibility": "public"
         }))
         .send()
@@ -2460,7 +2493,9 @@ async fn test_get_status_card_returns_null_for_visible_status() {
         .await
         .expect("get card");
     assert_eq!(response.status(), 200);
-    assert_eq!(response.json::<serde_json::Value>().await.unwrap(), serde_json::Value::Null);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["type"], "link");
+    assert_eq!(body["url"], "https://example.com/article");
 }
 
 #[tokio::test]
@@ -2713,6 +2748,9 @@ async fn test_reblog_status() {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_ne!(body["id"], body["uri"]);
+        assert_eq!(body["reblog"]["id"], status_id);
     }
 }
 
@@ -3005,7 +3043,11 @@ async fn test_get_notifications_v2() {
 
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().await.unwrap();
-    let groups = body.as_array().expect("notification groups should be array");
+    let accounts = body["accounts"].as_array().expect("accounts array");
+    let groups = body["notification_groups"]
+        .as_array()
+        .expect("notification groups should be array");
+    assert_eq!(accounts.len(), 1);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0]["type"], "mention");
     assert_eq!(groups[0]["notifications_count"], 1);
@@ -4854,6 +4896,23 @@ async fn test_filter_v2_crud_and_keyword_endpoints() {
     assert_eq!(listed_statuses.status(), 200);
     let listed_statuses: serde_json::Value = listed_statuses.json().await.unwrap();
     assert_eq!(listed_statuses.as_array().unwrap().len(), 1);
+
+    let filtered_status = server
+        .client
+        .get(server.url(&format!("/api/v1/statuses/{status_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filtered_status.status(), 200);
+    let filtered_status: serde_json::Value = filtered_status.json().await.unwrap();
+    let filtered = filtered_status["filtered"]
+        .as_array()
+        .expect("filtered array");
+    assert!(
+        filtered.iter().any(|entry| entry["status_matches"] == json!([status_id])),
+        "status filter should be reflected in status serialization"
+    );
 
     let deleted_keyword = server
         .client

@@ -8,6 +8,7 @@ use chrono::{Datelike, Timelike};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
+use super::accounts::build_remote_account_placeholder_response;
 use crate::InstanceApiState;
 
 const DEFAULT_INSTANCE_RULES: [&str; 3] = [
@@ -24,11 +25,17 @@ fn instance_version_string() -> String {
 
 fn streaming_base_url(base_url: &str) -> Option<String> {
     let url = url::Url::parse(base_url).ok()?;
-    match url.scheme() {
-        "http" | "https" => {}
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
         _ => return None,
-    }
-    Some(url.to_string().trim_end_matches('/').to_string())
+    };
+    let host = url.host_str()?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn streaming_endpoint_url(state: &InstanceApiState) -> String {
@@ -219,18 +226,69 @@ pub async fn custom_emojis() -> Json<serde_json::Value> {
 }
 
 /// GET /api/v1/announcements
-pub async fn announcements() -> Json<serde_json::Value> {
-    Json(serde_json::json!([]))
+pub async fn announcements(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let announcements = state
+        .db
+        .get_setting("instance.announcements")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|value| value.is_array())
+        .unwrap_or_else(|| serde_json::json!([]));
+    Json(announcements)
 }
 
 /// GET /api/v1/trends and /api/v1/trends/statuses
-pub async fn trending_statuses() -> Json<serde_json::Value> {
-    Json(serde_json::json!([]))
+pub async fn trending_statuses(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let Ok(Some(account)) = state.db.get_account().await else {
+        return Json(serde_json::json!([]));
+    };
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
+        .await
+        .unwrap_or_default();
+    let statuses = state
+        .db
+        .get_local_public_statuses(10, None, None)
+        .await
+        .unwrap_or_default();
+    let mut results = Vec::new();
+    for status in statuses {
+        if let Ok(response) = crate::api::build_status_response_with_account_stats(
+            state.db.as_ref(),
+            &status,
+            &account,
+            &state.config,
+            account_stats,
+            crate::api::StatusInteractions::default(),
+        )
+        .await
+            && let Ok(value) = serde_json::to_value(response)
+        {
+            results.push(value);
+        }
+    }
+    Json(serde_json::Value::Array(results))
 }
 
 /// GET /api/v1/trends/links
-pub async fn trending_links() -> Json<serde_json::Value> {
-    Json(serde_json::json!([]))
+pub async fn trending_links(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let statuses = state
+        .db
+        .get_local_public_statuses(20, None, None)
+        .await
+        .unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    let mut results = Vec::new();
+    for status in statuses {
+        if let Some(card) = crate::api::build_status_card_value(&status)
+            && let Some(url) = card.get("url").and_then(|value| value.as_str())
+            && seen.insert(url.to_string())
+        {
+            results.push(card);
+        }
+    }
+    Json(serde_json::Value::Array(results))
 }
 
 /// GET /api/v1/trends/tags
@@ -238,11 +296,30 @@ pub async fn trending_tags(State(state): State<InstanceApiState>) -> Json<serde_
     let tags = state.db.get_trending_hashtags(10).await.unwrap_or_default();
     Json(serde_json::Value::Array(
         tags.into_iter()
-            .map(|(name, _usage_count, _last_used)| {
+            .map(|(name, usage_count, last_used)| {
+                let history = last_used
+                    .and_then(|last_used| {
+                        chrono::NaiveDateTime::parse_from_str(&last_used, "%Y-%m-%d %H:%M:%S")
+                            .ok()
+                            .map(|parsed| {
+                                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                    parsed,
+                                    chrono::Utc,
+                                )
+                            })
+                    })
+                    .map(|last_used| {
+                        vec![serde_json::json!({
+                            "day": last_used.timestamp().to_string(),
+                            "uses": usage_count.to_string(),
+                            "accounts": "1",
+                        })]
+                    })
+                    .unwrap_or_default();
                 serde_json::json!({
                     "name": name,
                     "url": format!("{}/tags/{}", state.config.server.base_url(), name),
-                    "history": [],
+                    "history": history,
                 })
             })
             .collect(),
@@ -264,25 +341,41 @@ pub async fn directory(
 ) -> Json<serde_json::Value> {
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(40).min(80);
-    let _local_only = params.local.unwrap_or(false);
-    let _order = params.order.as_deref().unwrap_or("active");
+    let local_only = params.local.unwrap_or(false);
+    let mut results = Vec::new();
 
-    let results = if offset > 0 || limit == 0 {
-        Vec::new()
-    } else if let Ok(Some(account)) = state.db.get_account().await {
+    if let Ok(Some(account)) = state.db.get_account().await {
         let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
             .await
             .unwrap_or_default();
-        vec![
+        results.push(
             serde_json::to_value(crate::api::account_to_response_with_stats(
                 &account,
                 &state.config,
                 account_stats,
             ))
             .unwrap_or_default(),
-        ]
-    } else {
+        );
+    }
+
+    if !local_only {
+        for profile in state.db.list_remote_profiles().await.unwrap_or_default() {
+            if let Some(response) =
+                build_remote_account_placeholder_response(&profile.address, state.config.as_ref(), 0)
+                && let Ok(value) = serde_json::to_value(response)
+            {
+                results.push(value);
+            }
+        }
+    }
+
+    if matches!(params.order.as_deref(), Some("new")) {
+        results.reverse();
+    }
+    let results = if offset >= results.len() || limit == 0 {
         Vec::new()
+    } else {
+        results.into_iter().skip(offset).take(limit).collect::<Vec<_>>()
     };
     Json(serde_json::Value::Array(results))
 }

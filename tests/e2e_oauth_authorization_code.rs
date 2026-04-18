@@ -107,6 +107,45 @@ async fn test_oauth_oob_authorization_returns_code_page() {
 }
 
 #[tokio::test]
+async fn test_oauth_authorize_redirects_back_with_oauth_error_for_invalid_scope() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let app = server
+        .create_oauth_app("https://client.example/callback", "read:accounts")
+        .await;
+    let (_, session_cookie) = server.login_password().await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .get(server.url("/oauth/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", app["client_id"].as_str().unwrap()),
+            ("redirect_uri", "https://client.example/callback"),
+            ("scope", "write:statuses"),
+            ("state", "oauth-state"),
+        ])
+        .header("Cookie", session_cookie)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_redirection());
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let redirect = url::Url::parse(location).unwrap();
+    let params = redirect.query_pairs().collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(params.get("error").map(|value| value.as_ref()), Some("invalid_scope"));
+    assert_eq!(params.get("state").map(|value| value.as_ref()), Some("oauth-state"));
+}
+
+#[tokio::test]
 async fn test_public_account_creation_endpoint_is_not_exposed() {
     let server = TestServer::new().await;
 
@@ -493,4 +532,26 @@ async fn test_oauth_revoke_supports_http_basic_client_auth() {
         .await
         .unwrap();
     assert_eq!(verify.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_oauth_revoke_returns_oauth_error_for_invalid_client_credentials() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let response = server
+        .client
+        .post(server.url("/oauth/revoke"))
+        .form(&[
+            ("client_id", "invalid-client"),
+            ("client_secret", "wrong-secret"),
+            ("token", "bogus-token"),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["error"], "invalid_client");
 }

@@ -59,6 +59,20 @@ impl Database {
                     .await?;
             }
 
+            let existing_followers = sqlx::query_scalar::<_, String>(
+                "SELECT follower_address FROM followers",
+            )
+            .fetch_all(&mut *conn)
+            .await?;
+            let follower_matches =
+                find_matching_addresses(&existing_followers, target_address, default_port);
+            for existing in follower_matches {
+                sqlx::query("DELETE FROM followers WHERE follower_address COLLATE NOCASE = ?")
+                    .bind(existing)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+
             Ok(existing_match.is_none())
         }
         .await;

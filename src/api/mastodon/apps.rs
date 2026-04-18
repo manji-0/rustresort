@@ -221,6 +221,98 @@ fn build_authorize_redirect_location(
     location
 }
 
+fn build_authorize_error_redirect_location(
+    redirect_uri: &str,
+    error: &str,
+    description: &str,
+    state: Option<&str>,
+) -> String {
+    if let Ok(mut redirect) = Url::parse(redirect_uri) {
+        let mut serializer =
+            url::form_urlencoded::Serializer::new(redirect.query().unwrap_or("").to_string());
+        serializer.append_pair("error", error);
+        serializer.append_pair("error_description", description);
+        if let Some(state) = state {
+            serializer.append_pair("state", state);
+        }
+        redirect.set_query(Some(&serializer.finish()));
+        return redirect.to_string();
+    }
+
+    let separator = if redirect_uri.contains('?') { '&' } else { '?' };
+    let mut location = format!(
+        "{}{}error={}&error_description={}",
+        redirect_uri,
+        separator,
+        urlencoding::encode(error),
+        urlencoding::encode(description)
+    );
+    if let Some(state) = state {
+        location.push_str("&state=");
+        location.push_str(&urlencoding::encode(state));
+    }
+    location
+}
+
+fn authorize_error_parts(error: &AppError) -> (StatusCode, &'static str, String) {
+    match error {
+        AppError::Unauthorized => (
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "client authentication failed".to_string(),
+        ),
+        AppError::Validation(description) if description.contains("scope") => (
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            description.clone(),
+        ),
+        AppError::Validation(description) => {
+            (StatusCode::BAD_REQUEST, "invalid_request", description.clone())
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "authorization request is invalid".to_string(),
+        ),
+    }
+}
+
+async fn authorize_error_response(
+    state: &AppsApiState,
+    req: &AuthorizeRequest,
+    error: AppError,
+) -> Result<Response, AppError> {
+    let (status, code, description) = authorize_error_parts(&error);
+    let redirect_uri = req
+        .redirect_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let client_id = req
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let (Some(client_id), Some(redirect_uri)) = (client_id, redirect_uri)
+        && let Some(app) = state.db.get_oauth_app_by_client_id(client_id).await?
+        && is_registered_redirect_uri(&app.redirect_uri, redirect_uri)
+        && redirect_uri != OOB_REDIRECT_URI
+    {
+        return Ok(
+            Redirect::to(&build_authorize_error_redirect_location(
+                redirect_uri,
+                code,
+                &description,
+                req.state.as_deref(),
+            ))
+            .into_response(),
+        );
+    }
+
+    Ok(oauth_error_response(status, code, description))
+}
+
 fn normalize_pkce_method(method: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(method) = method.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -404,7 +496,9 @@ async fn validate_authorize_request(
         .filter(|scopes| !scopes.is_empty())
         .unwrap_or_else(|| normalize_scopes(&app.scopes));
     if !scopes_are_subset(&requested_scopes, &app.scopes) {
-        return Err(AppError::Unauthorized);
+        return Err(AppError::Validation(
+            "requested scope exceeds the application's registered scopes".to_string(),
+        ));
     }
 
     let code_challenge = req
@@ -554,7 +648,10 @@ pub async fn authorize(
         return Ok(Redirect::to(&login_url).into_response());
     };
 
-    let context = validate_authorize_request(&state, &req).await?;
+    let context = match validate_authorize_request(&state, &req).await {
+        Ok(context) => context,
+        Err(error) => return authorize_error_response(&state, &req, error).await,
+    };
     issue_authorization_code_response(&state, context, req.state.as_deref()).await
 }
 
@@ -589,7 +686,7 @@ pub async fn verify_app_credentials(
         "redirect_uris": redirect_uris_to_vec(&app.redirect_uri),
         "client_id": app.client_id,
         "vapid_key": app.vapid_key,
-        "scopes": scopes_to_vec(&app.scopes),
+        "scopes": normalize_scopes(&app.scopes),
     })))
 }
 
@@ -787,14 +884,14 @@ pub async fn create_token(
             let Some(existing) = state.db.get_oauth_token_by_refresh_token(refresh_token).await?
             else {
                 return Ok(oauth_error_response(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNAUTHORIZED,
                     "invalid_grant",
                     "refresh token is invalid or expired",
                 ));
             };
             if existing.app_id != app.id {
                 return Ok(oauth_error_response(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNAUTHORIZED,
                     "invalid_grant",
                     "refresh token does not belong to this client",
                 ));
@@ -804,7 +901,7 @@ pub async fn create_token(
                 "authorization_code" | "refresh_token"
             ) {
                 return Ok(oauth_error_response(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::UNAUTHORIZED,
                     "invalid_grant",
                     "refresh token cannot be used for this grant type",
                 ));
@@ -849,23 +946,56 @@ pub async fn revoke_token(
     State(state): State<AppsApiState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let req: RevokeTokenRequest = parse_body(&headers, &body)?;
+) -> Result<Response, AppError> {
+    let req: RevokeTokenRequest = match parse_body(&headers, &body) {
+        Ok(req) => req,
+        Err(AppError::Validation(description)) => {
+            return Ok(oauth_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                description,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let (client_id, client_secret) =
-        resolve_client_credentials(&headers, req.client_id, req.client_secret)?;
-    let app = state
-        .db
-        .get_oauth_app_by_client_id(&client_id)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+        match resolve_client_credentials(&headers, req.client_id, req.client_secret) {
+            Ok(credentials) => credentials,
+            Err(AppError::Validation(description)) => {
+                return Ok(oauth_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    description,
+                ));
+            }
+            Err(AppError::Unauthorized) => {
+                return Ok(oauth_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "client authentication failed",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+    let Some(app) = state.db.get_oauth_app_by_client_id(&client_id).await? else {
+        return Ok(oauth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client authentication failed",
+        ));
+    };
     if !verify_client_secret(&app.client_secret, &client_secret) {
-        return Err(AppError::Unauthorized);
+        return Ok(oauth_error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "client authentication failed",
+        ));
     }
     state
         .db
         .revoke_oauth_token_for_app(&app.id, &req.token)
         .await?;
-    Ok(Json(serde_json::json!({})))
+    Ok(Json(serde_json::json!({})).into_response())
 }
 
 #[cfg(test)]

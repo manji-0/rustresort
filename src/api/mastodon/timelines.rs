@@ -1,7 +1,7 @@
 //! Timeline endpoints
 
 use axum::{
-    extract::{Query, State},
+    extract::{Query, RawQuery, State},
     http::{HeaderMap, header::LINK},
     response::{IntoResponse, Json},
 };
@@ -39,6 +39,93 @@ pub struct TagTimelineParams {
     pub all: Vec<String>,
     #[serde(default, rename = "none[]")]
     pub none: Vec<String>,
+}
+
+fn parse_query_bool(field: &str, value: &str) -> Result<bool, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(AppError::Validation(format!(
+            "{field} must be a boolean value"
+        ))),
+    }
+}
+
+fn parse_query_limit(field: &str, value: &str) -> Result<usize, AppError> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| AppError::Validation(format!("{field} must be an integer")))
+}
+
+fn parse_public_timeline_params(raw_query: Option<&str>) -> Result<PublicTimelineParams, AppError> {
+    let mut params = PublicTimelineParams {
+        pagination: PaginationParams {
+            max_id: None,
+            since_id: None,
+            min_id: None,
+            limit: None,
+        },
+        local: None,
+        remote: None,
+        only_media: None,
+    };
+
+    if let Some(raw_query) = raw_query {
+        for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()).into_owned() {
+            match key.as_str() {
+                "max_id" => params.pagination.max_id = Some(value),
+                "since_id" => params.pagination.since_id = Some(value),
+                "min_id" => params.pagination.min_id = Some(value),
+                "limit" => params.pagination.limit = Some(parse_query_limit("limit", &value)?),
+                "local" => params.local = Some(parse_query_bool("local", &value)?),
+                "remote" => params.remote = Some(parse_query_bool("remote", &value)?),
+                "only_media" => {
+                    params.only_media = Some(parse_query_bool("only_media", &value)?)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(params)
+}
+
+fn parse_tag_timeline_params(raw_query: Option<&str>) -> Result<TagTimelineParams, AppError> {
+    let mut params = TagTimelineParams {
+        pagination: PaginationParams {
+            max_id: None,
+            since_id: None,
+            min_id: None,
+            limit: None,
+        },
+        local: None,
+        only_media: None,
+        any: Vec::new(),
+        all: Vec::new(),
+        none: Vec::new(),
+    };
+
+    if let Some(raw_query) = raw_query {
+        for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()).into_owned() {
+            match key.as_str() {
+                "max_id" => params.pagination.max_id = Some(value),
+                "since_id" => params.pagination.since_id = Some(value),
+                "min_id" => params.pagination.min_id = Some(value),
+                "limit" => params.pagination.limit = Some(parse_query_limit("limit", &value)?),
+                "local" => params.local = Some(parse_query_bool("local", &value)?),
+                "only_media" => {
+                    params.only_media = Some(parse_query_bool("only_media", &value)?)
+                }
+                "any[]" | "any" => params.any.push(value),
+                "all[]" | "all" => params.all.push(value),
+                "none[]" | "none" => params.none.push(value),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(params)
 }
 
 async fn status_has_media(state: &TimelineApiState, status_id: &str) -> bool {
@@ -220,7 +307,7 @@ pub async fn home_timeline(
 /// GET /api/v1/timelines/public
 pub async fn public_timeline(
     State(state): State<TimelineApiState>,
-    Query(params): Query<PublicTimelineParams>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
     // Start timing the request
     let _timer = HTTP_REQUEST_DURATION_SECONDS
@@ -238,6 +325,7 @@ pub async fn public_timeline(
         .inc();
     db_timer.observe_duration();
 
+    let params = parse_public_timeline_params(raw_query.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let local_only = params.local.unwrap_or(false);
     let remote_only = params.remote.unwrap_or(false);
@@ -377,8 +465,9 @@ pub async fn public_timeline(
 pub async fn tag_timeline(
     State(state): State<TimelineApiState>,
     axum::extract::Path(hashtag): axum::extract::Path<String>,
-    Query(params): Query<TagTimelineParams>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
+    let params = parse_tag_timeline_params(raw_query.as_deref())?;
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 

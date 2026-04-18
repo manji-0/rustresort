@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     response::Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,12 +12,6 @@ const HOME_MARKER_KEY: &str = "markers.home.last_read_id";
 const NOTIFICATIONS_MARKER_KEY: &str = "markers.notifications.last_read_id";
 const HOME_MARKER_UPDATED_AT_KEY: &str = "markers.home.updated_at";
 const NOTIFICATIONS_MARKER_UPDATED_AT_KEY: &str = "markers.notifications.updated_at";
-
-#[derive(Debug, Default, Deserialize)]
-pub struct GetMarkersParams {
-    #[serde(rename = "timeline[]", default)]
-    pub timelines: Vec<String>,
-}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SaveMarkersRequest {
@@ -96,21 +90,33 @@ async fn save_marker(
 
 pub async fn get_markers(
     State(state): State<TimelineApiState>,
-    Query(params): Query<GetMarkersParams>,
+    raw_query: RawQuery,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let explicit_timelines = params
-        .timelines
-        .iter()
-        .map(|timeline| timeline.trim())
+    let explicit_timelines = raw_query
+        .0
+        .as_deref()
+        .map(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .filter_map(|(key, value)| {
+                    ((key == "timeline[]" || key == "timeline") && !value.trim().is_empty())
+                        .then(|| value.into_owned())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|timeline| timeline.trim().to_string())
         .filter(|timeline| !timeline.is_empty())
         .collect::<Vec<_>>();
-    let wants_home = explicit_timelines.is_empty()
-        || explicit_timelines.iter().any(|timeline| *timeline == "home");
-    let wants_notifications = explicit_timelines.is_empty()
-        || explicit_timelines
-            .iter()
-            .any(|timeline| *timeline == "notifications");
+    if explicit_timelines.is_empty() {
+        return Ok(Json(serde_json::json!({})));
+    }
+
+    let wants_home = explicit_timelines.iter().any(|timeline| *timeline == "home");
+    let wants_notifications = explicit_timelines
+        .iter()
+        .any(|timeline| *timeline == "notifications");
     let envelope = MarkerEnvelope {
         home: if wants_home {
             load_marker(&state, HOME_MARKER_KEY).await?
@@ -131,17 +137,19 @@ pub async fn save_markers(
     CurrentUser(_session): CurrentUser,
     Json(request): Json<SaveMarkersRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let envelope = MarkerEnvelope {
-        home: match request.home {
-            Some(home) => Some(save_marker(&state, HOME_MARKER_KEY, home).await?),
-            None => load_marker(&state, HOME_MARKER_KEY).await?,
-        },
-        notifications: match request.notifications {
-            Some(notifications) => {
-                Some(save_marker(&state, NOTIFICATIONS_MARKER_KEY, notifications).await?)
-            }
-            None => load_marker(&state, NOTIFICATIONS_MARKER_KEY).await?,
-        },
-    };
-    Ok(Json(serde_json::to_value(envelope).unwrap()))
+    let mut response = serde_json::Map::new();
+    if let Some(home) = request.home {
+        response.insert(
+            "home".to_string(),
+            serde_json::to_value(save_marker(&state, HOME_MARKER_KEY, home).await?).unwrap(),
+        );
+    }
+    if let Some(notifications) = request.notifications {
+        response.insert(
+            "notifications".to_string(),
+            serde_json::to_value(save_marker(&state, NOTIFICATIONS_MARKER_KEY, notifications).await?)
+                .unwrap(),
+        );
+    }
+    Ok(Json(serde_json::Value::Object(response)))
 }

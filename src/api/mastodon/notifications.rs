@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use super::accounts::PaginationParams;
 use super::accounts::{
@@ -183,22 +184,32 @@ async fn build_notification_account_response(
 }
 
 fn notification_link_header(
+    endpoint: &str,
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    include_types: &[String],
+    exclude_types: &[String],
 ) -> Option<String> {
+    let build_path = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        for include in include_types {
+            serializer.append_pair("types[]", include);
+        }
+        for exclude in exclude_types {
+            serializer.append_pair("exclude_types[]", exclude);
+        }
+        format!("{endpoint}?{}", serializer.finish())
+    };
+
     let mut links = Vec::new();
     if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
-        links.push(format!(
-            "</api/v1/notifications?limit={limit}&max_id={}>; rel=\"next\"",
-            urlencoding::encode(last_id)
-        ));
+        links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
     }
     if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
-        links.push(format!(
-            "</api/v1/notifications?limit={limit}&min_id={}>; rel=\"prev\"",
-            urlencoding::encode(first_id)
-        ));
+        links.push(format!("<{}>; rel=\"prev\"", build_path("min_id", first_id)));
     }
     (!links.is_empty()).then(|| links.join(", "))
 }
@@ -321,7 +332,14 @@ pub async fn get_notifications(
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
-    if let Some(link) = notification_link_header(limit, first_id, last_id) {
+    if let Some(link) = notification_link_header(
+        "/api/v1/notifications",
+        limit,
+        first_id,
+        last_id,
+        &raw_include_types,
+        &raw_exclude_types,
+    ) {
         headers.insert(
             LINK,
             link.parse()
@@ -404,17 +422,32 @@ pub async fn get_notifications_v2(
     }
 
     let mut groups = Vec::new();
+    let mut accounts = Vec::new();
+    let mut seen_account_ids = HashSet::new();
+    let mut statuses = Vec::new();
+    let mut seen_status_ids = HashSet::new();
     for notification in notifications {
         let account =
             build_notification_account_response(&state, &notification.origin_account_address).await?;
-        let status = if let Some(status_uri) = &notification.status_uri {
+        if seen_account_ids.insert(account.id.clone()) {
+            accounts.push(
+                serde_json::to_value(account.clone()).map_err(|error| {
+                    AppError::serialization("notification v2 account response", error)
+                })?,
+            );
+        }
+
+        let status_id = if let Some(status_uri) = &notification.status_uri {
             if let Some(status) = get_notification_status(&state, status_uri).await {
-                Some(
-                    serde_json::to_value(build_notification_status_response(&state, &status).await?)
-                        .map_err(|error| {
+                let status_response = build_notification_status_response(&state, &status).await?;
+                if seen_status_ids.insert(status_response.id.clone()) {
+                    statuses.push(
+                        serde_json::to_value(status_response.clone()).map_err(|error| {
                             AppError::serialization("notification v2 status response", error)
                         })?,
-                )
+                    );
+                }
+                Some(status_response.id)
             } else {
                 None
             }
@@ -422,7 +455,6 @@ pub async fn get_notifications_v2(
             None
         };
         groups.push(serde_json::json!({
-            "id": notification.id,
             "group_key": format!("ungrouped-{}", notification.id),
             "type": notification.notification_type.to_string(),
             "latest_page_notification_at": notification.created_at,
@@ -431,8 +463,7 @@ pub async fn get_notifications_v2(
             "page_max_id": notification.id,
             "notifications_count": 1,
             "sample_account_ids": [account.id.clone()],
-            "sample_accounts": [account],
-            "status": status,
+            "status_id": status_id,
         }));
     }
 
@@ -445,16 +476,29 @@ pub async fn get_notifications_v2(
         .and_then(|value| value.get("most_recent_notification_id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
-    if let Some(link) = notification_link_header(limit, first_id, last_id) {
+    if let Some(link) = notification_link_header(
+        "/api/v2/notifications",
+        limit,
+        first_id,
+        last_id,
+        &raw_include_types,
+        &raw_exclude_types,
+    ) {
         headers.insert(
             LINK,
-            link.replace("/api/v1/notifications", "/api/v2/notifications")
-                .parse()
+            link.parse()
                 .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
         );
     }
 
-    Ok((headers, Json(groups)))
+    Ok((
+        headers,
+        Json(serde_json::json!({
+            "accounts": accounts,
+            "statuses": statuses,
+            "notification_groups": groups,
+        })),
+    ))
 }
 
 /// POST /api/v1/notifications/:id/dismiss

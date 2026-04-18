@@ -453,6 +453,20 @@ async fn status_response_with_viewer_interactions(
     .await
 }
 
+async fn status_context_response(
+    state: &StatusApiState,
+    account: &crate::data::Account,
+    account_stats: crate::api::AccountStats,
+    status: &crate::data::Status,
+    is_authenticated: bool,
+) -> Result<crate::api::StatusResponse, AppError> {
+    if is_authenticated {
+        status_response_with_viewer_interactions(state, account, account_stats, status).await
+    } else {
+        status_response_without_interaction_state(state, account, account_stats, status).await
+    }
+}
+
 async fn build_status_edit_snapshot_payload(
     state: &StatusApiState,
     account: &crate::data::Account,
@@ -1132,7 +1146,9 @@ pub async fn get_status_card(
     if !request_is_authenticated(&state, &headers, &jar).await {
         ensure_public_visibility_for_public_endpoint(status.visibility)?;
     }
-    Ok(Json(serde_json::Value::Null))
+    Ok(Json(
+        crate::api::build_status_card_value(&status).unwrap_or(serde_json::Value::Null),
+    ))
 }
 
 /// DELETE /api/v1/statuses/:id
@@ -1356,7 +1372,7 @@ pub async fn get_status_context(
     let mut ancestor_responses = Vec::with_capacity(ancestors.len());
     for ancestor in &ancestors {
         ancestor_responses.push(
-            status_response_with_viewer_interactions(&state, &account, account_stats, ancestor)
+            status_context_response(&state, &account, account_stats, ancestor, is_authenticated)
                 .await?,
         );
     }
@@ -1364,7 +1380,7 @@ pub async fn get_status_context(
     let mut descendant_responses = Vec::with_capacity(descendants.len());
     for descendant in &descendants {
         descendant_responses.push(
-            status_response_with_viewer_interactions(&state, &account, account_stats, descendant)
+            status_context_response(&state, &account, account_stats, descendant, is_authenticated)
                 .await?,
         );
     }
@@ -1469,6 +1485,9 @@ pub async fn get_status_source(
 
     // Get the status
     let status = status_service.get(&id).await?;
+    if !status.is_local {
+        return Err(AppError::Forbidden);
+    }
 
     // Only allow getting source for local statuses
     if !status.is_local {
@@ -1658,7 +1677,7 @@ pub async fn reblog_status(
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let action_uri = resolve_action_uri(&id, &params)?;
-    let (status, repost_uri) = if let Some(uri) = action_uri {
+    let (status, repost_uri, repost_id) = if let Some(uri) = action_uri {
         let status = status_service.repost(uri).await?;
         let repost_uri = status_service
             .get_repost_uri(&status.id)
@@ -1666,7 +1685,14 @@ pub async fn reblog_status(
             .ok_or_else(|| {
                 AppError::internal("repost URI missing after creating repost activity".to_string())
             })?;
-        (status, repost_uri)
+        let repost_id = state
+            .db
+            .get_repost_id(&status.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::internal("repost ID missing after creating repost activity".to_string())
+            })?;
+        (status, repost_uri, repost_id)
     } else {
         // Create repost record
         let repost_id = EntityId::new_string();
@@ -1677,7 +1703,12 @@ pub async fn reblog_status(
             repost_id
         );
         let status = status_service.repost_by_id(&id, &repost_uri).await?;
-        (status, repost_uri)
+        let persisted_repost_id = state
+            .db
+            .get_repost_id(&status.id)
+            .await?
+            .unwrap_or(repost_id);
+        (status, repost_uri, persisted_repost_id)
     };
     let status_id = status.id.clone();
     let announce_visibility = params
@@ -1738,9 +1769,14 @@ pub async fn reblog_status(
     )
     .await?;
     reblogged_status.reblogged = true;
+    if !status.is_local {
+        return Ok(Json(serde_json::to_value(reblogged_status).map_err(|error| {
+            AppError::serialization("reblogged status response serialization", error)
+        })?));
+    }
 
     let mut wrapper = reblogged_status.clone();
-    wrapper.id = repost_uri.clone();
+    wrapper.id = repost_id;
     wrapper.uri = repost_uri.clone();
     wrapper.url = repost_uri.clone();
     wrapper.created_at = Utc::now();
@@ -2305,7 +2341,7 @@ pub async fn update_status(
                     .iter()
                     .any(|(_, _, votes)| *votes > 0))
         {
-            return Err(AppError::Validation(
+            return Err(AppError::Unprocessable(
                 "cannot edit a poll after voting has started or it has expired".to_string(),
             ));
         }
@@ -2459,6 +2495,9 @@ pub async fn get_status_history(
 
     // Get the status
     let status = status_service.get(&id).await?;
+    if !status.is_local {
+        return Err(AppError::Forbidden);
+    }
 
     // Get account
     let account = build_account_service(&state).get_account().await?;

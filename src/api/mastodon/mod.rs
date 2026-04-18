@@ -37,7 +37,6 @@ pub mod statuses;
 pub mod streaming;
 pub mod timelines;
 
-const SESSION_ONLY: &[&str] = &[];
 const READ_ACCOUNTS: &[&str] = &["read:accounts"];
 const WRITE_ACCOUNTS: &[&str] = &["write:accounts"];
 const PROFILE_READ_ACCOUNTS: &[&str] = &["profile", "read:accounts"];
@@ -589,7 +588,7 @@ where
         .route("/v1/streaming/health", get(streaming::streaming_health))
         .route(
             "/v1/streaming",
-            scoped(get(streaming::stream_root), SESSION_ONLY),
+            get(streaming::stream_root),
         )
         .route(
             "/v1/streaming/user",
@@ -597,15 +596,15 @@ where
         )
         .route(
             "/v1/streaming/public",
-            scoped(get(streaming::stream_public), READ_STATUSES),
+            get(streaming::stream_public),
         )
         .route(
             "/v1/streaming/public/local",
-            scoped(get(streaming::stream_public_local), READ_STATUSES),
+            get(streaming::stream_public_local),
         )
         .route(
             "/v1/streaming/hashtag",
-            scoped(get(streaming::stream_hashtag), READ_STATUSES),
+            get(streaming::stream_hashtag),
         )
         .route(
             "/v1/streaming/list",

@@ -318,6 +318,7 @@ async fn test_markers_round_trip() {
     let get_response = server
         .client
         .get(server.url("/api/v1/markers"))
+        .query(&[("timeline[]", "home"), ("timeline[]", "notifications")])
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -326,6 +327,19 @@ async fn test_markers_round_trip() {
     let loaded: Value = get_response.json().await.unwrap();
     assert_eq!(loaded["home"]["last_read_id"], "status-123");
     assert_eq!(loaded["notifications"]["last_read_id"], "notif-456");
+
+    let default_get_response = server
+        .client
+        .get(server.url("/api/v1/markers"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default_get_response.status(), 200);
+    assert_eq!(
+        default_get_response.json::<Value>().await.unwrap(),
+        serde_json::json!({})
+    );
 }
 
 #[tokio::test]

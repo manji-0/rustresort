@@ -984,7 +984,7 @@ pub(crate) fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
             let collected = segments.collect::<Vec<_>>();
             collected
                 .windows(2)
-                .find_map(|window| (window[0] == "users").then_some(window[1]))
+                .find_map(|window| window[0].eq_ignore_ascii_case("users").then_some(window[1]))
                 .or_else(|| {
                     collected
                         .iter()
@@ -1002,6 +1002,18 @@ pub(crate) fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
         .filter(|value| !value.is_empty())?;
 
     Some(format!("{}@{}", username, domain))
+}
+
+fn actor_uri_placeholder_uses_uri_id(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    let Some(segments) = parsed.path_segments() else {
+        return false;
+    };
+    let collected = segments.collect::<Vec<_>>();
+    collected.windows(2).any(|window| window[0].eq_ignore_ascii_case("users"))
+        || collected.iter().any(|segment| segment.starts_with('@'))
 }
 
 fn canonical_remote_account_address(raw: &str) -> Option<String> {
@@ -1147,16 +1159,22 @@ pub(crate) fn build_remote_account_placeholder_response(
     statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
-    let (username, acct, url) =
+    let (id, username, acct, url) =
         if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
             let (username, _domain) = parsed_address.split_once('@')?;
             (
+                if actor_uri_placeholder_uses_uri_id(trimmed) {
+                    trimmed.to_string()
+                } else {
+                    parsed_address.clone()
+                },
                 username.to_string(),
                 parsed_address,
                 trimmed.to_string(),
             )
         } else if let Some((username, domain)) = trimmed.split_once('@') {
             (
+                trimmed.to_string(),
                 username.to_ascii_lowercase(),
                 trimmed.to_string(),
                 format!(
@@ -1173,7 +1191,7 @@ pub(crate) fn build_remote_account_placeholder_response(
     let header = format!("{}/default-header.png", media_url);
 
     Some(AccountResponse {
-        id: acct.clone(),
+        id,
         username: username.clone(),
         acct,
         uri: url.clone(),
@@ -1277,6 +1295,29 @@ pub(crate) async fn resolve_remote_account_response_for_list(
     raw_address: &str,
     default_port: Option<u16>,
 ) -> Option<AccountResponse> {
+    if let Some(response) = resolve_remote_account_response_for_list_without_placeholder(
+        config,
+        db,
+        profile_cache,
+        federation_fetch_client,
+        raw_address,
+    )
+    .await
+    {
+        return Some(response);
+    }
+
+    let statuses_count = observed_statuses_count_for_address(db, default_port, raw_address).await;
+    build_remote_account_placeholder_response(raw_address, config, statuses_count)
+}
+
+async fn resolve_remote_account_response_for_list_without_placeholder(
+    config: &crate::config::AppConfig,
+    db: &crate::data::Database,
+    profile_cache: &crate::data::ProfileCache,
+    federation_fetch_client: &reqwest::Client,
+    raw_address: &str,
+) -> Option<AccountResponse> {
     if let Some(response) =
         resolve_cached_remote_account_response(config, db, profile_cache, raw_address).await
     {
@@ -1299,8 +1340,7 @@ pub(crate) async fn resolve_remote_account_response_for_list(
         return Some(response);
     }
 
-    let statuses_count = observed_statuses_count_for_address(db, default_port, raw_address).await;
-    build_remote_account_placeholder_response(raw_address, config, statuses_count)
+    None
 }
 
 async fn remote_profile_lock_state(
@@ -1455,54 +1495,95 @@ fn extract_activity_collection_items(collection: &serde_json::Value) -> Vec<Stri
         .collect::<Vec<_>>()
 }
 
+fn extract_activity_collection_page_uri(
+    collection: &serde_json::Value,
+    key: &str,
+) -> Option<String> {
+    collection.get(key).and_then(|value| match value {
+        serde_json::Value::String(uri) => Some(uri.clone()),
+        serde_json::Value::Object(object) => object
+            .get("id")
+            .or_else(|| object.get("url"))
+            .and_then(|inner| inner.as_str())
+            .map(ToString::to_string),
+        _ => None,
+    })
+}
+
 async fn fetch_remote_collection_identities(
     state: &AccountApiState,
     target_address: &str,
     collection_key: &str,
     limit: usize,
-) -> Vec<String> {
+) -> Result<Vec<String>, AppError> {
     let Ok(Some((actor_uri, _locked))) = remote_profile_lock_state(state, target_address).await
     else {
-        return Vec::new();
+        return Err(AppError::NotFound);
     };
     let Some(actor_uri) = actor_uri else {
-        return Vec::new();
+        return Err(AppError::NotFound);
     };
 
-    let Ok(actor_document) =
-        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &actor_uri).await
-    else {
-        return Vec::new();
+    let actor_document =
+        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &actor_uri)
+            .await;
+    let Ok(actor_document) = actor_document else {
+        return Ok(Vec::new());
     };
     let Some(collection_uri) = extract_activity_collection_uri(&actor_document, collection_key)
     else {
-        return Vec::new();
-    };
-    let Ok(mut collection) =
-        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &collection_uri).await
-    else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
-    if extract_activity_collection_items(&collection).is_empty()
-        && let Some(first_uri) = collection.get("first").and_then(|value| match value {
-            serde_json::Value::String(uri) => Some(uri.clone()),
-            serde_json::Value::Object(object) => object
-                .get("id")
-                .and_then(|inner| inner.as_str())
-                .map(ToString::to_string),
-            _ => None,
-        })
-        && let Ok(first_page) =
-            fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &first_uri).await
+    let mut seen_pages = HashSet::new();
+    let mut seen_identities = HashSet::new();
+    let mut identities = Vec::new();
+    let initial_page =
+        fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &collection_uri).await;
+    let Ok(mut page) = initial_page else {
+        return Ok(Vec::new());
+    };
+
+    if extract_activity_collection_items(&page).is_empty()
+        && let Some(first_uri) = extract_activity_collection_page_uri(&page, "first")
     {
-        collection = first_page;
+        match fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &first_uri).await {
+            Ok(first_page) => page = first_page,
+            Err(_) => return Ok(Vec::new()),
+        }
     }
 
-    extract_activity_collection_items(&collection)
-        .into_iter()
-        .take(limit)
-        .collect()
+    loop {
+        let page_id = page
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&collection_uri)
+            .to_string();
+        if !seen_pages.insert(page_id) {
+            break;
+        }
+
+        for identity in extract_activity_collection_items(&page) {
+            if seen_identities.insert(identity.clone()) {
+                identities.push(identity);
+                if identities.len() >= limit {
+                    return Ok(identities);
+                }
+            }
+        }
+
+        let Some(next_uri) = extract_activity_collection_page_uri(&page, "next") else {
+            break;
+        };
+        let Ok(next_page) =
+            fetch_remote_activity_json(state.federation_fetch_client.as_ref(), &next_uri).await
+        else {
+            break;
+        };
+        page = next_page;
+    }
+
+    Ok(identities)
 }
 
 async fn resolve_remote_collection_accounts(
@@ -1510,11 +1591,13 @@ async fn resolve_remote_collection_accounts(
     target_address: &str,
     params: &PaginationParams,
     collection_key: &str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, AppError> {
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    let identities = fetch_remote_collection_identities(state, target_address, collection_key, 120)
-        .await;
+    let fetch_limit = limit.max(120).min(400);
+    let identities =
+        fetch_remote_collection_identities(state, target_address, collection_key, fetch_limit)
+            .await?;
 
     let mut resolved = Vec::new();
     for identity in identities {
@@ -1533,7 +1616,7 @@ async fn resolve_remote_collection_accounts(
         }
     }
 
-    paginate_account_response_values(resolved, params, limit)
+    Ok(paginate_account_response_values(resolved, params, limit))
 }
 
 async fn resolve_moved_account_response(
@@ -1994,13 +2077,12 @@ async fn resolve_remote_account_or_stub(
 ) -> serde_json::Value {
     let statuses_count =
         observed_statuses_count_for_address(state.db.as_ref(), default_port, &address).await;
-    if let Some(response) = resolve_remote_account_response_for_list(
+    if let Some(response) = resolve_remote_account_response_for_list_without_placeholder(
         state.config.as_ref(),
         state.db.as_ref(),
         state.profile_cache.as_ref(),
         state.federation_fetch_client.as_ref(),
         &address,
-        default_port,
     )
     .await
     {
@@ -2008,7 +2090,15 @@ async fn resolve_remote_account_or_stub(
             build_remote_account_stub(state.config.as_ref(), &address, statuses_count)
         });
     }
-    build_remote_account_stub(state.config.as_ref(), &address, statuses_count)
+
+    let mut stub = build_remote_account_stub(state.config.as_ref(), &address, statuses_count);
+    if url::Url::parse(&address)
+        .ok()
+        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+    {
+        stub["id"] = serde_json::Value::String(address);
+    }
+    stub
 }
 
 pub(crate) async fn resolve_remote_account_value_for_list(
@@ -2471,7 +2561,7 @@ pub async fn get_account_followers(
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
         return Ok(Json(
-            resolve_remote_collection_accounts(&state, &target_address, &params, "followers").await,
+            resolve_remote_collection_accounts(&state, &target_address, &params, "followers").await?,
         ));
     }
 
@@ -2543,7 +2633,7 @@ pub async fn get_account_following(
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
         return Ok(Json(
-            resolve_remote_collection_accounts(&state, &target_address, &params, "following").await,
+            resolve_remote_collection_accounts(&state, &target_address, &params, "following").await?,
         ));
     }
 
@@ -2962,6 +3052,9 @@ pub async fn search_accounts(
     // 2. Remote accounts (by address like user@domain.com)
 
     let query = params.q.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
     let mut results = vec![];
     let local_domain = state.config.server.domain.to_ascii_lowercase();
 
@@ -3575,15 +3668,7 @@ pub async fn get_follow_request(
         .await?
         .and_then(|(_, _, actor_uri)| actor_uri)
         .unwrap_or_else(|| requester_address.clone());
-    let account = resolve_remote_account_value_for_list(
-        state.config.as_ref(),
-        state.db.as_ref(),
-        state.profile_cache.as_ref(),
-        state.federation_fetch_client.as_ref(),
-        &actor_identity,
-        default_port,
-    )
-    .await;
+    let account = resolve_remote_account_or_stub(state.clone(), actor_identity, default_port).await;
 
     Ok(Json(account))
 }

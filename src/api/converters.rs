@@ -4,6 +4,7 @@ use crate::api::dto::*;
 use crate::config::AppConfig;
 use crate::data::{Account, Database, MediaAttachment, RemoteStatusAttachment, Status};
 use crate::error::AppError;
+use chrono::Utc;
 use std::collections::HashMap;
 
 /// Local account counters used in API responses.
@@ -97,6 +98,80 @@ fn status_content_to_source_text(content: &str) -> String {
         previous_blank = is_blank;
     }
     output
+}
+
+fn first_url_from_text(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let trimmed = token
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.'
+                )
+            })
+            .trim();
+        (!trimmed.is_empty()
+            && (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+            && url::Url::parse(trimmed).is_ok())
+        .then(|| trimmed.to_string())
+    })
+}
+
+pub fn build_status_card_value(status: &Status) -> Option<serde_json::Value> {
+    let text = status_content_to_source_text(&status.content);
+    let url = first_url_from_text(&text)?;
+    let parsed = url::Url::parse(&url).ok()?;
+    let provider_name = parsed.host_str().unwrap_or_default().to_string();
+    Some(serde_json::json!({
+        "url": url,
+        "title": provider_name,
+        "description": "",
+        "type": "link",
+        "author_name": "",
+        "author_url": "",
+        "provider_name": provider_name,
+        "provider_url": format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default()),
+        "html": "",
+        "width": 0,
+        "height": 0,
+        "image": serde_json::Value::Null,
+        "embed_url": "",
+        "blurhash": serde_json::Value::Null,
+    }))
+}
+
+async fn resolve_in_reply_to_account_id(
+    db: &Database,
+    status: &Status,
+    local_account_id: &str,
+) -> Result<Option<String>, AppError> {
+    let current_author = if status.is_local || status.account_address.trim().is_empty() {
+        "__local__".to_string()
+    } else {
+        status.account_address.trim().to_ascii_lowercase()
+    };
+    let mut next_parent_uri = status.in_reply_to_uri.clone();
+
+    while let Some(parent_uri) = next_parent_uri {
+        let Some(parent_status) = db.get_status_by_uri(&parent_uri).await? else {
+            return Ok(None);
+        };
+        if parent_status.is_local || parent_status.account_address.trim().is_empty() {
+            return Ok(Some(local_account_id.to_string()));
+        }
+        let parent_author = if parent_status.is_local || parent_status.account_address.trim().is_empty()
+        {
+            "__local__".to_string()
+        } else {
+            parent_status.account_address.trim().to_ascii_lowercase()
+        };
+        if parent_author != current_author {
+            return Ok(Some(parent_status.account_address));
+        }
+        next_parent_uri = parent_status.in_reply_to_uri.clone();
+    }
+
+    Ok(None)
 }
 
 fn build_status_tags(content: &str, base_url: &str) -> Vec<serde_json::Value> {
@@ -346,17 +421,7 @@ pub async fn build_status_response_with_media(
         &media_attachment_responses,
     );
     enrich_status_response(db, status, &mut response).await?;
-    if let Some(in_reply_to_uri) = status.in_reply_to_uri.as_deref()
-        && let Some(parent_status) = db.get_status_by_uri(in_reply_to_uri).await?
-    {
-        response.in_reply_to_account_id = Some(
-            if parent_status.is_local || parent_status.account_address.trim().is_empty() {
-                account.id.clone()
-            } else {
-                parent_status.account_address.clone()
-            },
-        );
-    }
+    response.in_reply_to_account_id = resolve_in_reply_to_account_id(db, status, &account.id).await?;
     if let Some(boost_of_uri) = status.boost_of_uri.as_deref()
         && boost_of_uri != status.uri
         && let Some(boosted_status) = db.get_status_by_uri(boost_of_uri).await?
@@ -368,6 +433,7 @@ pub async fn build_status_response_with_media(
     }
     response.poll = load_status_poll_response(db, &status.id, account, config).await?;
     response.filtered = load_status_filtered(db, status).await?;
+    response.card = build_status_card_value(status);
     if let Some(quote_of_uri) = status.quote_of_uri.as_deref()
         && let Some(quote_status) = db.get_status_by_uri(quote_of_uri).await?
     {
@@ -419,8 +485,37 @@ async fn load_status_filtered(
     let mut filtered = Vec::new();
 
     for (id, phrase, context, expires_at, irreversible, whole_word) in filters {
-        let normalized_phrase = phrase.trim().to_ascii_lowercase();
-        if !phrase_matches_text(&text, &normalized_phrase, whole_word) {
+        if expires_at.as_deref().is_some_and(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|datetime| datetime.with_timezone(&Utc) <= Utc::now())
+                .unwrap_or(false)
+        }) {
+            continue;
+        }
+
+        let keywords = db.get_filter_keywords(&id).await?;
+        let status_filters = db.get_filter_statuses(&id).await?;
+        let mut keyword_matches = Vec::new();
+
+        if keywords.is_empty() {
+            let normalized_phrase = phrase.trim().to_ascii_lowercase();
+            if phrase_matches_text(&text, &normalized_phrase, whole_word) {
+                keyword_matches.push(phrase.clone());
+            }
+        } else {
+            for (_keyword_id, keyword, keyword_whole_word) in keywords {
+                let normalized_keyword = keyword.trim().to_ascii_lowercase();
+                if phrase_matches_text(&text, &normalized_keyword, keyword_whole_word) {
+                    keyword_matches.push(keyword);
+                }
+            }
+        }
+
+        let status_matches = status_filters
+            .into_iter()
+            .filter_map(|(_filter_status_id, status_id)| (status_id == status.id).then_some(status_id))
+            .collect::<Vec<_>>();
+        if keyword_matches.is_empty() && status_matches.is_empty() {
             continue;
         }
 
@@ -438,8 +533,8 @@ async fn load_status_filtered(
                 "expires_at": expires_at,
                 "filter_action": if irreversible { "hide" } else { "warn" },
             },
-            "keyword_matches": [phrase],
-            "status_matches": [],
+            "keyword_matches": if keyword_matches.is_empty() { serde_json::Value::Null } else { serde_json::json!(keyword_matches) },
+            "status_matches": if status_matches.is_empty() { serde_json::Value::Null } else { serde_json::json!(status_matches) },
         }));
     }
 

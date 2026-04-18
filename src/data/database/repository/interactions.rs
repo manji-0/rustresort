@@ -437,6 +437,18 @@ impl Database {
         Ok(uri)
     }
 
+    /// Get the latest repost row ID for a status.
+    pub async fn get_repost_id(&self, status_id: &str) -> Result<Option<String>, AppError> {
+        let id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM reposts WHERE status_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
     /// Get a repost row by its Announce activity URI.
     pub async fn get_repost_by_uri(&self, uri: &str) -> Result<Option<Repost>, AppError> {
         sqlx::query_as::<_, Repost>("SELECT * FROM reposts WHERE uri = ? LIMIT 1")

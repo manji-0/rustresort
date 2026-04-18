@@ -522,6 +522,37 @@ async fn test_hashtag_stream_receives_remote_public_status_updates() {
 }
 
 #[tokio::test]
+async fn test_stream_root_public_is_accessible_without_auth() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming"))
+        .query(&[("stream", "public")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_stream_root_user_accepts_access_token_query_param() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/streaming"))
+        .query(&[("stream", "user"), ("access_token", token.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
 async fn test_local_hashtag_stream_excludes_remote_statuses_and_receives_local_statuses() {
     let server = TestServer::new().await;
     server.create_test_account().await;
