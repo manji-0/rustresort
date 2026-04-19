@@ -124,6 +124,47 @@ struct ParsedMediaUpload {
     focus: Option<(f64, f64)>,
 }
 
+fn infer_media_content_type(file_name: Option<&str>, bytes: &[u8]) -> Option<String> {
+    let from_extension = file_name
+        .and_then(|name| {
+            name.rsplit_once('.')
+                .map(|(_, ext)| ext.to_ascii_lowercase())
+        })
+        .and_then(|ext| match ext.as_str() {
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "png" => Some("image/png"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "mp4" | "m4v" => Some("video/mp4"),
+            "webm" => Some("video/webm"),
+            "mov" => Some("video/quicktime"),
+            _ => None,
+        });
+    if from_extension.is_some() {
+        return from_extension.map(ToString::to_string);
+    }
+
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return Some("image/png".to_string());
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg".to_string());
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif".to_string());
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp".to_string());
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some("video/mp4".to_string());
+    }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("video/webm".to_string());
+    }
+    None
+}
+
 async fn parse_media_upload(mut multipart: Multipart) -> Result<ParsedMediaUpload, AppError> {
     let mut file_data: Option<Vec<u8>> = None;
     let mut content_type: Option<String> = None;
@@ -139,19 +180,18 @@ async fn parse_media_upload(mut multipart: Multipart) -> Result<ParsedMediaUploa
 
         match field_name.as_str() {
             "file" => {
-                let detected_content_type =
-                    field
-                        .content_type()
-                        .map(|s| s.to_string())
-                        .ok_or(AppError::Validation(
-                            "Missing content type for uploaded file".to_string(),
-                        ))?;
-                let max_size = if detected_content_type.starts_with("image/") {
+                let field_file_name = field.file_name().map(ToString::to_string);
+                let declared_content_type = field.content_type().map(|s| s.to_string());
+                let provisional_content_type = declared_content_type
+                    .clone()
+                    .or_else(|| infer_media_content_type(field_file_name.as_deref(), &[]))
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let max_size = if provisional_content_type.starts_with("image/") {
                     MAX_IMAGE_UPLOAD_BYTES
-                } else if detected_content_type.starts_with("video/") {
+                } else if provisional_content_type.starts_with("video/") {
                     MAX_VIDEO_UPLOAD_BYTES
                 } else {
-                    return Err(AppError::Validation("Unsupported media type".to_string()));
+                    MAX_IMAGE_UPLOAD_BYTES
                 };
 
                 let mut bytes = Vec::new();
@@ -169,6 +209,9 @@ async fn parse_media_upload(mut multipart: Multipart) -> Result<ParsedMediaUploa
                     bytes.extend_from_slice(&chunk);
                 }
 
+                let detected_content_type = declared_content_type
+                    .or_else(|| infer_media_content_type(field_file_name.as_deref(), &bytes))
+                    .ok_or(AppError::Validation("Unsupported media type".to_string()))?;
                 content_type = Some(detected_content_type);
                 file_data = Some(bytes);
             }
@@ -192,9 +235,8 @@ async fn parse_media_upload(mut multipart: Multipart) -> Result<ParsedMediaUploa
     }
 
     let file_data = file_data.ok_or(AppError::Validation("No file provided".to_string()))?;
-    let content_type = content_type.ok_or(AppError::Validation(
-        "Missing content type for uploaded file".to_string(),
-    ))?;
+    let content_type =
+        content_type.ok_or(AppError::Validation("Unsupported media type".to_string()))?;
 
     Ok(ParsedMediaUpload {
         file_data,

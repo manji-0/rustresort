@@ -40,7 +40,7 @@ impl Database {
         status_id: &str,
     ) -> Result<Vec<MediaAttachment>, AppError> {
         let media = sqlx::query_as::<_, MediaAttachment>(
-            "SELECT * FROM media_attachments WHERE status_id = ?",
+            "SELECT * FROM media_attachments WHERE status_id = ? ORDER BY created_at ASC, id ASC",
         )
         .bind(status_id)
         .fetch_all(&self.pool)

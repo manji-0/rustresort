@@ -251,6 +251,27 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Look up the owning OAuth app for an access or refresh token, including
+    /// revoked tokens so revocation remains idempotent.
+    pub async fn lookup_oauth_token_owner(&self, token: &str) -> Result<Option<String>, AppError> {
+        let access_token_hash = hash_oauth_access_token(token);
+        let refresh_token_hash = hash_oauth_token_secret(token);
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT app_id
+            FROM oauth_tokens
+            WHERE access_token = ? OR refresh_token = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&access_token_hash)
+        .bind(&refresh_token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Get OAuth token by refresh token.
     pub async fn get_oauth_token_by_refresh_token(
         &self,

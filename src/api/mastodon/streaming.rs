@@ -26,10 +26,12 @@ use super::accounts::{
     build_remote_account_placeholder_response, resolve_account_response_for_identity,
 };
 use crate::StreamingApiState;
-use crate::auth::CurrentUser;
 use crate::data::{PersistedReason, Status, StatusVisibility};
 use crate::error::AppError;
 use crate::service::{EventReceiver, StreamEvent};
+
+const STREAM_SCOPE_USER: &[&str] = &["read:statuses", "read:notifications"];
+const STREAM_SCOPE_STATUSES: &[&str] = &["read:statuses"];
 
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
@@ -704,8 +706,13 @@ async fn multiplex_websocket_stream(
 /// Stream events for the authenticated user
 pub async fn stream_user(
     State(state): State<StreamingApiState>,
-    CurrentUser(_session): CurrentUser,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    enforce_stream_auth(auth.as_ref(), STREAM_SCOPE_USER)?;
     let account_id = state.config.auth.username.as_str();
     let receiver = state.streaming_event_bus.subscribe_user(account_id).await?;
     Ok(build_sse_stream(state, receiver, true))
@@ -717,10 +724,11 @@ pub async fn stream_public(
     State(state): State<StreamingApiState>,
     headers: HeaderMap,
     jar: CookieJar,
-    Query(_params): Query<StreamParams>,
+    Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public().await?;
-    let auth = authenticate_stream_request(&state, &headers, &jar, None).await?;
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
     Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
@@ -730,9 +738,11 @@ pub async fn stream_public_local(
     State(state): State<StreamingApiState>,
     headers: HeaderMap,
     jar: CookieJar,
+    Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public_local().await?;
-    let auth = authenticate_stream_request(&state, &headers, &jar, None).await?;
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
     Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
@@ -765,9 +775,13 @@ pub async fn stream_hashtag(
 /// Stream statuses from a specific list
 pub async fn stream_list(
     State(state): State<StreamingApiState>,
-    CurrentUser(_session): CurrentUser,
+    headers: HeaderMap,
+    jar: CookieJar,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    enforce_stream_auth(auth.as_ref(), STREAM_SCOPE_STATUSES)?;
     let list_id = params
         .list
         .ok_or(AppError::Validation("list parameter required".to_string()))?;
@@ -786,8 +800,13 @@ pub async fn stream_list(
 /// Stream direct messages
 pub async fn stream_direct(
     State(state): State<StreamingApiState>,
-    CurrentUser(_session): CurrentUser,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    enforce_stream_auth(auth.as_ref(), STREAM_SCOPE_STATUSES)?;
     let account_id = state.config.auth.username.as_str();
     let receiver = state
         .streaming_event_bus

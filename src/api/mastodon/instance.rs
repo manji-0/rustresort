@@ -8,7 +8,7 @@ use chrono::{Datelike, Timelike};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 
-use super::accounts::build_remote_account_placeholder_response;
+use super::accounts::resolve_cached_remote_account_response;
 use crate::InstanceApiState;
 use crate::api::mastodon::media::SUPPORTED_UPLOAD_MIME_TYPES;
 
@@ -18,10 +18,35 @@ const DEFAULT_INSTANCE_RULES: [&str; 3] = [
     "Content warnings are required for sensitive material.",
 ];
 
-const MASTODON_COMPAT_VERSION: &str = "4.2.0";
+const MASTODON_COMPAT_VERSION: &str = "4.3.0";
 
 fn instance_version_string() -> String {
     MASTODON_COMPAT_VERSION.to_string()
+}
+
+fn directory_sort_key(
+    value: &serde_json::Value,
+    order: Option<&str>,
+) -> (std::cmp::Reverse<i64>, std::cmp::Reverse<String>) {
+    match order {
+        Some("active") => (
+            std::cmp::Reverse(value["statuses_count"].as_i64().unwrap_or_default()),
+            std::cmp::Reverse(value["id"].as_str().unwrap_or_default().to_string()),
+        ),
+        _ => (
+            std::cmp::Reverse(
+                value["created_at"]
+                    .as_str()
+                    .map(|value| {
+                        value.as_bytes().iter().fold(0_i64, |acc, byte| {
+                            acc.wrapping_mul(31).wrapping_add(i64::from(*byte))
+                        })
+                    })
+                    .unwrap_or_default(),
+            ),
+            std::cmp::Reverse(value["id"].as_str().unwrap_or_default().to_string()),
+        ),
+    }
 }
 
 fn streaming_base_url(base_url: &str) -> Option<String> {
@@ -288,11 +313,32 @@ pub async fn trending_statuses(State(state): State<InstanceApiState>) -> Json<se
         .unwrap_or_default();
     let statuses = state
         .db
-        .get_local_public_statuses(10, None, None)
+        .get_local_public_statuses(50, None, None)
         .await
         .unwrap_or_default();
-    let mut results = Vec::new();
+    let mut ranked_statuses = Vec::with_capacity(statuses.len());
     for status in statuses {
+        let score = state
+            .db
+            .count_favourites(&status.id)
+            .await
+            .unwrap_or_default()
+            + state.db.count_reposts(&status.id).await.unwrap_or_default()
+            + state
+                .db
+                .count_quotes_by_uri(&status.uri)
+                .await
+                .unwrap_or_default();
+        ranked_statuses.push((score, status));
+    }
+    ranked_statuses.sort_by(|(left_score, left_status), (right_score, right_status)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right_status.created_at.cmp(&left_status.created_at))
+            .then_with(|| right_status.id.cmp(&left_status.id))
+    });
+    let mut results = Vec::new();
+    for (_, status) in ranked_statuses.into_iter().take(10) {
         if let Ok(response) = crate::api::build_status_response_with_account_stats(
             state.db.as_ref(),
             &status,
@@ -314,20 +360,36 @@ pub async fn trending_statuses(State(state): State<InstanceApiState>) -> Json<se
 pub async fn trending_links(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
     let statuses = state
         .db
-        .get_local_public_statuses(20, None, None)
+        .get_local_public_statuses(50, None, None)
         .await
         .unwrap_or_default();
-    let mut seen = BTreeSet::new();
-    let mut results = Vec::new();
+    let mut ranked_links = std::collections::HashMap::<String, (i64, serde_json::Value)>::new();
     for status in statuses {
         if let Some(card) = crate::api::build_status_card_value(&status)
             && let Some(url) = card.get("url").and_then(|value| value.as_str())
-            && seen.insert(url.to_string())
         {
-            results.push(card);
+            let score = state
+                .db
+                .count_favourites(&status.id)
+                .await
+                .unwrap_or_default()
+                + state.db.count_reposts(&status.id).await.unwrap_or_default()
+                + 1;
+            ranked_links
+                .entry(url.to_string())
+                .and_modify(|(total, _)| *total += score)
+                .or_insert((score, card));
         }
     }
-    Json(serde_json::Value::Array(results))
+    let mut ranked_links = ranked_links.into_values().collect::<Vec<_>>();
+    ranked_links.sort_by(|(left_score, _), (right_score, _)| right_score.cmp(left_score));
+    Json(serde_json::Value::Array(
+        ranked_links
+            .into_iter()
+            .take(10)
+            .map(|(_, card)| card)
+            .collect(),
+    ))
 }
 
 /// GET /api/v1/trends/tags
@@ -399,19 +461,22 @@ pub async fn directory(
 
     if !local_only {
         for profile in state.db.list_remote_profiles().await.unwrap_or_default() {
-            if let Some(response) = build_remote_account_placeholder_response(
-                &profile.address,
+            if let Some(response) = resolve_cached_remote_account_response(
                 state.config.as_ref(),
-                0,
-            ) && let Ok(value) = serde_json::to_value(response)
+                state.db.as_ref(),
+                state.profile_cache.as_ref(),
+                &profile.address,
+            )
+            .await
+                && let Ok(value) = serde_json::to_value(response)
             {
                 results.push(value);
             }
         }
     }
 
-    if matches!(params.order.as_deref(), Some("new")) {
-        results.reverse();
+    if matches!(params.order.as_deref(), Some("new" | "active")) {
+        results.sort_by_key(|value| directory_sort_key(value, params.order.as_deref()));
     }
     let results = if offset >= results.len() || limit == 0 {
         Vec::new()
@@ -682,7 +747,7 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "title": state.config.instance.title,
         "version": instance_version_string(),
         "api_versions": {
-            "mastodon": 9
+            "mastodon": 2
         },
         "source_url": env!("CARGO_PKG_REPOSITORY"),
         "description": state.config.instance.description,

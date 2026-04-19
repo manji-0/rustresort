@@ -22,6 +22,10 @@ pub enum AppError {
     #[error("Authentication required")]
     Unauthorized,
 
+    /// OAuth bearer token is invalid (401)
+    #[error("The access token is invalid")]
+    InvalidAccessToken,
+
     /// Access denied (403)
     #[error("Access denied")]
     Forbidden,
@@ -111,6 +115,12 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 self.to_string(),
                 "unauthorized",
+                false,
+            ),
+            AppError::InvalidAccessToken => (
+                StatusCode::UNAUTHORIZED,
+                self.to_string(),
+                "invalid_access_token",
                 false,
             ),
             AppError::InvalidSignature => (

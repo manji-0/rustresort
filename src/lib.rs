@@ -160,6 +160,7 @@ pub struct SearchApiState {
 pub struct InstanceApiState {
     pub config: Arc<config::AppConfig>,
     pub db: Arc<data::Database>,
+    pub profile_cache: Arc<data::ProfileCache>,
 }
 
 /// Minimal state required for Mastodon app registration and OAuth endpoints.
@@ -351,7 +352,11 @@ impl_from_ref_state!(AppsApiState {
     auth_rate_limiter,
     web_push_sender,
 });
-impl_from_ref_state!(InstanceApiState { config, db });
+impl_from_ref_state!(InstanceApiState {
+    config,
+    db,
+    profile_cache,
+});
 impl_from_ref_state!(AdminApiState {
     config,
     db,

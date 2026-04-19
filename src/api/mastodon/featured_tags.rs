@@ -81,6 +81,9 @@ pub async fn featured_tag_suggestions(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let profile_url_prefix =
+        crate::api::local_profile_url(&state.config.server.base_url(), &account.username);
     let tags = state
         .db
         .suggested_featured_tags(MAX_FEATURED_TAGS as usize)
@@ -91,7 +94,7 @@ pub async fn featured_tag_suggestions(
                 serde_json::json!({
                     "id": id,
                     "name": name,
-                    "url": format!("{}/tags/{}", state.config.server.base_url(), name),
+                    "url": format!("{profile_url_prefix}/tagged/{name}"),
                     "history": [],
                     "following": false
                 })

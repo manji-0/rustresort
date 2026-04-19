@@ -52,7 +52,6 @@ const WRITE_MUTES: &[&str] = &["write:mutes", "write:statuses", "write:accounts"
 const WRITE_ACCOUNTS_OR_STATUSES: &[&str] = &["write:accounts", "write:statuses"];
 const WRITE_FAVOURITES: &[&str] = &["write:favourites"];
 const READ_NOTIFICATIONS: &[&str] = &["read:notifications"];
-const READ_USER_STREAM: &[&str] = &["read:statuses", "read:notifications"];
 const WRITE_NOTIFICATIONS: &[&str] = &["write:notifications"];
 const WRITE_MEDIA: &[&str] = &["write:media"];
 const PUSH_SCOPE: &[&str] = &["push"];
@@ -400,6 +399,27 @@ where
             scoped(get(notifications::get_notifications_v2), READ_NOTIFICATIONS),
         )
         .route(
+            "/v2/notifications/:group_key",
+            scoped(
+                get(notifications::get_notification_group),
+                READ_NOTIFICATIONS,
+            ),
+        )
+        .route(
+            "/v2/notifications/:group_key/dismiss",
+            scoped(
+                post(notifications::dismiss_notification_group),
+                WRITE_NOTIFICATIONS,
+            ),
+        )
+        .route(
+            "/v2/notifications/:group_key/accounts",
+            scoped(
+                get(notifications::get_notification_group_accounts),
+                READ_NOTIFICATIONS,
+            ),
+        )
+        .route(
             "/v1/notifications/:id",
             scoped(get(notifications::get_notification), READ_NOTIFICATIONS),
         )
@@ -605,24 +625,15 @@ where
         // Streaming API
         .route("/v1/streaming/health", get(streaming::streaming_health))
         .route("/v1/streaming", get(streaming::stream_root))
-        .route(
-            "/v1/streaming/user",
-            scoped_all(get(streaming::stream_user), READ_USER_STREAM),
-        )
+        .route("/v1/streaming/user", get(streaming::stream_user))
         .route("/v1/streaming/public", get(streaming::stream_public))
         .route(
             "/v1/streaming/public/local",
             get(streaming::stream_public_local),
         )
         .route("/v1/streaming/hashtag", get(streaming::stream_hashtag))
-        .route(
-            "/v1/streaming/list",
-            scoped(get(streaming::stream_list), READ_STATUSES),
-        )
-        .route(
-            "/v1/streaming/direct",
-            scoped(get(streaming::stream_direct), READ_STATUSES),
-        )
+        .route("/v1/streaming/list", get(streaming::stream_list))
+        .route("/v1/streaming/direct", get(streaming::stream_direct))
         // Admin API
         .route(
             "/v1/admin/accounts",

@@ -3,6 +3,7 @@
 //! - /.well-known/webfinger
 //! - /.well-known/nodeinfo
 //! - /.well-known/host-meta
+//! - /.well-known/oauth-authorization-server
 
 use axum::{
     Router,
@@ -31,6 +32,10 @@ where
         .route("/.well-known/webfinger", get(webfinger))
         .route("/.well-known/nodeinfo", get(nodeinfo_links))
         .route("/.well-known/host-meta", get(host_meta))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_authorization_server),
+        )
         .route("/nodeinfo/2.0", get(nodeinfo))
 }
 
@@ -146,4 +151,64 @@ async fn host_meta(State(state): State<WellKnownState>) -> impl axum::response::
     );
 
     ([("Content-Type", "application/xrd+xml")], xml)
+}
+
+/// GET /.well-known/oauth-authorization-server
+///
+/// Returns OAuth 2 Authorization Server Metadata (RFC 8414).
+async fn oauth_authorization_server(
+    State(state): State<WellKnownState>,
+) -> Json<serde_json::Value> {
+    let base_url = state.config.server.base_url();
+    Json(serde_json::json!({
+        "issuer": format!("{}/", base_url.trim_end_matches('/')),
+        "service_documentation": "https://docs.joinmastodon.org/",
+        "authorization_endpoint": format!("{}/oauth/authorize", base_url),
+        "token_endpoint": format!("{}/oauth/token", base_url),
+        "app_registration_endpoint": format!("{}/api/v1/apps", base_url),
+        "revocation_endpoint": format!("{}/oauth/revoke", base_url),
+        "scopes_supported": [
+            "read",
+            "write",
+            "write:accounts",
+            "write:blocks",
+            "write:bookmarks",
+            "write:favourites",
+            "write:filters",
+            "write:follows",
+            "write:lists",
+            "write:media",
+            "write:mutes",
+            "write:notifications",
+            "write:reports",
+            "write:statuses",
+            "read:accounts",
+            "read:blocks",
+            "read:bookmarks",
+            "read:favourites",
+            "read:filters",
+            "read:follows",
+            "read:lists",
+            "read:mutes",
+            "read:notifications",
+            "read:search",
+            "read:statuses",
+            "follow",
+            "push",
+            "profile",
+            "admin:read",
+            "admin:read:accounts",
+            "admin:read:reports",
+            "admin:read:domain_blocks",
+            "admin:write",
+            "admin:write:accounts",
+            "admin:write:reports",
+            "admin:write:domain_blocks"
+        ],
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
+        "code_challenge_methods_supported": ["S256"],
+        "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
+    }))
 }

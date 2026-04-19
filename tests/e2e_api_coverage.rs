@@ -7,6 +7,17 @@ mod common;
 use common::TestServer;
 use serde_json::json;
 
+fn multipart_body_without_part_content_type(
+    boundary: &str,
+    field_name: &str,
+    file_name: &str,
+) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{file_name}\"\r\n\r\nPNGDATA\r\n--{boundary}--\r\n"
+    )
+    .into_bytes()
+}
+
 async fn cache_remote_profile(server: &TestServer, address: &str) {
     use chrono::Utc;
     use rustresort::data::CachedProfile;
@@ -3167,6 +3178,112 @@ async fn test_get_notifications_v2_groups_same_status_events() {
 }
 
 #[tokio::test]
+async fn test_get_notifications_v2_respects_grouped_types_filter_and_group_routes() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+    cache_remote_profile(&server, "bob@remote.example").await;
+
+    let status_uri = "https://remote.example/users/testuser/statuses/filter-group";
+    for (index, address) in ["alice@remote.example", "bob@remote.example"]
+        .into_iter()
+        .enumerate()
+    {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: EntityId::new_string(),
+                notification_type: NotificationType::Favourite,
+                origin_account_address: address.to_string(),
+                status_uri: Some(status_uri.to_string()),
+                read: false,
+                created_at: Utc::now() - Duration::seconds(index as i64),
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/notifications?grouped_types[]=follow"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let groups = body["notification_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(
+        groups[0]["group_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ungrouped-")
+    );
+
+    let grouped = server
+        .client
+        .get(server.url("/api/v2/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let group_key = grouped["notification_groups"][0]["group_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let accounts = server
+        .client
+        .get(server.url(&format!("/api/v2/notifications/{group_key}/accounts")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accounts.status(), 200);
+    assert_eq!(
+        accounts
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let dismiss = server
+        .client
+        .post(server.url(&format!("/api/v2/notifications/{group_key}/dismiss")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dismiss.status(), 200);
+
+    let after = server
+        .client
+        .get(server.url("/api/v2/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(after["notification_groups"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn test_notifications_return_origin_account() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Notification, NotificationType};
@@ -4677,6 +4794,106 @@ async fn test_get_lists() {
 }
 
 #[tokio::test]
+async fn test_upload_media_accepts_part_without_content_type() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let boundary = "rr-boundary";
+    let body = multipart_body_without_part_content_type(boundary, "file", "image.png");
+
+    let response = server
+        .client
+        .post(server.url("/api/v2/media"))
+        .header("Authorization", format!("Bearer {}", token))
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_streaming_endpoints_accept_query_access_token() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let list_id = server
+        .state
+        .db
+        .create_list("Streaming list", "list", false)
+        .await
+        .unwrap();
+
+    for path in [
+        format!("/api/v1/streaming/user?access_token={token}"),
+        format!("/api/v1/streaming/direct?access_token={token}"),
+        format!("/api/v1/streaming/list?access_token={token}&list={list_id}"),
+        format!("/api/v1/streaming/public?access_token={token}"),
+        format!("/api/v1/streaming/public/local?access_token={token}"),
+    ] {
+        let response = server.client.get(server.url(&path)).send().await.unwrap();
+        assert_eq!(response.status(), 200, "stream request failed for {path}");
+    }
+}
+
+#[tokio::test]
+async fn test_directory_uses_cached_remote_profiles_and_active_sort() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    persist_remote_profile(&server, "quiet@remote.example", "Quiet").await;
+    persist_remote_profile(&server, "busy@remote.example", "Busy").await;
+
+    let busy = rustresort::data::Status {
+        id: "busy-status".to_string(),
+        uri: "https://remote.example/users/busy/statuses/1".to_string(),
+        content: "busy".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Public,
+        language: None,
+        account_address: "busy@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Timeline,
+        created_at: chrono::Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&busy).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/directory?order=active"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    let accounts = body.as_array().unwrap();
+    assert!(
+        accounts
+            .iter()
+            .any(|value| value["display_name"] == "Quiet")
+    );
+    assert!(accounts.iter().any(|value| value["display_name"] == "Busy"));
+    let busy_index = accounts
+        .iter()
+        .position(|value| value["display_name"] == "Busy")
+        .unwrap();
+    let quiet_index = accounts
+        .iter()
+        .position(|value| value["display_name"] == "Quiet")
+        .unwrap();
+    assert!(busy_index < quiet_index);
+}
+
+#[tokio::test]
 async fn test_create_list() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -5493,6 +5710,37 @@ async fn test_search_v2_resolve_returns_remote_account_data() {
         accounts
             .iter()
             .any(|account| account["acct"] == remote_address)
+    );
+}
+
+#[tokio::test]
+async fn test_search_v2_without_resolve_does_not_expand_uncached_remote_account() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let remote_address = "uncached@remote.example";
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v2/search?q={}&type=accounts",
+            remote_address
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let accounts = body["accounts"]
+        .as_array()
+        .expect("search v2 accounts should be array");
+    assert!(
+        !accounts
+            .iter()
+            .any(|account| account["acct"] == remote_address),
+        "resolve=false should not trigger a remote lookup for uncached accounts"
     );
 }
 

@@ -276,9 +276,9 @@ pub async fn home_timeline(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;
@@ -600,9 +600,9 @@ pub async fn tag_timeline(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;
@@ -756,9 +756,9 @@ pub async fn list_timeline(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;
@@ -834,9 +834,9 @@ pub async fn direct_timeline(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;

@@ -194,6 +194,40 @@ fn extract_attachment_dimensions(value: &serde_json::Value) -> (Option<i32>, Opt
     (width, height)
 }
 
+fn infer_attachment_content_type(value: &serde_json::Value, remote_url: &str) -> String {
+    if let Some(media_type) = value.get("mediaType").and_then(serde_json::Value::as_str)
+        && !media_type.trim().is_empty()
+    {
+        return media_type.to_string();
+    }
+
+    if let Some(object_type) = value.get("type").and_then(serde_json::Value::as_str) {
+        match object_type {
+            "Image" => return "image/*".to_string(),
+            "Video" => return "video/*".to_string(),
+            "Audio" => return "audio/*".to_string(),
+            _ => {}
+        }
+    }
+
+    let extension = remote_url.split('?').next().and_then(|url| {
+        url.rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+    });
+    match extension.as_deref() {
+        Some("jpg" | "jpeg") => "image/jpeg".to_string(),
+        Some("png") => "image/png".to_string(),
+        Some("gif") => "image/gif".to_string(),
+        Some("webp") => "image/webp".to_string(),
+        Some("mp4" | "m4v") => "video/mp4".to_string(),
+        Some("webm") => "video/webm".to_string(),
+        Some("mov") => "video/quicktime".to_string(),
+        Some("mp3") => "audio/mpeg".to_string(),
+        Some("ogg") => "audio/ogg".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedQuestionPoll {
     expires_at: String,
@@ -2829,11 +2863,7 @@ impl ActivityProcessor {
                     status_id: status_id.to_string(),
                     remote_url: remote_url.clone(),
                     preview_url: value.get("icon").and_then(extract_first_uri_reference),
-                    content_type: value
-                        .get("mediaType")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("application/octet-stream")
-                        .to_string(),
+                    content_type: infer_attachment_content_type(value, &remote_url),
                     description: value
                         .get("name")
                         .and_then(serde_json::Value::as_str)
@@ -3540,13 +3570,9 @@ impl ActivityProcessor {
             };
 
             attachments.push(CachedAttachment {
-                url,
+                url: url.clone(),
                 thumbnail_url: value.get("icon").and_then(extract_first_uri_reference),
-                content_type: value
-                    .get("mediaType")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("application/octet-stream")
-                    .to_string(),
+                content_type: infer_attachment_content_type(value, &url),
                 description: value
                     .get("name")
                     .and_then(serde_json::Value::as_str)
@@ -4318,6 +4344,22 @@ mod tests {
             Some("https://remote.example/media/preview.jpg")
         );
         assert_eq!(attachments[0].blurhash.as_deref(), Some("hash"));
+    }
+
+    #[tokio::test]
+    async fn remote_status_attachments_from_object_infers_media_type_from_attachment_type() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "attachment": [{
+                "type": "Image",
+                "url": "https://remote.example/media/original-without-extension",
+            }]
+        });
+
+        let attachments =
+            processor.remote_status_attachments_from_object("status-2", &object, false);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].content_type, "image/*");
     }
 
     #[tokio::test]

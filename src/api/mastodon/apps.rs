@@ -1006,22 +1006,26 @@ pub async fn revoke_token(
     }
     if req.token.trim().is_empty() {
         return Ok(oauth_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "token is required",
+            StatusCode::FORBIDDEN,
+            "unauthorized_client",
+            "You are not authorized to revoke this token",
         ));
     }
-    let revoked = state
+
+    if let Some(owner_app_id) = state.db.lookup_oauth_token_owner(&req.token).await?
+        && owner_app_id != app.id
+    {
+        return Ok(oauth_error_response(
+            StatusCode::FORBIDDEN,
+            "unauthorized_client",
+            "You are not authorized to revoke this token",
+        ));
+    }
+
+    let _ = state
         .db
         .revoke_oauth_token_for_app(&app.id, &req.token)
         .await?;
-    if !revoked {
-        return Ok(oauth_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "token does not belong to this application",
-        ));
-    }
     Ok(Json(serde_json::json!({})).into_response())
 }
 

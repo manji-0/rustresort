@@ -340,13 +340,17 @@ impl TimelineService {
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
         let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
+        let muted_thread_uris = self.db.get_muted_thread_uris().await?;
 
         let mut items = Vec::with_capacity(statuses.len());
         for status in statuses {
             let reblogged = reposted_ids.contains(&status.id);
+            let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
             items.push(TimelineItem {
                 account: Self::timeline_account_from_status(&status),
                 bookmarked: bookmarked_ids.contains(&status.id),
+                muted: muted_thread_uris.contains(&thread_uri),
+                pinned: self.db.is_status_pinned(&status.id).await?,
                 status,
                 favourited: true,
                 reblogged,
@@ -377,13 +381,17 @@ impl TimelineService {
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
         let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
+        let muted_thread_uris = self.db.get_muted_thread_uris().await?;
 
         let mut items = Vec::with_capacity(statuses.len());
         for status in statuses {
             let reblogged = reposted_ids.contains(&status.id);
+            let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
             items.push(TimelineItem {
                 account: Self::timeline_account_from_status(&status),
                 favourited: favourited_ids.contains(&status.id),
+                muted: muted_thread_uris.contains(&thread_uri),
+                pinned: self.db.is_status_pinned(&status.id).await?,
                 status,
                 reblogged,
                 bookmarked: true,
@@ -444,20 +452,23 @@ impl TimelineService {
         let favourited_ids = self.db.get_favourited_status_ids_batch(&status_ids).await?;
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
         let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
+        let muted_thread_uris = self.db.get_muted_thread_uris().await?;
 
-        Ok(statuses
-            .into_iter()
-            .map(|status| {
-                let reblogged = reposted_ids.contains(&status.id);
-                TimelineItem {
-                    account: Self::timeline_account_from_status(&status),
-                    favourited: favourited_ids.contains(&status.id),
-                    bookmarked: bookmarked_ids.contains(&status.id),
-                    status,
-                    reblogged,
-                }
-            })
-            .collect())
+        let mut items = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            let reblogged = reposted_ids.contains(&status.id);
+            let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
+            items.push(TimelineItem {
+                account: Self::timeline_account_from_status(&status),
+                favourited: favourited_ids.contains(&status.id),
+                bookmarked: bookmarked_ids.contains(&status.id),
+                muted: muted_thread_uris.contains(&thread_uri),
+                pinned: self.db.is_status_pinned(&status.id).await?,
+                status,
+                reblogged,
+            });
+        }
+        Ok(items)
     }
 
     async fn resolve_cursor_key(
@@ -759,6 +770,10 @@ pub struct TimelineItem {
     pub reblogged: bool,
     /// Whether user has bookmarked this
     pub bookmarked: bool,
+    /// Whether the surrounding thread is muted
+    pub muted: bool,
+    /// Whether the status is pinned
+    pub pinned: bool,
 }
 
 /// Account info for timeline display

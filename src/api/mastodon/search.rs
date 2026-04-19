@@ -8,7 +8,10 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 
-use super::accounts::{resolve_account_response_for_identity, resolve_remote_account_response};
+use super::accounts::{
+    resolve_account_response_for_identity, resolve_cached_remote_account_response,
+    resolve_remote_account_response,
+};
 use crate::{SearchApiState, error::AppError};
 
 #[derive(Debug, Deserialize)]
@@ -250,15 +253,25 @@ pub async fn search_v2(
                     continue;
                 }
 
-                if let Some(remote_account) = resolve_remote_account_response(
-                    state.config.as_ref(),
-                    state.db.as_ref(),
-                    state.profile_cache.as_ref(),
-                    state.federation_fetch_client.as_ref(),
-                    &address,
-                )
-                .await
-                {
+                let remote_account = if params.resolve {
+                    resolve_remote_account_response(
+                        state.config.as_ref(),
+                        state.db.as_ref(),
+                        state.profile_cache.as_ref(),
+                        state.federation_fetch_client.as_ref(),
+                        &address,
+                    )
+                    .await
+                } else {
+                    resolve_cached_remote_account_response(
+                        state.config.as_ref(),
+                        state.db.as_ref(),
+                        state.profile_cache.as_ref(),
+                        &address,
+                    )
+                    .await
+                };
+                if let Some(remote_account) = remote_account {
                     let remote_identity =
                         canonical_account_identity(&remote_account.acct, &local_domain);
                     let already_present = accounts.iter().any(|account| {
@@ -319,24 +332,27 @@ pub async fn search_v2(
                                 }
                             })
                             .filter(|status| {
-                                matches!(
-                                    status.visibility,
-                                    crate::data::StatusVisibility::Public
-                                        | crate::data::StatusVisibility::Unlisted
-                                ) || target_account.as_ref().is_some_and(|target| {
-                                    target.id == account.id && status.is_local
-                                })
+                                viewer_authenticated
+                                    || matches!(
+                                        status.visibility,
+                                        crate::data::StatusVisibility::Public
+                                            | crate::data::StatusVisibility::Unlisted
+                                    )
+                                    || target_account.as_ref().is_some_and(|target| {
+                                        target.id == account.id && status.is_local
+                                    })
                             })
                             .collect::<Vec<_>>()
                     } else {
                         found_statuses
                             .into_iter()
                             .filter(|status| {
-                                matches!(
-                                    status.visibility,
-                                    crate::data::StatusVisibility::Public
-                                        | crate::data::StatusVisibility::Unlisted
-                                )
+                                viewer_authenticated
+                                    || matches!(
+                                        status.visibility,
+                                        crate::data::StatusVisibility::Public
+                                            | crate::data::StatusVisibility::Unlisted
+                                    )
                             })
                             .collect::<Vec<_>>()
                     };

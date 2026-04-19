@@ -2915,17 +2915,17 @@ pub async fn account_statuses(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                Some(is_pinned),
+                Some(item.pinned || is_pinned),
             )
         } else {
             crate::api::StatusInteractions::new(
                 Some(false),
                 Some(false),
-                None,
                 Some(false),
-                Some(is_pinned),
+                Some(false),
+                Some(item.pinned || is_pinned),
             )
         };
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(

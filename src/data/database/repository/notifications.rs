@@ -160,6 +160,32 @@ impl Database {
         Ok(notification)
     }
 
+    /// Get notifications belonging to a semantic notification group.
+    pub async fn get_notifications_by_group_scope(
+        &self,
+        notification_type: NotificationType,
+        scope: &str,
+    ) -> Result<Vec<Notification>, AppError> {
+        sqlx::query_as::<_, Notification>(
+            r#"
+            SELECT *
+            FROM notifications
+            WHERE notification_type = ?
+              AND (
+                    status_uri = ?
+                 OR (status_uri IS NULL AND origin_account_address = ?)
+              )
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )
+        .bind(notification_type)
+        .bind(scope)
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Mark all notifications as read
     pub async fn mark_all_notifications_read(&self) -> Result<(), AppError> {
         sqlx::query("UPDATE notifications SET read = 1")
@@ -183,6 +209,30 @@ impl Database {
         let result = sqlx::query("DELETE FROM notifications")
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete notifications belonging to a semantic notification group.
+    pub async fn delete_notifications_by_group_scope(
+        &self,
+        notification_type: NotificationType,
+        scope: &str,
+    ) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM notifications
+            WHERE notification_type = ?
+              AND (
+                    status_uri = ?
+                 OR (status_uri IS NULL AND origin_account_address = ?)
+              )
+            "#,
+        )
+        .bind(notification_type)
+        .bind(scope)
+        .bind(scope)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 

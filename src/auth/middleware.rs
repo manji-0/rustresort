@@ -71,12 +71,12 @@ async fn authenticate_oauth_bearer_token(
         .db
         .get_oauth_token(token)
         .await?
-        .ok_or(AppError::Unauthorized)?;
+        .ok_or(AppError::InvalidAccessToken)?;
     let account = state
         .db
         .get_account()
         .await?
-        .ok_or(AppError::Unauthorized)?;
+        .ok_or(AppError::InvalidAccessToken)?;
     let scopes = oauth_token
         .scopes
         .split_whitespace()
@@ -102,7 +102,7 @@ async fn authenticate_user_oauth_bearer_token(
 ) -> Result<(Session, Option<OAuthAccess>), AppError> {
     let (session, oauth_access) = authenticate_oauth_bearer_token(state, token).await?;
     let Some(oauth_access) = oauth_access else {
-        return Err(AppError::Unauthorized);
+        return Err(AppError::InvalidAccessToken);
     };
     if !oauth_grant_represents_user_session(&oauth_access.grant_type) {
         return Err(AppError::Unprocessable(
@@ -134,7 +134,7 @@ pub async fn require_app_auth(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let token = bearer_token(request.headers()).ok_or(AppError::Unauthorized)?;
+    let token = bearer_token(request.headers()).ok_or(AppError::InvalidAccessToken)?;
     let (_, oauth_access) = authenticate_oauth_bearer_token(&state, &token).await?;
     let mut request = request;
     if let Some(oauth_access) = oauth_access {
@@ -346,6 +346,6 @@ where
             .get::<OAuthAccess>()
             .cloned()
             .map(CurrentOAuthAccess)
-            .ok_or(AppError::Unauthorized)
+            .ok_or(AppError::InvalidAccessToken)
     }
 }

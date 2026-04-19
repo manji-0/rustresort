@@ -114,14 +114,9 @@ fn interaction_account_link_header(
         links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
     }
     if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
-        let cursor_key = if first_id.is_empty() {
-            "min_id"
-        } else {
-            "since_id"
-        };
         links.push(format!(
             "<{}>; rel=\"prev\"",
-            build_path(cursor_key, first_id)
+            build_path("min_id", first_id)
         ));
     }
     (!links.is_empty()).then(|| links.join(", "))

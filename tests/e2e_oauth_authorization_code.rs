@@ -566,3 +566,93 @@ async fn test_oauth_revoke_returns_oauth_error_for_invalid_client_credentials() 
     let body = response.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["error"], "invalid_client");
 }
+
+#[tokio::test]
+async fn test_oauth_revoke_rejects_foreign_token_with_unauthorized_client() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let first_app = server
+        .create_oauth_app("https://client.example/callback", "read:accounts")
+        .await;
+    let second_app = server
+        .create_oauth_app("https://other.example/callback", "read:accounts")
+        .await;
+
+    let token = server
+        .create_oauth_authorization_code_token_for_app(
+            first_app["client_id"].as_str().unwrap(),
+            first_app["client_secret"].as_str().unwrap(),
+            "https://client.example/callback",
+            "read:accounts",
+        )
+        .await;
+
+    let revoke = server
+        .client
+        .post(server.url("/oauth/revoke"))
+        .form(&[
+            ("client_id", second_app["client_id"].as_str().unwrap()),
+            (
+                "client_secret",
+                second_app["client_secret"].as_str().unwrap(),
+            ),
+            ("token", token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(revoke.status(), StatusCode::FORBIDDEN);
+    let body = revoke.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["error"], "unauthorized_client");
+}
+
+#[tokio::test]
+async fn test_oauth_metadata_endpoint_exposes_mastodon_compatible_server_metadata() {
+    let server = TestServer::new().await;
+
+    let response = server
+        .client
+        .get(server.url("/.well-known/oauth-authorization-server"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(
+        body["authorization_endpoint"],
+        "https://test.example.com/oauth/authorize"
+    );
+    assert_eq!(
+        body["app_registration_endpoint"],
+        "https://test.example.com/api/v1/apps"
+    );
+    assert_eq!(
+        body["token_endpoint_auth_methods_supported"],
+        serde_json::json!(["client_secret_basic", "client_secret_post"])
+    );
+    assert_eq!(
+        body["code_challenge_methods_supported"],
+        serde_json::json!(["S256"])
+    );
+}
+
+#[tokio::test]
+async fn test_invalid_bearer_token_returns_mastodon_style_error_payload() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/accounts/verify_credentials"))
+        .bearer_auth("bogus-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["error"], "The access token is invalid");
+}

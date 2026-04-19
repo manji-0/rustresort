@@ -5,6 +5,7 @@ use axum::{
     http::{HeaderMap, header::LINK},
     response::{IntoResponse, Json},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +25,15 @@ pub struct NotificationQueryParams {
 
 fn parse_notification_query(
     raw_query: Option<&str>,
-) -> Result<(NotificationQueryParams, Vec<String>, Vec<String>), AppError> {
+) -> Result<
+    (
+        NotificationQueryParams,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    ),
+    AppError,
+> {
     let mut pagination = PaginationParams {
         max_id: None,
         since_id: None,
@@ -34,8 +43,14 @@ fn parse_notification_query(
 
     let mut include = Vec::new();
     let mut exclude = Vec::new();
+    let mut grouped = Vec::new();
     let Some(raw_query) = raw_query else {
-        return Ok((NotificationQueryParams { pagination }, include, exclude));
+        return Ok((
+            NotificationQueryParams { pagination },
+            include,
+            exclude,
+            grouped,
+        ));
     };
 
     for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
@@ -50,11 +65,17 @@ fn parse_notification_query(
             }
             "types[]" => include.push(value.into_owned()),
             "exclude_types[]" => exclude.push(value.into_owned()),
+            "grouped_types[]" => grouped.push(value.into_owned()),
             _ => {}
         }
     }
 
-    Ok((NotificationQueryParams { pagination }, include, exclude))
+    Ok((
+        NotificationQueryParams { pagination },
+        include,
+        exclude,
+        grouped,
+    ))
 }
 
 fn parse_notification_type_filter(raw: &str) -> Option<NotificationType> {
@@ -103,7 +124,197 @@ pub(crate) fn notification_group_key(notification: &crate::data::Notification) -
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(notification.origin_account_address.as_str());
-    format!("{}::{scope}", notification.notification_type.as_str())
+    format!(
+        "{}::{}",
+        notification.notification_type.as_str(),
+        URL_SAFE_NO_PAD.encode(scope)
+    )
+}
+
+fn notification_type_supports_grouping(notification_type: NotificationType) -> bool {
+    matches!(
+        notification_type,
+        NotificationType::Favourite
+            | NotificationType::Follow
+            | NotificationType::Reblog
+            | NotificationType::AdminSignUp
+    )
+}
+
+fn notification_group_key_v2(
+    notification: &crate::data::Notification,
+    grouped_types: &[NotificationType],
+) -> String {
+    let supported = notification_type_supports_grouping(notification.notification_type);
+    let enabled = grouped_types.is_empty()
+        || grouped_types
+            .iter()
+            .any(|value| *value == notification.notification_type);
+    if supported && enabled {
+        notification_group_key(notification)
+    } else {
+        format!("ungrouped-{}", notification.id)
+    }
+}
+
+fn parse_notification_group_key(
+    group_key: &str,
+) -> Result<Option<(NotificationType, String)>, AppError> {
+    if let Some(id) = group_key.strip_prefix("ungrouped-") {
+        if id.trim().is_empty() {
+            return Err(AppError::Validation(
+                "invalid notification group key".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let (raw_type, encoded_scope) = group_key
+        .split_once("::")
+        .ok_or_else(|| AppError::Validation("invalid notification group key".to_string()))?;
+    let notification_type = parse_notification_type_filter(raw_type)
+        .ok_or_else(|| AppError::Validation("invalid notification group key".to_string()))?;
+    let scope = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(encoded_scope)
+            .map_err(|_| AppError::Validation("invalid notification group key".to_string()))?,
+    )
+    .map_err(|_| AppError::Validation("invalid notification group key".to_string()))?;
+    if scope.trim().is_empty() {
+        return Err(AppError::Validation(
+            "invalid notification group key".to_string(),
+        ));
+    }
+    Ok(Some((notification_type, scope)))
+}
+
+async fn load_notification_group(
+    state: &TimelineApiState,
+    group_key: &str,
+) -> Result<Vec<crate::data::Notification>, AppError> {
+    match parse_notification_group_key(group_key)? {
+        None => {
+            let id = group_key
+                .strip_prefix("ungrouped-")
+                .expect("checked prefix above");
+            let notification = state
+                .db
+                .get_notification(id)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            Ok(vec![notification])
+        }
+        Some((notification_type, scope)) => {
+            let notifications = state
+                .db
+                .get_notifications_by_group_scope(notification_type, &scope)
+                .await?;
+            if notifications.is_empty() {
+                return Err(AppError::NotFound);
+            }
+            Ok(notifications)
+        }
+    }
+}
+
+async fn delete_notification_group(
+    state: &TimelineApiState,
+    group_key: &str,
+) -> Result<u64, AppError> {
+    match parse_notification_group_key(group_key)? {
+        None => {
+            let id = group_key
+                .strip_prefix("ungrouped-")
+                .expect("checked prefix above");
+            Ok(u64::from(state.db.delete_notification(id).await?))
+        }
+        Some((notification_type, scope)) => {
+            state
+                .db
+                .delete_notifications_by_group_scope(notification_type, &scope)
+                .await
+        }
+    }
+}
+
+async fn build_grouped_notifications_result(
+    state: &TimelineApiState,
+    notifications: Vec<crate::data::Notification>,
+    grouped_types: &[NotificationType],
+) -> Result<serde_json::Value, AppError> {
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    let mut accounts = Vec::new();
+    let mut seen_account_ids = HashSet::new();
+    let mut statuses = Vec::new();
+    let mut seen_status_ids = HashSet::new();
+    let mut group_positions = HashMap::<String, usize>::new();
+
+    for notification in notifications {
+        let group_key = notification_group_key_v2(&notification, grouped_types);
+        let account =
+            build_notification_account_response(state, &notification.origin_account_address)
+                .await?;
+        if seen_account_ids.insert(account.id.clone()) {
+            accounts.push(serde_json::to_value(account.clone()).map_err(|error| {
+                AppError::serialization("notification v2 account response", error)
+            })?);
+        }
+
+        let status_id = if let Some(status_uri) = &notification.status_uri {
+            if let Some(status) = get_notification_status(state, status_uri).await {
+                let status_response = build_notification_status_response(state, &status).await?;
+                if seen_status_ids.insert(status_response.id.clone()) {
+                    statuses.push(serde_json::to_value(status_response.clone()).map_err(
+                        |error| AppError::serialization("notification v2 status response", error),
+                    )?);
+                }
+                Some(status_response.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(index) = group_positions.get(&group_key).copied() {
+            let group = groups
+                .get_mut(index)
+                .expect("existing notification group index must be valid");
+            let sample_account_ids = group["sample_account_ids"]
+                .as_array_mut()
+                .expect("sample_account_ids should be an array");
+            let account_id_value = serde_json::json!(account.id.clone());
+            if !sample_account_ids.contains(&account_id_value) {
+                sample_account_ids.push(account_id_value);
+            }
+            group["notifications_count"] =
+                serde_json::json!(group["notifications_count"].as_u64().unwrap_or_default() + 1);
+            group["page_min_id"] = serde_json::json!(notification.id);
+            if group["status_id"].is_null() && status_id.is_some() {
+                group["status_id"] = serde_json::json!(status_id);
+            }
+            continue;
+        }
+
+        group_positions.insert(group_key.clone(), groups.len());
+        groups.push(serde_json::json!({
+            "group_key": group_key,
+            "type": notification.notification_type.to_string(),
+            "latest_page_notification_at": notification.created_at,
+            "most_recent_notification_id": notification.id,
+            "page_min_id": notification.id,
+            "page_max_id": notification.id,
+            "notifications_count": 1,
+            "sample_account_ids": [account.id.clone()],
+            "status_id": status_id,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "accounts": accounts,
+        "statuses": statuses,
+        "notification_groups": groups,
+    }))
 }
 
 async fn load_notifications_page(
@@ -283,6 +494,7 @@ fn notification_link_header(
     has_next: bool,
     include_types: &[String],
     exclude_types: &[String],
+    grouped_types: &[String],
 ) -> Option<String> {
     let build_path = |cursor_key: &str, cursor_value: &str| {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -293,6 +505,9 @@ fn notification_link_header(
         }
         for exclude in exclude_types {
             serializer.append_pair("exclude_types[]", exclude);
+        }
+        for grouped in grouped_types {
+            serializer.append_pair("grouped_types[]", grouped);
         }
         format!("{endpoint}?{}", serializer.finish())
     };
@@ -318,7 +533,7 @@ pub async fn get_notifications(
 ) -> Result<impl IntoResponse, AppError> {
     use crate::api::dto::NotificationResponse;
 
-    let (params, raw_include_types, raw_exclude_types) =
+    let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let include_types = raw_include_types
@@ -388,6 +603,7 @@ pub async fn get_notifications(
         has_next,
         &raw_include_types,
         &raw_exclude_types,
+        &raw_grouped_types,
     ) {
         headers.insert(
             LINK,
@@ -405,7 +621,7 @@ pub async fn get_notifications_v2(
     CurrentUser(_session): CurrentUser,
     raw_query: RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
-    let (params, raw_include_types, raw_exclude_types) =
+    let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let include_types = raw_include_types
@@ -416,85 +632,26 @@ pub async fn get_notifications_v2(
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
         .collect::<Vec<_>>();
+    let grouped_types = raw_grouped_types
+        .iter()
+        .filter_map(|value| parse_notification_type_filter(value))
+        .collect::<Vec<_>>();
     let (notifications, has_next) =
         load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
     let has_prev = params.pagination.max_id.is_some()
         || params.pagination.min_id.is_some()
         || params.pagination.since_id.is_some();
+    let body = build_grouped_notifications_result(&state, notifications, &grouped_types).await?;
 
-    let mut groups: Vec<serde_json::Value> = Vec::new();
-    let mut accounts = Vec::new();
-    let mut seen_account_ids = HashSet::new();
-    let mut statuses = Vec::new();
-    let mut seen_status_ids = HashSet::new();
-    let mut group_positions = HashMap::<String, usize>::new();
-    for notification in notifications {
-        let group_key = notification_group_key(&notification);
-        let account =
-            build_notification_account_response(&state, &notification.origin_account_address)
-                .await?;
-        if seen_account_ids.insert(account.id.clone()) {
-            accounts.push(serde_json::to_value(account.clone()).map_err(|error| {
-                AppError::serialization("notification v2 account response", error)
-            })?);
-        }
-
-        let status_id = if let Some(status_uri) = &notification.status_uri {
-            if let Some(status) = get_notification_status(&state, status_uri).await {
-                let status_response = build_notification_status_response(&state, &status).await?;
-                if seen_status_ids.insert(status_response.id.clone()) {
-                    statuses.push(serde_json::to_value(status_response.clone()).map_err(
-                        |error| AppError::serialization("notification v2 status response", error),
-                    )?);
-                }
-                Some(status_response.id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(index) = group_positions.get(&group_key).copied() {
-            let group: &mut serde_json::Value = groups
-                .get_mut(index)
-                .expect("existing notification group index must be valid");
-            let sample_account_ids = group["sample_account_ids"]
-                .as_array_mut()
-                .expect("sample_account_ids should be an array");
-            let account_id_value = serde_json::json!(account.id.clone());
-            if !sample_account_ids.contains(&account_id_value) {
-                sample_account_ids.push(account_id_value);
-            }
-            group["notifications_count"] =
-                serde_json::json!(group["notifications_count"].as_u64().unwrap_or_default() + 1);
-            group["page_min_id"] = serde_json::json!(notification.id);
-            if group["status_id"].is_null() && status_id.is_some() {
-                group["status_id"] = serde_json::json!(status_id);
-            }
-            continue;
-        }
-
-        group_positions.insert(group_key.clone(), groups.len());
-        groups.push(serde_json::json!({
-            "group_key": group_key,
-            "type": notification.notification_type.to_string(),
-            "latest_page_notification_at": notification.created_at,
-            "most_recent_notification_id": notification.id,
-            "page_min_id": notification.id,
-            "page_max_id": notification.id,
-            "notifications_count": 1,
-            "sample_account_ids": [account.id.clone()],
-            "status_id": status_id,
-        }));
-    }
-
-    let first_id = groups
-        .first()
+    let first_id = body["notification_groups"]
+        .as_array()
+        .and_then(|groups| groups.first())
         .and_then(|value| value.get("most_recent_notification_id"))
         .and_then(|value| value.as_str());
-    let last_id = groups
-        .last()
-        .and_then(|value| value.get("most_recent_notification_id"))
+    let last_id = body["notification_groups"]
+        .as_array()
+        .and_then(|groups| groups.last())
+        .and_then(|value| value.get("page_min_id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
     if let Some(link) = notification_link_header(
@@ -506,6 +663,7 @@ pub async fn get_notifications_v2(
         has_next,
         &raw_include_types,
         &raw_exclude_types,
+        &raw_grouped_types,
     ) {
         headers.insert(
             LINK,
@@ -514,14 +672,42 @@ pub async fn get_notifications_v2(
         );
     }
 
-    Ok((
-        headers,
-        Json(serde_json::json!({
-            "accounts": accounts,
-            "statuses": statuses,
-            "notification_groups": groups,
-        })),
-    ))
+    Ok((headers, Json(body)))
+}
+
+/// GET /api/v2/notifications/:group_key
+pub async fn get_notification_group(
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(group_key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let notifications = load_notification_group(&state, &group_key).await?;
+    let body = build_grouped_notifications_result(&state, notifications, &[]).await?;
+    Ok(Json(body))
+}
+
+/// POST /api/v2/notifications/:group_key/dismiss
+pub async fn dismiss_notification_group(
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(group_key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = delete_notification_group(&state, &group_key).await?;
+    if deleted == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(serde_json::json!({})))
+}
+
+/// GET /api/v2/notifications/:group_key/accounts
+pub async fn get_notification_group_accounts(
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
+    Path(group_key): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let notifications = load_notification_group(&state, &group_key).await?;
+    let body = build_grouped_notifications_result(&state, notifications, &[]).await?;
+    Ok(Json(body["accounts"].clone()))
 }
 
 /// POST /api/v1/notifications/:id/dismiss
