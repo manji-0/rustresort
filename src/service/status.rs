@@ -1465,6 +1465,8 @@ mod tests {
                 created_at: Utc::now(),
                 visibility: "private".to_string(),
                 attachments: vec![],
+                mentions: vec![],
+                tags: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
                 quote_of_uri: None,

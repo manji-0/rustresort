@@ -35,6 +35,17 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn get_all_follow_request_details(
+        &self,
+    ) -> Result<Vec<(String, Option<String>)>, AppError> {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT requester_address, actor_uri FROM follow_requests ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
     /// Resolve a follow-request path identity to the stored requester address.
     ///
     /// Accepts either the raw requester address or a stored canonical actor URI.

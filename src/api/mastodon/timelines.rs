@@ -128,6 +128,28 @@ fn parse_tag_timeline_params(raw_query: Option<&str>) -> Result<TagTimelineParam
     Ok(params)
 }
 
+async fn enrich_timeline_status_response(
+    state: &TimelineApiState,
+    status: &crate::data::Status,
+    response: &mut crate::api::StatusResponse,
+    filter_context: &str,
+) {
+    if matches!(
+        status.persisted_reason,
+        crate::data::PersistedReason::CacheOnly
+    ) {
+        let cached = if let Some(cached) = state.timeline_cache.get(&status.id).await {
+            Some(cached)
+        } else {
+            state.timeline_cache.get_by_uri(&status.uri).await
+        };
+        if let Some(cached) = cached {
+            crate::api::apply_cached_status_metadata(response, &cached);
+        }
+    }
+    crate::api::apply_filtered_context(response, filter_context);
+}
+
 async fn status_has_media(state: &TimelineApiState, status_id: &str) -> bool {
     state
         .db
@@ -214,6 +236,10 @@ fn timeline_filter_overfetch_limit(limit: usize) -> usize {
         .saturating_mul(TIMELINE_FILTER_OVERFETCH_MULTIPLIER)
         .max(limit)
         .min(TIMELINE_FILTER_OVERFETCH_MAX_LIMIT)
+}
+
+fn has_prev_cursor(params: &PaginationParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
 }
 
 async fn load_exclusive_list_members(
@@ -396,7 +422,7 @@ pub async fn home_timeline(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
-        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
             &account,
@@ -412,6 +438,7 @@ pub async fn home_timeline(
             ),
         )
         .await?;
+        enrich_timeline_status_response(&state, &item.status, &mut response, "home").await;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -426,7 +453,7 @@ pub async fn home_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
-        !timeline_items.is_empty(),
+        has_prev_cursor(&params),
         timeline_items.len() == limit,
         &[],
     ) {
@@ -578,7 +605,7 @@ pub async fn public_timeline(
         } else {
             crate::api::StatusInteractions::public()
         };
-        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
             &account,
@@ -588,6 +615,7 @@ pub async fn public_timeline(
             interactions,
         )
         .await?;
+        enrich_timeline_status_response(&state, &item.status, &mut response, "public").await;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -613,7 +641,7 @@ pub async fn public_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
-        !timeline_items.is_empty(),
+        has_prev_cursor(&params.pagination),
         timeline_items.len() == limit,
         &extra_params,
     ) {
@@ -724,7 +752,7 @@ pub async fn tag_timeline(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
-        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
             &account,
@@ -740,6 +768,7 @@ pub async fn tag_timeline(
             ),
         )
         .await?;
+        enrich_timeline_status_response(&state, &item.status, &mut response, "public").await;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -770,7 +799,7 @@ pub async fn tag_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
-        !timeline_items.is_empty(),
+        has_prev_cursor(&params.pagination),
         timeline_items.len() == limit,
         &extra_params,
     ) {
@@ -907,7 +936,7 @@ pub async fn list_timeline(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
-        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
             &account,
@@ -923,6 +952,7 @@ pub async fn list_timeline(
             ),
         )
         .await?;
+        enrich_timeline_status_response(&state, &item.status, &mut response, "home").await;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -936,7 +966,7 @@ pub async fn list_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
-        !timeline_items.is_empty(),
+        has_prev_cursor(&params),
         timeline_items.len() == limit,
         &[],
     ) {
@@ -991,7 +1021,7 @@ pub async fn direct_timeline(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
-        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
             &account,
@@ -1007,6 +1037,7 @@ pub async fn direct_timeline(
             ),
         )
         .await?;
+        enrich_timeline_status_response(&state, &item.status, &mut response, "home").await;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
@@ -1016,7 +1047,7 @@ pub async fn direct_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
-        !timeline_items.is_empty(),
+        has_prev_cursor(&params),
         has_next,
         &[],
     ) {

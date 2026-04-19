@@ -82,6 +82,8 @@ pub struct UpdateCredentialsRequest {
     pub source_sensitive: Option<bool>,
     #[serde(rename = "source[language]")]
     pub source_language: Option<String>,
+    #[serde(rename = "source[quote_policy]")]
+    pub source_quote_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +91,7 @@ pub struct UpdateCredentialsSourceRequest {
     pub privacy: Option<String>,
     pub sensitive: Option<bool>,
     pub language: Option<String>,
+    pub quote_policy: Option<String>,
 }
 
 #[derive(Debug)]
@@ -118,6 +121,7 @@ struct ParsedUpdateCredentialsRequest {
     source_privacy: Option<String>,
     source_sensitive: Option<bool>,
     source_language: Option<Option<String>>,
+    source_quote_policy: Option<String>,
 }
 
 /// Search query parameters
@@ -148,6 +152,7 @@ const DEFAULT_POSTING_PRIVACY: &str = "public";
 const POSTING_DEFAULT_VISIBILITY_KEY: &str = "posting.default.visibility";
 const POSTING_DEFAULT_SENSITIVE_KEY: &str = "posting.default.sensitive";
 const POSTING_DEFAULT_LANGUAGE_KEY: &str = "posting.default.language";
+const POSTING_DEFAULT_QUOTE_POLICY_KEY: &str = "posting.default.quote_policy";
 const PROFILE_HIDE_COLLECTIONS_KEY: &str = "profile.hide_collections";
 const PROFILE_SHOW_MEDIA_KEY: &str = "profile.show_media";
 const PROFILE_SHOW_MEDIA_REPLIES_KEY: &str = "profile.show_media_replies";
@@ -160,6 +165,7 @@ struct PostingPreferences {
     privacy: String,
     sensitive: bool,
     language: Option<String>,
+    quote_policy: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -190,6 +196,10 @@ fn parse_setting_bool(value: Option<String>, default: bool) -> bool {
 
 fn normalize_follow_setting_key_suffix(address: &str) -> String {
     address.trim().to_ascii_lowercase()
+}
+
+fn has_prev_cursor(params: &PaginationParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
 }
 
 fn follow_reblogs_setting_key(address: &str) -> String {
@@ -227,11 +237,18 @@ async fn load_posting_preferences(state: &AccountApiState) -> Result<PostingPref
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
+    let quote_policy = state
+        .db
+        .get_setting(POSTING_DEFAULT_QUOTE_POLICY_KEY)
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "public".to_string());
 
     Ok(PostingPreferences {
         privacy,
         sensitive,
         language,
+        quote_policy,
     })
 }
 
@@ -240,6 +257,7 @@ async fn save_posting_preferences(
     privacy: Option<String>,
     sensitive: Option<bool>,
     language: Option<Option<String>>,
+    quote_policy: Option<String>,
 ) -> Result<(), AppError> {
     if let Some(privacy) = privacy {
         let trimmed = privacy.trim();
@@ -274,6 +292,19 @@ async fn save_posting_preferences(
                 POSTING_DEFAULT_LANGUAGE_KEY,
                 language.as_deref().unwrap_or_default(),
             )
+            .await?;
+    }
+
+    if let Some(quote_policy) = quote_policy {
+        let trimmed = quote_policy.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::Validation(
+                "source[quote_policy] must not be empty".to_string(),
+            ));
+        }
+        state
+            .db
+            .set_setting(POSTING_DEFAULT_QUOTE_POLICY_KEY, trimmed)
             .await?;
     }
 
@@ -518,6 +549,9 @@ fn apply_update_credentials_pair(
         "source[language]" | "source.language" => {
             request.source_language = Some((!value.trim().is_empty()).then_some(value));
         }
+        "source[quote_policy]" | "source.quote_policy" => {
+            request.source_quote_policy = Some(value);
+        }
         "fields_attributes" => {
             let parsed = if value.trim().is_empty() {
                 serde_json::Value::Null
@@ -577,6 +611,11 @@ fn parse_update_credentials_json(body: &[u8]) -> Result<ParsedUpdateCredentialsR
                     .source_language
                     .map(|value| (!value.trim().is_empty()).then_some(value))
             }),
+        source_quote_policy: request
+            .source
+            .as_ref()
+            .and_then(|source| source.quote_policy.clone())
+            .or(request.source_quote_policy),
     })
 }
 
@@ -1815,7 +1854,7 @@ async fn resolve_remote_collection_accounts(
     target_address: &str,
     params: &PaginationParams,
     collection_key: &str,
-) -> Result<Vec<serde_json::Value>, AppError> {
+) -> Result<(Vec<serde_json::Value>, bool), AppError> {
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
     let fetch_limit = limit.max(120).min(400);
@@ -1840,8 +1879,8 @@ async fn resolve_remote_collection_accounts(
         }
     }
 
-    let (resolved, _) = paginate_account_response_values(resolved, params, limit);
-    Ok(resolved)
+    let (resolved, has_next) = paginate_account_response_values(resolved, params, limit);
+    Ok((resolved, has_next))
 }
 
 async fn resolve_moved_account_response(
@@ -2260,11 +2299,11 @@ async fn account_source_payload(
         "privacy": preferences.privacy,
         "sensitive": preferences.sensitive,
         "language": preferences.language,
+        "quote_policy": preferences.quote_policy,
         "follow_requests_count": follow_requests_count,
         "hide_collections": profile_preferences.hide_collections,
         "discoverable": account.discoverable,
         "indexable": account.indexable,
-        "quote_policy": "public",
     }))
 }
 
@@ -2592,20 +2631,28 @@ pub async fn preferences(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let preferences = load_posting_preferences(&state).await?;
-    let profile_preferences = load_profile_preferences(&state).await?;
     Ok(Json(serde_json::json!({
         "posting:default:visibility": preferences.privacy,
         "posting:default:sensitive": preferences.sensitive,
         "posting:default:language": preferences.language,
-        "posting:default:quote_policy": "public",
+        "posting:default:quote_policy": preferences.quote_policy,
         "posting:default:privacy": preferences.privacy,
         "posting:default:media_sensitive": preferences.sensitive,
         "posting:default:content_type": "text/plain",
-        "reading:expand:media": if profile_preferences.show_media { "show_all" } else { "hide_all" },
+        "reading:expand:media": match state.db.get_setting(PROFILE_SHOW_MEDIA_KEY).await? {
+            None => "default",
+            Some(value) => if matches!(value.trim(), "1" | "true") { "show_all" } else { "hide_all" },
+        },
         "reading:expand:spoilers": false,
         "reading:autoplay:gifs": true,
-        "reading:display:media": if profile_preferences.show_media_replies { "show_all" } else { "hide_all" },
-        "reading:display:expand_media": if profile_preferences.show_media { "show_all" } else { "hide_all" },
+        "reading:display:media": match state.db.get_setting(PROFILE_SHOW_MEDIA_REPLIES_KEY).await? {
+            None => "default",
+            Some(value) => if matches!(value.trim(), "1" | "true") { "show_all" } else { "hide_all" },
+        },
+        "reading:display:expand_media": match state.db.get_setting(PROFILE_SHOW_MEDIA_KEY).await? {
+            None => "default",
+            Some(value) => if matches!(value.trim(), "1" | "true") { "show_all" } else { "hide_all" },
+        },
         "reading:display:expand_spoilers": false,
         "notifications:follow": true,
         "notifications:favourite": true,
@@ -2651,6 +2698,7 @@ pub async fn update_credentials(
         source_privacy,
         source_sensitive,
         source_language,
+        source_quote_policy,
     } = req;
 
     let profile_fields_json =
@@ -2660,16 +2708,6 @@ pub async fn update_credentials(
         Some(value) => normalize_moved_to_account_uri(&state, value).await?,
         None => None,
     };
-    save_posting_preferences(&state, source_privacy, source_sensitive, source_language).await?;
-    save_profile_preferences(
-        &state,
-        hide_collections,
-        show_media,
-        show_media_replies,
-        show_featured,
-    )
-    .await?;
-    save_profile_metadata(&state, avatar_description, header_description).await?;
 
     let avatar_bytes = match avatar {
         Some(ProfileImageInput::Encoded(encoded)) => {
@@ -2741,6 +2779,24 @@ pub async fn update_credentials(
 
         account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     }
+
+    save_posting_preferences(
+        &state,
+        source_privacy,
+        source_sensitive,
+        source_language,
+        source_quote_policy,
+    )
+    .await?;
+    save_profile_preferences(
+        &state,
+        hide_collections,
+        show_media,
+        show_media_replies,
+        show_featured,
+    )
+    .await?;
+    save_profile_metadata(&state, avatar_description, header_description).await?;
 
     let follower_inboxes = state
         .db
@@ -3028,7 +3084,8 @@ pub async fn get_account_followers(
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
-        let followers =
+        let encoded_id = urlencoding::encode(id.trim()).to_string();
+        let (followers, has_next) =
             resolve_remote_collection_accounts(&state, &target_address, &params, "followers")
                 .await?;
         let first_id = followers
@@ -3041,12 +3098,12 @@ pub async fn get_account_followers(
             .and_then(|value| value.as_str());
         let mut headers = HeaderMap::new();
         if let Some(link) = account_collection_link_header(
-            &format!("/api/v1/accounts/{id}/followers"),
+            &format!("/api/v1/accounts/{encoded_id}/followers"),
             limit,
             first_id,
             last_id,
-            !followers.is_empty(),
-            followers.len() >= limit,
+            has_prev_cursor(&params),
+            has_next,
         ) {
             headers.insert(
                 LINK,
@@ -3118,12 +3175,13 @@ pub async fn get_account_followers(
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
+    let encoded_id = urlencoding::encode(id.trim()).to_string();
     if let Some(link) = account_collection_link_header(
-        &format!("/api/v1/accounts/{id}/followers"),
+        &format!("/api/v1/accounts/{encoded_id}/followers"),
         limit,
         first_id,
         last_id,
-        !followers.is_empty(),
+        has_prev_cursor(&params),
         has_next,
     ) {
         headers.insert(
@@ -3147,7 +3205,8 @@ pub async fn get_account_following(
     let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
     if !local_requested {
         let target_address = resolve_target_address(&state, &id).await?;
-        let following =
+        let encoded_id = urlencoding::encode(id.trim()).to_string();
+        let (following, has_next) =
             resolve_remote_collection_accounts(&state, &target_address, &params, "following")
                 .await?;
         let first_id = following
@@ -3160,12 +3219,12 @@ pub async fn get_account_following(
             .and_then(|value| value.as_str());
         let mut headers = HeaderMap::new();
         if let Some(link) = account_collection_link_header(
-            &format!("/api/v1/accounts/{id}/following"),
+            &format!("/api/v1/accounts/{encoded_id}/following"),
             limit,
             first_id,
             last_id,
-            !following.is_empty(),
-            following.len() >= limit,
+            has_prev_cursor(&params),
+            has_next,
         ) {
             headers.insert(
                 LINK,
@@ -3237,12 +3296,13 @@ pub async fn get_account_following(
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
+    let encoded_id = urlencoding::encode(id.trim()).to_string();
     if let Some(link) = account_collection_link_header(
-        &format!("/api/v1/accounts/{id}/following"),
+        &format!("/api/v1/accounts/{encoded_id}/following"),
         limit,
         first_id,
         last_id,
-        !following.is_empty(),
+        has_prev_cursor(&params),
         has_next,
     ) {
         headers.insert(
@@ -4152,13 +4212,13 @@ pub async fn get_blocks(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Get blocked account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let blocked_accounts = state.db.get_blocked_account_details(limit).await?;
-    let accounts = stream::iter(blocked_accounts.into_iter().take(limit))
+    let blocked_accounts = state.db.get_all_blocked_account_details().await?;
+    let accounts = stream::iter(blocked_accounts.into_iter())
         .map(|(address, actor_uri, _inbox_uri)| {
             let state = state.clone();
             async move {
@@ -4169,7 +4229,27 @@ pub async fn get_blocks(
         .buffered(10)
         .collect::<Vec<_>>()
         .await;
-    Ok(Json(accounts))
+    let (accounts, has_next) = paginate_account_response_values(accounts, &params, limit);
+    let first_id = accounts
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = accounts
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = account_collection_link_header(
+        "/api/v1/blocks",
+        limit,
+        first_id,
+        last_id,
+        has_prev_cursor(&params),
+        has_next,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+    Ok((headers, Json(accounts)))
 }
 
 /// GET /api/v1/mutes
@@ -4178,13 +4258,13 @@ pub async fn get_mutes(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Get muted account addresses from database
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let muted_accounts = state.db.get_muted_account_details(limit).await?;
-    let accounts = stream::iter(muted_accounts.into_iter().take(limit))
+    let muted_accounts = state.db.get_all_muted_account_details().await?;
+    let accounts = stream::iter(muted_accounts.into_iter())
         .map(|(address, actor_uri)| {
             let state = state.clone();
             async move {
@@ -4195,7 +4275,27 @@ pub async fn get_mutes(
         .buffered(10)
         .collect::<Vec<_>>()
         .await;
-    Ok(Json(accounts))
+    let (accounts, has_next) = paginate_account_response_values(accounts, &params, limit);
+    let first_id = accounts
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = accounts
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = account_collection_link_header(
+        "/api/v1/mutes",
+        limit,
+        first_id,
+        last_id,
+        has_prev_cursor(&params),
+        has_next,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+    Ok((headers, Json(accounts)))
 }
 
 /// GET /api/v1/follow_requests
@@ -4204,13 +4304,13 @@ pub async fn get_follow_requests(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Get follow requests from database
     let limit = params.limit.unwrap_or(40).min(80);
     let default_port = default_port_for_protocol(&state.config.server.protocol);
 
-    let requests = state.db.get_follow_request_details(limit).await?;
-    let accounts = stream::iter(requests.into_iter().take(limit))
+    let requests = state.db.get_all_follow_request_details().await?;
+    let accounts = stream::iter(requests.into_iter())
         .map(|(address, actor_uri)| {
             let state = state.clone();
             async move {
@@ -4221,7 +4321,27 @@ pub async fn get_follow_requests(
         .buffered(10)
         .collect::<Vec<_>>()
         .await;
-    Ok(Json(accounts))
+    let (accounts, has_next) = paginate_account_response_values(accounts, &params, limit);
+    let first_id = accounts
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = accounts
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = account_collection_link_header(
+        "/api/v1/follow_requests",
+        limit,
+        first_id,
+        last_id,
+        has_prev_cursor(&params),
+        has_next,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+    Ok((headers, Json(accounts)))
 }
 
 /// GET /api/v1/follow_requests/:id

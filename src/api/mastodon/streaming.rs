@@ -285,6 +285,7 @@ async fn build_status_response_value(
             state.timeline_cache.get_by_uri(&status.uri).await
         };
         let media = cached
+            .as_ref()
             .map(|cached| {
                 cached
                     .attachments
@@ -293,7 +294,7 @@ async fn build_status_response_value(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        crate::api::status_to_response_with_media(
+        let mut response = crate::api::status_to_response_with_media(
             status,
             &account,
             &state.config,
@@ -305,7 +306,11 @@ async fn build_status_response_value(
                 .map(|stats| stats.force_sensitive)
                 .unwrap_or(false),
             &media,
-        )
+        );
+        if let Some(cached) = cached.as_ref() {
+            crate::api::apply_cached_status_metadata(&mut response, cached);
+        }
+        response
     } else {
         crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),

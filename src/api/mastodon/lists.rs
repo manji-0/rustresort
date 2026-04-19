@@ -118,6 +118,10 @@ fn list_collection_link_header(
     (!links.is_empty()).then(|| links.join(", "))
 }
 
+fn has_prev_cursor(params: &PaginationParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
+}
+
 /// GET /api/v1/lists
 /// Get all lists owned by the user
 pub async fn get_lists(
@@ -385,7 +389,7 @@ pub async fn get_list_accounts(
         limit,
         first_id,
         last_id,
-        !accounts.is_empty(),
+        has_prev_cursor(&params),
         has_next,
     ) {
         headers.insert(

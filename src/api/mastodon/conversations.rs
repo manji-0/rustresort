@@ -160,6 +160,10 @@ fn conversation_link_header(
     (!links.is_empty()).then(|| links.join(", "))
 }
 
+fn has_prev_cursor(params: &ConversationsParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
+}
+
 async fn publish_conversation_event(
     state: &ConversationsApiState,
     payload: serde_json::Value,
@@ -235,7 +239,7 @@ pub async fn get_conversations(
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
     if let Some(link) =
-        conversation_link_header(limit, first_id, last_id, !response.is_empty(), has_next)
+        conversation_link_header(limit, first_id, last_id, has_prev_cursor(&params), has_next)
     {
         headers.insert(LINK, link.parse().expect("valid link header"));
     }

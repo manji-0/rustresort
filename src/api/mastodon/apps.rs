@@ -164,6 +164,20 @@ fn normalize_redirect_uris_field(field: RedirectUrisField) -> Result<String, App
         ));
     }
 
+    for value in &values {
+        if value == OOB_REDIRECT_URI {
+            continue;
+        }
+        let parsed = Url::parse(value).map_err(|_| {
+            AppError::Validation("redirect_uris must contain absolute URIs".to_string())
+        })?;
+        if parsed.scheme().is_empty() || parsed.host_str().is_none() {
+            return Err(AppError::Validation(
+                "redirect_uris must contain absolute URIs".to_string(),
+            ));
+        }
+    }
+
     Ok(values.join("\n"))
 }
 

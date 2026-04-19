@@ -618,6 +618,8 @@ impl AppState {
                     created_at: status.created_at,
                     visibility: status.visibility.to_string(),
                     attachments,
+                    mentions: Vec::new(),
+                    tags: Vec::new(),
                     reply_to_uri: status.in_reply_to_uri.clone(),
                     boost_of_uri: status.boost_of_uri.clone(),
                     quote_of_uri: status.quote_of_uri.clone(),

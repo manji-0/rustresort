@@ -31,6 +31,8 @@ pub struct CachedStatus {
     pub created_at: DateTime<Utc>,
     pub visibility: String,
     pub attachments: Vec<CachedAttachment>,
+    pub mentions: Vec<CachedMention>,
+    pub tags: Vec<CachedTag>,
     pub reply_to_uri: Option<String>,
     pub boost_of_uri: Option<String>,
     pub quote_of_uri: Option<String>,
@@ -50,6 +52,20 @@ pub struct CachedAttachment {
     pub content_type: String,
     pub description: Option<String>,
     pub blurhash: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedMention {
+    pub id: String,
+    pub username: String,
+    pub acct: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedTag {
+    pub name: String,
+    pub url: String,
 }
 
 fn ttl_seconds_to_millis(ttl_seconds: u64) -> i64 {
@@ -1187,6 +1203,8 @@ mod tests {
             created_at,
             visibility: "public".to_string(),
             attachments: Vec::new(),
+            mentions: Vec::new(),
+            tags: Vec::new(),
             reply_to_uri: None,
             boost_of_uri: None,
             quote_of_uri: None,

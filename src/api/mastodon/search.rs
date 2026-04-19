@@ -108,6 +108,18 @@ pub async fn search_v2(
     } else {
         Vec::new()
     };
+    let following_actor_uris = if params.following {
+        state
+            .db
+            .get_all_follows()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|follow| follow.actor_uri)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     // Determine what to search based on type parameter
     let search_accounts =
@@ -289,6 +301,9 @@ pub async fn search_v2(
                 following_identities
                     .iter()
                     .any(|candidate| candidate == &identity)
+                    || following_actor_uris
+                        .iter()
+                        .any(|candidate| candidate == &account.url || candidate == &account.uri)
             });
         }
         let account_offset = params.offset.unwrap_or(0);

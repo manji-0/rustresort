@@ -2,7 +2,9 @@
 
 use crate::api::dto::*;
 use crate::config::AppConfig;
-use crate::data::{Account, Database, MediaAttachment, RemoteStatusAttachment, Status};
+use crate::data::{
+    Account, CachedStatus, Database, MediaAttachment, RemoteStatusAttachment, Status,
+};
 use crate::error::AppError;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -559,6 +561,72 @@ async fn load_status_filtered(
     }
 
     Ok(filtered)
+}
+
+pub fn retain_filtered_entries_for_context(filtered: &mut Vec<serde_json::Value>, context: &str) {
+    filtered.retain(|entry| {
+        let contexts = entry
+            .get("filter")
+            .and_then(|filter| filter.get("context"))
+            .and_then(serde_json::Value::as_array);
+        match contexts {
+            Some(contexts) if !contexts.is_empty() => contexts
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|candidate| candidate == context),
+            _ => true,
+        }
+    });
+}
+
+pub async fn load_status_filtered_for_context(
+    db: &Database,
+    status: &Status,
+    context: Option<&str>,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let mut filtered = load_status_filtered(db, status).await?;
+    if let Some(context) = context {
+        retain_filtered_entries_for_context(&mut filtered, context);
+    }
+    Ok(filtered)
+}
+
+pub fn apply_filtered_context(response: &mut StatusResponse, context: &str) {
+    retain_filtered_entries_for_context(&mut response.filtered, context);
+}
+
+pub fn apply_cached_status_metadata(response: &mut StatusResponse, cached: &CachedStatus) {
+    response.media_attachments = cached
+        .attachments
+        .iter()
+        .map(cached_media_attachment_to_response)
+        .collect();
+    if !cached.mentions.is_empty() {
+        response.mentions = cached
+            .mentions
+            .iter()
+            .map(|mention| {
+                serde_json::json!({
+                    "id": mention.id,
+                    "username": mention.username,
+                    "url": mention.url,
+                    "acct": mention.acct,
+                })
+            })
+            .collect();
+    }
+    if !cached.tags.is_empty() {
+        response.tags = cached
+            .tags
+            .iter()
+            .map(|tag| {
+                serde_json::json!({
+                    "name": tag.name,
+                    "url": tag.url,
+                })
+            })
+            .collect();
+    }
 }
 
 pub async fn build_status_response_with_account_stats_and_remote_stats(
@@ -1447,7 +1515,8 @@ mod tests {
     use super::*;
     use crate::config::*;
     use crate::data::{
-        Account, Database, EntityId, PersistedReason, RemoteStatusAttachment, Status,
+        Account, CachedAttachment, CachedMention, CachedStatus, CachedTag, Database, EntityId,
+        PersistedReason, RemoteStatusAttachment, Status,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -2401,5 +2470,152 @@ mod tests {
             response.media_attachments[0].remote_url.as_deref(),
             Some("https://cdn.remote.example/media/original.jpg")
         );
+    }
+
+    #[test]
+    fn apply_filtered_context_keeps_only_matching_entries() {
+        let mut response = StatusResponse {
+            filtered: vec![
+                serde_json::json!({
+                    "filter": { "context": ["home", "public"] }
+                }),
+                serde_json::json!({
+                    "filter": { "context": ["notifications"] }
+                }),
+                serde_json::json!({
+                    "filter": { "context": [] }
+                }),
+            ],
+            ..status_to_response_with_media(
+                &Status {
+                    id: "status-1".to_string(),
+                    uri: "https://remote.example/statuses/1".to_string(),
+                    content: "<p>Hello</p>".to_string(),
+                    content_warning: None,
+                    visibility: crate::data::StatusVisibility::Public,
+                    language: Some("en".to_string()),
+                    account_address: "testuser@test.example.com".to_string(),
+                    is_local: true,
+                    in_reply_to_uri: None,
+                    boost_of_uri: None,
+                    quote_of_uri: None,
+                    persisted_reason: PersistedReason::Own,
+                    created_at: Utc::now(),
+                    fetched_at: None,
+                },
+                &Account {
+                    id: "testuser".to_string(),
+                    username: "testuser".to_string(),
+                    display_name: Some("Test User".to_string()),
+                    note: None,
+                    profile_fields_json: None,
+                    locked: false,
+                    bot: false,
+                    discoverable: true,
+                    indexable: true,
+                    also_known_as: None,
+                    moved_to_uri: None,
+                    avatar_s3_key: None,
+                    header_s3_key: None,
+                    private_key_pem: "private-key".to_string(),
+                    public_key_pem: "public-key".to_string(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                &create_test_config(),
+                AccountStats::default(),
+                None,
+                StatusInteractions::default(),
+                false,
+                &[],
+            )
+        };
+
+        apply_filtered_context(&mut response, "home");
+        assert_eq!(response.filtered.len(), 2);
+    }
+
+    #[test]
+    fn apply_cached_status_metadata_overrides_mentions_tags_and_media() {
+        let config = create_test_config();
+        let account = Account {
+            id: "testuser".to_string(),
+            username: "testuser".to_string(),
+            display_name: Some("Test User".to_string()),
+            note: None,
+            profile_fields_json: None,
+            locked: false,
+            bot: false,
+            discoverable: true,
+            indexable: true,
+            also_known_as: None,
+            moved_to_uri: None,
+            avatar_s3_key: None,
+            header_s3_key: None,
+            private_key_pem: "private-key".to_string(),
+            public_key_pem: "public-key".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let status = Status {
+            id: "cache-only".to_string(),
+            uri: "https://remote.example/statuses/cache-only".to_string(),
+            content: "<p>Hello @derived #derived</p>".to_string(),
+            content_warning: None,
+            visibility: crate::data::StatusVisibility::Public,
+            language: Some("en".to_string()),
+            account_address: "bob@remote.example".to_string(),
+            is_local: false,
+            in_reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+            persisted_reason: PersistedReason::CacheOnly,
+            created_at: Utc::now(),
+            fetched_at: Some(Utc::now()),
+        };
+        let mut response = status_to_response_with_media(
+            &status,
+            &account,
+            &config,
+            AccountStats::default(),
+            None,
+            StatusInteractions::default(),
+            false,
+            &[],
+        );
+        let cached = CachedStatus {
+            id: status.id.clone(),
+            uri: status.uri.clone(),
+            content: status.content.clone(),
+            account_address: status.account_address.clone(),
+            created_at: status.created_at,
+            visibility: "public".to_string(),
+            attachments: vec![CachedAttachment {
+                url: "https://cdn.remote.example/media/original.jpg".to_string(),
+                thumbnail_url: Some("https://cdn.remote.example/media/preview.jpg".to_string()),
+                content_type: "image/jpeg".to_string(),
+                description: Some("remote alt".to_string()),
+                blurhash: None,
+            }],
+            mentions: vec![CachedMention {
+                id: "https://remote.example/users/alice".to_string(),
+                username: "alice".to_string(),
+                acct: "alice@remote.example".to_string(),
+                url: "https://remote.example/@alice".to_string(),
+            }],
+            tags: vec![CachedTag {
+                name: "rust".to_string(),
+                url: "https://remote.example/tags/rust".to_string(),
+            }],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        };
+
+        apply_cached_status_metadata(&mut response, &cached);
+
+        assert_eq!(response.media_attachments.len(), 1);
+        assert_eq!(response.mentions[0]["acct"], "alice@remote.example");
+        assert_eq!(response.tags[0]["name"], "rust");
     }
 }

@@ -126,7 +126,7 @@ async fn authenticate_request(
         return Ok((session, None));
     }
 
-    Err(AppError::Unauthorized)
+    Err(AppError::InvalidAccessToken)
 }
 
 pub async fn require_app_auth(

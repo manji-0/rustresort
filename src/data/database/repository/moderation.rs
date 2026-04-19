@@ -183,6 +183,17 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn get_all_blocked_account_details(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, AppError> {
+        sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT target_address, actor_uri, inbox_uri FROM account_blocks ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
     /// Check if a remote actor URI is explicitly blocked locally.
     pub async fn is_actor_uri_blocked(&self, actor_uri: &str) -> Result<bool, AppError> {
         let normalized = actor_uri.trim().trim_end_matches('/');
@@ -331,6 +342,17 @@ impl Database {
         .await?;
 
         Ok(rows)
+    }
+
+    pub async fn get_all_muted_account_details(
+        &self,
+    ) -> Result<Vec<(String, Option<String>)>, AppError> {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT target_address, actor_uri FROM account_mutes ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
     }
 
     /// Mark an account as sensitive for media/content warnings.

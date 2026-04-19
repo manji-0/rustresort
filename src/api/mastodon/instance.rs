@@ -37,11 +37,8 @@ fn directory_sort_key(
             std::cmp::Reverse(
                 value["created_at"]
                     .as_str()
-                    .map(|value| {
-                        value.as_bytes().iter().fold(0_i64, |acc, byte| {
-                            acc.wrapping_mul(31).wrapping_add(i64::from(*byte))
-                        })
-                    })
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp())
                     .unwrap_or_default(),
             ),
             std::cmp::Reverse(value["id"].as_str().unwrap_or_default().to_string()),
@@ -461,6 +458,9 @@ pub async fn directory(
 
     if !local_only {
         for profile in state.db.list_remote_profiles().await.unwrap_or_default() {
+            if !profile.discoverable {
+                continue;
+            }
             if let Some(response) = resolve_cached_remote_account_response(
                 state.config.as_ref(),
                 state.db.as_ref(),

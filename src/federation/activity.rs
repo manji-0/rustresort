@@ -7,9 +7,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::data::{
-    AdminReportState, CachedAttachment, CachedStatus, Database, DomainBlockRecord,
-    NotificationType, PersistedReason, ProfileCache, PushAlerts, PushPayload, Status,
-    StatusVisibility, TimelineCache,
+    AdminReportState, CachedAttachment, CachedMention, CachedStatus, CachedTag, Database,
+    DomainBlockRecord, NotificationType, PersistedReason, ProfileCache, PushAlerts, PushPayload,
+    Status, StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
 use crate::service::{StreamEvent, StreamTarget, StreamingEventBus, WebPushSender};
@@ -45,6 +45,41 @@ async fn fetch_remote_actor_document(
         AppError::Federation(format!(
             "Failed to decode actor document {}: {}",
             actor_uri, error
+        ))
+    })
+}
+
+async fn fetch_remote_object_document(
+    http_client: &reqwest::Client,
+    object_uri: &str,
+) -> Result<serde_json::Value, AppError> {
+    let object_url = url::Url::parse(object_uri).map_err(|error| {
+        AppError::Federation(format!("Invalid object URI {} ({})", object_uri, error))
+    })?;
+    let response = http_client
+        .get(object_url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/activity+json, application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Federation(format!("Object fetch failed for {}: {}", object_uri, error))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(AppError::Federation(format!(
+            "Object fetch failed for {}: HTTP {}",
+            object_uri,
+            response.status()
+        )));
+    }
+
+    response.json().await.map_err(|error| {
+        AppError::Federation(format!(
+            "Failed to decode remote object {}: {}",
+            object_uri, error
         ))
     })
 }
@@ -226,6 +261,16 @@ fn infer_attachment_content_type(value: &serde_json::Value, remote_url: &str) ->
         Some("ogg") => "audio/ogg".to_string(),
         _ => "application/octet-stream".to_string(),
     }
+}
+
+fn extract_attachment_preview_url(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("icon")
+        .and_then(extract_first_uri_reference)
+        .or_else(|| value.get("image").and_then(extract_first_uri_reference))
+        .or_else(|| value.get("preview").and_then(extract_first_uri_reference))
+        .or_else(|| value.get("thumbnail").and_then(extract_first_uri_reference))
+        .or_else(|| value.get("poster").and_then(extract_first_uri_reference))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2515,6 +2560,40 @@ impl ActivityProcessor {
         object_uri: &str,
         persisted_reason: PersistedReason,
     ) -> Result<Option<Status>, AppError> {
+        if self.db.get_status_by_uri(object_uri).await?.is_none()
+            && let Some(client) = &self.federation_fetch_client
+        {
+            match fetch_remote_object_document(client, object_uri).await {
+                Ok(document) => {
+                    let object = document
+                        .get("object")
+                        .filter(|value| object_has_embedded_status_content(value))
+                        .cloned()
+                        .unwrap_or(document);
+                    let object_actor = object
+                        .get("attributedTo")
+                        .and_then(extract_first_uri_reference)
+                        .or_else(|| object.get("actor").and_then(extract_first_uri_reference))
+                        .unwrap_or_else(|| actor_uri.to_string());
+                    let _ = self
+                        .upsert_remote_status_from_object(
+                            &object,
+                            &object_actor,
+                            persisted_reason,
+                            false,
+                        )
+                        .await?;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        object_uri,
+                        %error,
+                        "failed to hydrate boosted remote object before storing Announce wrapper"
+                    );
+                }
+            }
+        }
+
         let Some(activity_uri) = activity.get("id").and_then(|id| id.as_str()) else {
             return Ok(None);
         };
@@ -2537,6 +2616,8 @@ impl ActivityProcessor {
             created_at,
             visibility: visibility.as_str().to_string(),
             attachments: Vec::new(),
+            mentions: Vec::new(),
+            tags: Vec::new(),
             reply_to_uri: None,
             boost_of_uri: Some(object_uri.to_string()),
             quote_of_uri: None,
@@ -2789,6 +2870,113 @@ impl ActivityProcessor {
         Ok(self.current_poll_snapshot(status_id).await? != parse_question_poll(object))
     }
 
+    fn extract_cached_mentions(&self, object: &serde_json::Value) -> Vec<CachedMention> {
+        let Some(values) = object.get("tag").and_then(serde_json::Value::as_array) else {
+            return Vec::new();
+        };
+
+        let mut mentions = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for value in values {
+            if value.get("type").and_then(|kind| kind.as_str()) != Some("Mention") {
+                continue;
+            }
+
+            let href = value
+                .get("href")
+                .and_then(extract_first_uri_reference)
+                .unwrap_or_default();
+            let raw_name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .trim_start_matches('@')
+                .to_string();
+            let acct = if raw_name.contains('@') {
+                raw_name.to_ascii_lowercase()
+            } else if !href.is_empty() {
+                self.extract_actor_address(&href).to_ascii_lowercase()
+            } else {
+                raw_name.to_ascii_lowercase()
+            };
+            if acct.is_empty() || !seen.insert(acct.clone()) {
+                continue;
+            }
+
+            let username = acct
+                .split_once('@')
+                .map(|(username, _)| username)
+                .unwrap_or(acct.as_str())
+                .to_string();
+            let url = if !href.is_empty() {
+                href.clone()
+            } else {
+                let base = self
+                    .local_address
+                    .split_once('@')
+                    .map(|(_, domain)| format!("{}://{}", self.local_protocol, domain));
+                match base {
+                    Some(base) => format!("{}/users/{}", base, username),
+                    None => username.clone(),
+                }
+            };
+
+            mentions.push(CachedMention {
+                id: if !href.is_empty() { href } else { acct.clone() },
+                username,
+                acct,
+                url,
+            });
+        }
+
+        mentions
+    }
+
+    fn extract_cached_tags(&self, object: &serde_json::Value) -> Vec<CachedTag> {
+        let Some(values) = object.get("tag").and_then(serde_json::Value::as_array) else {
+            return Vec::new();
+        };
+
+        let mut tags = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let local_base = self
+            .local_address
+            .split_once('@')
+            .map(|(_, domain)| format!("{}://{}", self.local_protocol, domain));
+
+        for value in values {
+            if value.get("type").and_then(|kind| kind.as_str()) != Some("Hashtag") {
+                continue;
+            }
+
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .trim_start_matches('#')
+                .to_ascii_lowercase();
+            if name.is_empty() || !seen.insert(name.clone()) {
+                continue;
+            }
+
+            let url = value
+                .get("href")
+                .and_then(extract_first_uri_reference)
+                .or_else(|| {
+                    local_base
+                        .as_ref()
+                        .map(|base| format!("{}/tags/{}", base, name))
+                })
+                .unwrap_or_else(|| format!("/tags/{name}"));
+
+            tags.push(CachedTag { name, url });
+        }
+
+        tags
+    }
+
     async fn cached_status_from_object(
         &self,
         object: &serde_json::Value,
@@ -2821,6 +3009,8 @@ impl ActivityProcessor {
             created_at,
             visibility: self.extract_visibility(object),
             attachments: self.extract_cached_attachments(object, reject_media),
+            mentions: self.extract_cached_mentions(object),
+            tags: self.extract_cached_tags(object),
             reply_to_uri: object
                 .get("inReplyTo")
                 .and_then(|reply| reply.as_str())
@@ -2886,7 +3076,7 @@ impl ActivityProcessor {
                     id: format!("{status_id}:remote:{index}"),
                     status_id: status_id.to_string(),
                     remote_url: remote_url.clone(),
-                    preview_url: value.get("icon").and_then(extract_first_uri_reference),
+                    preview_url: extract_attachment_preview_url(value),
                     content_type: infer_attachment_content_type(value, &remote_url),
                     description: value
                         .get("name")
@@ -3595,7 +3785,7 @@ impl ActivityProcessor {
 
             attachments.push(CachedAttachment {
                 url: url.clone(),
-                thumbnail_url: value.get("icon").and_then(extract_first_uri_reference),
+                thumbnail_url: extract_attachment_preview_url(value),
                 content_type: infer_attachment_content_type(value, &url),
                 description: value
                     .get("name")
@@ -3800,10 +3990,12 @@ mod tests {
     use crate::error::AppError;
     use crate::service::WebPushSender;
     use axum::async_trait;
+    use axum::{Json, Router, routing::get};
     use chrono::Utc;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
 
     const TEST_PRIVATE_KEY_PEM: &str = include_str!("../../tests/fixtures/test_private_key.pem");
 
@@ -4204,6 +4396,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_remote_announce_status_fetches_missing_boost_target() {
+        let (processor, db, _timeline_cache, _temp_dir) =
+            create_test_processor_with_timeline("alice@example.com", "https").await;
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote_listener.local_addr().unwrap();
+        let object_uri = format!("http://{remote_addr}/users/carol/statuses/42");
+        let actor_uri = format!("http://{remote_addr}/users/carol");
+        let remote_router = {
+            let object_uri = object_uri.clone();
+            let actor_uri = actor_uri.clone();
+            Router::new().route(
+                "/users/carol/statuses/42",
+                get(move || {
+                    let object_uri = object_uri.clone();
+                    let actor_uri = actor_uri.clone();
+                    async move {
+                        Json(json!({
+                            "id": object_uri,
+                            "type": "Note",
+                            "attributedTo": actor_uri,
+                            "content": "<p>boost target</p>",
+                            "published": "2026-01-01T00:00:00Z",
+                            "to": ["https://www.w3.org/ns/activitystreams#Public"]
+                        }))
+                    }
+                }),
+            )
+        };
+        tokio::spawn(async move {
+            axum::serve(remote_listener, remote_router).await.unwrap();
+        });
+
+        let processor = processor.with_federation_fetch_client(Arc::new(reqwest::Client::new()));
+        let announce = json!({
+            "id": "https://remote.example/activities/announce-1",
+            "type": "Announce",
+            "published": "2026-01-01T00:00:00Z",
+        });
+
+        let wrapper = processor
+            .upsert_remote_announce_status(
+                &announce,
+                "https://remote.example/users/bob",
+                &object_uri,
+                PersistedReason::Timeline,
+            )
+            .await
+            .unwrap()
+            .expect("announce wrapper should persist");
+        let boosted = db
+            .get_status_by_uri(&object_uri)
+            .await
+            .unwrap()
+            .expect("boost target should be hydrated");
+
+        assert_eq!(wrapper.boost_of_uri.as_deref(), Some(object_uri.as_str()));
+        assert_eq!(
+            boosted.account_address,
+            format!("carol@127.0.0.1:{}", remote_addr.port())
+        );
+        assert_eq!(boosted.content, "<p>boost target</p>");
+    }
+
+    #[tokio::test]
     async fn handle_follow_sends_accept_when_delivery_is_configured() {
         let (processor, db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
         let delivery = Arc::new(crate::federation::ActivityDelivery::new(
@@ -4384,6 +4640,62 @@ mod tests {
             processor.remote_status_attachments_from_object("status-2", &object, false);
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].content_type, "image/*");
+    }
+
+    #[tokio::test]
+    async fn remote_status_attachments_from_object_uses_image_preview_fallback() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "attachment": [{
+                "type": "Document",
+                "url": "https://remote.example/media/original.mp4",
+                "image": [{
+                    "type": "Link",
+                    "href": "https://remote.example/media/poster.jpg"
+                }]
+            }]
+        });
+
+        let attachments =
+            processor.remote_status_attachments_from_object("status-3", &object, false);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].preview_url.as_deref(),
+            Some("https://remote.example/media/poster.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_status_from_object_preserves_ap_mentions_and_tags() {
+        let (processor, _db, _temp_dir) = create_test_processor("alice@example.com", "https").await;
+        let object = json!({
+            "id": "https://remote.example/statuses/9",
+            "type": "Note",
+            "content": "<p>Hello world</p>",
+            "published": "2026-01-01T00:00:00Z",
+            "tag": [
+                {
+                    "type": "Mention",
+                    "href": "https://remote.example/users/bob",
+                    "name": "@bob@remote.example"
+                },
+                {
+                    "type": "Hashtag",
+                    "href": "https://remote.example/tags/rust",
+                    "name": "#rust"
+                }
+            ]
+        });
+
+        let cached = processor
+            .cached_status_from_object(&object, "https://remote.example/users/carol", false)
+            .await
+            .unwrap();
+
+        assert_eq!(cached.mentions.len(), 1);
+        assert_eq!(cached.mentions[0].acct, "bob@remote.example");
+        assert_eq!(cached.tags.len(), 1);
+        assert_eq!(cached.tags[0].name, "rust");
     }
 
     #[tokio::test]
@@ -5225,6 +5537,8 @@ mod tests {
                 created_at: Utc::now(),
                 visibility: "public".to_string(),
                 attachments: vec![],
+                mentions: vec![],
+                tags: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
                 quote_of_uri: None,
@@ -5455,6 +5769,8 @@ mod tests {
                 created_at: Utc::now(),
                 visibility: "public".to_string(),
                 attachments: vec![],
+                mentions: vec![],
+                tags: vec![],
                 reply_to_uri: None,
                 boost_of_uri: None,
                 quote_of_uri: None,

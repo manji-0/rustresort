@@ -13,6 +13,10 @@ use crate::auth::CurrentUser;
 use crate::error::AppError;
 use crate::service::TimelineService;
 
+fn has_prev_cursor(params: &PaginationParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
+}
+
 /// GET /api/v1/bookmarks
 pub async fn get_bookmarks(
     State(state): State<TimelineApiState>,
@@ -92,7 +96,7 @@ pub async fn get_bookmarks(
         limit,
         first_id,
         last_id,
-        !responses.is_empty(),
+        has_prev_cursor(&params),
         has_next,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
@@ -180,7 +184,7 @@ pub async fn get_favourites(
         limit,
         first_id,
         last_id,
-        !responses.is_empty(),
+        has_prev_cursor(&params),
         has_next,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));

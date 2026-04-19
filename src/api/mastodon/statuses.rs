@@ -2531,6 +2531,9 @@ pub async fn update_status(
     let previous_status = status.clone();
 
     // Only allow editing local statuses
+    if !status.is_local {
+        return Err(AppError::NotFound);
+    }
     // Get account
     let account = build_account_service(&state).get_account().await?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;

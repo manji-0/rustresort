@@ -344,6 +344,7 @@ async fn load_notifications_page(
 ) -> Result<(Vec<crate::data::Notification>, bool), AppError> {
     let limit = params.pagination.limit.unwrap_or(20).min(80);
     let fetch_limit = (limit + 1).max(80);
+    let include_filtered = params.include_filtered.unwrap_or(false);
     let mut notifications = Vec::new();
     let mut cursor = params.pagination.max_id.clone();
     let min_cursor = if let Some(cursor_id) = params.pagination.min_id.as_deref() {
@@ -399,6 +400,19 @@ async fn load_notifications_page(
                 .as_deref()
                 .is_none_or(|account_id| notification.origin_account_address == account_id)
             {
+                if !include_filtered
+                    && let Some(status_uri) = notification.status_uri.as_deref()
+                    && let Some(status) = get_notification_status(state, status_uri).await
+                    && !crate::api::load_status_filtered_for_context(
+                        state.db.as_ref(),
+                        &status,
+                        Some("notifications"),
+                    )
+                    .await?
+                    .is_empty()
+                {
+                    continue;
+                }
                 notifications.push(notification);
                 if notifications.len() > limit {
                     break;
@@ -483,6 +497,7 @@ async fn build_notification_status_response(
             state.timeline_cache.get_by_uri(&status.uri).await
         };
         let media = cached
+            .as_ref()
             .map(|cached| {
                 cached
                     .attachments
@@ -491,7 +506,7 @@ async fn build_notification_status_response(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        return Ok(crate::api::status_to_response_with_media(
+        let mut response = crate::api::status_to_response_with_media(
             status,
             &account,
             &state.config,
@@ -503,10 +518,20 @@ async fn build_notification_status_response(
                 .map(|stats| stats.force_sensitive)
                 .unwrap_or(false),
             &media,
-        ));
+        );
+        if let Some(cached) = cached.as_ref() {
+            crate::api::apply_cached_status_metadata(&mut response, &cached);
+        }
+        response.filtered = crate::api::load_status_filtered_for_context(
+            state.db.as_ref(),
+            status,
+            Some("notifications"),
+        )
+        .await?;
+        return Ok(response);
     }
 
-    crate::api::build_status_response_with_account_stats_and_remote_stats(
+    let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
         status,
         &account,
@@ -515,7 +540,9 @@ async fn build_notification_status_response(
         remote_stats,
         interactions,
     )
-    .await
+    .await?;
+    crate::api::apply_filtered_context(&mut response, "notifications");
+    Ok(response)
 }
 
 async fn build_notification_account_response(
@@ -578,6 +605,10 @@ fn notification_link_header(
     (!links.is_empty()).then(|| links.join(", "))
 }
 
+fn has_prev_cursor(params: &PaginationParams) -> bool {
+    params.min_id.is_some() || params.since_id.is_some()
+}
+
 /// GET /api/v1/notifications
 pub async fn get_notifications(
     State(state): State<TimelineApiState>,
@@ -589,7 +620,6 @@ pub async fn get_notifications(
     let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(80);
-    let _include_filtered = params.include_filtered.unwrap_or(false);
     let include_types = raw_include_types
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
@@ -635,7 +665,7 @@ pub async fn get_notifications(
 
         responses.push(serde_json::to_value(response).unwrap());
     }
-    let has_prev = !responses.is_empty();
+    let has_prev = has_prev_cursor(&params.pagination);
 
     let first_id = responses
         .first()
@@ -676,7 +706,6 @@ pub async fn get_notifications_v2(
     let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
     let limit = params.pagination.limit.unwrap_or(20).min(80);
-    let _include_filtered = params.include_filtered.unwrap_or(false);
     let include_types = raw_include_types
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
@@ -692,9 +721,7 @@ pub async fn get_notifications_v2(
     let (notifications, has_next) =
         load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
     let body = build_grouped_notifications_result(&state, notifications, &grouped_types).await?;
-    let has_prev = body["notification_groups"]
-        .as_array()
-        .is_some_and(|groups| !groups.is_empty());
+    let has_prev = has_prev_cursor(&params.pagination);
 
     let first_id = body["notification_groups"]
         .as_array()
