@@ -506,10 +506,10 @@ impl TimelineService {
             id: cached.id.clone(),
             uri: cached.uri.clone(),
             content: cached.content.clone(),
-            content_warning: None,
+            content_warning: cached.content_warning.clone(),
             visibility: StatusVisibility::parse(&cached.visibility)
                 .unwrap_or(StatusVisibility::Public),
-            language: None,
+            language: cached.language.clone(),
             account_address: cached.account_address.clone(),
             is_local: false,
             in_reply_to_uri: cached.reply_to_uri.clone(),

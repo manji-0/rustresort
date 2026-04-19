@@ -442,7 +442,9 @@ pub async fn directory(
     let local_only = params.local.unwrap_or(false);
     let mut results = Vec::new();
 
-    if let Ok(Some(account)) = state.db.get_account().await {
+    if let Ok(Some(account)) = state.db.get_account().await
+        && account.discoverable
+    {
         let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
             .await
             .unwrap_or_default();

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::FiltersApiState;
 use crate::auth::CurrentUser;
 use crate::error::AppError;
+use crate::service::{StreamEvent, StreamTarget};
 
 /// Filter response (v1 API)
 #[derive(Debug, Serialize)]
@@ -144,6 +145,23 @@ async fn filter_v2_value_from_row(
     ))
 }
 
+async fn publish_filters_changed(state: &FiltersApiState) -> Result<(), AppError> {
+    let Some(account) = state.db.get_account().await? else {
+        return Ok(());
+    };
+    state
+        .streaming_event_bus
+        .publish(StreamEvent::FiltersChanged {
+            payload: serde_json::json!({
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            }),
+            targets: vec![StreamTarget::User {
+                account_id: account.username,
+            }],
+        })
+        .await
+}
+
 /// Create filter request
 #[derive(Debug, Deserialize)]
 pub struct CreateFilterRequest {
@@ -266,6 +284,7 @@ pub async fn create_filter(
         .db
         .replace_filter_keywords(&id, &[(req.phrase.clone(), whole_word)])
         .await?;
+    publish_filters_changed(&state).await?;
 
     Ok(Json(FilterResponse {
         id,
@@ -339,6 +358,7 @@ pub async fn update_filter(
         .db
         .replace_filter_keywords(&id, &[(phrase.clone(), whole_word)])
         .await?;
+    publish_filters_changed(&state).await?;
 
     Ok(Json(FilterResponse {
         id,
@@ -362,6 +382,7 @@ pub async fn delete_filter(
     if !deleted {
         return Err(AppError::NotFound);
     }
+    publish_filters_changed(&state).await?;
 
     Ok(Json(serde_json::json!({})))
 }
@@ -456,6 +477,7 @@ pub async fn create_filter_v2(
         )
         .await?;
     state.db.replace_filter_keywords(&id, &keywords).await?;
+    publish_filters_changed(&state).await?;
     let filter = state.db.get_filter(&id).await?.ok_or(AppError::NotFound)?;
     Ok(Json(filter_v2_value_from_row(&state, filter).await?))
 }
@@ -536,6 +558,7 @@ pub async fn update_filter_v2(
     if !keywords.is_empty() {
         state.db.replace_filter_keywords(&id, &keywords).await?;
     }
+    publish_filters_changed(&state).await?;
     let filter = state.db.get_filter(&id).await?.ok_or(AppError::NotFound)?;
     Ok(Json(filter_v2_value_from_row(&state, filter).await?))
 }
@@ -564,6 +587,7 @@ pub async fn create_filter_keyword(
         .db
         .create_filter_keyword(&id, phrase, request.whole_word.unwrap_or(true))
         .await?;
+    publish_filters_changed(&state).await?;
     Ok(Json(filter_keyword_value(
         &keyword_id,
         phrase,
@@ -594,6 +618,7 @@ pub async fn update_filter_keyword(
     if !updated {
         return Err(AppError::NotFound);
     }
+    publish_filters_changed(&state).await?;
     Ok(Json(filter_keyword_value(&keyword_id, phrase, whole_word)))
 }
 
@@ -606,6 +631,7 @@ pub async fn delete_filter_keyword(
     if !deleted {
         return Err(AppError::NotFound);
     }
+    publish_filters_changed(&state).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -648,6 +674,7 @@ pub async fn create_filter_status(
         return Err(AppError::Validation("status_id is required".to_string()));
     }
     let filter_status_id = state.db.create_filter_status(&id, status_id).await?;
+    publish_filters_changed(&state).await?;
     Ok(Json(serde_json::json!({
         "id": filter_status_id,
         "status_id": status_id,
@@ -663,5 +690,6 @@ pub async fn delete_filter_status(
     if !deleted {
         return Err(AppError::NotFound);
     }
+    publish_filters_changed(&state).await?;
     Ok(Json(serde_json::json!({})))
 }

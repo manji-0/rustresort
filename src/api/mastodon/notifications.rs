@@ -395,11 +395,12 @@ async fn load_notifications_page(
                 notification.notification_type,
                 include_types,
                 exclude_types,
-            ) && params
-                .account_id
-                .as_deref()
-                .is_none_or(|account_id| notification.origin_account_address == account_id)
-            {
+            ) {
+                if let Some(account_id) = params.account_id.as_deref()
+                    && !notification_matches_account_id(state, &notification, account_id).await
+                {
+                    continue;
+                }
                 if !include_filtered
                     && let Some(status_uri) = notification.status_uri.as_deref()
                     && let Some(status) = get_notification_status(state, status_uri).await
@@ -436,6 +437,43 @@ async fn load_notifications_page(
     Ok((notifications, has_next))
 }
 
+async fn notification_matches_account_id(
+    state: &TimelineApiState,
+    notification: &crate::data::Notification,
+    account_id: &str,
+) -> bool {
+    if let Some(account) = resolve_account_response_for_identity(
+        state.config.as_ref(),
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        None,
+        &notification.origin_account_address,
+    )
+    .await
+    {
+        return account.id == account_id
+            || account.acct.eq_ignore_ascii_case(account_id)
+            || account.uri.eq_ignore_ascii_case(account_id)
+            || notification
+                .origin_account_address
+                .eq_ignore_ascii_case(account_id);
+    }
+
+    build_remote_account_placeholder_response(
+        &notification.origin_account_address,
+        state.config.as_ref(),
+        0,
+    )
+    .is_some_and(|account| {
+        account.id == account_id
+            || account.acct.eq_ignore_ascii_case(account_id)
+            || account.uri.eq_ignore_ascii_case(account_id)
+            || notification
+                .origin_account_address
+                .eq_ignore_ascii_case(account_id)
+    })
+}
+
 async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> Option<Status> {
     if let Ok(status) = state.db.get_status_by_uri(status_uri).await
         && status.is_some()
@@ -448,10 +486,10 @@ async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> 
         id: cached.id.clone(),
         uri: cached.uri.clone(),
         content: cached.content.clone(),
-        content_warning: None,
+        content_warning: cached.content_warning.clone(),
         visibility: StatusVisibility::parse(&cached.visibility)
             .unwrap_or(StatusVisibility::Private),
-        language: None,
+        language: cached.language.clone(),
         account_address: cached.account_address.clone(),
         is_local: false,
         in_reply_to_uri: cached.reply_to_uri.clone(),
@@ -575,6 +613,8 @@ fn notification_link_header(
     include_types: &[String],
     exclude_types: &[String],
     grouped_types: &[String],
+    account_id: Option<&str>,
+    include_filtered: Option<bool>,
 ) -> Option<String> {
     let build_path = |cursor_key: &str, cursor_value: &str| {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -588,6 +628,15 @@ fn notification_link_header(
         }
         for grouped in grouped_types {
             serializer.append_pair("grouped_types[]", grouped);
+        }
+        if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+            serializer.append_pair("account_id", account_id);
+        }
+        if let Some(include_filtered) = include_filtered {
+            serializer.append_pair(
+                "include_filtered",
+                if include_filtered { "true" } else { "false" },
+            );
         }
         format!("{endpoint}?{}", serializer.finish())
     };
@@ -686,6 +735,8 @@ pub async fn get_notifications(
         &raw_include_types,
         &raw_exclude_types,
         &raw_grouped_types,
+        params.account_id.as_deref(),
+        params.include_filtered,
     ) {
         headers.insert(
             LINK,
@@ -744,6 +795,8 @@ pub async fn get_notifications_v2(
         &raw_include_types,
         &raw_exclude_types,
         &raw_grouped_types,
+        params.account_id.as_deref(),
+        params.include_filtered,
     ) {
         headers.insert(
             LINK,

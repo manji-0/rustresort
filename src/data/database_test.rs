@@ -3505,3 +3505,81 @@ async fn test_delete_follow_request_by_address_and_uri_respects_follow_activity_
 
     assert!(!db.has_follow_request("alice@remote.example").await.unwrap());
 }
+
+#[tokio::test]
+async fn test_remote_status_mentions_and_tags_roundtrip() {
+    let (db, _temp_dir) = create_test_db().await;
+    let now = Utc::now();
+    let status = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/statuses/1".to_string(),
+        content: "<p>Hello <a href=\"https://remote.example/@alice\">@alice</a> #rust</p>"
+            .to_string(),
+        content_warning: Some("cw".to_string()),
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "bob@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: now,
+        fetched_at: Some(now),
+    };
+    db.insert_status(&status).await.unwrap();
+
+    db.replace_remote_status_mentions(
+        &status.id,
+        &[RemoteStatusMention {
+            id: format!("{}:mention:0", status.id),
+            status_id: status.id.clone(),
+            actor_uri: "https://remote.example/users/alice".to_string(),
+            username: "alice".to_string(),
+            acct: "alice@remote.example".to_string(),
+            url: "https://remote.example/@alice".to_string(),
+            created_at: now,
+        }],
+    )
+    .await
+    .unwrap();
+    db.replace_remote_status_tags(
+        &status.id,
+        &[RemoteStatusTag {
+            id: format!("{}:tag:0", status.id),
+            status_id: status.id.clone(),
+            name: "rust".to_string(),
+            url: "https://remote.example/tags/rust".to_string(),
+            created_at: now,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let mentions = db.get_remote_status_mentions(&status.id).await.unwrap();
+    assert_eq!(mentions.len(), 1);
+    assert_eq!(mentions[0].acct, "alice@remote.example");
+    assert_eq!(mentions[0].url, "https://remote.example/@alice");
+
+    let tags = db.get_remote_status_tags(&status.id).await.unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].name, "rust");
+    assert_eq!(tags[0].url, "https://remote.example/tags/rust");
+}
+
+#[tokio::test]
+async fn test_get_account_mute_expires_at_returns_duration_deadline() {
+    let (db, _temp_dir) = create_test_db().await;
+    db.mute_account("alice@remote.example", true, Some(3600), Some(443))
+        .await
+        .unwrap();
+
+    let expires_at = db
+        .get_account_mute_expires_at("alice@remote.example", Some(443))
+        .await
+        .unwrap()
+        .expect("temporary mute should have an expiry");
+
+    let seconds_until_expiry = expires_at.signed_duration_since(Utc::now()).num_seconds();
+    assert!((3500..=3605).contains(&seconds_until_expiry));
+}

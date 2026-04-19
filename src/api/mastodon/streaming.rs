@@ -126,12 +126,7 @@ async fn authenticate_stream_request(
 
     let had_candidate_token = !candidate_tokens.is_empty();
     for token in candidate_tokens {
-        if let Some(oauth_token) = state.db.get_oauth_token(token).await?
-            && matches!(
-                oauth_token.grant_type.as_str(),
-                "authorization_code" | "refresh_token"
-            )
-        {
+        if let Some(oauth_token) = state.db.get_oauth_token(token).await? {
             let scopes = oauth_token
                 .scopes
                 .split_whitespace()
@@ -190,10 +185,10 @@ fn cached_status_to_status(cached: &crate::data::CachedStatus) -> Status {
         id: cached.id.clone(),
         uri: cached.uri.clone(),
         content: cached.content.clone(),
-        content_warning: None,
+        content_warning: cached.content_warning.clone(),
         visibility: StatusVisibility::parse(&cached.visibility)
             .unwrap_or(StatusVisibility::Private),
-        language: None,
+        language: cached.language.clone(),
         account_address: cached.account_address.clone(),
         is_local: false,
         in_reply_to_uri: cached.reply_to_uri.clone(),
@@ -249,6 +244,7 @@ async fn build_status_response_value(
     state: &StreamingApiState,
     status: &Status,
     viewer_scoped: bool,
+    filter_context: Option<&'static str>,
 ) -> Result<Value, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
@@ -310,9 +306,12 @@ async fn build_status_response_value(
         if let Some(cached) = cached.as_ref() {
             crate::api::apply_cached_status_metadata(&mut response, cached);
         }
+        response.filtered =
+            crate::api::load_status_filtered_for_context(state.db.as_ref(), status, filter_context)
+                .await?;
         response
     } else {
-        crate::api::build_status_response_with_account_stats_and_remote_stats(
+        let mut response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             status,
             &account,
@@ -321,7 +320,11 @@ async fn build_status_response_value(
             remote_stats,
             interactions,
         )
-        .await?
+        .await?;
+        if let Some(context) = filter_context {
+            crate::api::apply_filtered_context(&mut response, context);
+        }
+        response
     };
 
     serde_json::to_value(response)
@@ -332,8 +335,9 @@ async fn build_status_response(
     state: &StreamingApiState,
     status: &Status,
     viewer_scoped: bool,
+    filter_context: Option<&'static str>,
 ) -> Result<crate::api::dto::StatusResponse, AppError> {
-    let value = build_status_response_value(state, status, viewer_scoped).await?;
+    let value = build_status_response_value(state, status, viewer_scoped, filter_context).await?;
     serde_json::from_value(value)
         .map_err(|error| AppError::serialization("streaming status response decode", error))
 }
@@ -353,7 +357,7 @@ async fn build_notification_response_value(
 
     let status_response = if let Some(status_uri) = notification.status_uri.as_deref() {
         if let Some(status) = get_notification_status(state, status_uri).await {
-            Some(build_status_response(state, &status, viewer_scoped).await?)
+            Some(build_status_response(state, &status, viewer_scoped, Some("notifications")).await?)
         } else {
             None
         }
@@ -398,6 +402,7 @@ async fn serialize_stream_event_data(
     state: &StreamingApiState,
     event: &StreamEvent,
     viewer_scoped: bool,
+    status_filter_context: Option<&'static str>,
 ) -> String {
     match event {
         StreamEvent::Delete { payload, .. } => payload
@@ -407,7 +412,14 @@ async fn serialize_stream_event_data(
             .unwrap_or_else(|| json_value_to_string(payload)),
         StreamEvent::Update { payload, .. } => match load_stream_status(state, payload).await {
             Ok(Some(status)) => {
-                match build_status_response_value(state, &status, viewer_scoped).await {
+                match build_status_response_value(
+                    state,
+                    &status,
+                    viewer_scoped,
+                    status_filter_context,
+                )
+                .await
+                {
                     Ok(value) => json_value_to_string(&value),
                     Err(error) => {
                         tracing::warn!(%error, "failed to build streaming status payload");
@@ -439,6 +451,7 @@ fn build_sse_stream(
     state: StreamingApiState,
     receiver: EventReceiver,
     viewer_scoped: bool,
+    status_filter_context: Option<&'static str>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = stream::unfold(
         (state, receiver.into_inner()),
@@ -446,7 +459,13 @@ fn build_sse_stream(
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        let data = serialize_stream_event_data(&state, &event, viewer_scoped).await;
+                        let data = serialize_stream_event_data(
+                            &state,
+                            &event,
+                            viewer_scoped,
+                            status_filter_context,
+                        )
+                        .await;
                         let sse_event = Event::default().event(event.event_name()).data(data);
                         return Some((Ok(sse_event), (state, receiver)));
                     }
@@ -469,12 +488,19 @@ async fn forward_websocket_stream(
     receiver: EventReceiver,
     stream_name: String,
     viewer_scoped: bool,
+    status_filter_context: Option<&'static str>,
 ) {
     let mut receiver = receiver.into_inner();
     loop {
         match receiver.recv().await {
             Ok(event) => {
-                let payload = serialize_stream_event_data(&state, &event, viewer_scoped).await;
+                let payload = serialize_stream_event_data(
+                    &state,
+                    &event,
+                    viewer_scoped,
+                    status_filter_context,
+                )
+                .await;
                 let frame = serde_json::json!({
                     "stream": [stream_name],
                     "event": event.event_name(),
@@ -617,6 +643,14 @@ fn subscription_key(subscription: &StreamSubscription) -> String {
     }
 }
 
+fn stream_status_filter_context(stream_name: &str) -> Option<&'static str> {
+    match stream_name {
+        "public" | "public:local" | "hashtag" | "hashtag:local" => Some("public"),
+        "user" | "list" | "direct" => Some("home"),
+        _ => None,
+    }
+}
+
 async fn multiplex_websocket_stream(
     state: StreamingApiState,
     socket: WebSocket,
@@ -669,6 +703,8 @@ async fn multiplex_websocket_stream(
                                     let state_for_task = state.clone();
                                     let viewer_scoped = auth.is_some()
                                         || matches!(stream_name.as_str(), "user" | "list" | "direct");
+                                    let status_filter_context =
+                                        stream_status_filter_context(&stream_name);
                                     let handle = tokio::spawn(async move {
                                         let mut event_receiver = event_receiver.into_inner();
                                         loop {
@@ -678,6 +714,7 @@ async fn multiplex_websocket_stream(
                                                         &state_for_task,
                                                         &event,
                                                         viewer_scoped,
+                                                        status_filter_context,
                                                     )
                                                     .await;
                                                     let frame = serde_json::json!({
@@ -750,7 +787,7 @@ pub async fn stream_user(
     enforce_stream_auth(auth.as_ref(), STREAM_SCOPE_USER)?;
     let account_id = state.config.auth.username.as_str();
     let receiver = state.streaming_event_bus.subscribe_user(account_id).await?;
-    Ok(build_sse_stream(state, receiver, true))
+    Ok(build_sse_stream(state, receiver, true, Some("home")))
 }
 
 /// GET /api/v1/streaming/public
@@ -767,7 +804,12 @@ pub async fn stream_public(
     if let Some(auth) = auth.as_ref() {
         enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
     }
-    Ok(build_sse_stream(state, receiver, auth.is_some()))
+    Ok(build_sse_stream(
+        state,
+        receiver,
+        auth.is_some(),
+        Some("public"),
+    ))
 }
 
 /// GET /api/v1/streaming/public/local
@@ -784,7 +826,12 @@ pub async fn stream_public_local(
     if let Some(auth) = auth.as_ref() {
         enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
     }
-    Ok(build_sse_stream(state, receiver, auth.is_some()))
+    Ok(build_sse_stream(
+        state,
+        receiver,
+        auth.is_some(),
+        Some("public"),
+    ))
 }
 
 /// GET /api/v1/streaming/hashtag
@@ -812,7 +859,12 @@ pub async fn stream_hashtag(
     if let Some(auth) = auth.as_ref() {
         enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
     }
-    Ok(build_sse_stream(state, receiver, auth.is_some()))
+    Ok(build_sse_stream(
+        state,
+        receiver,
+        auth.is_some(),
+        Some("public"),
+    ))
 }
 
 /// GET /api/v1/streaming/list
@@ -837,7 +889,7 @@ pub async fn stream_list(
         .ok_or(AppError::NotFound)?;
 
     let receiver = state.streaming_event_bus.subscribe_list(&list_id).await?;
-    Ok(build_sse_stream(state, receiver, true))
+    Ok(build_sse_stream(state, receiver, true, Some("home")))
 }
 
 /// GET /api/v1/streaming/direct
@@ -856,7 +908,7 @@ pub async fn stream_direct(
         .streaming_event_bus
         .subscribe_direct(account_id)
         .await?;
-    Ok(build_sse_stream(state, receiver, true))
+    Ok(build_sse_stream(state, receiver, true, Some("home")))
 }
 
 /// GET /api/v1/streaming
@@ -890,12 +942,20 @@ pub async fn stream_root(
     let (receiver, stream_name) = subscribe_stream(&state, auth.as_ref(), &subscription).await?;
     let viewer_scoped =
         auth.is_some() || matches!(stream_name.as_str(), "user" | "list" | "direct");
+    let status_filter_context = stream_status_filter_context(&stream_name);
     if let Some(ws) = ws {
         return Ok(ws
             .on_upgrade(move |socket| {
-                forward_websocket_stream(state, socket, receiver, stream_name, viewer_scoped)
+                forward_websocket_stream(
+                    state,
+                    socket,
+                    receiver,
+                    stream_name,
+                    viewer_scoped,
+                    status_filter_context,
+                )
             })
             .into_response());
     }
-    Ok(build_sse_stream(state, receiver, viewer_scoped).into_response())
+    Ok(build_sse_stream(state, receiver, viewer_scoped, status_filter_context).into_response())
 }

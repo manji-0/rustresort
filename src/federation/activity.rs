@@ -294,6 +294,20 @@ struct AttachmentSnapshot {
     height: Option<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionSnapshot {
+    actor_uri: String,
+    username: String,
+    acct: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagSnapshot {
+    name: String,
+    url: String,
+}
+
 fn parse_question_poll(object: &serde_json::Value) -> Option<ParsedQuestionPoll> {
     let raw_options = object
         .get("oneOf")
@@ -2612,9 +2626,11 @@ impl ActivityProcessor {
             id: activity_uri.to_string(),
             uri: activity_uri.to_string(),
             content: String::new(),
+            content_warning: None,
             account_address: account_address.clone(),
             created_at,
             visibility: visibility.as_str().to_string(),
+            language: None,
             attachments: Vec::new(),
             mentions: Vec::new(),
             tags: Vec::new(),
@@ -2742,6 +2758,14 @@ impl ActivityProcessor {
             self.db
                 .replace_remote_status_attachments(&status.id, &attachments)
                 .await?;
+            let mentions = self.remote_status_mentions_from_object(&status.id, object);
+            self.db
+                .replace_remote_status_mentions(&status.id, &mentions)
+                .await?;
+            let tags = self.remote_status_tags_from_object(&status.id, object);
+            self.db
+                .replace_remote_status_tags(&status.id, &tags)
+                .await?;
             self.replace_remote_poll_for_status(&status.id, object)
                 .await?;
             if matches!(status.visibility, StatusVisibility::Direct) {
@@ -2764,6 +2788,14 @@ impl ActivityProcessor {
             self.remote_status_attachments_from_object(&status.id, object, reject_media);
         self.db
             .replace_remote_status_attachments(&status.id, &attachments)
+            .await?;
+        let mentions = self.remote_status_mentions_from_object(&status.id, object);
+        self.db
+            .replace_remote_status_mentions(&status.id, &mentions)
+            .await?;
+        let tags = self.remote_status_tags_from_object(&status.id, object);
+        self.db
+            .replace_remote_status_tags(&status.id, &tags)
             .await?;
         self.replace_remote_poll_for_status(&status.id, object)
             .await?;
@@ -2818,6 +2850,22 @@ impl ActivityProcessor {
         }
     }
 
+    fn mention_snapshot(mention: &crate::data::RemoteStatusMention) -> MentionSnapshot {
+        MentionSnapshot {
+            actor_uri: mention.actor_uri.clone(),
+            username: mention.username.clone(),
+            acct: mention.acct.clone(),
+            url: mention.url.clone(),
+        }
+    }
+
+    fn tag_snapshot(tag: &crate::data::RemoteStatusTag) -> TagSnapshot {
+        TagSnapshot {
+            name: tag.name.clone(),
+            url: tag.url.clone(),
+        }
+    }
+
     async fn current_poll_snapshot(
         &self,
         status_id: &str,
@@ -2864,6 +2912,38 @@ impl ActivityProcessor {
             .map(|attachment| Self::attachment_snapshot(&attachment))
             .collect::<Vec<_>>();
         if existing_attachments != updated_attachments {
+            return Ok(true);
+        }
+
+        let existing_mentions = self
+            .db
+            .get_remote_status_mentions(status_id)
+            .await?
+            .into_iter()
+            .map(|mention| Self::mention_snapshot(&mention))
+            .collect::<Vec<_>>();
+        let updated_mentions = self
+            .remote_status_mentions_from_object(status_id, object)
+            .into_iter()
+            .map(|mention| Self::mention_snapshot(&mention))
+            .collect::<Vec<_>>();
+        if existing_mentions != updated_mentions {
+            return Ok(true);
+        }
+
+        let existing_tags = self
+            .db
+            .get_remote_status_tags(status_id)
+            .await?
+            .into_iter()
+            .map(|tag| Self::tag_snapshot(&tag))
+            .collect::<Vec<_>>();
+        let updated_tags = self
+            .remote_status_tags_from_object(status_id, object)
+            .into_iter()
+            .map(|tag| Self::tag_snapshot(&tag))
+            .collect::<Vec<_>>();
+        if existing_tags != updated_tags {
             return Ok(true);
         }
 
@@ -3005,9 +3085,24 @@ impl ActivityProcessor {
             id: status_uri.to_string(),
             uri: status_uri.to_string(),
             content: sanitized_content,
+            content_warning: object
+                .get("summary")
+                .and_then(|summary| summary.as_str())
+                .map(str::to_string)
+                .filter(|summary| !summary.trim().is_empty()),
             account_address: self.extract_actor_address(actor_uri),
             created_at,
             visibility: self.extract_visibility(object),
+            language: object
+                .get("contentMap")
+                .and_then(|map| map.as_object())
+                .and_then(|map| map.keys().next().cloned())
+                .or_else(|| {
+                    object
+                        .get("language")
+                        .and_then(|language| language.as_str())
+                        .map(str::to_string)
+                }),
             attachments: self.extract_cached_attachments(object, reject_media),
             mentions: self.extract_cached_mentions(object),
             tags: self.extract_cached_tags(object),
@@ -3090,6 +3185,44 @@ impl ActivityProcessor {
                     height,
                     created_at: Utc::now(),
                 })
+            })
+            .collect()
+    }
+
+    fn remote_status_mentions_from_object(
+        &self,
+        status_id: &str,
+        object: &serde_json::Value,
+    ) -> Vec<crate::data::RemoteStatusMention> {
+        self.extract_cached_mentions(object)
+            .into_iter()
+            .enumerate()
+            .map(|(index, mention)| crate::data::RemoteStatusMention {
+                id: format!("{status_id}:mention:{index}"),
+                status_id: status_id.to_string(),
+                actor_uri: mention.id,
+                username: mention.username,
+                acct: mention.acct,
+                url: mention.url,
+                created_at: Utc::now(),
+            })
+            .collect()
+    }
+
+    fn remote_status_tags_from_object(
+        &self,
+        status_id: &str,
+        object: &serde_json::Value,
+    ) -> Vec<crate::data::RemoteStatusTag> {
+        self.extract_cached_tags(object)
+            .into_iter()
+            .enumerate()
+            .map(|(index, tag)| crate::data::RemoteStatusTag {
+                id: format!("{status_id}:tag:{index}"),
+                status_id: status_id.to_string(),
+                name: tag.name,
+                url: tag.url,
+                created_at: Utc::now(),
             })
             .collect()
     }
@@ -3418,12 +3551,39 @@ impl ActivityProcessor {
         default_port_for_scheme(&self.local_protocol)
     }
 
+    async fn hashtags_for_status(&self, status: &Status) -> Result<Vec<String>, AppError> {
+        if status.is_local {
+            return Ok(crate::data::extract_hashtags_from_content(
+                status.content.as_str(),
+            ));
+        }
+
+        let tags = self.db.get_remote_status_tags(&status.id).await?;
+        if !tags.is_empty() {
+            return Ok(tags.into_iter().map(|tag| tag.name).collect());
+        }
+
+        Ok(crate::data::extract_hashtags_from_content(
+            status.content.as_str(),
+        ))
+    }
+
+    fn hashtags_for_cached_status(&self, cached_status: &CachedStatus) -> Vec<String> {
+        if !cached_status.tags.is_empty() {
+            return cached_status
+                .tags
+                .iter()
+                .map(|tag| tag.name.clone())
+                .collect();
+        }
+
+        crate::data::extract_hashtags_from_content(cached_status.content.as_str())
+    }
+
     async fn stream_targets_for_remote_status(
         &self,
-        account_address: &str,
-        visibility: StatusVisibility,
+        status: &Status,
         include_home_stream: bool,
-        content: &str,
     ) -> Result<Vec<StreamTarget>, AppError> {
         let mut targets = std::collections::HashSet::new();
         let local_account_id = self.local_account_id().to_string();
@@ -3434,10 +3594,10 @@ impl ActivityProcessor {
             });
         }
 
-        match visibility {
+        match status.visibility {
             StatusVisibility::Public => {
                 targets.insert(StreamTarget::Public);
-                for hashtag in crate::data::extract_hashtags_from_content(content) {
+                for hashtag in self.hashtags_for_status(status).await? {
                     targets.insert(StreamTarget::Hashtag { hashtag });
                 }
             }
@@ -3449,10 +3609,13 @@ impl ActivityProcessor {
             StatusVisibility::Unlisted | StatusVisibility::Private => {}
         }
 
-        if !matches!(visibility, StatusVisibility::Direct) {
+        if !matches!(status.visibility, StatusVisibility::Direct) {
             for list_id in self
                 .db
-                .get_list_ids_for_account(account_address, self.local_default_port())
+                .get_list_ids_for_account(
+                    status.account_address.as_str(),
+                    self.local_default_port(),
+                )
                 .await?
             {
                 targets.insert(StreamTarget::List { list_id });
@@ -3468,12 +3631,7 @@ impl ActivityProcessor {
         };
 
         let Ok(targets) = self
-            .stream_targets_for_remote_status(
-                status.account_address.as_str(),
-                status.visibility,
-                include_home_stream,
-                status.content.as_str(),
-            )
+            .stream_targets_for_remote_status(status, include_home_stream)
             .await
         else {
             return;
@@ -3503,12 +3661,7 @@ impl ActivityProcessor {
         };
 
         let Ok(targets) = self
-            .stream_targets_for_remote_status(
-                status.account_address.as_str(),
-                status.visibility,
-                include_home_stream,
-                status.content.as_str(),
-            )
+            .stream_targets_for_remote_status(status, include_home_stream)
             .await
         else {
             return;
@@ -3545,7 +3698,7 @@ impl ActivityProcessor {
             StatusVisibility::Public => {
                 targets.insert(StreamTarget::Public);
                 targets.insert(StreamTarget::PublicLocal);
-                for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
+                for hashtag in self.hashtags_for_status(status).await.unwrap_or_default() {
                     targets.insert(StreamTarget::Hashtag {
                         hashtag: hashtag.clone(),
                     });
@@ -3586,17 +3739,43 @@ impl ActivityProcessor {
 
         let visibility =
             StatusVisibility::parse(&cached_status.visibility).unwrap_or(StatusVisibility::Private);
-        let Ok(targets) = self
-            .stream_targets_for_remote_status(
-                cached_status.account_address.as_str(),
-                visibility,
-                include_home_stream,
-                cached_status.content.as_str(),
-            )
-            .await
-        else {
-            return;
-        };
+        let mut targets = std::collections::HashSet::new();
+        let local_account_id = self.local_account_id().to_string();
+        if include_home_stream {
+            targets.insert(StreamTarget::User {
+                account_id: local_account_id.clone(),
+            });
+        }
+        match visibility {
+            StatusVisibility::Public => {
+                targets.insert(StreamTarget::Public);
+                for hashtag in self.hashtags_for_cached_status(cached_status) {
+                    targets.insert(StreamTarget::Hashtag { hashtag });
+                }
+            }
+            StatusVisibility::Direct => {
+                targets.insert(StreamTarget::Direct {
+                    account_id: local_account_id,
+                });
+            }
+            StatusVisibility::Unlisted | StatusVisibility::Private => {}
+        }
+        if !matches!(visibility, StatusVisibility::Direct) {
+            let Ok(list_ids) = self
+                .db
+                .get_list_ids_for_account(
+                    cached_status.account_address.as_str(),
+                    self.local_default_port(),
+                )
+                .await
+            else {
+                return;
+            };
+            for list_id in list_ids {
+                targets.insert(StreamTarget::List { list_id });
+            }
+        }
+        let targets = targets.into_iter().collect::<Vec<_>>();
         if targets.is_empty() {
             return;
         }
@@ -3627,17 +3806,43 @@ impl ActivityProcessor {
 
         let visibility =
             StatusVisibility::parse(&cached_status.visibility).unwrap_or(StatusVisibility::Private);
-        let Ok(targets) = self
-            .stream_targets_for_remote_status(
-                cached_status.account_address.as_str(),
-                visibility,
-                include_home_stream,
-                cached_status.content.as_str(),
-            )
-            .await
-        else {
-            return;
-        };
+        let mut targets = std::collections::HashSet::new();
+        let local_account_id = self.local_account_id().to_string();
+        if include_home_stream {
+            targets.insert(StreamTarget::User {
+                account_id: local_account_id.clone(),
+            });
+        }
+        match visibility {
+            StatusVisibility::Public => {
+                targets.insert(StreamTarget::Public);
+                for hashtag in self.hashtags_for_cached_status(cached_status) {
+                    targets.insert(StreamTarget::Hashtag { hashtag });
+                }
+            }
+            StatusVisibility::Direct => {
+                targets.insert(StreamTarget::Direct {
+                    account_id: local_account_id,
+                });
+            }
+            StatusVisibility::Unlisted | StatusVisibility::Private => {}
+        }
+        if !matches!(visibility, StatusVisibility::Direct) {
+            let Ok(list_ids) = self
+                .db
+                .get_list_ids_for_account(
+                    cached_status.account_address.as_str(),
+                    self.local_default_port(),
+                )
+                .await
+            else {
+                return;
+            };
+            for list_id in list_ids {
+                targets.insert(StreamTarget::List { list_id });
+            }
+        }
+        let targets = targets.into_iter().collect::<Vec<_>>();
         if targets.is_empty() {
             return;
         }
@@ -5533,9 +5738,11 @@ mod tests {
                 id: "cache-entry-1".to_string(),
                 uri: status_uri.to_string(),
                 content: "<p>Cached only</p>".to_string(),
+                content_warning: None,
                 account_address: "bob@remote.example".to_string(),
                 created_at: Utc::now(),
                 visibility: "public".to_string(),
+                language: None,
                 attachments: vec![],
                 mentions: vec![],
                 tags: vec![],
@@ -5765,9 +5972,11 @@ mod tests {
                 id: "cache-entry-7".to_string(),
                 uri: status_uri.to_string(),
                 content: "<p>Owned by bob without explicit port</p>".to_string(),
+                content_warning: None,
                 account_address: "bob@remote.example".to_string(),
                 created_at: Utc::now(),
                 visibility: "public".to_string(),
+                language: None,
                 attachments: vec![],
                 mentions: vec![],
                 tags: vec![],

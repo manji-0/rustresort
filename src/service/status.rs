@@ -9,8 +9,9 @@ use super::{StreamEvent, StreamTarget, StreamingEventBus};
 #[cfg(test)]
 use crate::data::Database;
 use crate::data::{
-    CachedAttachment, EntityId, MediaAttachment, PersistedReason, RemoteStatusAttachment,
-    ScheduledStatusInsert, Status, StatusRepository, StatusVisibility, TimelineCache,
+    CachedAttachment, CachedMention, CachedTag, EntityId, MediaAttachment, PersistedReason,
+    RemoteStatusAttachment, RemoteStatusMention, RemoteStatusTag, ScheduledStatusInsert, Status,
+    StatusRepository, StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
 #[cfg(test)]
@@ -789,10 +790,10 @@ impl StatusService {
             id: cached.id.clone(),
             uri: cached.uri.clone(),
             content: cached.content.clone(),
-            content_warning: None,
+            content_warning: cached.content_warning.clone(),
             visibility: StatusVisibility::parse(&cached.visibility)
                 .unwrap_or(StatusVisibility::Private),
-            language: None,
+            language: cached.language.clone(),
             account_address: cached.account_address.clone(),
             is_local: false,
             in_reply_to_uri: cached.reply_to_uri.clone(),
@@ -828,6 +829,45 @@ impl StatusService {
             .collect()
     }
 
+    fn remote_mentions_from_cached(
+        &self,
+        status_id: &str,
+        mentions: &[CachedMention],
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<RemoteStatusMention> {
+        mentions
+            .iter()
+            .enumerate()
+            .map(|(index, mention)| RemoteStatusMention {
+                id: format!("{status_id}:cached-mention:{index}"),
+                status_id: status_id.to_string(),
+                actor_uri: mention.id.clone(),
+                username: mention.username.clone(),
+                acct: mention.acct.clone(),
+                url: mention.url.clone(),
+                created_at,
+            })
+            .collect()
+    }
+
+    fn remote_tags_from_cached(
+        &self,
+        status_id: &str,
+        tags: &[CachedTag],
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<RemoteStatusTag> {
+        tags.iter()
+            .enumerate()
+            .map(|(index, tag)| RemoteStatusTag {
+                id: format!("{status_id}:cached-tag:{index}"),
+                status_id: status_id.to_string(),
+                name: tag.name.clone(),
+                url: tag.url.clone(),
+                created_at,
+            })
+            .collect()
+    }
+
     async fn persist_cached_remote_status(
         &self,
         cached: &crate::data::CachedStatus,
@@ -842,8 +882,37 @@ impl StatusService {
                 .replace_remote_status_attachments(&status.id, &attachments)
                 .await?;
         }
+        self.db
+            .replace_remote_status_mentions(
+                &status.id,
+                &self.remote_mentions_from_cached(&status.id, &cached.mentions, status.created_at),
+            )
+            .await?;
+        self.db
+            .replace_remote_status_tags(
+                &status.id,
+                &self.remote_tags_from_cached(&status.id, &cached.tags, status.created_at),
+            )
+            .await?;
         self.invalidate_cached_status(&status).await;
         Ok(status)
+    }
+
+    async fn hashtags_for_status(&self, status: &Status) -> Result<Vec<String>, AppError> {
+        if status.is_local {
+            return Ok(crate::data::extract_hashtags_from_content(
+                status.content.as_str(),
+            ));
+        }
+
+        let tags = self.db.get_remote_status_tags(&status.id).await?;
+        if !tags.is_empty() {
+            return Ok(tags.into_iter().map(|tag| tag.name).collect());
+        }
+
+        Ok(crate::data::extract_hashtags_from_content(
+            status.content.as_str(),
+        ))
     }
 
     async fn stream_targets_for_status(
@@ -874,7 +943,7 @@ impl StatusService {
         }
 
         if matches!(status.visibility, StatusVisibility::Public) {
-            for hashtag in crate::data::extract_hashtags_from_content(status.content.as_str()) {
+            for hashtag in self.hashtags_for_status(status).await? {
                 targets.insert(StreamTarget::Hashtag {
                     hashtag: hashtag.clone(),
                 });
@@ -1461,9 +1530,11 @@ mod tests {
                 id: EntityId::new_string(),
                 uri: remote_uri.to_string(),
                 content: "<p>cached non-http status</p>".to_string(),
+                content_warning: None,
                 account_address: "alice@remote.example".to_string(),
                 created_at: Utc::now(),
                 visibility: "private".to_string(),
+                language: None,
                 attachments: vec![],
                 mentions: vec![],
                 tags: vec![],

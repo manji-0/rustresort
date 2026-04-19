@@ -165,16 +165,30 @@ fn normalize_tag_set(tags: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn status_matches_tag_filters(
+async fn status_matches_tag_filters(
+    state: &TimelineApiState,
     status: &crate::data::Status,
     any: &[String],
     all: &[String],
     none: &[String],
 ) -> bool {
-    let present = crate::data::extract_hashtags_from_content(&status.content)
-        .into_iter()
-        .map(|tag| tag.to_ascii_lowercase())
-        .collect::<std::collections::HashSet<_>>();
+    let remote_tags = if status.is_local {
+        Vec::new()
+    } else {
+        state
+            .db
+            .get_remote_status_tags(&status.id)
+            .await
+            .unwrap_or_default()
+    };
+    let present = if remote_tags.is_empty() {
+        crate::data::extract_hashtags_from_content(&status.content)
+    } else {
+        remote_tags.into_iter().map(|tag| tag.name).collect()
+    }
+    .into_iter()
+    .map(|tag| tag.to_ascii_lowercase())
+    .collect::<std::collections::HashSet<_>>();
 
     if !any.is_empty() && !any.iter().any(|tag| present.contains(tag)) {
         return false;
@@ -717,7 +731,7 @@ pub async fn tag_timeline(
             if only_media && !status_has_media(&state, &item.status.id).await {
                 continue;
             }
-            if !status_matches_tag_filters(&item.status, &any, &all, &none) {
+            if !status_matches_tag_filters(&state, &item.status, &any, &all, &none).await {
                 continue;
             }
             timeline_items.push(item);

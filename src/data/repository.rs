@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use crate::error::AppError;
 
 use super::{
-    Account, Database, Follow, MediaAttachment, RemoteStatusAttachment, Status, TimelineCursorKey,
+    Account, Database, Follow, MediaAttachment, RemoteStatusAttachment, RemoteStatusMention,
+    RemoteStatusTag, Status, TimelineCursorKey,
 };
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,16 @@ pub trait StatusRepository: Send + Sync {
         status_id: &str,
         attachments: &[RemoteStatusAttachment],
     ) -> Result<(), AppError>;
+    async fn replace_remote_status_mentions(
+        &self,
+        status_id: &str,
+        mentions: &[RemoteStatusMention],
+    ) -> Result<(), AppError>;
+    async fn replace_remote_status_tags(
+        &self,
+        status_id: &str,
+        tags: &[RemoteStatusTag],
+    ) -> Result<(), AppError>;
     async fn update_status_with_edit_snapshot(
         &self,
         previous: &Status,
@@ -121,6 +132,14 @@ pub trait StatusRepository: Send + Sync {
         quote_json: Option<&str>,
     ) -> Result<(), AppError>;
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError>;
+    async fn get_remote_status_mentions(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusMention>, AppError>;
+    async fn get_remote_status_tags(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusTag>, AppError>;
     async fn replace_status_media(
         &self,
         status_id: &str,
@@ -416,6 +435,22 @@ impl StatusRepository for Database {
         Database::replace_remote_status_attachments(self, status_id, attachments).await
     }
 
+    async fn replace_remote_status_mentions(
+        &self,
+        status_id: &str,
+        mentions: &[RemoteStatusMention],
+    ) -> Result<(), AppError> {
+        Database::replace_remote_status_mentions(self, status_id, mentions).await
+    }
+
+    async fn replace_remote_status_tags(
+        &self,
+        status_id: &str,
+        tags: &[RemoteStatusTag],
+    ) -> Result<(), AppError> {
+        Database::replace_remote_status_tags(self, status_id, tags).await
+    }
+
     async fn update_status_with_edit_snapshot(
         &self,
         previous: &Status,
@@ -447,6 +482,20 @@ impl StatusRepository for Database {
 
     async fn get_media_by_status(&self, status_id: &str) -> Result<Vec<MediaAttachment>, AppError> {
         Database::get_media_by_status(self, status_id).await
+    }
+
+    async fn get_remote_status_mentions(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusMention>, AppError> {
+        Database::get_remote_status_mentions(self, status_id).await
+    }
+
+    async fn get_remote_status_tags(
+        &self,
+        status_id: &str,
+    ) -> Result<Vec<RemoteStatusTag>, AppError> {
+        Database::get_remote_status_tags(self, status_id).await
     }
 
     async fn replace_status_media(

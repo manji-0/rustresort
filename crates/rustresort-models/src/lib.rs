@@ -212,6 +212,28 @@ pub struct RemoteStatusAttachment {
     pub created_at: DateTime<Utc>,
 }
 
+/// Persisted mention metadata parsed from a remote ActivityPub object.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RemoteStatusMention {
+    pub id: String,
+    pub status_id: String,
+    pub actor_uri: String,
+    pub username: String,
+    pub acct: String,
+    pub url: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persisted hashtag metadata parsed from a remote ActivityPub object.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RemoteStatusTag {
+    pub id: String,
+    pub status_id: String,
+    pub name: String,
+    pub url: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Notification categories enabled for Web Push.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

@@ -206,8 +206,8 @@ async fn oauth_authorization_server(
             "admin:write:domain_blocks"
         ],
         "response_types_supported": ["code"],
-        "response_modes_supported": ["query", "fragment", "form_post"],
-        "code_challenge_methods_supported": ["S256"],
+        "response_modes_supported": ["query"],
+        "code_challenge_methods_supported": ["plain", "S256"],
         "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
     }))

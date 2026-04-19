@@ -317,6 +317,32 @@ impl Database {
             .map(|(_, notifications)| notifications != 0))
     }
 
+    /// Get mute expiration time for an account, if the mute is temporary.
+    pub async fn get_account_mute_expires_at(
+        &self,
+        target_address: &str,
+        default_port: Option<u16>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+        let existing_mutes =
+            sqlx::query_as::<_, (String, Option<i64>, chrono::DateTime<chrono::Utc>)>(
+                "SELECT target_address, duration, created_at FROM account_mutes",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(existing_mutes
+            .into_iter()
+            .find(|(existing, _, _)| {
+                account_addresses_match(existing, target_address, default_port)
+            })
+            .and_then(|(_, duration, created_at)| {
+                duration
+                    .filter(|seconds| *seconds > 0)
+                    .and_then(|seconds| chrono::Duration::try_seconds(seconds))
+                    .map(|duration| created_at + duration)
+            }))
+    }
+
     /// Get muted account addresses
     pub async fn get_muted_accounts(&self, limit: usize) -> Result<Vec<String>, AppError> {
         let addresses = sqlx::query_scalar::<_, String>(

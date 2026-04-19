@@ -299,6 +299,34 @@ async fn enrich_status_response(
     response.favourites_count = saturating_i32(db.count_favourites(&status.id).await?);
     response.quotes_count = saturating_i32(db.count_quotes_by_uri(&status.uri).await?);
     response.edited_at = db.get_latest_status_edit_at(&status.id).await?;
+    if !status.is_local {
+        let mentions = db.get_remote_status_mentions(&status.id).await?;
+        if !mentions.is_empty() {
+            response.mentions = mentions
+                .into_iter()
+                .map(|mention| {
+                    serde_json::json!({
+                        "id": mention.actor_uri,
+                        "username": mention.username,
+                        "url": mention.url,
+                        "acct": mention.acct,
+                    })
+                })
+                .collect();
+        }
+        let tags = db.get_remote_status_tags(&status.id).await?;
+        if !tags.is_empty() {
+            response.tags = tags
+                .into_iter()
+                .map(|tag| {
+                    serde_json::json!({
+                        "name": tag.name,
+                        "url": tag.url,
+                    })
+                })
+                .collect();
+        }
+    }
     Ok(())
 }
 
@@ -2587,9 +2615,11 @@ mod tests {
             id: status.id.clone(),
             uri: status.uri.clone(),
             content: status.content.clone(),
+            content_warning: None,
             account_address: status.account_address.clone(),
             created_at: status.created_at,
             visibility: "public".to_string(),
+            language: None,
             attachments: vec![CachedAttachment {
                 url: "https://cdn.remote.example/media/original.jpg".to_string(),
                 thumbnail_url: Some("https://cdn.remote.example/media/preview.jpg".to_string()),

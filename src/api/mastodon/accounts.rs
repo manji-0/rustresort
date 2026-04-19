@@ -329,6 +329,30 @@ async fn load_profile_preferences(state: &AccountApiState) -> Result<ProfilePref
     })
 }
 
+async fn load_notification_preferences(
+    state: &AccountApiState,
+) -> Result<crate::data::PushAlerts, AppError> {
+    let Some(subscription) = state.db.get_push_subscription().await? else {
+        return Ok(crate::data::PushAlerts {
+            mention: true,
+            quote: true,
+            status: true,
+            reblog: true,
+            follow: true,
+            follow_request: true,
+            favourite: true,
+            poll: true,
+            update: true,
+            quoted_update: true,
+            admin_sign_up: true,
+            admin_report: true,
+        });
+    };
+
+    serde_json::from_str(&subscription.alerts_json)
+        .map_err(|error| AppError::Validation(format!("invalid push alerts JSON: {error}")))
+}
+
 async fn save_profile_preferences(
     state: &AccountApiState,
     hide_collections: Option<bool>,
@@ -1595,10 +1619,10 @@ async fn resolve_remote_account_response_for_list_without_placeholder(
 async fn remote_profile_lock_state(
     state: &AccountApiState,
     target_address: &str,
-) -> Result<Option<(Option<String>, bool)>, AppError> {
+) -> Result<Option<(Option<String>, Option<bool>)>, AppError> {
     let default_port = default_port_for_protocol(&state.config.server.protocol);
     if let Some(profile) = state.profile_cache.get(target_address).await {
-        return Ok(Some((Some(profile.uri.clone()), profile.locked)));
+        return Ok(Some((Some(profile.uri.clone()), Some(profile.locked))));
     }
 
     let resolved = resolve_remote_actor_and_inbox_with_dependencies(
@@ -1610,15 +1634,15 @@ async fn remote_profile_lock_state(
     .await;
     if let Ok((actor_uri, _)) = resolved {
         if let Some(profile) = state.profile_cache.get_by_uri(&actor_uri).await {
-            return Ok(Some((Some(actor_uri), profile.locked)));
+            return Ok(Some((Some(actor_uri), Some(profile.locked))));
         }
-        return Ok(Some((Some(actor_uri), false)));
+        return Ok(Some((Some(actor_uri), None)));
     }
 
     if let Some(normalized) = canonical_remote_account_address(target_address)
         && let Some(follow) = state.db.get_follow(&normalized, default_port).await?
     {
-        return Ok(Some((follow.actor_uri, false)));
+        return Ok(Some((follow.actor_uri, None)));
     }
 
     Ok(None)
@@ -1673,6 +1697,11 @@ async fn relationship_response_for_target(
         .get_account_mute_notifications(target_address, default_port)
         .await?
         .unwrap_or(false);
+    let muting_expires_at = state
+        .db
+        .get_account_mute_expires_at(target_address, default_port)
+        .await?
+        .map(|expires_at| expires_at.to_rfc3339());
     let follow_preferences = load_follow_preferences(state, target_address).await?;
     let requested_by = state
         .db
@@ -1702,7 +1731,7 @@ async fn relationship_response_for_target(
         endorsed: false,
         notifying: follow_preferences.notify,
         languages: Vec::new(),
-        muting_expires_at: None,
+        muting_expires_at,
         note: String::new(),
     })
 }
@@ -2056,7 +2085,7 @@ fn contains_equivalent_address(
 }
 
 fn paginate_account_response_values(
-    mut accounts: Vec<serde_json::Value>,
+    accounts: Vec<serde_json::Value>,
     params: &PaginationParams,
     limit: usize,
 ) -> (Vec<serde_json::Value>, bool) {
@@ -2076,34 +2105,45 @@ fn paginate_account_response_values(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    accounts.sort_by(|left, right| {
-        let left_id = left
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let right_id = right
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        right_id.cmp(left_id)
-    });
-    accounts.dedup_by(|left, right| {
-        left.get("id").and_then(|value| value.as_str())
-            == right.get("id").and_then(|value| value.as_str())
-    });
-    let mut accounts = accounts
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut ordered = accounts
         .into_iter()
         .filter(|account| {
             let id = account
                 .get("id")
                 .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            max_id.map(|cursor| id < cursor).unwrap_or(true)
-                && min_id.map(|cursor| id > cursor).unwrap_or(true)
-                && since_id.map(|cursor| id > cursor).unwrap_or(true)
+                .unwrap_or_default()
+                .to_string();
+            !id.is_empty() && seen_ids.insert(id)
         })
-        .take(limit + 1)
         .collect::<Vec<_>>();
+
+    let position_for = |cursor: &str, values: &[serde_json::Value]| {
+        values.iter().position(|account| {
+            account
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| id == cursor)
+        })
+    };
+
+    if let Some(cursor) = max_id
+        && let Some(position) = position_for(cursor, &ordered)
+    {
+        ordered = ordered.into_iter().skip(position + 1).collect();
+    }
+    if let Some(cursor) = min_id
+        && let Some(position) = position_for(cursor, &ordered)
+    {
+        ordered = ordered.into_iter().take(position).collect();
+    }
+    if let Some(cursor) = since_id
+        && let Some(position) = position_for(cursor, &ordered)
+    {
+        ordered = ordered.into_iter().take(position).collect();
+    }
+
+    let mut accounts = ordered.into_iter().take(limit + 1).collect::<Vec<_>>();
     let has_next = accounts.len() > limit;
     if has_next {
         accounts.truncate(limit);
@@ -2360,6 +2400,51 @@ async fn resolve_target_address(state: &AccountApiState, id: &str) -> Result<Str
     if id.starts_with("http://") || id.starts_with("https://") {
         if let Some(address) = parse_actor_uri_account_address(id) {
             return normalize_account_address(&address);
+        }
+        if let Some(profile) = state.profile_cache.get_by_uri(id).await {
+            return normalize_account_address(&profile.address);
+        }
+        for (address, actor_uri) in state.db.get_all_muted_account_details().await? {
+            if actor_uri
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(id))
+            {
+                return normalize_account_address(&address);
+            }
+        }
+        for (address, actor_uri) in state.db.get_all_follow_request_details().await? {
+            if actor_uri
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(id))
+            {
+                return normalize_account_address(&address);
+            }
+        }
+        for follow in state.db.get_all_follows().await? {
+            if follow
+                .actor_uri
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(id))
+            {
+                return normalize_account_address(&follow.target_address);
+            }
+        }
+        for follower in state.db.get_all_followers().await? {
+            if follower
+                .actor_uri
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(id))
+            {
+                return normalize_account_address(&follower.follower_address);
+            }
+        }
+        for (address, actor_uri, _) in state.db.get_all_blocked_account_details().await? {
+            if actor_uri
+                .as_deref()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(id))
+            {
+                return normalize_account_address(&address);
+            }
         }
         return Err(AppError::Validation(
             "Invalid account ID format".to_string(),
@@ -2631,6 +2716,7 @@ pub async fn preferences(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let preferences = load_posting_preferences(&state).await?;
+    let notification_preferences = load_notification_preferences(&state).await?;
     Ok(Json(serde_json::json!({
         "posting:default:visibility": preferences.privacy,
         "posting:default:sensitive": preferences.sensitive,
@@ -2654,11 +2740,11 @@ pub async fn preferences(
             Some(value) => if matches!(value.trim(), "1" | "true") { "show_all" } else { "hide_all" },
         },
         "reading:display:expand_spoilers": false,
-        "notifications:follow": true,
-        "notifications:favourite": true,
-        "notifications:reblog": true,
-        "notifications:mention": true,
-        "notifications:poll": true,
+        "notifications:follow": notification_preferences.follow,
+        "notifications:favourite": notification_preferences.favourite,
+        "notifications:reblog": notification_preferences.reblog,
+        "notifications:mention": notification_preferences.mention,
+        "notifications:poll": notification_preferences.poll,
         "web:theme": "default",
     })))
 }
@@ -3360,10 +3446,7 @@ pub async fn follow_account(
     let target_actor_uri_hint = remote_follow_state
         .as_ref()
         .and_then(|(actor_uri, _)| actor_uri.clone());
-    let target_is_locked = remote_follow_state
-        .as_ref()
-        .map(|(_, locked)| *locked)
-        .unwrap_or(false);
+    let target_is_locked = remote_follow_state.as_ref().and_then(|(_, locked)| *locked);
 
     // Persist follow relationship if not already present.
     let follow_id = EntityId::new_string();
@@ -3386,7 +3469,7 @@ pub async fn follow_account(
         .await?;
     save_follow_preferences(&state, &target_address, follow_preferences).await?;
 
-    if !target_is_locked {
+    if target_is_locked == Some(false) {
         let accepted_actor_uri = target_actor_uri_hint.as_deref().unwrap_or(&target_address);
         let _ = state
             .db
@@ -3437,7 +3520,8 @@ pub async fn follow_account(
 
 #[cfg(test)]
 mod account_normalization_tests {
-    use super::normalize_account_address;
+    use super::{PaginationParams, normalize_account_address, paginate_account_response_values};
+    use serde_json::json;
 
     #[test]
     fn normalize_account_address_preserves_ipv6_brackets_without_port() {
@@ -3454,6 +3538,55 @@ mod account_normalization_tests {
     #[test]
     fn normalize_account_address_rejects_url_shaped_values() {
         assert!(normalize_account_address("https://remote.example/@alice").is_err());
+    }
+
+    #[test]
+    fn paginate_account_response_values_preserves_source_order() {
+        let accounts = vec![
+            json!({"id": "https://remote.example/users/c"}),
+            json!({"id": "https://remote.example/users/a"}),
+            json!({"id": "https://remote.example/users/b"}),
+        ];
+
+        let (page, has_next) = paginate_account_response_values(
+            accounts,
+            &PaginationParams {
+                max_id: None,
+                since_id: None,
+                min_id: None,
+                limit: Some(2),
+            },
+            2,
+        );
+
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0]["id"], "https://remote.example/users/c");
+        assert_eq!(page[1]["id"], "https://remote.example/users/a");
+        assert!(has_next);
+    }
+
+    #[test]
+    fn paginate_account_response_values_uses_cursor_position_not_lexicographic_order() {
+        let accounts = vec![
+            json!({"id": "https://remote.example/users/c"}),
+            json!({"id": "https://remote.example/users/a"}),
+            json!({"id": "https://remote.example/users/b"}),
+        ];
+
+        let (page, has_next) = paginate_account_response_values(
+            accounts,
+            &PaginationParams {
+                max_id: Some("https://remote.example/users/a".to_string()),
+                since_id: None,
+                min_id: None,
+                limit: Some(10),
+            },
+            10,
+        );
+
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["id"], "https://remote.example/users/b");
+        assert!(!has_next);
     }
 }
 
@@ -3631,6 +3764,11 @@ pub async fn get_relationships(
             .get_account_mute_notifications(&target_address, default_port)
             .await?
             .unwrap_or(false);
+        let muting_expires_at = state
+            .db
+            .get_account_mute_expires_at(&target_address, default_port)
+            .await?
+            .map(|expires_at| expires_at.to_rfc3339());
         let follow_is_accepted = state
             .db
             .is_follow_accepted(&target_address, default_port)
@@ -3665,7 +3803,7 @@ pub async fn get_relationships(
             endorsed: false,
             notifying: follow_preferences.notify,
             languages: Vec::new(),
-            muting_expires_at: None,
+            muting_expires_at,
             note: String::new(),
         };
 
@@ -4141,17 +4279,23 @@ pub async fn mute_account(
     State(state): State<AccountApiState>,
     CurrentUser(_session): CurrentUser,
     Path(id): Path<String>,
-    req: Option<Json<MuteAccountRequest>>,
+    request: Request,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Accept account addresses and local account IDs.
     let target_address = resolve_target_address(&state, &id).await?;
 
-    let req = req
-        .map(|Json(payload)| payload)
-        .unwrap_or(MuteAccountRequest {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| AppError::Validation(format!("failed to read request body: {error}")))?;
+    let req = if body.is_empty() {
+        MuteAccountRequest {
             notifications: None,
             duration: None,
-        });
+        }
+    } else {
+        parse_json_or_form_body::<MuteAccountRequest>(&parts.headers, &body)?
+    };
 
     let mute_notifications = req.notifications.unwrap_or(true);
     let duration = req.duration;

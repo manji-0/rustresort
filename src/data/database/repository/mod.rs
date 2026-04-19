@@ -20,6 +20,7 @@ mod push_subscriptions;
 mod remote_blocks;
 mod remote_profiles;
 mod remote_status_attachments;
+mod remote_status_metadata;
 mod scheduled_statuses;
 mod search;
 mod settings;

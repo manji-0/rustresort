@@ -216,6 +216,7 @@ pub struct ListsApiState {
 #[derive(Clone)]
 pub struct FiltersApiState {
     pub db: Arc<data::Database>,
+    pub streaming_event_bus: Arc<dyn service::StreamingEventBus>,
 }
 
 /// Minimal state required for Mastodon conversation endpoints.
@@ -385,7 +386,10 @@ impl_from_ref_state!(ListsApiState {
     profile_cache,
     federation_fetch_client,
 });
-impl_from_ref_state!(FiltersApiState { db });
+impl_from_ref_state!(FiltersApiState {
+    db,
+    streaming_event_bus,
+});
 impl_from_ref_state!(ConversationsApiState {
     config,
     db,
@@ -609,17 +613,41 @@ impl AppState {
                         blurhash: attachment.blurhash,
                     }),
             );
+            let mentions = db
+                .get_remote_status_mentions(&status.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mention| data::CachedMention {
+                    id: mention.actor_uri,
+                    username: mention.username,
+                    acct: mention.acct,
+                    url: mention.url,
+                })
+                .collect::<Vec<_>>();
+            let tags = db
+                .get_remote_status_tags(&status.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| data::CachedTag {
+                    name: tag.name,
+                    url: tag.url,
+                })
+                .collect::<Vec<_>>();
             timeline_cache
                 .insert(data::CachedStatus {
                     id: status.id.clone(),
                     uri: status.uri.clone(),
                     content: status.content.clone(),
+                    content_warning: status.content_warning.clone(),
                     account_address: status.account_address.clone(),
                     created_at: status.created_at,
                     visibility: status.visibility.to_string(),
+                    language: status.language.clone(),
                     attachments,
-                    mentions: Vec::new(),
-                    tags: Vec::new(),
+                    mentions,
+                    tags,
                     reply_to_uri: status.in_reply_to_uri.clone(),
                     boost_of_uri: status.boost_of_uri.clone(),
                     quote_of_uri: status.quote_of_uri.clone(),
