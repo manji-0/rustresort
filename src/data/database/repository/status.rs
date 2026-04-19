@@ -230,6 +230,46 @@ impl Database {
         Ok(statuses)
     }
 
+    /// Get direct-message statuses in a pagination window for the single local user.
+    pub async fn get_direct_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let max_cursor = match max_id {
+            Some(id) => self
+                .status_cursor_by_id(id)
+                .await?
+                .map(|(created_at, id)| TimelineCursorKey { created_at, id }),
+            None => None,
+        };
+        let min_cursor = match min_id {
+            Some(id) => self
+                .status_cursor_by_id(id)
+                .await?
+                .map(|(created_at, id)| TimelineCursorKey { created_at, id }),
+            None => None,
+        };
+
+        let mut query_builder =
+            QueryBuilder::<Sqlite>::new("SELECT * FROM statuses WHERE visibility = 'direct'");
+        Self::push_status_window_clauses(
+            &mut query_builder,
+            max_cursor.as_ref(),
+            min_cursor.as_ref(),
+            "",
+        );
+        query_builder.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        query_builder.push_bind(limit as i64);
+
+        query_builder
+            .build_query_as::<Status>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Resolve thread root URI by walking the reply chain from a status.
     ///
     /// Returns the top-most known ancestor URI, or an unknown parent URI when

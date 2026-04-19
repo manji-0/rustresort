@@ -900,6 +900,15 @@ fn media_url(media_base_url: &str, s3_key: &str) -> String {
     )
 }
 
+fn media_focus_json(focus_x: Option<f64>, focus_y: Option<f64>) -> Option<serde_json::Value> {
+    focus_x.zip(focus_y).map(|(x, y)| {
+        serde_json::json!({
+            "x": x,
+            "y": y,
+        })
+    })
+}
+
 fn media_attachment_to_response(
     attachment: &MediaAttachment,
     config: &AppConfig,
@@ -923,7 +932,7 @@ fn media_attachment_to_response(
                 "height": attachment.height,
                 "size": attachment.width.zip(attachment.height).map(|(w, h)| format!("{w}x{h}")),
                 "aspect": attachment.width.zip(attachment.height).and_then(|(w, h)| (h != 0).then_some(w as f64 / h as f64)),
-                "focus": attachment.focus_x.zip(attachment.focus_y).map(|(x, y)| format!("{x:.3},{y:.3}")),
+                "focus": media_focus_json(attachment.focus_x, attachment.focus_y),
             }
         }))
     } else {

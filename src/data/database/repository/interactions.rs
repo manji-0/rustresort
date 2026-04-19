@@ -259,6 +259,65 @@ impl Database {
         Ok(statuses)
     }
 
+    /// Get bookmarked statuses in a Mastodon-style pagination window.
+    pub async fn get_bookmarked_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = match (max_id, min_id) {
+            (Some(max_id), Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.* FROM statuses s
+                    INNER JOIN bookmarks b ON s.id = b.status_id
+                    LEFT JOIN bookmarks cbmax ON cbmax.status_id = ?
+                    LEFT JOIN bookmarks cbmin ON cbmin.status_id = ?
+                    WHERE (
+                        cbmax.status_id IS NOT NULL
+                        AND (b.created_at < cbmax.created_at OR (b.created_at = cbmax.created_at AND s.id < ?))
+                    ) AND (
+                        cbmin.status_id IS NOT NULL
+                        AND (b.created_at > cbmin.created_at OR (b.created_at = cbmin.created_at AND s.id > ?))
+                    )
+                    ORDER BY b.created_at DESC, s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(min_id)
+                .bind(max_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None) => self.get_bookmarked_statuses(limit, Some(max_id)).await?,
+            (None, Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.* FROM statuses s
+                    INNER JOIN bookmarks b ON s.id = b.status_id
+                    LEFT JOIN bookmarks cb ON cb.status_id = ?
+                    WHERE cb.status_id IS NOT NULL
+                      AND (b.created_at > cb.created_at OR (b.created_at = cb.created_at AND s.id > ?))
+                    ORDER BY b.created_at DESC, s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => self.get_bookmarked_statuses(limit, None).await?,
+        };
+
+        Ok(statuses)
+    }
+
     /// Get favourited statuses with JOIN (optimized, avoids N+1)
     pub async fn get_favourited_statuses(
         &self,
@@ -306,6 +365,65 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?
             }
+        };
+
+        Ok(statuses)
+    }
+
+    /// Get favourited statuses in a Mastodon-style pagination window.
+    pub async fn get_favourited_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        let statuses = match (max_id, min_id) {
+            (Some(max_id), Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.* FROM statuses s
+                    INNER JOIN favourites f ON s.id = f.status_id
+                    LEFT JOIN favourites cfmax ON cfmax.status_id = ?
+                    LEFT JOIN favourites cfmin ON cfmin.status_id = ?
+                    WHERE (
+                        cfmax.status_id IS NOT NULL
+                        AND (f.created_at < cfmax.created_at OR (f.created_at = cfmax.created_at AND s.id < ?))
+                    ) AND (
+                        cfmin.status_id IS NOT NULL
+                        AND (f.created_at > cfmin.created_at OR (f.created_at = cfmin.created_at AND s.id > ?))
+                    )
+                    ORDER BY f.created_at DESC, s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(min_id)
+                .bind(max_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None) => self.get_favourited_statuses(limit, Some(max_id)).await?,
+            (None, Some(min_id)) => {
+                sqlx::query_as::<_, Status>(
+                    r#"
+                    SELECT s.* FROM statuses s
+                    INNER JOIN favourites f ON s.id = f.status_id
+                    LEFT JOIN favourites cf ON cf.status_id = ?
+                    WHERE cf.status_id IS NOT NULL
+                      AND (f.created_at > cf.created_at OR (f.created_at = cf.created_at AND s.id > ?))
+                    ORDER BY f.created_at DESC, s.id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(min_id)
+                .bind(min_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => self.get_favourited_statuses(limit, None).await?,
         };
 
         Ok(statuses)

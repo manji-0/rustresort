@@ -69,16 +69,18 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn websocket_protocol_token(headers: &HeaderMap) -> Option<&str> {
+fn websocket_protocol_tokens(headers: &HeaderMap) -> Vec<&str> {
     headers
         .get("Sec-WebSocket-Protocol")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
+        .map(|value| {
             value
                 .split(',')
                 .map(str::trim)
-                .find(|value| !value.is_empty())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
         })
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -111,10 +113,17 @@ async fn authenticate_stream_request(
     jar: &CookieJar,
     query_access_token: Option<&str>,
 ) -> Result<Option<StreamAuth>, AppError> {
-    let token = bearer_token(headers)
-        .or(query_access_token)
-        .or_else(|| websocket_protocol_token(headers));
-    if let Some(token) = token {
+    let mut candidate_tokens = Vec::new();
+    if let Some(token) = bearer_token(headers) {
+        candidate_tokens.push(token);
+    }
+    if let Some(token) = query_access_token {
+        candidate_tokens.push(token);
+    }
+    candidate_tokens.extend(websocket_protocol_tokens(headers));
+
+    let had_candidate_token = !candidate_tokens.is_empty();
+    for token in candidate_tokens {
         if let Some(oauth_token) = state.db.get_oauth_token(token).await?
             && matches!(
                 oauth_token.grant_type.as_str(),
@@ -131,6 +140,9 @@ async fn authenticate_stream_request(
         if crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok() {
             return Ok(Some(StreamAuth::Session));
         }
+    }
+
+    if had_candidate_token {
         return Err(AppError::Unauthorized);
     }
 
@@ -316,7 +328,7 @@ async fn build_notification_response_value(
     let response = crate::api::NotificationResponse {
         id: notification_id.clone(),
         notification_type: notification.notification_type.to_string(),
-        group_key: format!("ungrouped-{}", notification_id),
+        group_key: super::notifications::notification_group_key(&notification),
         created_at: notification.created_at,
         account: resolve_account_response_for_identity(
             state.config.as_ref(),
@@ -703,25 +715,33 @@ pub async fn stream_user(
 /// Stream public statuses
 pub async fn stream_public(
     State(state): State<StreamingApiState>,
+    headers: HeaderMap,
+    jar: CookieJar,
     Query(_params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public().await?;
-    Ok(build_sse_stream(state, receiver, false))
+    let auth = authenticate_stream_request(&state, &headers, &jar, None).await?;
+    Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
 /// GET /api/v1/streaming/public/local
 /// Stream local public statuses
 pub async fn stream_public_local(
     State(state): State<StreamingApiState>,
+    headers: HeaderMap,
+    jar: CookieJar,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let receiver = state.streaming_event_bus.subscribe_public_local().await?;
-    Ok(build_sse_stream(state, receiver, false))
+    let auth = authenticate_stream_request(&state, &headers, &jar, None).await?;
+    Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
 /// GET /api/v1/streaming/hashtag
 /// Stream statuses with a specific hashtag
 pub async fn stream_hashtag(
     State(state): State<StreamingApiState>,
+    headers: HeaderMap,
+    jar: CookieJar,
     Query(params): Query<StreamParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
     let tag = params
@@ -736,7 +756,9 @@ pub async fn stream_hashtag(
     } else {
         state.streaming_event_bus.subscribe_hashtag(&tag).await?
     };
-    Ok(build_sse_stream(state, receiver, false))
+    let auth =
+        authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
 /// GET /api/v1/streaming/list

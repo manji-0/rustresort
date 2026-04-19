@@ -216,6 +216,7 @@ impl TimelineService {
         limit: usize,
         max_id: Option<&str>,
         min_id: Option<&str>,
+        include_non_public: bool,
         only_media: bool,
         exclude_replies: bool,
         exclude_reblogs: bool,
@@ -268,10 +269,12 @@ impl TimelineService {
                 .await?;
 
             for status in statuses {
-                if !matches!(
-                    status.visibility,
-                    StatusVisibility::Public | StatusVisibility::Unlisted
-                ) {
+                if !include_non_public
+                    && !matches!(
+                        status.visibility,
+                        StatusVisibility::Public | StatusVisibility::Unlisted
+                    )
+                {
                     continue;
                 }
                 if exclude_reblogs && status.boost_of_uri.is_some() {
@@ -321,6 +324,7 @@ impl TimelineService {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
         let statuses = self
             .collect_visible_statuses(
@@ -328,22 +332,24 @@ impl TimelineService {
                 max_id.map(str::to_string),
                 |fetch_limit, cursor| async move {
                     self.db
-                        .get_favourited_statuses(fetch_limit, cursor.as_deref())
+                        .get_favourited_statuses_in_window(fetch_limit, cursor.as_deref(), min_id)
                         .await
                 },
             )
             .await?;
         let status_ids: Vec<String> = statuses.iter().map(|status| status.id.clone()).collect();
         let bookmarked_ids = self.db.get_bookmarked_status_ids_batch(&status_ids).await?;
+        let reposted_ids = self.db.get_reposted_status_ids_batch(&status_ids).await?;
 
         let mut items = Vec::with_capacity(statuses.len());
         for status in statuses {
+            let reblogged = reposted_ids.contains(&status.id);
             items.push(TimelineItem {
                 account: Self::timeline_account_from_status(&status),
                 bookmarked: bookmarked_ids.contains(&status.id),
                 status,
                 favourited: true,
-                reblogged: false,
+                reblogged,
             });
         }
 
@@ -355,6 +361,7 @@ impl TimelineService {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<TimelineItem>, AppError> {
         let statuses = self
             .collect_visible_statuses(
@@ -362,7 +369,7 @@ impl TimelineService {
                 max_id.map(str::to_string),
                 |fetch_limit, cursor| async move {
                     self.db
-                        .get_bookmarked_statuses(fetch_limit, cursor.as_deref())
+                        .get_bookmarked_statuses_in_window(fetch_limit, cursor.as_deref(), min_id)
                         .await
                 },
             )
@@ -384,6 +391,20 @@ impl TimelineService {
         }
 
         Ok(items)
+    }
+
+    /// Get direct-message timeline for the single local user.
+    pub async fn direct_timeline(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<TimelineItem>, AppError> {
+        let statuses = self
+            .db
+            .get_direct_statuses_in_window(limit, max_id, min_id)
+            .await?;
+        self.build_timeline_items_with_interactions(statuses).await
     }
 
     fn timeline_account_from_status(status: &Status) -> TimelineAccount {

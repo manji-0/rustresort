@@ -771,6 +771,7 @@ pub fn build_router(state: AppState) -> axum::Router {
     let mut router = Router::new()
         .route("/health", axum::routing::get(health_check))
         .route("/@:username", axum::routing::get(html_profile_page))
+        .route("/@:username/:id", axum::routing::get(html_status_page))
         .merge(auth::auth_router(config_state.clone()))
         .merge(api::oauth_router())
         .merge(api::wellknown_router())
@@ -911,6 +912,41 @@ async fn html_profile_page(
         domain = escape_html(&state.config.server.domain),
         note = escape_html(note),
         actor_url = escape_html(&actor_url),
+    );
+    Ok(axum::response::Html(html))
+}
+
+async fn html_status_page(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path((username, id)): axum::extract::Path<(String, String)>,
+) -> Result<axum::response::Html<String>, error::AppError> {
+    let account = state
+        .db
+        .get_account()
+        .await?
+        .ok_or(error::AppError::NotFound)?;
+    if account.username != username {
+        return Err(error::AppError::NotFound);
+    }
+
+    let status = state
+        .db
+        .get_status(&id)
+        .await?
+        .ok_or(error::AppError::NotFound)?;
+    if !status.is_local {
+        return Err(error::AppError::NotFound);
+    }
+
+    let title = account
+        .display_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(account.username.as_str());
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title}</title></head><body><main><h1>{title}</h1><article>{content}</article></main></body></html>",
+        title = escape_html(title),
+        content = status.content,
     );
     Ok(axum::response::Html(html))
 }

@@ -102,10 +102,44 @@ impl Database {
         &self,
         limit: usize,
         max_id: Option<&str>,
+        since_id: Option<&str>,
         min_id: Option<&str>,
     ) -> Result<Vec<(String, Option<String>, bool)>, AppError> {
-        let conversations = match (max_id, min_id) {
-            (Some(max_id), Some(min_id)) => {
+        let conversations = match (max_id, since_id, min_id) {
+            (Some(max_id), Some(since_id), _) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    r#"
+                    SELECT id, last_status_id, unread
+                    FROM conversations
+                    WHERE (
+                        updated_at < (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id < ?
+                        )
+                    )
+                    AND (
+                        updated_at > (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id > ?
+                        )
+                    )
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(max_id)
+                .bind(max_id)
+                .bind(max_id)
+                .bind(since_id)
+                .bind(since_id)
+                .bind(since_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(max_id), None, Some(min_id)) => {
                 sqlx::query_as::<_, (String, Option<String>, i64)>(
                     r#"
                     SELECT id, last_status_id, unread
@@ -138,7 +172,7 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?
             }
-            (Some(max_id), None) => {
+            (Some(max_id), None, None) => {
                 sqlx::query_as::<_, (String, Option<String>, i64)>(
                     r#"
                     SELECT id, last_status_id, unread
@@ -160,7 +194,29 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?
             }
-            (None, Some(min_id)) => {
+            (None, Some(since_id), _) => {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(
+                    r#"
+                    SELECT id, last_status_id, unread
+                    FROM conversations
+                    WHERE
+                        updated_at > (SELECT updated_at FROM conversations WHERE id = ?)
+                        OR (
+                            updated_at = (SELECT updated_at FROM conversations WHERE id = ?)
+                            AND id > ?
+                        )
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    "#,
+                )
+                .bind(since_id)
+                .bind(since_id)
+                .bind(since_id)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None, Some(min_id)) => {
                 sqlx::query_as::<_, (String, Option<String>, i64)>(
                     r#"
                     SELECT id, last_status_id, unread
@@ -182,7 +238,7 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?
             }
-            (None, None) => {
+            (None, None, None) => {
                 sqlx::query_as::<_, (String, Option<String>, i64)>(
                     "SELECT id, last_status_id, unread FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?",
                 )

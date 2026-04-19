@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 use super::accounts::build_remote_account_placeholder_response;
 use crate::InstanceApiState;
+use crate::api::mastodon::media::SUPPORTED_UPLOAD_MIME_TYPES;
 
 const DEFAULT_INSTANCE_RULES: [&str; 3] = [
     "Be respectful and civil in all interactions.",
@@ -43,6 +44,23 @@ fn streaming_endpoint_url(state: &InstanceApiState) -> String {
     let streaming_base = streaming_base_url(&base_url)
         .unwrap_or_else(|| format!("https://{}", state.config.server.domain));
     format!("{streaming_base}/api/v1/streaming")
+}
+
+fn supported_upload_mime_types_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        SUPPORTED_UPLOAD_MIME_TYPES
+            .iter()
+            .map(|value| serde_json::Value::String((*value).to_string()))
+            .collect(),
+    )
+}
+
+fn local_status_url_template(state: &InstanceApiState) -> String {
+    format!(
+        "{}/@{}/{{id}}",
+        state.config.server.base_url(),
+        state.config.auth.username
+    )
 }
 
 fn domain_from_account_address(address: &str) -> Option<String> {
@@ -220,9 +238,30 @@ fn rules_to_json(rule_texts: &[String]) -> serde_json::Value {
     )
 }
 
+fn parse_custom_emojis_value(raw: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .filter(|value| value.is_array())
+}
+
 /// GET /api/v1/custom_emojis
-pub async fn custom_emojis() -> Json<serde_json::Value> {
-    Json(serde_json::json!([]))
+pub async fn custom_emojis(State(state): State<InstanceApiState>) -> Json<serde_json::Value> {
+    let emojis = state
+        .db
+        .get_setting("instance.custom_emojis")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(parse_custom_emojis_value)
+        .or_else(|| {
+            std::env::var("RUSTRESORT_INSTANCE_CUSTOM_EMOJIS")
+                .ok()
+                .as_deref()
+                .and_then(parse_custom_emojis_value)
+        })
+        .unwrap_or_else(|| serde_json::json!([]));
+    Json(emojis)
 }
 
 /// GET /api/v1/announcements
@@ -412,6 +451,41 @@ pub async fn instance_privacy_policy(
     }))
 }
 
+/// GET /api/v1/instance/terms_of_service
+pub async fn instance_terms_of_service(
+    State(state): State<InstanceApiState>,
+) -> Json<serde_json::Value> {
+    let terms_content = state
+        .db
+        .get_setting("instance.terms_of_service")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let privacy_content = state
+        .db
+        .get_setting("instance.privacy_policy")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+    let content = terms_content
+        .or(privacy_content)
+        .unwrap_or_else(|| state.config.instance.description.clone());
+    let updated_at = state
+        .db
+        .get_setting("instance.terms_of_service.updated_at")
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    Json(serde_json::json!({
+        "content": content,
+        "updated_at": updated_at
+    }))
+}
+
 /// GET /api/v1/instance/translation_languages
 pub async fn instance_translation_languages() -> Json<serde_json::Value> {
     Json(serde_json::json!({}))
@@ -464,14 +538,19 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
         "configuration": {
             "urls": {
                 "streaming": streaming_endpoint_url(&state),
-                "status": format!("{}/@{}/{{id}}", base_url, state.config.auth.username),
+                "status": local_status_url_template(&state),
                 "about": base_url,
                 "privacy_policy": format!("{}/api/v1/instance/privacy_policy", base_url),
-                "terms_of_service": base_url,
+                "terms_of_service": format!("{}/api/v1/instance/terms_of_service", base_url),
             },
             "accounts": {
                 "max_featured_tags": 10,
                 "max_pinned_statuses": 10,
+                "max_display_name_length": 30,
+                "max_note_length": 500,
+                "max_profile_fields": 4,
+                "max_profile_field_name_length": 255,
+                "max_profile_field_value_length": 255,
             },
             "statuses": {
                 "max_characters": 500,
@@ -479,23 +558,13 @@ pub async fn instance(State(state): State<InstanceApiState>) -> Json<serde_json:
                 "characters_reserved_per_url": 23,
             },
             "media_attachments": {
-                "supported_mime_types": [
-                    "image/jpeg",
-                    "image/png",
-                    "image/gif",
-                    "image/webp",
-                    "image/avif",
-                    "image/heif",
-                    "image/heic",
-                    "video/mp4",
-                    "video/webm",
-                    "video/quicktime"
-                ],
+                "supported_mime_types": supported_upload_mime_types_json(),
                 "image_size_limit": 10485760,
                 "image_matrix_limit": 16777216,
                 "video_size_limit": 41943040,
                 "video_frame_rate_limit": 60,
-                "video_matrix_limit": 2304000
+                "video_matrix_limit": 2304000,
+                "description_limit": 1500
             },
             "polls": {
                 "max_options": 4,
@@ -633,14 +702,19 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
         "configuration": {
             "urls": {
                 "streaming": streaming_endpoint_url(&state),
-                "status": format!("{}/@{}/{{id}}", base_url, state.config.auth.username),
+                "status": local_status_url_template(&state),
                 "about": base_url,
                 "privacy_policy": format!("{}/api/v1/instance/privacy_policy", base_url),
-                "terms_of_service": base_url
+                "terms_of_service": format!("{}/api/v1/instance/terms_of_service", base_url)
             },
             "accounts": {
                 "max_featured_tags": 10,
-                "max_pinned_statuses": 10
+                "max_pinned_statuses": 10,
+                "max_display_name_length": 30,
+                "max_note_length": 500,
+                "max_profile_fields": 4,
+                "max_profile_field_name_length": 255,
+                "max_profile_field_value_length": 255
             },
             "statuses": {
                 "max_characters": 500,
@@ -648,23 +722,13 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
                 "characters_reserved_per_url": 23
             },
             "media_attachments": {
-                "supported_mime_types": [
-                    "image/jpeg",
-                    "image/png",
-                    "image/gif",
-                    "image/webp",
-                    "image/avif",
-                    "image/heif",
-                    "image/heic",
-                    "video/mp4",
-                    "video/webm",
-                    "video/quicktime"
-                ],
+                "supported_mime_types": supported_upload_mime_types_json(),
                 "image_size_limit": 10485760,
                 "image_matrix_limit": 16777216,
                 "video_size_limit": 41943040,
                 "video_frame_rate_limit": 60,
-                "video_matrix_limit": 2304000
+                "video_matrix_limit": 2304000,
+                "description_limit": 1500
             },
             "polls": {
                 "max_options": 4,
@@ -679,7 +743,10 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
                 "enabled": false
             }
         },
-        "icon": null,
+        "icon": {
+            "src": format!("{}/favicon.ico", base_url),
+            "size": "16x16"
+        },
         "registrations": {
             "enabled": false,
             "approval_required": false,

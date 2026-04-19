@@ -2,6 +2,8 @@
 
 use axum::{
     extract::{Query, State},
+    http::{HeaderMap, header::LINK},
+    response::IntoResponse,
     response::Json,
 };
 
@@ -16,20 +18,29 @@ pub async fn get_bookmarks(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
     let timeline_items = timeline_service
-        .bookmarks_timeline(limit, params.max_id.as_deref())
+        .bookmarks_timeline(limit + 1, params.max_id.as_deref(), lower_bound_id)
         .await?;
+    let has_next = timeline_items.len() > limit;
+    let mut timeline_items = timeline_items;
+    if has_next {
+        timeline_items.truncate(limit);
+    }
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -67,7 +78,27 @@ pub async fn get_bookmarks(
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = collection_link_header(
+        "/api/v1/bookmarks",
+        limit,
+        first_id,
+        last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/favourites
@@ -75,20 +106,29 @@ pub async fn get_favourites(
     State(state): State<TimelineApiState>,
     CurrentUser(_session): CurrentUser,
     Query(params): Query<PaginationParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     // Get account
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
     let timeline_items = timeline_service
-        .favourites_timeline(limit, params.max_id.as_deref())
+        .favourites_timeline(limit + 1, params.max_id.as_deref(), lower_bound_id)
         .await?;
+    let has_next = timeline_items.len() > limit;
+    let mut timeline_items = timeline_items;
+    if has_next {
+        timeline_items.truncate(limit);
+    }
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
         .map(|item| item.status.clone())
@@ -126,5 +166,50 @@ pub async fn get_favourites(
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut headers = HeaderMap::new();
+    if let Some(link) = collection_link_header(
+        "/api/v1/favourites",
+        limit,
+        first_id,
+        last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
+    ) {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
+}
+
+fn collection_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
+) -> Option<String> {
+    let build = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        format!("{path}?{}", serializer.finish())
+    };
+
+    let mut links = Vec::new();
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"next\"", build("max_id", last_id)));
+    }
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"prev\"", build("min_id", first_id)));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
 }

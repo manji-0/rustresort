@@ -5,6 +5,7 @@ use axum::{
     http::{HeaderMap, header},
     response::Json,
 };
+use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 
 use super::accounts::{resolve_account_response_for_identity, resolve_remote_account_response};
@@ -55,6 +56,7 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
 pub async fn search_v2(
     State(state): State<SearchApiState>,
     headers: HeaderMap,
+    jar: CookieJar,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let query = params.q.trim();
@@ -72,7 +74,11 @@ pub async fn search_v2(
             .await?
             .is_some_and(|oauth_token| oauth_token.grant_type != "client_credentials")
     } else {
-        false
+        jar.get("session")
+            .map(|cookie| cookie.value())
+            .is_some_and(|token| {
+                crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+            })
     };
 
     if query.is_empty() {
@@ -312,9 +318,27 @@ pub async fn search_v2(
                                     })
                                 }
                             })
+                            .filter(|status| {
+                                matches!(
+                                    status.visibility,
+                                    crate::data::StatusVisibility::Public
+                                        | crate::data::StatusVisibility::Unlisted
+                                ) || target_account.as_ref().is_some_and(|target| {
+                                    target.id == account.id && status.is_local
+                                })
+                            })
                             .collect::<Vec<_>>()
                     } else {
                         found_statuses
+                            .into_iter()
+                            .filter(|status| {
+                                matches!(
+                                    status.visibility,
+                                    crate::data::StatusVisibility::Public
+                                        | crate::data::StatusVisibility::Unlisted
+                                )
+                            })
+                            .collect::<Vec<_>>()
                     };
                     let account_stats = crate::api::load_local_account_stats(state.db.as_ref())
                         .await
@@ -447,9 +471,10 @@ pub async fn search_v2(
 pub async fn search_v1(
     State(state): State<SearchApiState>,
     headers: HeaderMap,
+    jar: CookieJar,
     params: Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let Json(mut response) = search_v2(State(state), headers, params).await?;
+    let Json(mut response) = search_v2(State(state), headers, jar, params).await?;
     if let Some(obj) = response.as_object_mut()
         && let Some(hashtags) = obj
             .get_mut("hashtags")

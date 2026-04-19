@@ -32,11 +32,8 @@ pub async fn get_featured_tags(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<Vec<FeaturedTagResponse>>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let profile_url_prefix = format!(
-        "{}/users/{}",
-        state.config.server.base_url(),
-        account.username
-    );
+    let profile_url_prefix =
+        crate::api::local_profile_url(&state.config.server.base_url(), &account.username);
     let rows = state.db.list_featured_tags().await?;
     Ok(Json(
         rows.into_iter()
@@ -51,11 +48,8 @@ pub async fn feature_tag(
     Form(req): Form<FeatureTagRequest>,
 ) -> Result<Json<FeaturedTagResponse>, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
-    let profile_url_prefix = format!(
-        "{}/users/{}",
-        state.config.server.base_url(),
-        account.username
-    );
+    let profile_url_prefix =
+        crate::api::local_profile_url(&state.config.server.base_url(), &account.username);
     if state.db.count_featured_tags().await? >= MAX_FEATURED_TAGS
         && state
             .db

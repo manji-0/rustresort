@@ -4,11 +4,12 @@ use axum::{
     body::to_bytes,
     extract::{Path, Query, RawQuery, Request, State},
     http::{
-        HeaderMap,
+        HeaderMap, header,
         header::{CONTENT_TYPE, LINK},
     },
     response::{IntoResponse, Json},
 };
+use axum_extra::extract::CookieJar;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -58,6 +59,8 @@ pub struct UpdateCredentialsRequest {
     pub note: Option<String>,
     pub avatar: Option<String>, // Base64 encoded image
     pub header: Option<String>, // Base64 encoded image
+    pub avatar_description: Option<String>,
+    pub header_description: Option<String>,
     pub fields_attributes: Option<serde_json::Value>,
     pub moved_to_account_id: Option<String>,
     #[serde(rename = "locked")]
@@ -100,6 +103,8 @@ struct ParsedUpdateCredentialsRequest {
     note: Option<String>,
     avatar: Option<ProfileImageInput>,
     header: Option<ProfileImageInput>,
+    avatar_description: Option<String>,
+    header_description: Option<String>,
     fields_attributes: Option<serde_json::Value>,
     moved_to_account_id: Option<String>,
     locked: Option<bool>,
@@ -147,6 +152,8 @@ const PROFILE_HIDE_COLLECTIONS_KEY: &str = "profile.hide_collections";
 const PROFILE_SHOW_MEDIA_KEY: &str = "profile.show_media";
 const PROFILE_SHOW_MEDIA_REPLIES_KEY: &str = "profile.show_media_replies";
 const PROFILE_SHOW_FEATURED_KEY: &str = "profile.show_featured";
+const PROFILE_AVATAR_DESCRIPTION_KEY: &str = "profile.avatar_description";
+const PROFILE_HEADER_DESCRIPTION_KEY: &str = "profile.header_description";
 
 #[derive(Debug, Clone)]
 struct PostingPreferences {
@@ -167,6 +174,12 @@ struct ProfilePreferences {
     show_media: bool,
     show_media_replies: bool,
     show_featured: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProfileMetadata {
+    avatar_description: String,
+    header_description: String,
 }
 
 fn parse_setting_bool(value: Option<String>, default: bool) -> bool {
@@ -328,6 +341,41 @@ async fn save_profile_preferences(
     Ok(())
 }
 
+async fn load_profile_metadata(state: &AccountApiState) -> Result<ProfileMetadata, AppError> {
+    Ok(ProfileMetadata {
+        avatar_description: state
+            .db
+            .get_setting(PROFILE_AVATAR_DESCRIPTION_KEY)
+            .await?
+            .unwrap_or_default(),
+        header_description: state
+            .db
+            .get_setting(PROFILE_HEADER_DESCRIPTION_KEY)
+            .await?
+            .unwrap_or_default(),
+    })
+}
+
+async fn save_profile_metadata(
+    state: &AccountApiState,
+    avatar_description: Option<String>,
+    header_description: Option<String>,
+) -> Result<(), AppError> {
+    if let Some(value) = avatar_description {
+        state
+            .db
+            .set_setting(PROFILE_AVATAR_DESCRIPTION_KEY, value.trim())
+            .await?;
+    }
+    if let Some(value) = header_description {
+        state
+            .db
+            .set_setting(PROFILE_HEADER_DESCRIPTION_KEY, value.trim())
+            .await?;
+    }
+    Ok(())
+}
+
 fn apply_local_profile_preferences(
     response: &mut AccountResponse,
     preferences: ProfilePreferences,
@@ -437,6 +485,8 @@ fn apply_update_credentials_pair(
         "note" => request.note = Some(value),
         "avatar" => request.avatar = Some(ProfileImageInput::Encoded(value)),
         "header" => request.header = Some(ProfileImageInput::Encoded(value)),
+        "avatar_description" => request.avatar_description = Some(value),
+        "header_description" => request.header_description = Some(value),
         "moved_to_account_id" => request.moved_to_account_id = Some(value),
         "locked" => request.locked = Some(parse_update_credentials_bool("locked", &value)?),
         "bot" => request.bot = Some(parse_update_credentials_bool("bot", &value)?),
@@ -495,6 +545,8 @@ fn parse_update_credentials_json(body: &[u8]) -> Result<ParsedUpdateCredentialsR
         note: request.note,
         avatar: request.avatar.map(ProfileImageInput::Encoded),
         header: request.header.map(ProfileImageInput::Encoded),
+        avatar_description: request.avatar_description,
+        header_description: request.header_description,
         fields_attributes: request.fields_attributes,
         moved_to_account_id: request.moved_to_account_id,
         locked: request.locked,
@@ -1552,6 +1604,10 @@ async fn relationship_response_for_target(
         .await?
         .unwrap_or(false);
     let follow_preferences = load_follow_preferences(state, target_address).await?;
+    let requested_by = state
+        .db
+        .has_follow_request_with_default_port(target_address, default_port)
+        .await?;
     let blocked_by = if requested_id.starts_with("http://") || requested_id.starts_with("https://")
     {
         state.db.is_blocked_by_remote(requested_id).await?
@@ -1570,7 +1626,7 @@ async fn relationship_response_for_target(
         muting,
         muting_notifications,
         requested,
-        requested_by: false,
+        requested_by,
         domain_blocking: false,
         showing_reblogs: follow_preferences.reblogs,
         endorsed: false,
@@ -1753,7 +1809,8 @@ async fn resolve_remote_collection_accounts(
         }
     }
 
-    Ok(paginate_account_response_values(resolved, params, limit))
+    let (resolved, _) = paginate_account_response_values(resolved, params, limit);
+    Ok(resolved)
 }
 
 async fn resolve_moved_account_response(
@@ -1932,7 +1989,7 @@ fn paginate_account_response_values(
     mut accounts: Vec<serde_json::Value>,
     params: &PaginationParams,
     limit: usize,
-) -> Vec<serde_json::Value> {
+) -> (Vec<serde_json::Value>, bool) {
     let max_id = params
         .max_id
         .as_deref()
@@ -1975,12 +2032,16 @@ fn paginate_account_response_values(
                 && min_id.map(|cursor| id > cursor).unwrap_or(true)
                 && since_id.map(|cursor| id > cursor).unwrap_or(true)
         })
-        .take(limit)
+        .take(limit + 1)
         .collect::<Vec<_>>();
+    let has_next = accounts.len() > limit;
+    if has_next {
+        accounts.truncate(limit);
+    }
     if min_id.is_some() {
         accounts.reverse();
     }
-    accounts
+    (accounts, has_next)
 }
 
 fn account_collection_link_header(
@@ -1988,6 +2049,8 @@ fn account_collection_link_header(
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
 ) -> Option<String> {
     let build_path = |cursor_key: &str, cursor_value: &str| {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -1997,13 +2060,45 @@ fn account_collection_link_header(
     };
 
     let mut links = Vec::new();
-    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
         links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
     }
-    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}>; rel=\"prev\"",
-            build_path("since_id", first_id)
+            build_path("min_id", first_id)
+        ));
+    }
+    (!links.is_empty()).then(|| links.join(", "))
+}
+
+fn timeline_collection_link_header(
+    path: &str,
+    limit: usize,
+    first_id: Option<&str>,
+    last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
+    extra_params: &[(&str, &str)],
+) -> Option<String> {
+    let build_path = |cursor_key: &str, cursor_value: &str| {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair("limit", &limit.to_string());
+        serializer.append_pair(cursor_key, cursor_value);
+        for (key, value) in extra_params {
+            serializer.append_pair(key, value);
+        }
+        format!("{path}?{}", serializer.finish())
+    };
+
+    let mut links = Vec::new();
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+        links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
+    }
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+        links.push(format!(
+            "<{}>; rel=\"prev\"",
+            build_path("min_id", first_id)
         ));
     }
     (!links.is_empty()).then(|| links.join(", "))
@@ -2019,6 +2114,57 @@ fn canonical_account_identity(acct: &str, local_domain: &str) -> String {
             local_domain.trim().to_ascii_lowercase()
         )
     }
+}
+
+async fn request_has_authenticated_user(
+    state: &AccountApiState,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+) -> Result<bool, AppError> {
+    if let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let oauth_token = state.db.get_oauth_token(token).await?;
+        return Ok(oauth_token.is_some_and(|token| {
+            matches!(
+                token.grant_type.as_str(),
+                "authorization_code" | "refresh_token"
+            )
+        }));
+    }
+
+    Ok(jar
+        .get("session")
+        .map(|cookie| cookie.value())
+        .is_some_and(|token| {
+            crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+        }))
+}
+
+async fn featured_tags_payload(state: &AccountApiState) -> Result<serde_json::Value, AppError> {
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let profile_url_prefix =
+        crate::api::local_profile_url(&state.config.server.base_url(), &account.username);
+    let tags = state
+        .db
+        .list_featured_tags()
+        .await?
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.0,
+                "name": row.1.clone(),
+                "url": format!("{profile_url_prefix}/tagged/{}", row.1),
+                "statuses_count": row.2,
+                "last_status_at": row.3,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::Value::Array(tags))
 }
 
 fn build_delivery(
@@ -2384,6 +2530,8 @@ pub async fn verify_credentials(
         .moved
         .as_ref()
         .map(|moved| serde_json::to_value(moved).unwrap());
+    let profile_metadata = load_profile_metadata(&state).await?;
+    let featured_tags = featured_tags_payload(&state).await?;
     let mut value = serde_json::to_value(response).unwrap();
     if let Some(obj) = value.as_object_mut() {
         if let Some(moved) = moved_value {
@@ -2391,14 +2539,14 @@ pub async fn verify_credentials(
         }
         obj.insert(
             "avatar_description".to_string(),
-            serde_json::Value::String(String::new()),
+            serde_json::Value::String(profile_metadata.avatar_description),
         );
         obj.insert(
             "header_description".to_string(),
-            serde_json::Value::String(String::new()),
+            serde_json::Value::String(profile_metadata.header_description),
         );
         obj.insert("attribution_domains".to_string(), serde_json::json!([]));
-        obj.insert("featured_tags".to_string(), serde_json::json!([]));
+        obj.insert("featured_tags".to_string(), featured_tags);
         obj.insert(
             "source".to_string(),
             account_source_payload(&state, &account).await?,
@@ -2413,6 +2561,7 @@ pub async fn preferences(
     CurrentUser(_session): CurrentUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let preferences = load_posting_preferences(&state).await?;
+    let profile_preferences = load_profile_preferences(&state).await?;
     Ok(Json(serde_json::json!({
         "posting:default:visibility": preferences.privacy,
         "posting:default:sensitive": preferences.sensitive,
@@ -2421,11 +2570,11 @@ pub async fn preferences(
         "posting:default:privacy": preferences.privacy,
         "posting:default:media_sensitive": preferences.sensitive,
         "posting:default:content_type": "text/plain",
-        "reading:expand:media": "default",
+        "reading:expand:media": if profile_preferences.show_media { "show_all" } else { "hide_all" },
         "reading:expand:spoilers": false,
         "reading:autoplay:gifs": true,
-        "reading:display:media": "default",
-        "reading:display:expand_media": "default",
+        "reading:display:media": if profile_preferences.show_media_replies { "show_all" } else { "hide_all" },
+        "reading:display:expand_media": if profile_preferences.show_media { "show_all" } else { "hide_all" },
         "reading:display:expand_spoilers": false,
         "notifications:follow": true,
         "notifications:favourite": true,
@@ -2456,6 +2605,8 @@ pub async fn update_credentials(
         note,
         avatar,
         header,
+        avatar_description,
+        header_description,
         fields_attributes,
         moved_to_account_id,
         locked,
@@ -2487,6 +2638,7 @@ pub async fn update_credentials(
         show_featured,
     )
     .await?;
+    save_profile_metadata(&state, avatar_description, header_description).await?;
 
     let avatar_bytes = match avatar {
         Some(ProfileImageInput::Encoded(encoded)) => {
@@ -2616,6 +2768,8 @@ pub async fn update_credentials(
         .moved
         .as_ref()
         .map(|moved| serde_json::to_value(moved).unwrap());
+    let profile_metadata = load_profile_metadata(&state).await?;
+    let featured_tags = featured_tags_payload(&state).await?;
     let mut value = serde_json::to_value(response).unwrap();
     if let Some(obj) = value.as_object_mut() {
         if let Some(moved) = moved_value {
@@ -2623,14 +2777,14 @@ pub async fn update_credentials(
         }
         obj.insert(
             "avatar_description".to_string(),
-            serde_json::Value::String(String::new()),
+            serde_json::Value::String(profile_metadata.avatar_description),
         );
         obj.insert(
             "header_description".to_string(),
-            serde_json::Value::String(String::new()),
+            serde_json::Value::String(profile_metadata.header_description),
         );
         obj.insert("attribution_domains".to_string(), serde_json::json!([]));
-        obj.insert("featured_tags".to_string(), serde_json::json!([]));
+        obj.insert("featured_tags".to_string(), featured_tags);
         obj.insert(
             "source".to_string(),
             account_source_payload(&state, &account).await?,
@@ -2688,13 +2842,17 @@ fn is_public_account_status_visibility(visibility: crate::data::StatusVisibility
 pub async fn account_statuses(
     State(state): State<AccountApiState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
+    jar: CookieJar,
     Query(params): Query<AccountStatusesParams>,
-) -> Result<Json<Vec<serde_json::Value>>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
     let default_port = default_port_for_protocol(&state.config.server.protocol);
-    let requested_identity = if local_account_matches_identity(&account, state.config.as_ref(), &id)
-    {
+    let local_requested = local_account_matches_identity(&account, state.config.as_ref(), &id);
+    let viewer_authenticated = request_has_authenticated_user(&state, &headers, &jar).await?;
+    let allow_non_public = viewer_authenticated && local_requested;
+    let requested_identity = if local_requested {
         None
     } else {
         Some(resolve_target_address(&state, &id).await?)
@@ -2715,9 +2873,10 @@ pub async fn account_statuses(
         .account_timeline(
             requested_identity.as_deref(),
             default_port,
-            limit,
+            limit + 1,
             params.max_id.as_deref(),
             lower_bound_id,
+            allow_non_public,
             only_media,
             exclude_replies,
             exclude_reblogs,
@@ -2726,6 +2885,10 @@ pub async fn account_statuses(
         .await?;
     if params.min_id.is_some() {
         timeline_items.reverse();
+    }
+    let has_next = timeline_items.len() > limit;
+    if has_next {
+        timeline_items.truncate(limit);
     }
     let timeline_statuses: Vec<_> = timeline_items
         .iter()
@@ -2741,13 +2904,30 @@ pub async fn account_statuses(
     .unwrap_or_default();
     let mut responses = Vec::with_capacity(limit);
     for item in timeline_items {
-        if !is_public_account_status_visibility(item.status.visibility) {
+        if !allow_non_public && !is_public_account_status_visibility(item.status.visibility) {
             continue;
         }
         let is_pinned = state.db.is_status_pinned(&item.status.id).await?;
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
+        let interactions = if viewer_authenticated {
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                Some(is_pinned),
+            )
+        } else {
+            crate::api::StatusInteractions::new(
+                Some(false),
+                Some(false),
+                None,
+                Some(false),
+                Some(is_pinned),
+            )
+        };
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -2755,19 +2935,55 @@ pub async fn account_statuses(
             &state.config,
             account_stats,
             remote_stats,
-            crate::api::StatusInteractions::new(
-                Some(false),
-                Some(false),
-                None,
-                Some(false),
-                Some(is_pinned),
-            ),
+            interactions,
         )
         .await?;
         responses.push(serde_json::to_value(response).unwrap());
     }
 
-    Ok(Json(responses))
+    let first_id = responses
+        .first()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let last_id = responses
+        .last()
+        .and_then(|value| value.get("id"))
+        .and_then(|value| value.as_str());
+    let mut extra_params = Vec::new();
+    if params.exclude_reblogs.unwrap_or(false) {
+        extra_params.push(("exclude_reblogs", "true"));
+    }
+    if params.exclude_replies.unwrap_or(false) {
+        extra_params.push(("exclude_replies", "true"));
+    }
+    if params.only_media.unwrap_or(false) {
+        extra_params.push(("only_media", "true"));
+    }
+    if params.pinned.unwrap_or(false) {
+        extra_params.push(("pinned", "true"));
+    }
+    let path = format!(
+        "/api/v1/accounts/{}/statuses",
+        urlencoding::encode(id.trim())
+    );
+    let mut headers = HeaderMap::new();
+    if let Some(link) = timeline_collection_link_header(
+        &path,
+        limit,
+        first_id,
+        last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
+        &extra_params,
+    ) {
+        headers.insert(
+            LINK,
+            link.parse()
+                .map_err(|_| AppError::Validation("invalid Link header".to_string()))?,
+        );
+    }
+
+    Ok((headers, Json(responses)))
 }
 
 /// GET /api/v1/accounts/:id/followers
@@ -2798,6 +3014,8 @@ pub async fn get_account_followers(
             limit,
             first_id,
             last_id,
+            params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+            followers.len() >= limit,
         ) {
             headers.insert(
                 LINK,
@@ -2859,7 +3077,7 @@ pub async fn get_account_followers(
         .await;
     followers.extend(resolved.into_iter().flatten());
 
-    let followers = paginate_account_response_values(followers, &params, limit);
+    let (followers, has_next) = paginate_account_response_values(followers, &params, limit);
     let first_id = followers
         .first()
         .and_then(|value| value.get("id"))
@@ -2874,6 +3092,8 @@ pub async fn get_account_followers(
         limit,
         first_id,
         last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
     ) {
         headers.insert(
             LINK,
@@ -2913,6 +3133,8 @@ pub async fn get_account_following(
             limit,
             first_id,
             last_id,
+            params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+            following.len() >= limit,
         ) {
             headers.insert(
                 LINK,
@@ -2974,7 +3196,7 @@ pub async fn get_account_following(
         .await;
     following.extend(resolved.into_iter().flatten());
 
-    let following = paginate_account_response_values(following, &params, limit);
+    let (following, has_next) = paginate_account_response_values(following, &params, limit);
     let first_id = following
         .first()
         .and_then(|value| value.get("id"))
@@ -2989,6 +3211,8 @@ pub async fn get_account_following(
         limit,
         first_id,
         last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
     ) {
         headers.insert(
             LINK,
@@ -3344,7 +3568,7 @@ pub async fn get_relationships(
             muting,
             muting_notifications,
             requested,
-            requested_by: false,
+            requested_by: has_follow_request,
             domain_blocking: false,
             showing_reblogs: follow_preferences.reblogs,
             endorsed: false,

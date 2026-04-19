@@ -268,10 +268,28 @@ pub trait TimelineRepository: Send + Sync {
         limit: usize,
         max_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError>;
+    async fn get_favourited_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError>;
     async fn get_bookmarked_statuses(
         &self,
         limit: usize,
         max_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError>;
+    async fn get_bookmarked_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError>;
+    async fn get_direct_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError>;
     async fn get_bookmarked_status_ids_batch(
         &self,
@@ -735,12 +753,39 @@ impl TimelineRepository for Database {
         Database::get_favourited_statuses(self, limit, max_id).await
     }
 
+    async fn get_favourited_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_favourited_statuses_in_window(self, limit, max_id, min_id).await
+    }
+
     async fn get_bookmarked_statuses(
         &self,
         limit: usize,
         max_id: Option<&str>,
     ) -> Result<Vec<Status>, AppError> {
         Database::get_bookmarked_statuses(self, limit, max_id).await
+    }
+
+    async fn get_bookmarked_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_bookmarked_statuses_in_window(self, limit, max_id, min_id).await
+    }
+
+    async fn get_direct_statuses_in_window(
+        &self,
+        limit: usize,
+        max_id: Option<&str>,
+        min_id: Option<&str>,
+    ) -> Result<Vec<Status>, AppError> {
+        Database::get_direct_statuses_in_window(self, limit, max_id, min_id).await
     }
 
     async fn get_bookmarked_status_ids_batch(

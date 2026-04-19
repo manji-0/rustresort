@@ -930,7 +930,7 @@ async fn featured(
                 state.profile_cache.clone(),
             );
             let pinned_statuses = timeline_service
-                .account_timeline(None, None, 40, None, None, false, false, false, true)
+                .account_timeline(None, None, 40, None, None, false, false, false, false, true)
                 .await?
                 .into_iter()
                 .map(|item| item.status)

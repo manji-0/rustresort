@@ -5,6 +5,7 @@ use axum::{
     http::{HeaderMap, header::LINK},
     response::{IntoResponse, Json},
 };
+use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -272,7 +273,13 @@ pub async fn home_timeline(
             &state.config,
             account_stats,
             remote_stats,
-            crate::api::StatusInteractions::public(),
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
         )
         .await?;
         responses.push(serde_json::to_value(response).unwrap());
@@ -300,6 +307,8 @@ pub async fn home_timeline(
 /// GET /api/v1/timelines/public
 pub async fn public_timeline(
     State(state): State<TimelineApiState>,
+    headers: HeaderMap,
+    jar: CookieJar,
     RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
     // Start timing the request
@@ -319,6 +328,25 @@ pub async fn public_timeline(
     db_timer.observe_duration();
 
     let params = parse_public_timeline_params(raw_query.as_deref())?;
+    let viewer_authenticated = if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state
+            .db
+            .get_oauth_token(token)
+            .await?
+            .is_some_and(|oauth_token| oauth_token.grant_type != "client_credentials")
+    } else {
+        jar.get("session")
+            .map(|cookie| cookie.value())
+            .is_some_and(|token| {
+                crate::auth::verify_session_token(token, &state.config.auth.session_secret).is_ok()
+            })
+    };
     let limit = params.pagination.limit.unwrap_or(20).min(40);
     let local_only = params.local.unwrap_or(false);
     let remote_only = params.remote.unwrap_or(false);
@@ -407,6 +435,17 @@ pub async fn public_timeline(
         let remote_stats = remote_account_stats
             .get(item.status.account_address.trim())
             .cloned();
+        let interactions = if viewer_authenticated {
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            )
+        } else {
+            crate::api::StatusInteractions::public()
+        };
         let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
             state.db.as_ref(),
             &item.status,
@@ -414,7 +453,7 @@ pub async fn public_timeline(
             &state.config,
             account_stats,
             remote_stats,
-            crate::api::StatusInteractions::public(),
+            interactions,
         )
         .await?;
         responses.push(serde_json::to_value(response).unwrap());
@@ -734,6 +773,84 @@ pub async fn list_timeline(
     if let Some(link) =
         timeline_link_header(&path, limit, first_id.as_deref(), last_id.as_deref(), &[])
     {
+        headers.insert(LINK, link.parse().expect("valid link header"));
+    }
+
+    Ok((headers, Json(responses)))
+}
+
+/// GET /api/v1/timelines/direct
+pub async fn direct_timeline(
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
+    Query(params): Query<PaginationParams>,
+) -> Result<impl IntoResponse, AppError> {
+    let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
+    let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let limit = params.limit.unwrap_or(20).min(40);
+    let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
+    let timeline_service = TimelineService::new(
+        state.db.clone(),
+        state.timeline_cache.clone(),
+        state.profile_cache.clone(),
+    );
+    let mut timeline_items = timeline_service
+        .direct_timeline(limit + 1, params.max_id.as_deref(), lower_bound_id)
+        .await?;
+    let has_next = timeline_items.len() > limit;
+    if has_next {
+        timeline_items.truncate(limit);
+    }
+    if params.min_id.is_some() {
+        timeline_items.reverse();
+    }
+
+    let first_id = timeline_items.first().map(|item| item.status.id.clone());
+    let last_id = timeline_items.last().map(|item| item.status.id.clone());
+    let timeline_statuses: Vec<_> = timeline_items
+        .iter()
+        .map(|item| item.status.clone())
+        .collect();
+    let remote_account_stats = crate::api::load_remote_account_stats_map(
+        state.db.as_ref(),
+        state.profile_cache.as_ref(),
+        &state.config.server.protocol,
+        &timeline_statuses,
+    )
+    .await?;
+
+    let mut responses = Vec::with_capacity(timeline_items.len());
+    for item in &timeline_items {
+        let remote_stats = remote_account_stats
+            .get(item.status.account_address.trim())
+            .cloned();
+        let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            &item.status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            crate::api::StatusInteractions::new(
+                Some(item.favourited),
+                Some(item.reblogged),
+                None,
+                Some(item.bookmarked),
+                None,
+            ),
+        )
+        .await?;
+        responses.push(serde_json::to_value(response).unwrap());
+    }
+
+    let mut headers = HeaderMap::new();
+    if let Some(link) = timeline_link_header(
+        "/api/v1/timelines/direct",
+        limit,
+        first_id.as_deref(),
+        last_id.as_deref(),
+        &[],
+    ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
     }
 

@@ -186,6 +186,7 @@ async fn test_auxiliary_instance_endpoints() {
         "/api/v1/trends/links",
         "/api/v1/directory",
         "/api/v1/instance/privacy_policy",
+        "/api/v1/instance/terms_of_service",
         "/api/v1/instance/translation_languages",
     ];
 
@@ -280,6 +281,15 @@ async fn test_instance_rules() {
 #[tokio::test]
 async fn test_custom_emojis_endpoint_returns_array() {
     let server = TestServer::new().await;
+    server
+        .state
+        .db
+        .set_setting(
+            "instance.custom_emojis",
+            r#"[{"shortcode":"wave","url":"https://test.example.com/emoji/wave.png","static_url":"https://test.example.com/emoji/wave.png","visible_in_picker":true}]"#,
+        )
+        .await
+        .unwrap();
     let response = server
         .client
         .get(server.url("/api/v1/custom_emojis"))
@@ -288,7 +298,8 @@ async fn test_custom_emojis_endpoint_returns_array() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let body = response.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(body, json!([]));
+    assert!(body.is_array());
+    assert_eq!(body[0]["shortcode"], "wave");
 }
 
 // ============================================================================
@@ -3103,6 +3114,59 @@ async fn test_get_notifications_v2() {
 }
 
 #[tokio::test]
+async fn test_get_notifications_v2_groups_same_status_events() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Notification, NotificationType};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    cache_remote_profile(&server, "alice@remote.example").await;
+    cache_remote_profile(&server, "bob@remote.example").await;
+
+    let status_uri = "https://remote.example/users/testuser/statuses/grouped";
+    for (index, address) in ["alice@remote.example", "bob@remote.example"]
+        .into_iter()
+        .enumerate()
+    {
+        server
+            .state
+            .db
+            .insert_notification(&Notification {
+                id: EntityId::new_string(),
+                notification_type: NotificationType::Favourite,
+                origin_account_address: address.to_string(),
+                status_uri: Some(status_uri.to_string()),
+                read: false,
+                created_at: Utc::now() - Duration::seconds(index as i64),
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v2/notifications"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let groups = body["notification_groups"]
+        .as_array()
+        .expect("notification groups should be array");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["type"], "favourite");
+    assert_eq!(groups[0]["notifications_count"], 2);
+    let sample_ids = groups[0]["sample_account_ids"]
+        .as_array()
+        .expect("sample account ids should be array");
+    assert_eq!(sample_ids.len(), 2);
+}
+
+#[tokio::test]
 async fn test_notifications_return_origin_account() {
     use chrono::Utc;
     use rustresort::data::{EntityId, Notification, NotificationType};
@@ -4544,6 +4608,53 @@ async fn test_update_media() {
     assert_eq!(updated.focus_y, Some(-0.25));
 }
 
+#[tokio::test]
+async fn test_update_media_returns_focus_object_meta() {
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    use chrono::Utc;
+    use rustresort::data::{EntityId, MediaAttachment};
+
+    let media = MediaAttachment {
+        id: EntityId::new_string(),
+        status_id: None,
+        s3_key: "media/update-focus.webp".to_string(),
+        thumbnail_s3_key: None,
+        content_type: "image/webp".to_string(),
+        file_size: 1024,
+        description: Some("before".to_string()),
+        blurhash: None,
+        width: Some(128),
+        height: Some(64),
+        focus_x: None,
+        focus_y: None,
+        created_at: Utc::now(),
+    };
+    server.state.db.insert_media(&media).await.unwrap();
+
+    let response = server
+        .client
+        .put(server.url(&format!("/api/v1/media/{}", media.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&json!({
+            "focus": "0.25,-0.25"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["meta"]["original"]["focus"],
+        json!({
+            "x": 0.25,
+            "y": -0.25
+        })
+    );
+}
+
 // ============================================================================
 // Lists Endpoints (7 endpoints)
 // ============================================================================
@@ -5064,6 +5175,74 @@ async fn test_get_bookmarks() {
 }
 
 #[tokio::test]
+async fn test_get_bookmarks_emits_link_header_and_supports_min_id() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    for (index, id) in ["bookmark-a", "bookmark-b"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: "testuser@test.example.com".to_string(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds(index as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+        server.state.db.insert_bookmark(id).await.unwrap();
+    }
+
+    let first_page = server
+        .client
+        .get(server.url("/api/v1/bookmarks?limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), 200);
+    let link = first_page
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(link.contains("/api/v1/bookmarks?"));
+    assert!(link.contains("rel=\"next\""));
+    let first_page_body: serde_json::Value = first_page.json().await.unwrap();
+    let first_page_items = first_page_body.as_array().expect("array response expected");
+    let first_id = first_page_items[0]["id"].as_str().unwrap().to_string();
+
+    let newer_page = server
+        .client
+        .get(server.url(&format!("/api/v1/bookmarks?limit=1&min_id={first_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(newer_page.status(), 200);
+    let newer_body: serde_json::Value = newer_page.json().await.unwrap();
+    let newer_items = newer_body.as_array().expect("array response expected");
+    assert!(newer_items.len() <= 1);
+}
+
+#[tokio::test]
 async fn test_get_favourites() {
     let server = TestServer::new().await;
     server.create_test_account().await;
@@ -5078,6 +5257,74 @@ async fn test_get_favourites() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn test_get_favourites_emits_link_header_and_supports_min_id() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    for (index, id) in ["favourite-a", "favourite-b"].into_iter().enumerate() {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility: StatusVisibility::Public,
+                language: Some("en".to_string()),
+                account_address: "testuser@test.example.com".to_string(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds(index as i64),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+        server.state.db.insert_favourite(id).await.unwrap();
+    }
+
+    let first_page = server
+        .client
+        .get(server.url("/api/v1/favourites?limit=1"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), 200);
+    let link = first_page
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(link.contains("/api/v1/favourites?"));
+    assert!(link.contains("rel=\"next\""));
+    let first_page_body: serde_json::Value = first_page.json().await.unwrap();
+    let first_page_items = first_page_body.as_array().expect("array response expected");
+    let first_id = first_page_items[0]["id"].as_str().unwrap().to_string();
+
+    let newer_page = server
+        .client
+        .get(server.url(&format!("/api/v1/favourites?limit=1&min_id={first_id}")))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(newer_page.status(), 200);
+    let newer_body: serde_json::Value = newer_page.json().await.unwrap();
+    let newer_items = newer_body.as_array().expect("array response expected");
+    assert!(newer_items.len() <= 1);
 }
 
 // ============================================================================
@@ -5169,6 +5416,53 @@ async fn test_search_v2_unauthenticated_does_not_return_statuses() {
         .as_array()
         .expect("search v2 statuses should be an array");
     assert!(statuses.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_v2_authenticated_self_account_can_find_private_status() {
+    use chrono::Utc;
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let status = rustresort::data::Status {
+        id: "private-search-status".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/private-search-status".to_string(),
+        content: "<p>private search content</p>".to_string(),
+        content_warning: None,
+        visibility: rustresort::data::StatusVisibility::Private,
+        language: Some("en".to_string()),
+        account_address: format!("{}@{}", account.username, server.state.config.server.domain),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: rustresort::data::PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!(
+            "/api/v2/search?q=private&type=statuses&account_id={}",
+            account.id
+        )))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let statuses = body["statuses"]
+        .as_array()
+        .expect("search v2 statuses should be an array");
+    assert!(
+        statuses.iter().any(|item| item["id"] == status.id),
+        "authenticated self search should include local private statuses"
+    );
 }
 
 #[tokio::test]

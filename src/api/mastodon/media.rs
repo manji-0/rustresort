@@ -21,6 +21,13 @@ use crate::service::StatusService;
 
 const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_BYTES: usize = 40 * 1024 * 1024;
+pub(crate) const SUPPORTED_UPLOAD_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "video/mp4",
+];
 
 /// Media attachment response
 #[derive(Debug, Serialize)]
@@ -49,12 +56,18 @@ pub struct MediaMetaInfo {
     pub height: Option<i32>,
     pub size: Option<String>,
     pub aspect: Option<f64>,
-    pub focus: Option<String>,
+    pub focus: Option<MediaFocus>,
 }
 
-fn format_media_focus(focus_x: Option<f64>, focus_y: Option<f64>) -> Option<String> {
+#[derive(Debug, Serialize, PartialEq)]
+pub struct MediaFocus {
+    pub x: f64,
+    pub y: f64,
+}
+
+fn build_media_focus(focus_x: Option<f64>, focus_y: Option<f64>) -> Option<MediaFocus> {
     match (focus_x, focus_y) {
-        (Some(x), Some(y)) => Some(format!("{:.3},{:.3}", x, y)),
+        (Some(x), Some(y)) => Some(MediaFocus { x, y }),
         _ => None,
     }
 }
@@ -65,7 +78,7 @@ fn build_original_media_meta(
     focus_x: Option<f64>,
     focus_y: Option<f64>,
 ) -> Option<MediaMetaInfo> {
-    let focus = format_media_focus(focus_x, focus_y);
+    let focus = build_media_focus(focus_x, focus_y);
     if width.is_none() && height.is_none() && focus.is_none() {
         return None;
     }
@@ -239,20 +252,7 @@ async fn upload_media_response_value(
 ) -> Result<serde_json::Value, AppError> {
     let parsed = parse_media_upload(multipart).await?;
 
-    let supported_types = [
-        "image/jpeg",
-        "image/png",
-        "image/gif",
-        "image/webp",
-        "image/avif",
-        "image/heif",
-        "image/heic",
-        "video/mp4",
-        "video/webm",
-        "video/quicktime",
-    ];
-
-    if !supported_types.contains(&parsed.content_type.as_str()) {
+    if !SUPPORTED_UPLOAD_MIME_TYPES.contains(&parsed.content_type.as_str()) {
         return Err(AppError::Validation(format!(
             "Unsupported MIME type: {}",
             parsed.content_type
@@ -371,7 +371,7 @@ pub async fn update_media(
     }
 
     if let Some(thumbnail_bytes) = thumbnail_bytes {
-        let (_, thumbnail_key) = state
+        let (thumbnail_key, _) = state
             .storage
             .upload_thumbnail(&media.id, thumbnail_bytes)
             .await?;
@@ -498,7 +498,7 @@ async fn parse_update_media_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_original_media_meta, format_media_focus, parse_media_focus};
+    use super::{MediaFocus, build_media_focus, build_original_media_meta, parse_media_focus};
 
     #[test]
     fn parse_media_focus_accepts_valid_values() {
@@ -514,9 +514,9 @@ mod tests {
     }
 
     #[test]
-    fn format_media_focus_returns_none_if_incomplete() {
-        assert_eq!(format_media_focus(Some(0.0), None), None);
-        assert_eq!(format_media_focus(None, Some(0.0)), None);
+    fn build_media_focus_returns_none_if_incomplete() {
+        assert_eq!(build_media_focus(Some(0.0), None), None);
+        assert_eq!(build_media_focus(None, Some(0.0)), None);
     }
 
     #[test]
@@ -527,6 +527,6 @@ mod tests {
         assert_eq!(meta.height, None);
         assert_eq!(meta.size, None);
         assert_eq!(meta.aspect, None);
-        assert_eq!(meta.focus.as_deref(), Some("0.250,-0.500"));
+        assert_eq!(meta.focus, Some(MediaFocus { x: 0.25, y: -0.5 }));
     }
 }

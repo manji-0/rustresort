@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::accounts::PaginationParams;
 use super::accounts::{
@@ -95,6 +95,97 @@ fn notification_is_newer_than(
 ) -> bool {
     notification.created_at > cursor.0
         || (notification.created_at == cursor.0 && notification.id > cursor.1)
+}
+
+pub(crate) fn notification_group_key(notification: &crate::data::Notification) -> String {
+    let scope = notification
+        .status_uri
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(notification.origin_account_address.as_str());
+    format!("{}::{scope}", notification.notification_type.as_str())
+}
+
+async fn load_notifications_page(
+    state: &TimelineApiState,
+    params: &NotificationQueryParams,
+    include_types: &[NotificationType],
+    exclude_types: &[NotificationType],
+) -> Result<(Vec<crate::data::Notification>, bool), AppError> {
+    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let fetch_limit = (limit + 1).max(40);
+    let mut notifications = Vec::new();
+    let mut cursor = params.pagination.max_id.clone();
+    let min_cursor = if let Some(cursor_id) = params.pagination.min_id.as_deref() {
+        state
+            .db
+            .get_notification(cursor_id)
+            .await?
+            .map(|notification| (notification.created_at, notification.id))
+    } else {
+        None
+    };
+    let since_cursor = if let Some(cursor_id) = params.pagination.since_id.as_deref() {
+        state
+            .db
+            .get_notification(cursor_id)
+            .await?
+            .map(|notification| (notification.created_at, notification.id))
+    } else {
+        None
+    };
+
+    while notifications.len() <= limit {
+        let batch = state
+            .db
+            .get_notifications(fetch_limit, cursor.as_deref(), false)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        let reached_end = batch.len() < fetch_limit;
+        cursor = batch.last().map(|notification| notification.id.clone());
+
+        for notification in batch {
+            if min_cursor
+                .as_ref()
+                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
+            {
+                continue;
+            }
+            if since_cursor
+                .as_ref()
+                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
+            {
+                continue;
+            }
+            if notification_is_included(
+                notification.notification_type,
+                include_types,
+                exclude_types,
+            ) {
+                notifications.push(notification);
+                if notifications.len() > limit {
+                    break;
+                }
+            }
+        }
+
+        if notifications.len() > limit || reached_end {
+            break;
+        }
+    }
+
+    let has_next = notifications.len() > limit;
+    if has_next {
+        notifications.truncate(limit);
+    }
+    if params.pagination.min_id.is_some() {
+        notifications.reverse();
+    }
+
+    Ok((notifications, has_next))
 }
 
 async fn get_notification_status(state: &TimelineApiState, status_uri: &str) -> Option<Status> {
@@ -188,6 +279,8 @@ fn notification_link_header(
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
     include_types: &[String],
     exclude_types: &[String],
 ) -> Option<String> {
@@ -205,10 +298,10 @@ fn notification_link_header(
     };
 
     let mut links = Vec::new();
-    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
         links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
     }
-    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}>; rel=\"prev\"",
             build_path("min_id", first_id)
@@ -236,76 +329,11 @@ pub async fn get_notifications(
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
         .collect::<Vec<_>>();
-    let fetch_limit = limit.max(40);
-    let mut notifications = Vec::new();
-    let mut cursor = params.pagination.max_id.clone();
-    let min_cursor = if let Some(cursor_id) = params.pagination.min_id.as_deref() {
-        state
-            .db
-            .get_notification(cursor_id)
-            .await?
-            .map(|notification| (notification.created_at, notification.id))
-    } else {
-        None
-    };
-    let since_cursor = if let Some(cursor_id) = params.pagination.since_id.as_deref() {
-        state
-            .db
-            .get_notification(cursor_id)
-            .await?
-            .map(|notification| (notification.created_at, notification.id))
-    } else {
-        None
-    };
-
-    while notifications.len() < limit {
-        let batch = state
-            .db
-            .get_notifications(
-                fetch_limit,
-                cursor.as_deref(),
-                false, // Get all notifications, not just unread
-            )
-            .await?;
-        if batch.is_empty() {
-            break;
-        }
-
-        let reached_end = batch.len() < fetch_limit;
-        cursor = batch.last().map(|notification| notification.id.clone());
-
-        for notification in batch {
-            if min_cursor
-                .as_ref()
-                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
-            {
-                continue;
-            }
-            if since_cursor
-                .as_ref()
-                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
-            {
-                continue;
-            }
-            if notification_is_included(
-                notification.notification_type,
-                &include_types,
-                &exclude_types,
-            ) {
-                notifications.push(notification);
-                if notifications.len() == limit {
-                    break;
-                }
-            }
-        }
-
-        if reached_end {
-            break;
-        }
-    }
-    if params.pagination.min_id.is_some() {
-        notifications.reverse();
-    }
+    let (notifications, has_next) =
+        load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
+    let has_prev = params.pagination.max_id.is_some()
+        || params.pagination.min_id.is_some()
+        || params.pagination.since_id.is_some();
 
     // Convert to API responses
     let mut responses = vec![];
@@ -326,7 +354,7 @@ pub async fn get_notifications(
         let response = NotificationResponse {
             id: notification.id.clone(),
             notification_type: notification.notification_type.to_string(),
-            group_key: format!("ungrouped-{}", notification.id),
+            group_key: notification_group_key(&notification),
             created_at: notification.created_at,
             account: build_notification_account_response(
                 &state,
@@ -356,6 +384,8 @@ pub async fn get_notifications(
         limit,
         first_id,
         last_id,
+        has_prev,
+        has_next,
         &raw_include_types,
         &raw_exclude_types,
     ) {
@@ -386,79 +416,20 @@ pub async fn get_notifications_v2(
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
         .collect::<Vec<_>>();
-    let fetch_limit = limit.max(40);
-    let mut notifications = Vec::new();
-    let mut cursor = params.pagination.max_id.clone();
-    let min_cursor = if let Some(cursor_id) = params.pagination.min_id.as_deref() {
-        state
-            .db
-            .get_notification(cursor_id)
-            .await?
-            .map(|notification| (notification.created_at, notification.id))
-    } else {
-        None
-    };
-    let since_cursor = if let Some(cursor_id) = params.pagination.since_id.as_deref() {
-        state
-            .db
-            .get_notification(cursor_id)
-            .await?
-            .map(|notification| (notification.created_at, notification.id))
-    } else {
-        None
-    };
+    let (notifications, has_next) =
+        load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
+    let has_prev = params.pagination.max_id.is_some()
+        || params.pagination.min_id.is_some()
+        || params.pagination.since_id.is_some();
 
-    while notifications.len() < limit {
-        let batch = state
-            .db
-            .get_notifications(fetch_limit, cursor.as_deref(), false)
-            .await?;
-        if batch.is_empty() {
-            break;
-        }
-
-        let reached_end = batch.len() < fetch_limit;
-        cursor = batch.last().map(|notification| notification.id.clone());
-
-        for notification in batch {
-            if min_cursor
-                .as_ref()
-                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
-            {
-                continue;
-            }
-            if since_cursor
-                .as_ref()
-                .is_some_and(|cursor| !notification_is_newer_than(&notification, cursor))
-            {
-                continue;
-            }
-            if notification_is_included(
-                notification.notification_type,
-                &include_types,
-                &exclude_types,
-            ) {
-                notifications.push(notification);
-                if notifications.len() == limit {
-                    break;
-                }
-            }
-        }
-
-        if reached_end {
-            break;
-        }
-    }
-    if params.pagination.min_id.is_some() {
-        notifications.reverse();
-    }
-
-    let mut groups = Vec::new();
+    let mut groups: Vec<serde_json::Value> = Vec::new();
     let mut accounts = Vec::new();
     let mut seen_account_ids = HashSet::new();
     let mut statuses = Vec::new();
     let mut seen_status_ids = HashSet::new();
+    let mut group_positions = HashMap::<String, usize>::new();
     for notification in notifications {
+        let group_key = notification_group_key(&notification);
         let account =
             build_notification_account_response(&state, &notification.origin_account_address)
                 .await?;
@@ -483,8 +454,29 @@ pub async fn get_notifications_v2(
         } else {
             None
         };
+        if let Some(index) = group_positions.get(&group_key).copied() {
+            let group: &mut serde_json::Value = groups
+                .get_mut(index)
+                .expect("existing notification group index must be valid");
+            let sample_account_ids = group["sample_account_ids"]
+                .as_array_mut()
+                .expect("sample_account_ids should be an array");
+            let account_id_value = serde_json::json!(account.id.clone());
+            if !sample_account_ids.contains(&account_id_value) {
+                sample_account_ids.push(account_id_value);
+            }
+            group["notifications_count"] =
+                serde_json::json!(group["notifications_count"].as_u64().unwrap_or_default() + 1);
+            group["page_min_id"] = serde_json::json!(notification.id);
+            if group["status_id"].is_null() && status_id.is_some() {
+                group["status_id"] = serde_json::json!(status_id);
+            }
+            continue;
+        }
+
+        group_positions.insert(group_key.clone(), groups.len());
         groups.push(serde_json::json!({
-            "group_key": format!("ungrouped-{}", notification.id),
+            "group_key": group_key,
             "type": notification.notification_type.to_string(),
             "latest_page_notification_at": notification.created_at,
             "most_recent_notification_id": notification.id,
@@ -510,6 +502,8 @@ pub async fn get_notifications_v2(
         limit,
         first_id,
         last_id,
+        has_prev,
+        has_next,
         &raw_include_types,
         &raw_exclude_types,
     ) {
@@ -584,7 +578,7 @@ pub async fn get_notification(
     let response = NotificationResponse {
         id: notification.id.clone(),
         notification_type: notification.notification_type.to_string(),
-        group_key: format!("ungrouped-{}", notification.id),
+        group_key: notification_group_key(&notification),
         created_at: notification.created_at,
         account: build_notification_account_response(&state, &notification.origin_account_address)
             .await?,

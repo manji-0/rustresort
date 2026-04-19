@@ -172,6 +172,58 @@ async fn test_public_timeline_emits_link_header_preserving_filters() {
 }
 
 #[tokio::test]
+async fn test_direct_timeline_returns_only_direct_statuses() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+    let now = Utc::now();
+
+    for (id, visibility, seconds) in [
+        ("direct-1", StatusVisibility::Direct, 0),
+        ("public-1", StatusVisibility::Public, 1),
+        ("direct-2", StatusVisibility::Direct, 2),
+    ] {
+        server
+            .state
+            .db
+            .insert_status(&Status {
+                id: id.to_string(),
+                uri: format!("https://test.example.com/users/testuser/statuses/{id}"),
+                content: format!("<p>{id}</p>"),
+                content_warning: None,
+                visibility,
+                language: Some("en".to_string()),
+                account_address: "testuser@test.example.com".to_string(),
+                is_local: true,
+                in_reply_to_uri: None,
+                boost_of_uri: None,
+                quote_of_uri: None,
+                persisted_reason: PersistedReason::Own,
+                created_at: now - Duration::seconds(seconds),
+                fetched_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/direct"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let items = body.as_array().expect("direct timeline should be an array");
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| item["visibility"] == "direct"));
+}
+
+#[tokio::test]
 async fn test_public_timeline_only_media_includes_remote_status_with_remote_attachment() {
     use chrono::Utc;
     use rustresort::data::{PersistedReason, RemoteStatusAttachment, Status, StatusVisibility};

@@ -154,6 +154,10 @@ where
             get(instance::instance_privacy_policy),
         )
         .route(
+            "/v1/instance/terms_of_service",
+            get(instance::instance_terms_of_service),
+        )
+        .route(
             "/v1/instance/translation_languages",
             get(instance::instance_translation_languages),
         )
@@ -381,6 +385,10 @@ where
         .route(
             "/v1/timelines/list/:list_id",
             scoped(get(timelines::list_timeline), READ_STATUSES),
+        )
+        .route(
+            "/v1/timelines/direct",
+            scoped(get(timelines::direct_timeline), READ_STATUSES),
         )
         // Notifications
         .route(

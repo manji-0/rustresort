@@ -46,7 +46,7 @@ pub struct UpdateListRequest {
 /// Add accounts to list request
 #[derive(Debug, Deserialize)]
 pub struct AddAccountsRequest {
-    #[serde(rename = "account_ids")]
+    #[serde(rename = "account_ids", alias = "account_ids[]")]
     pub account_ids: Vec<String>,
 }
 
@@ -95,6 +95,8 @@ fn list_collection_link_header(
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
 ) -> Option<String> {
     let build_path = |cursor_key: &str, cursor_value: &str| {
         let mut serializer = url::form_urlencoded::Serializer::new(String::new());
@@ -104,10 +106,10 @@ fn list_collection_link_header(
     };
 
     let mut links = Vec::new();
-    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
         links.push(format!("<{}>; rel=\"next\"", build_path("max_id", last_id)));
     }
-    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}>; rel=\"prev\"",
             build_path("min_id", first_id)
@@ -326,6 +328,22 @@ pub async fn get_list_accounts(
         .collect::<Vec<_>>()
         .await;
 
+    accounts.sort_by(|left, right| {
+        let left_id = left
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let right_id = right
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        right_id.cmp(left_id)
+    });
+    accounts.dedup_by(|left, right| {
+        left.get("id").and_then(|value| value.as_str())
+            == right.get("id").and_then(|value| value.as_str())
+    });
+
     if let Some(max_id) = params.max_id.as_deref() {
         accounts.retain(|account| {
             account
@@ -350,6 +368,7 @@ pub async fn get_list_accounts(
                 .is_some_and(|value| value > since_id)
         });
     }
+    let has_next = accounts.len() > limit;
     accounts.truncate(limit);
 
     let first_id = accounts
@@ -366,6 +385,8 @@ pub async fn get_list_accounts(
         limit,
         first_id,
         last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
     ) {
         headers.insert(
             LINK,

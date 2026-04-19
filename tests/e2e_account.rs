@@ -788,6 +788,74 @@ async fn test_account_statuses_only_media_pages_until_limit() {
 }
 
 #[tokio::test]
+async fn test_account_statuses_authenticated_self_includes_private_and_interactions() {
+    use chrono::Utc;
+    use rustresort::data::{PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let status = Status {
+        id: "private-self-status".to_string(),
+        uri: "https://test.example.com/users/testuser/statuses/private-self-status".to_string(),
+        content: "<p>Private self status</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Private,
+        language: Some("en".to_string()),
+        account_address: "testuser@test.example.com".to_string(),
+        is_local: true,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: Utc::now(),
+        fetched_at: None,
+    };
+    server.state.db.insert_status(&status).await.unwrap();
+    server.state.db.insert_favourite(&status.id).await.unwrap();
+    server.state.db.insert_bookmark(&status.id).await.unwrap();
+    server.state.db.insert_status_pin(&status.id).await.unwrap();
+
+    let authed = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), 200);
+    let authed_body: Value = authed.json().await.unwrap();
+    let authed_items = authed_body
+        .as_array()
+        .expect("account statuses should be an array");
+    let private_item = authed_items
+        .iter()
+        .find(|item| item["id"] == status.id)
+        .expect("authenticated self view should include private status");
+    assert_eq!(private_item["visibility"], "private");
+    assert_eq!(private_item["favourited"], true);
+    assert_eq!(private_item["bookmarked"], true);
+    assert_eq!(private_item["pinned"], true);
+
+    let unauthed = server
+        .client
+        .get(server.url(&format!("/api/v1/accounts/{}/statuses", account.id)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthed.status(), 200);
+    let unauthed_body: Value = unauthed.json().await.unwrap();
+    let unauthed_items = unauthed_body
+        .as_array()
+        .expect("account statuses should be an array");
+    assert!(
+        unauthed_items.iter().all(|item| item["id"] != status.id),
+        "unauthenticated account statuses must not expose private self posts"
+    );
+}
+
+#[tokio::test]
 async fn test_account_followers() {
     let server = TestServer::new().await;
     let account = server.create_test_account().await;

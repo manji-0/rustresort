@@ -141,17 +141,19 @@ fn conversation_link_header(
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
 ) -> Option<String> {
     let mut links = Vec::new();
-    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "</api/v1/conversations?limit={limit}&max_id={}>; rel=\"next\"",
             urlencoding::encode(last_id)
         ));
     }
-    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
-            "</api/v1/conversations?limit={limit}&since_id={}>; rel=\"prev\"",
+            "</api/v1/conversations?limit={limit}&min_id={}>; rel=\"prev\"",
             urlencoding::encode(first_id)
         ));
     }
@@ -191,14 +193,22 @@ pub async fn get_conversations(
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
 
-    let conversations = state
+    let mut conversations = state
         .db
         .get_conversations(
-            limit,
+            limit + 1,
             params.max_id.as_deref(),
-            params.min_id.as_deref().or(params.since_id.as_deref()),
+            params.since_id.as_deref(),
+            params.min_id.as_deref(),
         )
         .await?;
+    let has_next = conversations.len() > limit;
+    if has_next {
+        conversations.truncate(limit);
+    }
+    if params.min_id.is_some() {
+        conversations.reverse();
+    }
 
     let mut response = Vec::new();
     for (conversation_id, last_status_id, unread) in conversations {
@@ -224,7 +234,13 @@ pub async fn get_conversations(
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
-    if let Some(link) = conversation_link_header(limit, first_id, last_id) {
+    if let Some(link) = conversation_link_header(
+        limit,
+        first_id,
+        last_id,
+        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        has_next,
+    ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
     }
 

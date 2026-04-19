@@ -843,7 +843,10 @@ async fn test_create_status_applies_media_attributes_from_form_payload() {
     assert_eq!(body["media_attachments"][0]["description"], "alt text");
     assert_eq!(
         body["media_attachments"][0]["meta"]["original"]["focus"],
-        "0.100,-0.200"
+        serde_json::json!({
+            "x": 0.1,
+            "y": -0.2
+        })
     );
 }
 
