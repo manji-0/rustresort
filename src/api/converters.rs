@@ -987,6 +987,28 @@ fn remote_media_attachment_to_response(
     }
 }
 
+pub fn cached_media_attachment_to_response(
+    attachment: &crate::data::CachedAttachment,
+) -> MediaAttachmentResponse {
+    let url = attachment.url.clone();
+    let preview_url = attachment
+        .thumbnail_url
+        .clone()
+        .unwrap_or_else(|| url.clone());
+
+    MediaAttachmentResponse {
+        id: attachment.url.clone(),
+        media_type: media_type_from_content_type(&attachment.content_type).to_string(),
+        url: url.clone(),
+        preview_url,
+        remote_url: Some(url),
+        text_url: None,
+        meta: None,
+        description: attachment.description.clone(),
+        blurhash: attachment.blurhash.clone(),
+    }
+}
+
 async fn load_status_media_attachment_responses(
     db: &Database,
     status_id: &str,
@@ -1520,7 +1542,7 @@ mod tests {
         assert_eq!(response.acct, "testuser");
         assert_eq!(response.display_name, "Test User");
         assert_eq!(response.note, "Test bio");
-        assert_eq!(response.url, "https://test.example.com/users/testuser");
+        assert_eq!(response.url, "https://test.example.com/@testuser");
         assert!(response.avatar.contains("media.test.example.com"));
         assert!(response.avatar.contains("avatar.webp"));
         assert!(!response.locked);

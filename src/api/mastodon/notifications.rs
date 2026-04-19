@@ -21,6 +21,8 @@ use crate::error::AppError;
 #[derive(Debug, Deserialize)]
 pub struct NotificationQueryParams {
     pub pagination: PaginationParams,
+    pub account_id: Option<String>,
+    pub include_filtered: Option<bool>,
 }
 
 fn parse_notification_query(
@@ -40,13 +42,19 @@ fn parse_notification_query(
         min_id: None,
         limit: None,
     };
+    let mut account_id = None;
+    let mut include_filtered = None;
 
     let mut include = Vec::new();
     let mut exclude = Vec::new();
     let mut grouped = Vec::new();
     let Some(raw_query) = raw_query else {
         return Ok((
-            NotificationQueryParams { pagination },
+            NotificationQueryParams {
+                pagination,
+                account_id,
+                include_filtered,
+            },
             include,
             exclude,
             grouped,
@@ -66,12 +74,23 @@ fn parse_notification_query(
             "types[]" => include.push(value.into_owned()),
             "exclude_types[]" => exclude.push(value.into_owned()),
             "grouped_types[]" => grouped.push(value.into_owned()),
+            "account_id" => account_id = Some(value.into_owned()),
+            "include_filtered" => {
+                include_filtered = Some(matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                ))
+            }
             _ => {}
         }
     }
 
     Ok((
-        NotificationQueryParams { pagination },
+        NotificationQueryParams {
+            pagination,
+            account_id,
+            include_filtered,
+        },
         include,
         exclude,
         grouped,
@@ -323,8 +342,8 @@ async fn load_notifications_page(
     include_types: &[NotificationType],
     exclude_types: &[NotificationType],
 ) -> Result<(Vec<crate::data::Notification>, bool), AppError> {
-    let limit = params.pagination.limit.unwrap_or(20).min(40);
-    let fetch_limit = (limit + 1).max(40);
+    let limit = params.pagination.limit.unwrap_or(20).min(80);
+    let fetch_limit = (limit + 1).max(80);
     let mut notifications = Vec::new();
     let mut cursor = params.pagination.max_id.clone();
     let min_cursor = if let Some(cursor_id) = params.pagination.min_id.as_deref() {
@@ -375,7 +394,11 @@ async fn load_notifications_page(
                 notification.notification_type,
                 include_types,
                 exclude_types,
-            ) {
+            ) && params
+                .account_id
+                .as_deref()
+                .is_none_or(|account_id| notification.origin_account_address == account_id)
+            {
                 notifications.push(notification);
                 if notifications.len() > limit {
                     break;
@@ -452,6 +475,36 @@ async fn build_notification_status_response(
         Some(state.db.is_bookmarked(&status.id).await?),
         Some(state.db.is_status_pinned(&status.id).await?),
     );
+
+    if matches!(status.persisted_reason, PersistedReason::CacheOnly) {
+        let cached = if let Some(cached) = state.timeline_cache.get(&status.id).await {
+            Some(cached)
+        } else {
+            state.timeline_cache.get_by_uri(&status.uri).await
+        };
+        let media = cached
+            .map(|cached| {
+                cached
+                    .attachments
+                    .iter()
+                    .map(crate::api::cached_media_attachment_to_response)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Ok(crate::api::status_to_response_with_media(
+            status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats.clone(),
+            interactions,
+            remote_stats
+                .as_ref()
+                .map(|stats| stats.force_sensitive)
+                .unwrap_or(false),
+            &media,
+        ));
+    }
 
     crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
@@ -535,7 +588,8 @@ pub async fn get_notifications(
 
     let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
-    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let limit = params.pagination.limit.unwrap_or(20).min(80);
+    let _include_filtered = params.include_filtered.unwrap_or(false);
     let include_types = raw_include_types
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
@@ -546,9 +600,6 @@ pub async fn get_notifications(
         .collect::<Vec<_>>();
     let (notifications, has_next) =
         load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
-    let has_prev = params.pagination.max_id.is_some()
-        || params.pagination.min_id.is_some()
-        || params.pagination.since_id.is_some();
 
     // Convert to API responses
     let mut responses = vec![];
@@ -584,6 +635,7 @@ pub async fn get_notifications(
 
         responses.push(serde_json::to_value(response).unwrap());
     }
+    let has_prev = !responses.is_empty();
 
     let first_id = responses
         .first()
@@ -623,7 +675,8 @@ pub async fn get_notifications_v2(
 ) -> Result<impl IntoResponse, AppError> {
     let (params, raw_include_types, raw_exclude_types, raw_grouped_types) =
         parse_notification_query(raw_query.0.as_deref())?;
-    let limit = params.pagination.limit.unwrap_or(20).min(40);
+    let limit = params.pagination.limit.unwrap_or(20).min(80);
+    let _include_filtered = params.include_filtered.unwrap_or(false);
     let include_types = raw_include_types
         .iter()
         .filter_map(|value| parse_notification_type_filter(value))
@@ -638,10 +691,10 @@ pub async fn get_notifications_v2(
         .collect::<Vec<_>>();
     let (notifications, has_next) =
         load_notifications_page(&state, &params, &include_types, &exclude_types).await?;
-    let has_prev = params.pagination.max_id.is_some()
-        || params.pagination.min_id.is_some()
-        || params.pagination.since_id.is_some();
     let body = build_grouped_notifications_result(&state, notifications, &grouped_types).await?;
+    let has_prev = body["notification_groups"]
+        .as_array()
+        .is_some_and(|groups| !groups.is_empty());
 
     let first_id = body["notification_groups"]
         .as_array()
@@ -785,6 +838,17 @@ pub async fn get_unread_count(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let count = state.db.count_unread_notifications().await?;
 
+    Ok(Json(serde_json::json!({
+        "count": count
+    })))
+}
+
+/// GET /api/v2/notifications/unread_count
+pub async fn get_unread_count_v2(
+    State(state): State<TimelineApiState>,
+    CurrentUser(_session): CurrentUser,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let count = state.db.count_unread_notifications().await?;
     Ok(Json(serde_json::json!({
         "count": count
     })))

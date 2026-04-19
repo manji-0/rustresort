@@ -106,11 +106,14 @@ impl Database {
             query.execute(&mut *tx).await?;
         }
 
-        for media_id in media_ids {
+        for (index, media_id) in media_ids.iter().enumerate() {
+            let ordered_created_at =
+                chrono::Utc::now() + chrono::Duration::milliseconds(index as i64);
             let result = sqlx::query(
-                "UPDATE media_attachments SET status_id = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
+                "UPDATE media_attachments SET status_id = ?, created_at = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
             )
             .bind(status_id)
+            .bind(ordered_created_at)
             .bind(media_id)
             .bind(status_id)
             .execute(&mut *tx)

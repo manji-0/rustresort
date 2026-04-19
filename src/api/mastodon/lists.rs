@@ -385,7 +385,7 @@ pub async fn get_list_accounts(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !accounts.is_empty(),
         has_next,
     ) {
         headers.insert(

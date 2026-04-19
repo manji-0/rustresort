@@ -147,6 +147,12 @@ async fn save_marker(
         .db
         .set_setting(version_key, &version.to_string())
         .await?;
+    if key == NOTIFICATIONS_MARKER_KEY {
+        state
+            .db
+            .mark_notifications_read_through(last_read_id)
+            .await?;
+    }
     Ok(Marker {
         last_read_id: last_read_id.to_string(),
         version,

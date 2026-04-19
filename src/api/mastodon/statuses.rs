@@ -471,6 +471,27 @@ fn build_delivery(
     .with_media_storage(state.storage.clone())
 }
 
+async fn cached_status_media_attachment_responses(
+    state: &StatusApiState,
+    status: &crate::data::Status,
+) -> Vec<crate::api::dto::MediaAttachmentResponse> {
+    let cached = if let Some(cached) = state.timeline_cache.get(&status.id).await {
+        Some(cached)
+    } else {
+        state.timeline_cache.get_by_uri(&status.uri).await
+    };
+
+    cached
+        .map(|cached| {
+            cached
+                .attachments
+                .iter()
+                .map(crate::api::cached_media_attachment_to_response)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 async fn status_response_without_interaction_state(
     state: &StatusApiState,
     account: &crate::data::Account,
@@ -486,6 +507,27 @@ async fn status_response_without_interaction_state(
     .await?
     .get(status.account_address.trim())
     .cloned();
+
+    if matches!(
+        status.persisted_reason,
+        crate::data::PersistedReason::CacheOnly
+    ) {
+        let force_sensitive = remote_account_stats
+            .as_ref()
+            .map(|stats| stats.force_sensitive)
+            .unwrap_or(false);
+        let media = cached_status_media_attachment_responses(state, status).await;
+        return Ok(crate::api::status_to_response_with_media(
+            status,
+            account,
+            &state.config,
+            account_stats,
+            remote_account_stats,
+            crate::api::StatusInteractions::default(),
+            force_sensitive,
+            &media,
+        ));
+    }
 
     crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
@@ -516,6 +558,34 @@ async fn status_response_with_viewer_interactions(
     .cloned();
     let thread_uri = state.db.resolve_thread_root_uri(status).await?;
 
+    let interactions = crate::api::StatusInteractions::new(
+        Some(state.db.is_favourited(&status.id).await?),
+        Some(state.db.is_reposted(&status.id).await?),
+        Some(state.db.is_thread_muted(&thread_uri).await?),
+        Some(state.db.is_bookmarked(&status.id).await?),
+        Some(state.db.is_status_pinned(&status.id).await?),
+    );
+    if matches!(
+        status.persisted_reason,
+        crate::data::PersistedReason::CacheOnly
+    ) {
+        let force_sensitive = remote_account_stats
+            .as_ref()
+            .map(|stats| stats.force_sensitive)
+            .unwrap_or(false);
+        let media = cached_status_media_attachment_responses(state, status).await;
+        return Ok(crate::api::status_to_response_with_media(
+            status,
+            account,
+            &state.config,
+            account_stats,
+            remote_account_stats,
+            interactions,
+            force_sensitive,
+            &media,
+        ));
+    }
+
     crate::api::build_status_response_with_account_stats_and_remote_stats(
         state.db.as_ref(),
         status,
@@ -523,13 +593,7 @@ async fn status_response_with_viewer_interactions(
         &state.config,
         account_stats,
         remote_account_stats,
-        crate::api::StatusInteractions::new(
-            Some(state.db.is_favourited(&status.id).await?),
-            Some(state.db.is_reposted(&status.id).await?),
-            Some(state.db.is_thread_muted(&thread_uri).await?),
-            Some(state.db.is_bookmarked(&status.id).await?),
-            Some(state.db.is_status_pinned(&status.id).await?),
-        ),
+        interactions,
     )
     .await
 }
@@ -785,6 +849,8 @@ struct StatusSourceResponse {
     id: String,
     text: String,
     spoiler_text: String,
+    media_attachments: Vec<serde_json::Value>,
+    poll: Option<serde_json::Value>,
 }
 
 /// POST /api/v1/statuses
@@ -1059,6 +1125,30 @@ pub async fn create_status(
             )
             .await?;
         apply_status_media_attributes(&state, &media_ids, &status.id, &media_attributes).await?;
+        if matches!(status.visibility, StatusVisibility::Direct) {
+            let local_account_address =
+                format!("{}@{}", account.username, state.config.server.domain);
+            let mut participants = vec![local_account_address];
+            participants.extend(
+                extract_mentions_from_content(&content)
+                    .into_iter()
+                    .filter(|mention| mention.contains('@')),
+            );
+            if let Some(reply_target_account_address) = reply_target_account_address {
+                participants.push(reply_target_account_address);
+            }
+            if let Some(quote_target_account_address) = quote_target
+                .as_ref()
+                .and_then(|target| target.remote_account_address.clone())
+            {
+                participants.push(quote_target_account_address);
+            }
+            let conversation_id = state.db.get_or_create_conversation(&participants).await?;
+            state
+                .db
+                .add_status_to_conversation(&conversation_id, &status.id)
+                .await?;
+        }
         DB_QUERIES_TOTAL
             .with_label_values(&["INSERT", "statuses"])
             .inc();
@@ -1679,11 +1769,40 @@ pub async fn get_status_source(
         return Err(AppError::Forbidden);
     }
 
+    let media_attachments = status_service
+        .get_media_by_status(&id)
+        .await?
+        .into_iter()
+        .map(|media| serde_json::json!({ "id": media.id }))
+        .collect::<Vec<_>>();
+    let poll = if let Some((poll_id, expires_at, expired, multiple, hide_totals, _, _)) =
+        state.db.get_poll_by_status_id(&id).await?
+    {
+        let options = state
+            .db
+            .get_poll_options(&poll_id)
+            .await?
+            .into_iter()
+            .map(|(_, title, _)| serde_json::json!({ "title": title }))
+            .collect::<Vec<_>>();
+        Some(serde_json::json!({
+            "options": options,
+            "expires_at": expires_at,
+            "multiple": multiple,
+            "hide_totals": hide_totals,
+            "expired": expired,
+        }))
+    } else {
+        None
+    };
+
     // Return the source
     let source = StatusSourceResponse {
         id: status.id.clone(),
         text: status_content_to_source_text(&status.content),
         spoiler_text: status.content_warning.unwrap_or_default(),
+        media_attachments,
+        poll,
     };
 
     Ok(Json(serde_json::to_value(source).unwrap()))
@@ -2467,12 +2586,7 @@ pub async fn update_status(
             }
         }
 
-        let current_media_ids = media_ids_after_update
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let requested_media_ids = normalized_media_ids.iter().cloned().collect::<HashSet<_>>();
-        if current_media_ids != requested_media_ids {
+        if media_ids_after_update != normalized_media_ids {
             media_ids_after_update = normalized_media_ids.clone();
             media_ids_to_replace = Some(normalized_media_ids);
             changed = true;

@@ -234,13 +234,9 @@ pub async fn get_conversations(
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_str());
     let mut headers = HeaderMap::new();
-    if let Some(link) = conversation_link_header(
-        limit,
-        first_id,
-        last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
-        has_next,
-    ) {
+    if let Some(link) =
+        conversation_link_header(limit, first_id, last_id, !response.is_empty(), has_next)
+    {
         headers.insert(LINK, link.parse().expect("valid link header"));
     }
 

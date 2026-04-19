@@ -9,8 +9,8 @@ use super::{StreamEvent, StreamTarget, StreamingEventBus};
 #[cfg(test)]
 use crate::data::Database;
 use crate::data::{
-    EntityId, MediaAttachment, PersistedReason, ScheduledStatusInsert, Status, StatusRepository,
-    StatusVisibility, TimelineCache,
+    CachedAttachment, EntityId, MediaAttachment, PersistedReason, RemoteStatusAttachment,
+    ScheduledStatusInsert, Status, StatusRepository, StatusVisibility, TimelineCache,
 };
 use crate::error::AppError;
 #[cfg(test)]
@@ -268,8 +268,20 @@ impl StatusService {
         if let Some(status) = self.db.get_status(id).await? {
             return Ok(Some(status));
         }
+        if let Some(cached) = self.cache.get(id).await {
+            return Ok(Some(
+                self.status_from_cached(&cached, PersistedReason::CacheOnly),
+            ));
+        }
         if id.starts_with("http://") || id.starts_with("https://") {
-            return self.db.get_status_by_uri(id).await;
+            if let Some(status) = self.db.get_status_by_uri(id).await? {
+                return Ok(Some(status));
+            }
+            if let Some(cached) = self.cache.get_by_uri(id).await {
+                return Ok(Some(
+                    self.status_from_cached(&cached, PersistedReason::CacheOnly),
+                ));
+            }
         }
         Ok(None)
     }
@@ -730,26 +742,7 @@ impl StatusService {
             return Ok(existing);
         }
         if let Some(cached) = self.cache.get_by_uri(status_uri).await {
-            let status = Status {
-                id: cached.id.clone(),
-                uri: cached.uri.clone(),
-                content: cached.content.clone(),
-                content_warning: None,
-                visibility: StatusVisibility::parse(&cached.visibility)
-                    .unwrap_or(StatusVisibility::Private),
-                language: None,
-                account_address: cached.account_address.clone(),
-                is_local: false,
-                in_reply_to_uri: cached.reply_to_uri.clone(),
-                boost_of_uri: cached.boost_of_uri.clone(),
-                quote_of_uri: cached.quote_of_uri.clone(),
-                persisted_reason: reason,
-                created_at: cached.created_at,
-                fetched_at: Some(chrono::Utc::now()),
-            };
-            self.db.insert_status(&status).await?;
-            self.invalidate_cached_status(&status).await;
-            return Ok(status);
+            return self.persist_cached_remote_status(&cached, reason).await;
         }
 
         let normalized = normalize_remote_status_uri(status_uri)?;
@@ -759,26 +752,7 @@ impl StatusService {
                 return Ok(existing);
             }
             if let Some(cached) = self.cache.get_by_uri(&normalized_uri).await {
-                let status = Status {
-                    id: cached.id.clone(),
-                    uri: cached.uri.clone(),
-                    content: cached.content.clone(),
-                    content_warning: None,
-                    visibility: StatusVisibility::parse(&cached.visibility)
-                        .unwrap_or(StatusVisibility::Private),
-                    language: None,
-                    account_address: cached.account_address.clone(),
-                    is_local: false,
-                    in_reply_to_uri: cached.reply_to_uri.clone(),
-                    boost_of_uri: cached.boost_of_uri.clone(),
-                    quote_of_uri: cached.quote_of_uri.clone(),
-                    persisted_reason: reason,
-                    created_at: cached.created_at,
-                    fetched_at: Some(chrono::Utc::now()),
-                };
-                self.db.insert_status(&status).await?;
-                self.invalidate_cached_status(&status).await;
-                return Ok(status);
+                return self.persist_cached_remote_status(&cached, reason).await;
             }
         }
 
@@ -804,6 +778,72 @@ impl StatusService {
         self.db.insert_status(&placeholder).await?;
         self.invalidate_cached_status(&placeholder).await;
         Ok(placeholder)
+    }
+
+    fn status_from_cached(
+        &self,
+        cached: &crate::data::CachedStatus,
+        reason: PersistedReason,
+    ) -> Status {
+        Status {
+            id: cached.id.clone(),
+            uri: cached.uri.clone(),
+            content: cached.content.clone(),
+            content_warning: None,
+            visibility: StatusVisibility::parse(&cached.visibility)
+                .unwrap_or(StatusVisibility::Private),
+            language: None,
+            account_address: cached.account_address.clone(),
+            is_local: false,
+            in_reply_to_uri: cached.reply_to_uri.clone(),
+            boost_of_uri: cached.boost_of_uri.clone(),
+            quote_of_uri: cached.quote_of_uri.clone(),
+            persisted_reason: reason,
+            created_at: cached.created_at,
+            fetched_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    fn remote_attachments_from_cached(
+        &self,
+        status_id: &str,
+        attachments: &[CachedAttachment],
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<RemoteStatusAttachment> {
+        attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| RemoteStatusAttachment {
+                id: format!("{status_id}:cached:{index}"),
+                status_id: status_id.to_string(),
+                remote_url: attachment.url.clone(),
+                preview_url: attachment.thumbnail_url.clone(),
+                content_type: attachment.content_type.clone(),
+                description: attachment.description.clone(),
+                blurhash: attachment.blurhash.clone(),
+                width: None,
+                height: None,
+                created_at,
+            })
+            .collect()
+    }
+
+    async fn persist_cached_remote_status(
+        &self,
+        cached: &crate::data::CachedStatus,
+        reason: PersistedReason,
+    ) -> Result<Status, AppError> {
+        let status = self.status_from_cached(cached, reason);
+        self.db.insert_status(&status).await?;
+        let attachments =
+            self.remote_attachments_from_cached(&status.id, &cached.attachments, status.created_at);
+        if !attachments.is_empty() {
+            self.db
+                .replace_remote_status_attachments(&status.id, &attachments)
+                .await?;
+        }
+        self.invalidate_cached_status(&status).await;
+        Ok(status)
     }
 
     async fn stream_targets_for_status(
@@ -921,6 +961,19 @@ impl StatusService {
         self.cache.remove_by_uri(&status.uri).await;
     }
 
+    async fn ensure_interactable_status(
+        &self,
+        status_id: &str,
+        reason: PersistedReason,
+    ) -> Result<Status, AppError> {
+        let status = self.get(status_id).await?;
+        if status.is_local || self.db.get_status(&status.id).await?.is_some() {
+            return Ok(status);
+        }
+        self.ensure_remote_status_persisted(&status.uri, reason)
+            .await
+    }
+
     /// Favourite by local status ID
     pub async fn favourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
         let (status, _) = self.favourite_by_id_with_id(status_id).await?;
@@ -932,7 +985,9 @@ impl StatusService {
         &self,
         status_id: &str,
     ) -> Result<(Status, String), AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Favourited)
+            .await?;
         let favourite_id = self.db.insert_favourite(&status.id).await?;
         self.publish_status_update(&status).await?;
         Ok((status, favourite_id))
@@ -940,14 +995,18 @@ impl StatusService {
 
     /// Unfavourite by local status ID
     pub async fn unfavourite_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Favourited)
+            .await?;
         self.unfavourite_loaded(&status).await?;
         Ok(status)
     }
 
     /// Bookmark by local status ID
     pub async fn bookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Bookmarked)
+            .await?;
         self.db.insert_bookmark(&status.id).await?;
         self.publish_status_update(&status).await?;
         Ok(status)
@@ -955,7 +1014,9 @@ impl StatusService {
 
     /// Unbookmark by local status ID
     pub async fn unbookmark_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Bookmarked)
+            .await?;
         self.unbookmark_loaded(&status).await?;
         Ok(status)
     }
@@ -966,7 +1027,9 @@ impl StatusService {
         status_id: &str,
         repost_uri: &str,
     ) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Reposted)
+            .await?;
         self.db.insert_repost(&status.id, repost_uri).await?;
         self.publish_status_update(&status).await?;
         Ok(status)
@@ -1002,7 +1065,9 @@ impl StatusService {
 
     /// Undo repost for a status by its persisted database ID
     pub async fn unrepost_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::Reposted)
+            .await?;
         self.db.delete_repost(&status.id).await?;
         self.publish_status_update(&status).await?;
         Ok(status)
@@ -1044,7 +1109,9 @@ impl StatusService {
 
     /// Mute conversation by status ID.
     pub async fn mute_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::CacheOnly)
+            .await?;
         let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
         self.db.insert_muted_thread(&thread_uri).await?;
         Ok(status)
@@ -1052,7 +1119,9 @@ impl StatusService {
 
     /// Unmute conversation by status ID.
     pub async fn unmute_by_id(&self, status_id: &str) -> Result<Status, AppError> {
-        let status = self.get(status_id).await?;
+        let status = self
+            .ensure_interactable_status(status_id, PersistedReason::CacheOnly)
+            .await?;
         let thread_uri = self.db.resolve_thread_root_uri(&status).await?;
         self.db.delete_muted_thread(&thread_uri).await?;
         Ok(status)

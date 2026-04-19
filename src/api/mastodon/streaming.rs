@@ -278,16 +278,46 @@ async fn build_status_response_value(
         crate::api::StatusInteractions::public()
     };
 
-    let response = crate::api::build_status_response_with_account_stats_and_remote_stats(
-        state.db.as_ref(),
-        status,
-        &account,
-        &state.config,
-        account_stats,
-        remote_stats,
-        interactions,
-    )
-    .await?;
+    let response = if matches!(status.persisted_reason, PersistedReason::CacheOnly) {
+        let cached = if let Some(cached) = state.timeline_cache.get(&status.id).await {
+            Some(cached)
+        } else {
+            state.timeline_cache.get_by_uri(&status.uri).await
+        };
+        let media = cached
+            .map(|cached| {
+                cached
+                    .attachments
+                    .iter()
+                    .map(crate::api::cached_media_attachment_to_response)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        crate::api::status_to_response_with_media(
+            status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats.clone(),
+            interactions,
+            remote_stats
+                .as_ref()
+                .map(|stats| stats.force_sensitive)
+                .unwrap_or(false),
+            &media,
+        )
+    } else {
+        crate::api::build_status_response_with_account_stats_and_remote_stats(
+            state.db.as_ref(),
+            status,
+            &account,
+            &state.config,
+            account_stats,
+            remote_stats,
+            interactions,
+        )
+        .await?
+    };
 
     serde_json::to_value(response)
         .map_err(|error| AppError::serialization("streaming status payload", error))
@@ -729,6 +759,9 @@ pub async fn stream_public(
     let receiver = state.streaming_event_bus.subscribe_public().await?;
     let auth =
         authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    if let Some(auth) = auth.as_ref() {
+        enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
+    }
     Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
@@ -743,6 +776,9 @@ pub async fn stream_public_local(
     let receiver = state.streaming_event_bus.subscribe_public_local().await?;
     let auth =
         authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    if let Some(auth) = auth.as_ref() {
+        enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
+    }
     Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 
@@ -768,6 +804,9 @@ pub async fn stream_hashtag(
     };
     let auth =
         authenticate_stream_request(&state, &headers, &jar, params.access_token.as_deref()).await?;
+    if let Some(auth) = auth.as_ref() {
+        enforce_stream_auth(Some(auth), STREAM_SCOPE_STATUSES)?;
+    }
     Ok(build_sse_stream(state, receiver, auth.is_some()))
 }
 

@@ -602,6 +602,74 @@ async fn test_home_timeline_excludes_silenced_remote_followee_status() {
 }
 
 #[tokio::test]
+async fn test_home_timeline_excludes_accounts_in_exclusive_lists() {
+    use chrono::Utc;
+    use rustresort::data::{CachedStatus, EntityId, Follow};
+
+    let server = TestServer::new().await;
+    server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let actor_uri = "https://remote.example/users/alice";
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: actor_uri.to_string(),
+            actor_uri: Some(actor_uri.to_string()),
+            uri: "https://test.example.com/users/testuser/follow/alice-exclusive".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Exclusive followee", "list", true)
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_account_to_list(&list_id, "alice@remote.example")
+        .await
+        .unwrap();
+
+    let status_uri = "https://remote.example/users/alice/statuses/exclusive-home";
+    server
+        .state
+        .timeline_cache
+        .insert(CachedStatus {
+            id: status_uri.to_string(),
+            uri: status_uri.to_string(),
+            content: "<p>Exclusive followee post</p>".to_string(),
+            account_address: "alice@remote.example".to_string(),
+            created_at: Utc::now(),
+            visibility: "public".to_string(),
+            attachments: vec![],
+            reply_to_uri: None,
+            boost_of_uri: None,
+            quote_of_uri: None,
+        })
+        .await;
+
+    let response = server
+        .client
+        .get(server.url("/api/v1/timelines/home"))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let entries = json.as_array().expect("timeline should be array");
+    assert!(entries.iter().all(|item| item["uri"] != status_uri));
+}
+
+#[tokio::test]
 async fn test_public_timeline_includes_cached_remote_public_status() {
     use chrono::Utc;
     use rustresort::data::CachedStatus;
@@ -1759,6 +1827,258 @@ async fn test_list_timeline_respects_none_replies_policy() {
         .collect();
     assert!(ids.contains(&root.id));
     assert!(!ids.contains(&reply.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_respects_followed_replies_policy() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, Follow, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    server
+        .state
+        .db
+        .insert_follow(&Follow {
+            id: EntityId::new_string(),
+            target_address: "followed@remote.example".to_string(),
+            actor_uri: Some("https://remote.example/users/followed".to_string()),
+            uri: "https://test.example.com/users/testuser/follow/followed".to_string(),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Replies followed list", "followed", false)
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_account_to_list(&list_id, &account.id)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let followed_parent = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/followed/statuses/1".to_string(),
+        content: "<p>Followed parent</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "followed@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: now - Duration::seconds(5),
+        fetched_at: None,
+    };
+    let other_parent = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/other/statuses/1".to_string(),
+        content: "<p>Other parent</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "other@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: now - Duration::seconds(4),
+        fetched_at: None,
+    };
+    let visible_reply = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/list-followed-visible".to_string(),
+        content: "<p>Reply to followed account</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(followed_parent.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(2),
+        fetched_at: None,
+    };
+    let hidden_reply = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/list-followed-hidden".to_string(),
+        content: "<p>Reply to unfollowed account</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(other_parent.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(1),
+        fetched_at: None,
+    };
+
+    server
+        .state
+        .db
+        .insert_status(&followed_parent)
+        .await
+        .unwrap();
+    server.state.db.insert_status(&other_parent).await.unwrap();
+    server.state.db.insert_status(&visible_reply).await.unwrap();
+    server.state.db.insert_status(&hidden_reply).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ids: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(ids.contains(&visible_reply.id));
+    assert!(!ids.contains(&hidden_reply.id));
+}
+
+#[tokio::test]
+async fn test_list_timeline_respects_list_replies_policy() {
+    use chrono::{Duration, Utc};
+    use rustresort::data::{EntityId, PersistedReason, Status, StatusVisibility};
+
+    let server = TestServer::new().await;
+    let account = server.create_test_account().await;
+    let token = server.create_test_token().await;
+
+    let list_id = server
+        .state
+        .db
+        .create_list("Replies list-members", "list", false)
+        .await
+        .unwrap();
+    server
+        .state
+        .db
+        .add_accounts_to_list(
+            &list_id,
+            &[account.id.clone(), "friend@remote.example".to_string()],
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let listed_parent = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/friend/statuses/1".to_string(),
+        content: "<p>Listed parent</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "friend@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: now - Duration::seconds(5),
+        fetched_at: None,
+    };
+    let outsider_parent = Status {
+        id: EntityId::new_string(),
+        uri: "https://remote.example/users/outsider/statuses/1".to_string(),
+        content: "<p>Outsider parent</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: "outsider@remote.example".to_string(),
+        is_local: false,
+        in_reply_to_uri: None,
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Timeline,
+        created_at: now - Duration::seconds(4),
+        fetched_at: None,
+    };
+    let visible_reply = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/list-policy-visible".to_string(),
+        content: "<p>Reply to listed account</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(listed_parent.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(2),
+        fetched_at: None,
+    };
+    let hidden_reply = Status {
+        id: EntityId::new_string(),
+        uri: "https://test.example.com/status/list-policy-hidden".to_string(),
+        content: "<p>Reply to outsider</p>".to_string(),
+        content_warning: None,
+        visibility: StatusVisibility::Public,
+        language: Some("en".to_string()),
+        account_address: String::new(),
+        is_local: true,
+        in_reply_to_uri: Some(outsider_parent.uri.clone()),
+        boost_of_uri: None,
+        quote_of_uri: None,
+        persisted_reason: PersistedReason::Own,
+        created_at: now - Duration::seconds(1),
+        fetched_at: None,
+    };
+
+    server.state.db.insert_status(&listed_parent).await.unwrap();
+    server
+        .state
+        .db
+        .insert_status(&outsider_parent)
+        .await
+        .unwrap();
+    server.state.db.insert_status(&visible_reply).await.unwrap();
+    server.state.db.insert_status(&hidden_reply).await.unwrap();
+
+    let response = server
+        .client
+        .get(server.url(&format!("/api/v1/timelines/list/{}", list_id)))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let json: Value = response.json().await.unwrap();
+    let ids: Vec<String> = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert!(ids.contains(&visible_reply.id));
+    assert!(!ids.contains(&hidden_reply.id));
 }
 
 #[tokio::test]

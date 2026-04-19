@@ -1159,13 +1159,6 @@ pub(crate) fn parse_actor_uri_account_address(raw: &str) -> Option<String> {
                         .iter()
                         .find_map(|segment| segment.strip_prefix('@'))
                 })
-                .or_else(|| {
-                    collected
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|segment| !segment.is_empty())
-                })
         })
         .map(str::to_ascii_lowercase)
         .filter(|value| !value.is_empty())?;
@@ -1193,7 +1186,7 @@ fn canonical_remote_account_address(raw: &str) -> Option<String> {
         .or_else(|| normalize_account_address(raw).ok())
 }
 
-fn account_addresses_match_with_default_port(
+pub(crate) fn account_addresses_match_with_default_port(
     left: &str,
     right: &str,
     default_port: Option<u16>,
@@ -1233,6 +1226,22 @@ fn account_addresses_match_with_default_port(
         Some(port) => left_port.unwrap_or(port) == right_port.unwrap_or(port),
         None => left_port == right_port,
     }
+}
+
+fn placeholder_username_from_actor_uri(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    parsed
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .next_back()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.trim_start_matches('@').to_ascii_lowercase())
+        .filter(|segment| !segment.is_empty())
 }
 
 fn remote_account_placeholder_created_at() -> chrono::DateTime<chrono::Utc> {
@@ -1334,33 +1343,43 @@ pub(crate) fn build_remote_account_placeholder_response(
     statuses_count: i32,
 ) -> Option<AccountResponse> {
     let trimmed = address.trim();
-    let (id, username, acct, url) =
-        if let Some(parsed_address) = parse_actor_uri_account_address(trimmed) {
-            let (username, _domain) = parsed_address.split_once('@')?;
-            (
-                if actor_uri_placeholder_uses_uri_id(trimmed) {
-                    trimmed.to_string()
-                } else {
-                    parsed_address.clone()
-                },
-                username.to_string(),
-                parsed_address,
-                trimmed.to_string(),
-            )
-        } else if let Some((username, domain)) = trimmed.split_once('@') {
-            (
-                trimmed.to_string(),
-                username.to_ascii_lowercase(),
-                trimmed.to_string(),
-                format!(
-                    "https://{}/@{}",
-                    domain.to_ascii_lowercase(),
-                    username.to_ascii_lowercase()
-                ),
-            )
-        } else {
-            return None;
-        };
+    let (id, username, acct, url) = if let Some(parsed_address) =
+        parse_actor_uri_account_address(trimmed)
+    {
+        let (username, _domain) = parsed_address.split_once('@')?;
+        (
+            if actor_uri_placeholder_uses_uri_id(trimmed) {
+                trimmed.to_string()
+            } else {
+                parsed_address.clone()
+            },
+            username.to_string(),
+            parsed_address,
+            trimmed.to_string(),
+        )
+    } else if let Ok(parsed) = url::Url::parse(trimmed) {
+        let host = parsed
+            .host_str()?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let username = placeholder_username_from_actor_uri(trimmed).unwrap_or_else(|| host.clone());
+        let acct = format!("{username}@{host}");
+        (acct.clone(), username, acct, trimmed.to_string())
+    } else if let Some((username, domain)) = trimmed.split_once('@') {
+        (
+            trimmed.to_string(),
+            username.to_ascii_lowercase(),
+            trimmed.to_string(),
+            format!(
+                "https://{}/@{}",
+                domain.to_ascii_lowercase(),
+                username.to_ascii_lowercase()
+            ),
+        )
+    } else {
+        return None;
+    };
     let media_url = &config.storage.media.public_url;
     let avatar = format!("{}/default-avatar.png", media_url);
     let header = format!("{}/default-header.png", media_url);
@@ -1406,11 +1425,17 @@ pub(crate) async fn resolve_remote_account_response(
     federation_fetch_client: &reqwest::Client,
     raw_address: &str,
 ) -> Option<AccountResponse> {
-    let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
+    let profile_by_uri = profile_cache.get_by_uri(raw_address.trim()).await;
+    let normalized_address =
+        if let Some(normalized_address) = normalize_remote_lookup_account_address(raw_address) {
+            normalized_address
+        } else {
+            normalize_account_address(&profile_by_uri.as_ref()?.address).ok()?
+        };
 
     let mut profile = profile_cache.get(&normalized_address).await;
     if profile.is_none() {
-        profile = profile_cache.get_by_uri(raw_address.trim()).await;
+        profile = profile_by_uri;
     }
     if profile.is_none()
         && resolve_remote_actor_and_inbox_with_dependencies(
@@ -1446,11 +1471,17 @@ pub(crate) async fn resolve_cached_remote_account_response(
     profile_cache: &crate::data::ProfileCache,
     raw_address: &str,
 ) -> Option<AccountResponse> {
-    let normalized_address = normalize_remote_lookup_account_address(raw_address)?;
+    let profile_by_uri = profile_cache.get_by_uri(raw_address.trim()).await;
+    let normalized_address =
+        if let Some(normalized_address) = normalize_remote_lookup_account_address(raw_address) {
+            normalized_address
+        } else {
+            normalize_account_address(&profile_by_uri.as_ref()?.address).ok()?
+        };
     let profile = if let Some(profile) = profile_cache.get(&normalized_address).await {
         profile
     } else {
-        profile_cache.get_by_uri(raw_address.trim()).await?
+        profile_by_uri?
     };
     let statuses_count = observed_statuses_count_for_address(
         db,
@@ -2972,7 +3003,7 @@ pub async fn account_statuses(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !responses.is_empty(),
         has_next,
         &extra_params,
     ) {
@@ -3014,7 +3045,7 @@ pub async fn get_account_followers(
             limit,
             first_id,
             last_id,
-            params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+            !followers.is_empty(),
             followers.len() >= limit,
         ) {
             headers.insert(
@@ -3092,7 +3123,7 @@ pub async fn get_account_followers(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !followers.is_empty(),
         has_next,
     ) {
         headers.insert(
@@ -3133,7 +3164,7 @@ pub async fn get_account_following(
             limit,
             first_id,
             last_id,
-            params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+            !following.is_empty(),
             following.len() >= limit,
         ) {
             headers.insert(
@@ -3211,7 +3242,7 @@ pub async fn get_account_following(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !following.is_empty(),
         has_next,
     ) {
         headers.insert(
@@ -3683,13 +3714,11 @@ pub async fn search_accounts(
                 continue;
             }
 
-            if let Some(remote_account) = resolve_remote_account_response_for_list(
+            if let Some(remote_account) = resolve_cached_remote_account_response(
                 state.config.as_ref(),
                 state.db.as_ref(),
                 state.profile_cache.as_ref(),
-                state.federation_fetch_client.as_ref(),
                 &address,
-                default_port_for_protocol(&state.config.server.protocol),
             )
             .await
             {

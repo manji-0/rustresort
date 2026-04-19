@@ -808,10 +808,10 @@ pub async fn instance_v2(State(state): State<InstanceApiState>) -> Json<serde_js
                 "enabled": false
             }
         },
-        "icon": {
+        "icon": [{
             "src": format!("{}/favicon.ico", base_url),
             "size": "16x16"
-        },
+        }],
         "registrations": {
             "enabled": false,
             "approval_required": false,

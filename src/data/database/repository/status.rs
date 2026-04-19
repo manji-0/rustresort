@@ -252,8 +252,21 @@ impl Database {
             None => None,
         };
 
-        let mut query_builder =
-            QueryBuilder::<Sqlite>::new("SELECT * FROM statuses WHERE visibility = 'direct'");
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT *
+            FROM statuses
+            WHERE visibility = 'direct'
+              AND (
+                    is_local = 1
+                 OR EXISTS (
+                        SELECT 1
+                        FROM conversation_statuses
+                        WHERE conversation_statuses.status_id = statuses.id
+                    )
+              )
+            "#,
+        );
         Self::push_status_window_clauses(
             &mut query_builder,
             max_cursor.as_ref(),
@@ -521,11 +534,13 @@ impl Database {
             self.replace_status_hashtags_in_connection(&mut conn, &status.id, &status.content)
                 .await?;
 
-            for media_id in media_ids {
+            for (index, media_id) in media_ids.iter().enumerate() {
+                let ordered_created_at = status.created_at + chrono::Duration::milliseconds(index as i64);
                 let updated = sqlx::query(
-                    "UPDATE media_attachments SET status_id = ? WHERE id = ? AND status_id IS NULL",
+                    "UPDATE media_attachments SET status_id = ?, created_at = ? WHERE id = ? AND status_id IS NULL",
                 )
                 .bind(&status.id)
+                .bind(ordered_created_at)
                 .bind(media_id)
                 .execute(&mut *conn)
                 .await?;
@@ -737,11 +752,14 @@ impl Database {
                     query.execute(&mut *conn).await?;
                 }
 
-                for media_id in media_ids {
+                for (index, media_id) in media_ids.iter().enumerate() {
+                    let ordered_created_at =
+                        updated.created_at + chrono::Duration::milliseconds(index as i64);
                     let attach_result = sqlx::query(
-                        "UPDATE media_attachments SET status_id = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
+                        "UPDATE media_attachments SET status_id = ?, created_at = ? WHERE id = ? AND (status_id IS NULL OR status_id = ?)",
                     )
                     .bind(&updated.id)
+                    .bind(ordered_created_at)
                     .bind(media_id)
                     .bind(&updated.id)
                     .execute(&mut *conn)

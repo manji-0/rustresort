@@ -383,7 +383,7 @@ where
         )
         .route(
             "/v1/timelines/list/:list_id",
-            scoped(get(timelines::list_timeline), READ_STATUSES),
+            scoped(get(timelines::list_timeline), READ_LISTS),
         )
         .route(
             "/v1/timelines/direct",
@@ -440,6 +440,10 @@ where
         .route(
             "/v1/notifications/unread_count",
             scoped(get(notifications::get_unread_count), READ_NOTIFICATIONS),
+        )
+        .route(
+            "/v2/notifications/unread_count",
+            scoped(get(notifications::get_unread_count_v2), READ_NOTIFICATIONS),
         )
         .route(
             "/v1/push/subscription",

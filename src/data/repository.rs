@@ -101,6 +101,11 @@ pub trait StatusRepository: Send + Sync {
     async fn get_status(&self, id: &str) -> Result<Option<Status>, AppError>;
     async fn get_status_by_uri(&self, uri: &str) -> Result<Option<Status>, AppError>;
     async fn update_status(&self, status: &Status) -> Result<(), AppError>;
+    async fn replace_remote_status_attachments(
+        &self,
+        status_id: &str,
+        attachments: &[RemoteStatusAttachment],
+    ) -> Result<(), AppError>;
     async fn update_status_with_edit_snapshot(
         &self,
         previous: &Status,
@@ -401,6 +406,14 @@ impl StatusRepository for Database {
 
     async fn update_status(&self, status: &Status) -> Result<(), AppError> {
         Database::update_status(self, status).await
+    }
+
+    async fn replace_remote_status_attachments(
+        &self,
+        status_id: &str,
+        attachments: &[RemoteStatusAttachment],
+    ) -> Result<(), AppError> {
+        Database::replace_remote_status_attachments(self, status_id, attachments).await
     }
 
     async fn update_status_with_edit_snapshot(

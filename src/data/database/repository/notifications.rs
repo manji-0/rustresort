@@ -195,6 +195,35 @@ impl Database {
         Ok(())
     }
 
+    /// Mark notifications up to and including the cursor notification as read.
+    pub async fn mark_notifications_read_through(&self, id: &str) -> Result<(), AppError> {
+        let Some(created_at) = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT created_at FROM notifications WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE notifications
+            SET read = 1
+            WHERE created_at < ?
+               OR (created_at = ? AND id <= ?)
+            "#,
+        )
+        .bind(created_at)
+        .bind(created_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Delete a single notification by ID.
     pub async fn delete_notification(&self, id: &str) -> Result<bool, AppError> {
         let result = sqlx::query("DELETE FROM notifications WHERE id = ?")

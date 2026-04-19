@@ -97,6 +97,16 @@ async fn render_poll(
     include_user_votes: bool,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let poll = state.db.get_poll(id).await?.ok_or(AppError::NotFound)?;
+    if let Some(status_id) = state.db.get_status_id_by_poll_id(id).await?
+        && let Some(status) = state.db.get_status(&status_id).await?
+        && !include_user_votes
+        && !matches!(
+            status.visibility,
+            crate::data::StatusVisibility::Public | crate::data::StatusVisibility::Unlisted
+        )
+    {
+        return Err(AppError::NotFound);
+    }
     let options = state.db.get_poll_options(id).await?;
 
     let user_votes = if include_user_votes {
@@ -123,7 +133,11 @@ async fn render_poll(
         .map(|(_, title, votes_count)| {
             serde_json::json!({
                 "title": title,
-                "votes_count": votes_count
+                "votes_count": if poll.4 && !poll.2 && own_votes.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(votes_count)
+                }
             })
         })
         .collect();
@@ -134,8 +148,16 @@ async fn render_poll(
         "expired": poll.2,
         "multiple": poll.3,
         "hide_totals": poll.4,
-        "votes_count": poll.5,
-        "voters_count": poll.6,
+        "votes_count": if poll.4 && !poll.2 && own_votes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(poll.5)
+        },
+        "voters_count": if poll.4 && !poll.2 && own_votes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(poll.6)
+        },
         "voted": !own_votes.is_empty(),
         "own_votes": own_votes,
         "options": options_response,

@@ -69,9 +69,9 @@ pub async fn get_bookmarks(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;
@@ -92,7 +92,7 @@ pub async fn get_bookmarks(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !responses.is_empty(),
         has_next,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
@@ -157,9 +157,9 @@ pub async fn get_favourites(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             ),
         )
         .await?;
@@ -180,7 +180,7 @@ pub async fn get_favourites(
         limit,
         first_id,
         last_id,
-        params.max_id.is_some() || params.min_id.is_some() || params.since_id.is_some(),
+        !responses.is_empty(),
         has_next,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));

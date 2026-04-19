@@ -2663,6 +2663,18 @@ impl ActivityProcessor {
                 .await?;
             self.replace_remote_poll_for_status(&status.id, object)
                 .await?;
+            if matches!(status.visibility, StatusVisibility::Direct) {
+                let conversation_id = self
+                    .db
+                    .get_or_create_conversation(&[
+                        self.local_address.clone(),
+                        status.account_address.clone(),
+                    ])
+                    .await?;
+                self.db
+                    .add_status_to_conversation(&conversation_id, &status.id)
+                    .await?;
+            }
             return Ok(Some(status));
         }
 
@@ -2674,6 +2686,18 @@ impl ActivityProcessor {
             .await?;
         self.replace_remote_poll_for_status(&status.id, object)
             .await?;
+        if matches!(status.visibility, StatusVisibility::Direct) {
+            let conversation_id = self
+                .db
+                .get_or_create_conversation(&[
+                    self.local_address.clone(),
+                    status.account_address.clone(),
+                ])
+                .await?;
+            self.db
+                .add_status_to_conversation(&conversation_id, &status.id)
+                .await?;
+        }
         Ok(Some(status))
     }
 

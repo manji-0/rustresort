@@ -9,7 +9,7 @@ use axum_extra::extract::CookieJar;
 use serde::Deserialize;
 use std::collections::HashSet;
 
-use super::accounts::PaginationParams;
+use super::accounts::{PaginationParams, account_addresses_match_with_default_port};
 use crate::TimelineApiState;
 use crate::auth::CurrentUser;
 use crate::data::ListTimelineQuery;
@@ -18,6 +18,9 @@ use crate::metrics::{
     DB_QUERIES_TOTAL, DB_QUERY_DURATION_SECONDS, HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL,
 };
 use crate::service::TimelineService;
+
+const TIMELINE_FILTER_OVERFETCH_MULTIPLIER: usize = 5;
+const TIMELINE_FILTER_OVERFETCH_MAX_LIMIT: usize = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct PublicTimelineParams {
@@ -168,6 +171,8 @@ fn timeline_link_header(
     limit: usize,
     first_id: Option<&str>,
     last_id: Option<&str>,
+    has_prev: bool,
+    has_next: bool,
     extra_params: &[(String, String)],
 ) -> Option<String> {
     fn build_query(
@@ -186,14 +191,14 @@ fn timeline_link_header(
     }
 
     let mut links = Vec::new();
-    if let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
+    if has_next && let Some(last_id) = last_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}?{}>; rel=\"next\"",
             path,
             build_query(limit, "max_id", last_id, extra_params)
         ));
     }
-    if let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
+    if has_prev && let Some(first_id) = first_id.filter(|value| !value.is_empty()) {
         links.push(format!(
             "<{}?{}>; rel=\"prev\"",
             path,
@@ -202,6 +207,106 @@ fn timeline_link_header(
     }
 
     (!links.is_empty()).then(|| links.join(", "))
+}
+
+fn timeline_filter_overfetch_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(TIMELINE_FILTER_OVERFETCH_MULTIPLIER)
+        .max(limit)
+        .min(TIMELINE_FILTER_OVERFETCH_MAX_LIMIT)
+}
+
+async fn load_exclusive_list_members(
+    state: &TimelineApiState,
+) -> Result<Vec<(String, bool)>, AppError> {
+    let mut members = Vec::new();
+    for (list_id, _title, _replies_policy, exclusive) in state.db.get_all_lists().await? {
+        if !exclusive {
+            continue;
+        }
+        for member in state.db.get_list_accounts(&list_id).await? {
+            let is_local_id = !member.contains('@')
+                && !member.starts_with("http://")
+                && !member.starts_with("https://");
+            members.push((member, is_local_id));
+        }
+    }
+    Ok(members)
+}
+
+fn status_matches_exclusive_list_member(
+    status: &crate::data::Status,
+    local_account_id: &str,
+    local_account_address: &str,
+    members: &[(String, bool)],
+    default_port: Option<u16>,
+) -> bool {
+    members.iter().any(|(member, is_local_id)| {
+        if *is_local_id {
+            status.is_local && member == local_account_id
+        } else if status.is_local {
+            account_addresses_match_with_default_port(member, local_account_address, default_port)
+        } else {
+            account_addresses_match_with_default_port(member, &status.account_address, default_port)
+        }
+    })
+}
+
+async fn should_include_list_reply(
+    state: &TimelineApiState,
+    status: &crate::data::Status,
+    replies_policy: &str,
+    list_members: &[String],
+    followed_accounts: &HashSet<String>,
+    local_account_id: &str,
+    local_account_address: &str,
+    default_port: Option<u16>,
+) -> Result<bool, AppError> {
+    let Some(parent_uri) = status.in_reply_to_uri.as_deref() else {
+        return Ok(true);
+    };
+
+    match replies_policy {
+        "none" => Ok(false),
+        "followed" | "list" => {
+            let Some(parent) = state.db.get_status_by_uri(parent_uri).await? else {
+                return Ok(false);
+            };
+
+            if replies_policy == "followed" {
+                if parent.is_local || parent.account_address.trim().is_empty() {
+                    return Ok(false);
+                }
+                return Ok(followed_accounts.iter().any(|followed| {
+                    account_addresses_match_with_default_port(
+                        followed,
+                        &parent.account_address,
+                        default_port,
+                    )
+                }));
+            }
+
+            if parent.is_local || parent.account_address.trim().is_empty() {
+                return Ok(list_members.iter().any(|member| {
+                    (member == local_account_id)
+                        || account_addresses_match_with_default_port(
+                            member,
+                            local_account_address,
+                            default_port,
+                        )
+                }));
+            }
+
+            Ok(list_members.iter().any(|member| {
+                account_addresses_match_with_default_port(
+                    member,
+                    &parent.account_address,
+                    default_port,
+                )
+            }))
+        }
+        _ => Ok(true),
+    }
 }
 
 /// GET /api/v1/timelines/home
@@ -221,12 +326,25 @@ pub async fn home_timeline(
         .start_timer();
     let account = state.db.get_account().await?.ok_or(AppError::NotFound)?;
     let account_stats = crate::api::load_local_account_stats(state.db.as_ref()).await?;
+    let local_account_address = format!("{}@{}", account.username, state.config.server.domain);
+    let local_account_id = account.id.to_string();
+    let default_port = match state.config.server.protocol.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
     DB_QUERIES_TOTAL
         .with_label_values(&["SELECT", "accounts"])
         .inc();
     db_timer.observe_duration();
 
     let limit = params.limit.unwrap_or(20).min(40);
+    let exclusive_members = load_exclusive_list_members(&state).await?;
+    let fetch_limit = if exclusive_members.is_empty() {
+        limit
+    } else {
+        timeline_filter_overfetch_limit(limit)
+    };
     let lower_bound_id = params.min_id.as_deref().or(params.since_id.as_deref());
     let timeline_service = TimelineService::new(
         state.db.clone(),
@@ -237,8 +355,20 @@ pub async fn home_timeline(
         .with_label_values(&["SELECT", "statuses"])
         .start_timer();
     let mut timeline_items = timeline_service
-        .home_timeline(limit, params.max_id.as_deref(), lower_bound_id)
+        .home_timeline(fetch_limit, params.max_id.as_deref(), lower_bound_id)
         .await?;
+    if !exclusive_members.is_empty() {
+        timeline_items.retain(|item| {
+            !status_matches_exclusive_list_member(
+                &item.status,
+                &local_account_id,
+                &local_account_address,
+                &exclusive_members,
+                default_port,
+            )
+        });
+        timeline_items.truncate(limit);
+    }
     if params.min_id.is_some() {
         timeline_items.reverse();
     }
@@ -296,6 +426,8 @@ pub async fn home_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
+        !timeline_items.is_empty(),
+        timeline_items.len() == limit,
         &[],
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
@@ -439,9 +571,9 @@ pub async fn public_timeline(
             crate::api::StatusInteractions::new(
                 Some(item.favourited),
                 Some(item.reblogged),
-                None,
+                Some(item.muted),
                 Some(item.bookmarked),
-                None,
+                Some(item.pinned),
             )
         } else {
             crate::api::StatusInteractions::public()
@@ -481,6 +613,8 @@ pub async fn public_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
+        !timeline_items.is_empty(),
+        timeline_items.len() == limit,
         &extra_params,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
@@ -636,6 +770,8 @@ pub async fn tag_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
+        !timeline_items.is_empty(),
+        timeline_items.len() == limit,
         &extra_params,
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
@@ -674,55 +810,80 @@ pub async fn list_timeline(
         state.timeline_cache.clone(),
         state.profile_cache.clone(),
     );
-    let timeline_items = if list.2 == "none" {
-        let mut collected = Vec::with_capacity(limit);
-        let mut cursor = params.max_id.clone();
-        let min_id = lower_bound_id.clone();
+    let replies_policy = list.2.as_str();
+    let list_members = state.db.get_list_accounts(&list_id).await?;
+    let followed_accounts: HashSet<String> = if replies_policy == "followed" {
+        state
+            .db
+            .get_all_follows()
+            .await?
+            .into_iter()
+            .map(|follow| follow.target_address)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let timeline_items =
+        if replies_policy == "none" || replies_policy == "followed" || replies_policy == "list" {
+            let mut collected = Vec::with_capacity(limit);
+            let mut cursor = params.max_id.clone();
+            let min_id = lower_bound_id.clone();
 
-        while collected.len() < limit {
+            while collected.len() < limit {
+                let query = ListTimelineQuery {
+                    list_id: list_id.clone(),
+                    local_account_address: local_account_address.clone(),
+                    local_account_id: local_account_id.clone(),
+                    default_port,
+                    limit,
+                    max_id: cursor.clone(),
+                    min_id: min_id.clone(),
+                };
+                let page = timeline_service.list_timeline(&query).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let fetched_count = page.len();
+                cursor = page.last().map(|item| item.status.id.clone());
+
+                for item in page {
+                    if should_include_list_reply(
+                        &state,
+                        &item.status,
+                        replies_policy,
+                        &list_members,
+                        &followed_accounts,
+                        &local_account_id,
+                        &local_account_address,
+                        default_port,
+                    )
+                    .await?
+                    {
+                        collected.push(item);
+                        if collected.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+
+                if fetched_count < limit || cursor.is_none() {
+                    break;
+                }
+            }
+
+            collected
+        } else {
             let query = ListTimelineQuery {
                 list_id: list_id.clone(),
                 local_account_address: local_account_address.clone(),
                 local_account_id: local_account_id.clone(),
                 default_port,
                 limit,
-                max_id: cursor.clone(),
-                min_id: min_id.clone(),
+                max_id: params.max_id.clone(),
+                min_id: lower_bound_id,
             };
-            let page = timeline_service.list_timeline(&query).await?;
-            if page.is_empty() {
-                break;
-            }
-            let fetched_count = page.len();
-            cursor = page.last().map(|item| item.status.id.clone());
-
-            for item in page {
-                if item.status.in_reply_to_uri.is_none() {
-                    collected.push(item);
-                    if collected.len() >= limit {
-                        break;
-                    }
-                }
-            }
-
-            if fetched_count < limit || cursor.is_none() {
-                break;
-            }
-        }
-
-        collected
-    } else {
-        let query = ListTimelineQuery {
-            list_id: list_id.clone(),
-            local_account_address: local_account_address.clone(),
-            local_account_id: local_account_id.clone(),
-            default_port,
-            limit,
-            max_id: params.max_id.clone(),
-            min_id: lower_bound_id,
+            timeline_service.list_timeline(&query).await?
         };
-        timeline_service.list_timeline(&query).await?
-    };
     let mut timeline_items = timeline_items;
     if params.min_id.is_some() {
         timeline_items.reverse();
@@ -770,9 +931,15 @@ pub async fn list_timeline(
         "/api/v1/timelines/list/{}",
         urlencoding::encode(list_id.trim())
     );
-    if let Some(link) =
-        timeline_link_header(&path, limit, first_id.as_deref(), last_id.as_deref(), &[])
-    {
+    if let Some(link) = timeline_link_header(
+        &path,
+        limit,
+        first_id.as_deref(),
+        last_id.as_deref(),
+        !timeline_items.is_empty(),
+        timeline_items.len() == limit,
+        &[],
+    ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
     }
 
@@ -849,6 +1016,8 @@ pub async fn direct_timeline(
         limit,
         first_id.as_deref(),
         last_id.as_deref(),
+        !timeline_items.is_empty(),
+        has_next,
         &[],
     ) {
         headers.insert(LINK, link.parse().expect("valid link header"));
